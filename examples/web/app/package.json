@@ -1,9 +1,9 @@
 {
-  "name": "origo-web-plate",
+  "name": "origofs-web-plate",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "React + PlateJS editor over an origo workspace, with per-block attribution (blame) and version lineage.",
+  "description": "React + PlateJS editor over an origofs workspace, with per-block attribution (blame) and version lineage.",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

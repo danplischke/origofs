@@ -4,4 +4,4 @@ Cargo.lock.orig
 *.db
 *.db-wal
 *.db-shm
-.origo-cas/
+.origofs-cas/

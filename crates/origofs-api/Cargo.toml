@@ -1,0 +1,20 @@
+[package]
+name = "origofs-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk" }
+async-trait = "0.1.83"
+axum = "0.8.7"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.2", features = ["util"] }
+http-body-util = "0.1.3"

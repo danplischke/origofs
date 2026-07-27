@@ -1,0 +1,16 @@
+[package]
+name = "origofs-sdk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+origofs-core = { version = "0.1.0", path = "../origofs-core" }
+bytes = "1.12.1"
+futures = "0.3.33"
+getrandom = "0.2"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["time"] }

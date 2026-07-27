@@ -8,7 +8,7 @@ import type { BlockAuthorship } from "../lib/blame";
 import { actorColor } from "../lib/colors";
 
 export interface AttributionOptions {
-  /** Per top-level block (index-aligned) dominant author, from origo blame. */
+  /** Per top-level block (index-aligned) dominant author, from origofs blame. */
   spans: BlockAuthorship[];
   enabled: boolean;
 }

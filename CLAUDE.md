@@ -2,9 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## What origo is
+## What origofs is
 
-origo is a filesystem where humans and AI agents share the same files, and every
+origofs is a filesystem where humans and AI agents share the same files, and every
 edit is recorded against the actor that made it. It is **not** a wrapper over
 `git` or a VFS shim — it is a storage engine with four properties at its core:
 content-addressed storage, a pluggable metadata database (Postgres or SQLite),
@@ -23,42 +23,42 @@ model, attribution, and the failure-surface work are the way they are. The
 ## Build, test, lint
 
 ```bash
-cargo build --release                 # ./target/release/origo
-cargo install --path crates/origo-cli   # installs the `origo` binary
-cargo run -p origo-cli -- --workspace ./ws init   # run the CLI without installing
+cargo build --release                 # ./target/release/origofs
+cargo install --path crates/origofs-cli   # installs the `origofs` binary
+cargo run -p origofs-cli -- --workspace ./ws init   # run the CLI without installing
 
 cargo test --workspace                # all Rust tests
-cargo test -p origo-core                # one crate
-cargo test -p origo-core --test merge   # one integration-test file (tests/merge.rs)
-cargo test -p origo-core roundtrip      # filter by test-name substring (single test)
+cargo test -p origofs-core                # one crate
+cargo test -p origofs-core --test merge   # one integration-test file (tests/merge.rs)
+cargo test -p origofs-core roundtrip      # filter by test-name substring (single test)
 
 cargo clippy --workspace --all-targets
 cargo fmt                             # no rustfmt.toml — plain default style
 
-cargo bench -p origo-core               # Criterion micro-benchmarks (hot paths)
+cargo bench -p origofs-core               # Criterion micro-benchmarks (hot paths)
 ```
 
-**Postgres-backed tests self-skip** unless `ORIGO_PG_TEST_URL` points at a
+**Postgres-backed tests self-skip** unless `ORIGOFS_PG_TEST_URL` points at a
 reachable database — so a plain `cargo test --workspace` silently exercises only
 the SQLite path. To run the multi-writer / `LISTEN‑NOTIFY` / Postgres tests:
 
 ```bash
-ORIGO_PG_TEST_URL="host=127.0.0.1 port=5432 user=postgres dbname=origo" cargo test --workspace
+ORIGOFS_PG_TEST_URL="host=127.0.0.1 port=5432 user=postgres dbname=origofs" cargo test --workspace
 ```
 
-**Python bindings** (`crates/origo-py`) build with maturin, not cargo:
+**Python bindings** (`crates/origofs-py`) build with maturin, not cargo:
 
 ```bash
-cd crates/origo-py
+cd crates/origofs-py
 python -m venv .venv && . .venv/bin/activate
 pip install maturin
-maturin develop        # builds the pyo3 extension + installs the `origo` module
-pytest tests/          # some tests also gate on ORIGO_PG_TEST_URL
+maturin develop        # builds the pyo3 extension + installs the `origofs` module
+pytest tests/          # some tests also gate on ORIGOFS_PG_TEST_URL
 ```
 
 ### Toolchain note
 
-There is no `rust-toolchain` file and no CI config in the repo. **`origo-core`
+There is no `rust-toolchain` file and no CI config in the repo. **`origofs-core`
 uses `edition = "2024"`** (needs Rust ≥ 1.85), while the other crates inherit
 `edition = "2021"` from the workspace. Use a recent stable toolchain.
 
@@ -75,7 +75,7 @@ uses `edition = "2024"`** (needs Rust ≥ 1.85), while the other crates inherit
   feed, and presence. It stores content only as `manifest_hash` references —
   **it must never hold large file bytes.**
 
-Both traits live in `origo-core` (`content.rs`, `metadata.rs`) and both are used
+Both traits live in `origofs-core` (`content.rs`, `metadata.rs`) and both are used
 as `Arc<dyn …>`, so a workspace picks its backends at runtime. The mutable POSIX
 working tree (inode/dentry rows) is an **overlay whose base is a commit tree** —
 exactly git's index idea. Reads fall through the working tree to the base tree
@@ -87,21 +87,21 @@ to understanding the whole codebase (`docs/DESIGN.md` §3).
 ## How a call flows through the layers
 
 Every surface funnels down to the same core, so a behavior change usually
-belongs in `origo-core`, not in each surface:
+belongs in `origofs-core`, not in each surface:
 
 ```
 CLI / MCP / HTTP API / FUSE / NFS / Python   (access surfaces, one crate each)
         │  each resolves the caller → (actor, session)
         ▼
-origo-sdk::Workspace          ergonomic façade; `open_*` constructors wire backends
+origofs-sdk::Workspace          ergonomic façade; `open_*` constructors wire backends
         ▼
-origo-core::Fs<M, C>          the working-tree engine — POSIX ops, chunking, commit,
+origofs-core::Fs<M, C>          the working-tree engine — POSIX ops, chunking, commit,
         │                   merge, attribution, gc, recovery (engine.rs et al.)
         ├──► dyn MetadataStore   (SqliteMetadataStore | PostgresMetadataStore)
         └──► dyn ContentStore    (see "content backends compose" below)
 ```
 
-`Workspace` (`crates/origo-sdk/src/lib.rs`) is the front door you almost always
+`Workspace` (`crates/origofs-sdk/src/lib.rs`) is the front door you almost always
 extend: it owns the `Fs`, exposes the public API, and is what the CLI, HTTP API,
 sandbox, and Python bindings all call. It holds an `Option<Arc<PostgresMetadataStore>>`
 on the side because a few Postgres-only features (the `subscribe` push feed via
@@ -110,7 +110,7 @@ callers use `watch` (polling) instead.
 
 ## Content backends compose (decorator pattern)
 
-Content backends wrap each other; the `open_*` constructors in `origo-sdk` are the
+Content backends wrap each other; the `open_*` constructors in `origofs-sdk` are the
 canonical recipes for how they stack. Key point: **`VerifyingStore` goes on the
 outside** so integrity is checked at the chunk-addressed boundary a caller reads
 by.
@@ -121,7 +121,7 @@ by.
 - `PackStore` — batches chunks into large pack objects (few big PUTs instead of
   thousands of tiny ones) with a local per-chunk index; needs `flush`/`repack`.
 - `VerifyingStore` — re-hashes on read; a bit-rotted/tampered object surfaces as
-  `OrigoError::Corrupt` instead of being served as authentic.
+  `OrigoFSError::Corrupt` instead of being served as authentic.
 - `EncryptedStore` — XChaCha20-Poly1305 at rest; addresses stay the *plaintext*
   hash (convergent encryption) so dedup still works.
 - `TieredStore` / `MemStore` — local cache tier / in-memory store.
@@ -140,7 +140,7 @@ write path enforces this and you must not weaken it:
   every file an actor touched in a session and removes exactly the lines it
   authored, leaving others' edits intact.
 - **The server never trusts a client-named actor.** Identity is resolved
-  server-side. See `build_api_auth` in `crates/origo-cli/src/main.rs`: it *refuses*
+  server-side. See `build_api_auth` in `crates/origofs-cli/src/main.rs`: it *refuses*
   to expose an unauthenticated API on a non-loopback address, and the HTTP body
   never names an actor. Preserve this when touching any surface.
 - **Suggestions** (`suggest`/`accept`/`reject`) are the propose-and-review path:
@@ -152,9 +152,9 @@ write path enforces this and you must not weaken it:
 ## Versioning
 
 Opt-in, three modes (`VersioningMode` in `objectgraph.rs`): `off` (working tree +
-attribution only), `native` (origo's own chunked commit DAG — the default when a
-workspace is initialized), and `git` (native DAG *plus* the `origo-git`
-export/import + `git-remote-origo` bridge to genuine git objects). `native` and
+attribution only), `native` (origofs's own chunked commit DAG — the default when a
+workspace is initialized), and `git` (native DAG *plus* the `origofs-git`
+export/import + `git-remote-origofs` bridge to genuine git objects). `native` and
 `git` share one commit-DAG and merge engine (three-way / diff3, conflicts, LFS-style
 `lock`s for binaries); they differ only in on-disk object encoding.
 
@@ -162,15 +162,15 @@ export/import + `git-remote-origo` bridge to genuine git objects). `native` and
 
 | Crate | Role |
 |---|---|
-| `origo-core` | The engine. Both trait abstractions, all content backends, chunking, versioning, merge, attribution, gc, recovery, migrations. Everything else depends on it. (`edition 2024`) |
-| `origo-sdk` | `Workspace` — the ergonomic façade over `origo-core::Fs`. The API every other surface calls. |
-| `origo-cli` | The `origo` binary (clap). A thin shell over `origo-sdk`; the best index of what the system can do. |
-| `origo-sandbox` | Overlay / sandbox edit-capture: run a process over a copy-on-write view, import its delta as attributed writes. Not a security boundary by default; opt-in bubblewrap *filesystem* isolation via `--isolate` (see below). |
-| `origo-fuse`, `origo-nfs` | POSIX mounts (FUSE on Linux; NFSv3 elsewhere). |
-| `origo-mcp` | MCP server — agents call filesystem tools over stdio, auto-attributed. |
-| `origo-git` | Real-`git` interop: export/import genuine git objects; ships the `git-remote-origo` helper binary (`git clone origo://…`). |
-| `origo-api` | HTTP/JSON server (axum). `Authenticator`/`BearerAuth` resolve identity server-side. |
-| `origo-py` | pyo3/maturin bindings: async-native (`await` every I/O), a FastAPI router (`origo.fastapi`), and overlay orchestration (`origo.overlay`). |
+| `origofs-core` | The engine. Both trait abstractions, all content backends, chunking, versioning, merge, attribution, gc, recovery, migrations. Everything else depends on it. (`edition 2024`) |
+| `origofs-sdk` | `Workspace` — the ergonomic façade over `origofs-core::Fs`. The API every other surface calls. |
+| `origofs-cli` | The `origofs` binary (clap). A thin shell over `origofs-sdk`; the best index of what the system can do. |
+| `origofs-sandbox` | Overlay / sandbox edit-capture: run a process over a copy-on-write view, import its delta as attributed writes. Not a security boundary by default; opt-in bubblewrap *filesystem* isolation via `--isolate` (see below). |
+| `origofs-fuse`, `origofs-nfs` | POSIX mounts (FUSE on Linux; NFSv3 elsewhere). |
+| `origofs-mcp` | MCP server — agents call filesystem tools over stdio, auto-attributed. |
+| `origofs-git` | Real-`git` interop: export/import genuine git objects; ships the `git-remote-origofs` helper binary (`git clone origofs://…`). |
+| `origofs-api` | HTTP/JSON server (axum). `Authenticator`/`BearerAuth` resolve identity server-side. |
+| `origofs-py` | pyo3/maturin bindings: async-native (`await` every I/O), a FastAPI router (`origofs.fastapi`), and overlay orchestration (`origofs.overlay`). |
 
 ## Conventions & gotchas that will bite you
 
@@ -181,11 +181,11 @@ export/import + `git-remote-origo` bridge to genuine git objects). `native` and
   never be *stored* — which is what stops it escaping during host materialization
   (e.g. the sandbox's `export_tree`). Any new inode-oriented op (FUSE/NFS handlers
   especially) must validate names too.
-- **`origo sandbox` / `origo overlay` are edit-capture; a security boundary only with
+- **`origofs sandbox` / `origofs overlay` are edit-capture; a security boundary only with
   `--isolate`.** By **default** (`isolate: false`) the child runs with your
   privileges over a plain copy-on-write overlay — the whole host filesystem stays
   reachable (incl. this workspace's `meta.db`/`cas`), with no network namespace or
-  seccomp, and origo only strips `ORIGO_ENCRYPTION_KEY` from the env. **Not a security
+  seccomp, and origofs only strips `ORIGOFS_ENCRYPTION_KEY` from the env. **Not a security
   boundary; run only trusted code.** Passing **`--isolate`** (`RunOpts::isolate` /
   `LiveOpts::isolate`; needs `bwrap` ≥ 0.8.0, gated by `bwrap_available()`) runs
   the command under bubblewrap in a fresh tmpfs root that hides the host filesystem
@@ -199,7 +199,7 @@ export/import + `git-remote-origo` bridge to genuine git objects). `native` and
   alongside active writers; packed stores additionally need `repack` to reclaim
   space. Content writes are idempotent (content-addressed), so retries are safe.
 - **The content store can rebuild the DB, but not attribution.** It is a
-  self-describing Merkle DAG with a mirrored ref table, so `origo fsck --rebuild`
+  self-describing Merkle DAG with a mirrored ref table, so `origofs fsck --rebuild`
   (SDK `rebuild`/`scan`) restores committed files, dirs, symlinks, and branches
   from the bucket alone. Blame, the audit log, actors, and uncommitted edits live
   **only** in the DB — so the DB is the thing to back up.
@@ -208,10 +208,10 @@ export/import + `git-remote-origo` bridge to genuine git objects). `native` and
   (`migrations.rs`, `latest_schema_version`) are forward-only and authored once
   with per-engine SQL variants where they diverge. `Workspace::migrate` is the
   explicit runner (a normal `open` already migrates).
-- **`ORIGO_ENCRYPTION_KEY`** opts a workspace into encryption at rest (kept out of
+- **`ORIGOFS_ENCRYPTION_KEY`** opts a workspace into encryption at rest (kept out of
   argv/history); the *same* value must be used on every open or reads fail loudly.
 - Integration tests live in each crate's `tests/` and are the clearest executable
-  spec of behavior (e.g. `origo-core/tests/{merge,attribution,recover,durability,
+  spec of behavior (e.g. `origofs-core/tests/{merge,attribution,recover,durability,
   integrity}.rs`). Mirror their style when adding coverage.
 
 ## License

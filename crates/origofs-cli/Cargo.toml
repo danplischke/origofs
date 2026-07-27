@@ -1,0 +1,20 @@
+[package]
+name = "origofs-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "origofs"
+path = "src/main.rs"
+
+[dependencies]
+origofs-api = { version = "0.0.0", path = "../origofs-api" }
+origofs-fuse = { version = "0.0.0", path = "../origofs-fuse" }
+origofs-git = { version = "0.0.0", path = "../origofs-git" }
+origofs-mcp = { version = "0.0.0", path = "../origofs-mcp" }
+origofs-nfs = { version = "0.0.0", path = "../origofs-nfs" }
+origofs-sandbox = { version = "0.0.0", path = "../origofs-sandbox" }
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk" }
+anyhow = "1.0.104"
+clap = { version = "4.6.4", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }

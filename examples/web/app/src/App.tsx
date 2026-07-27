@@ -78,7 +78,7 @@ export function App() {
     <div className="app">
       <header className="app-header">
         <div className="brand">
-          <span className="logo">origo</span>
+          <span className="logo">origofs</span>
           <span className="tagline">attribution &amp; lineage</span>
         </div>
         <div className="doc-open">

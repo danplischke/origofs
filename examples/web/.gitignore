@@ -10,7 +10,7 @@ __pycache__/
 .venv/
 venv/
 
-# origo workspaces the demo server creates locally
+# origofs workspaces the demo server creates locally
 cas/
 *.db
-origo-web-ws/
+origofs-web-ws/

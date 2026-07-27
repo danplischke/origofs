@@ -1,20 +1,20 @@
-# origo
+# origofs
 
 **A filesystem where humans and AI agents share the same files — and you always
 know who changed what.**
 
-origo is content-addressed storage with a real metadata database (Postgres or
+origofs is content-addressed storage with a real metadata database (Postgres or
 SQLite), opt-in Git-style versioning, and per-actor attribution built in. Point
 your agents at it and let them work: every edit is recorded against the actor
 that made it, an agent's whole session can be reverted in one call, and the bytes
 you read back are cryptographically guaranteed to be the bytes that were written.
 
 ```bash
-# an agent works in a fast native mount; its edits stream into origo, attributed
-origo --workspace ./ws overlay --actor "$AGENT" -- claude -p "refactor the parser"
+# an agent works in a fast native mount; its edits stream into origofs, attributed
+origofs --workspace ./ws overlay --actor "$AGENT" -- claude -p "refactor the parser"
 
 # afterwards, see exactly which lines the agent wrote
-origo --workspace ./ws blame /src/parser.rs
+origofs --workspace ./ws blame /src/parser.rs
 ```
 
 Don't like the result? One SDK call undoes everything that agent did in a
@@ -22,13 +22,13 @@ session — across every file it touched — and leaves human edits untouched.
 
 ---
 
-## Why origo
+## Why origofs
 
 When people and AI agents edit the same workspace, a plain filesystem stops being
 enough. You need to answer questions a directory of files can't:
 
 - **Who wrote this line — a person or an agent?** Every attributed write records
-  the actor, session, and tool-call behind it. `origo blame` reports it per line;
+  the actor, session, and tool-call behind it. `origofs blame` reports it per line;
   the record survives commits, branch switches, and reformatting.
 - **Can I undo just the agent's work?** Revert an agent's entire session across
   every file it touched, keeping everyone else's edits intact.
@@ -42,21 +42,21 @@ enough. You need to answer questions a directory of files can't:
   every read: silent bit-rot or tampering in object storage surfaces as an error
   instead of being served as if it were real.
 
-origo isn't a wrapper over `git` or a VFS shim — it's a storage engine with these
+origofs isn't a wrapper over `git` or a VFS shim — it's a storage engine with these
 properties at its core, exposed through a CLI, a Rust SDK, Python bindings, an
 HTTP API, and real filesystem mounts (FUSE/NFS).
 
 ## Install
 
-origo is a Rust workspace. Build the `origo` CLI with a recent stable toolchain:
+origofs is a Rust workspace. Build the `origofs` CLI with a recent stable toolchain:
 
 ```bash
-cargo install --path crates/origo-cli     # installs the `origo` binary
+cargo install --path crates/origofs-cli     # installs the `origofs` binary
 # or, without installing:
-cargo build --release                    # ./target/release/origo
+cargo build --release                    # ./target/release/origofs
 ```
 
-A workspace is just a directory origo manages (metadata DB + content store). For a
+A workspace is just a directory origofs manages (metadata DB + content store). For a
 team deployment, point it at Postgres and object storage instead — see
 [Running for a team](#running-for-a-team) and [Storage backends](#storage-backends).
 
@@ -64,17 +64,17 @@ team deployment, point it at Postgres and object storage instead — see
 
 ```bash
 WS=./ws
-origo --workspace "$WS" init
-echo 'hello from origo' | origo --workspace "$WS" write /notes/a.txt
-origo --workspace "$WS" ls   /notes
-origo --workspace "$WS" read /notes/a.txt
-origo --workspace "$WS" stat /notes/a.txt
+origofs --workspace "$WS" init
+echo 'hello from origofs' | origofs --workspace "$WS" write /notes/a.txt
+origofs --workspace "$WS" ls   /notes
+origofs --workspace "$WS" read /notes/a.txt
+origofs --workspace "$WS" stat /notes/a.txt
 ```
 
 From Rust:
 
 ```rust
-use origo_sdk::Workspace;
+use origofs_sdk::Workspace;
 
 let ws = Workspace::open_local("meta.db", "cas").await?;   // or open_pg(dsn, cas)
 ws.mkdir_p("/notes").await?;
@@ -86,28 +86,28 @@ let bytes = ws.read("/notes/a.txt").await?;
 
 ### A native mount agents edit in place
 
-The fastest way to put an agent to work is a **live overlay mount**. origo sets up
+The fastest way to put an agent to work is a **live overlay mount**. origofs sets up
 an unprivileged kernel overlay over the workspace, runs your agent inside it, and
-streams the agent's changes back into origo — *attributed, as they happen*, not
+streams the agent's changes back into origofs — *attributed, as they happen*, not
 only when the process exits:
 
 ```bash
-origo --workspace "$WS" overlay --actor "$AGENT" --sync-ms 500 -- \
+origofs --workspace "$WS" overlay --actor "$AGENT" --sync-ms 500 -- \
     some-agent --do-the-thing
 ```
 
-The agent sees an ordinary directory and reads/writes at native speed; origo
+The agent sees an ordinary directory and reads/writes at native speed; origofs
 captures each change (create, modify, delete) into the content store and records
-it against `--actor`. When it finishes, `origo blame` and the change feed already
-reflect everything it did. This is how agents are meant to interact with origo day
+it against `--actor`. When it finishes, `origofs blame` and the change feed already
+reflect everything it did. This is how agents are meant to interact with origofs day
 to day.
 
-Prefer a protocol integration? origo also speaks **MCP** (Model Context Protocol)
+Prefer a protocol integration? origofs also speaks **MCP** (Model Context Protocol)
 over stdio, so an agent can call filesystem tools directly — and every write is
 attributed to the agent:
 
 ```bash
-origo --workspace "$WS" mcp --agent-name claude --model claude-opus-4-8
+origofs --workspace "$WS" mcp --agent-name claude --model claude-opus-4-8
 ```
 
 ### Propose-and-review, not just apply
@@ -117,10 +117,10 @@ bytes go straight into the content store (deduplicated, diffable); the working
 tree doesn't change until someone accepts:
 
 ```bash
-echo "patched" | origo --workspace "$WS" suggest /main.rs --actor "$AGENT" --summary "fix bug"
-origo --workspace "$WS" suggestions --status pending
-origo --workspace "$WS" suggestion-diff 1              # base → proposed, unified diff
-origo --workspace "$WS" accept 1 --actor "$HUMAN"      # applies it, credited to the agent
+echo "patched" | origofs --workspace "$WS" suggest /main.rs --actor "$AGENT" --summary "fix bug"
+origofs --workspace "$WS" suggestions --status pending
+origofs --workspace "$WS" suggestion-diff 1              # base → proposed, unified diff
+origofs --workspace "$WS" accept 1 --actor "$HUMAN"      # applies it, credited to the agent
 ```
 
 `accept` lands the edit **attributed to the authoring agent** (so blame stays
@@ -131,11 +131,11 @@ honest) and records the approver; it refuses if the file moved since the proposa
 
 Every attributed write (`write_as`) records an append-only edit-op — actor,
 session, tool-call, before/after content — and updates a per-line authorship map.
-`origo blame` then reports, per line range, whether a **human** or an **agent** wrote
+`origofs blame` then reports, per line range, whether a **human** or an **agent** wrote
 it:
 
 ```bash
-origo --workspace "$WS" blame /src/parser.rs
+origofs --workspace "$WS" blame /src/parser.rs
 #    1-40   human:dan
 #   41-58   agent:claude
 #   59-72   human:dan
@@ -159,16 +159,16 @@ let files_changed = ws.revert_session(agent_id, session_id).await?;
 ## Versioning
 
 Versioning is opt-in and Git-shaped — a real commit DAG, branches, checkout, log,
-status, three-way merge, and locks — but backed by origo's content-addressed store,
+status, three-way merge, and locks — but backed by origofs's content-addressed store,
 so snapshots are incremental (only changed chunks are stored) and identical trees
 are shared across commits for free.
 
 ```bash
-origo --workspace "$WS" commit -m "initial" --author "Dan <dan@example.com>"
-origo --workspace "$WS" branch feature
-origo --workspace "$WS" checkout feature
-origo --workspace "$WS" diff main feature                # changed-path list
-origo --workspace "$WS" diff main feature --path /x.rs   # one file's line diff
+origofs --workspace "$WS" commit -m "initial" --author "Dan <dan@example.com>"
+origofs --workspace "$WS" branch feature
+origofs --workspace "$WS" checkout feature
+origofs --workspace "$WS" diff main feature                # changed-path list
+origofs --workspace "$WS" diff main feature --path /x.rs   # one file's line diff
 ```
 
 Branch comparison works on content addresses, not file reads: equal hashes mean
@@ -177,41 +177,41 @@ actually changed — the metadata trees *are* the index.
 
 ### Real-`git` interop
 
-origo stays BLAKE3-native internally, but its history projects to — and imports
+origofs stays BLAKE3-native internally, but its history projects to — and imports
 from — genuine git objects, so you can keep using the `git` CLI and hosts like
 GitHub:
 
 ```bash
-# origo history → a real git repo the `git` binary reads directly
-origo --workspace "$WS" git export ./repo --format sha256   # or sha1 for GitHub
+# origofs history → a real git repo the `git` binary reads directly
+origofs --workspace "$WS" git export ./repo --format sha256   # or sha1 for GitHub
 git -C ./repo log --oneline
 git -C ./repo fsck --strict                                # clean
 
-# a real git repo → origo history
-origo --workspace "$WS2" git import ./repo --branch main
+# a real git repo → origofs history
+origofs --workspace "$WS2" git import ./repo --branch main
 ```
 
-With `git-remote-origo` on your `PATH`, the real `git` can even clone, fetch, and
-push an origo workspace over `origo://` URLs — no export step:
+With `git-remote-origofs` on your `PATH`, the real `git` can even clone, fetch, and
+push an origofs workspace over `origofs://` URLs — no export step:
 
 ```bash
-git clone origo://"$WS" checkout
+git clone origofs://"$WS" checkout
 cd checkout && echo hi >> readme.md && git commit -am edit && git push origin main
 ```
 
 Large files can be exported as git-LFS pointer blobs (`--lfs-threshold <bytes>`),
-backed by origo's chunk store.
+backed by origofs's chunk store.
 
 ## Running for a team
 
-For a shared human+agent workspace, run origo on **Postgres** — the backend built
+For a shared human+agent workspace, run origofs on **Postgres** — the backend built
 for many concurrent writers. Atomic-create is serialized so racing writers never
 leave orphaned inodes, and the whole write path is transactional: content is made
 durable first, then metadata, blame, and the audit log commit together, so a
 crash can never leave a half-recorded edit.
 
 ```rust
-let ws = Workspace::open_pg("host=db port=5432 user=origo dbname=origo", content).await?;
+let ws = Workspace::open_pg("host=db port=5432 user=origofs dbname=origofs", content).await?;
 ```
 
 ### Live collaboration
@@ -222,8 +222,8 @@ path). Tail the feed by cursor, or — on Postgres — let `LISTEN/NOTIFY` push 
 events so clients never poll:
 
 ```bash
-origo --workspace "$WS" watch --follow    # live feed: seq  kind  actor  path
-origo --workspace "$WS" presence          # who's active right now
+origofs --workspace "$WS" watch --follow    # live feed: seq  kind  actor  path
+origofs --workspace "$WS" presence          # who's active right now
 ```
 
 The feed is **exactly-once and in commit order** even under concurrent writers,
@@ -240,7 +240,7 @@ same path as every other surface, so they land on the change feed and carry
 attribution:
 
 ```bash
-origo --workspace "$WS" serve --addr 127.0.0.1:8080 &
+origofs --workspace "$WS" serve --addr 127.0.0.1:8080 &
 curl -X PUT --data-binary 'hello' http://127.0.0.1:8080/files/notes/a.txt
 curl 'http://127.0.0.1:8080/files/notes/a.txt'                   # → hello
 curl -X POST -d '{"author":"dan","message":"first"}' http://127.0.0.1:8080/commit
@@ -269,7 +269,7 @@ under failure is a first-class concern:
 - **The bucket can rebuild the database.** Content is stored as a self-describing
   git-style graph (commit → tree → file manifest → chunks), and the branch table
   is mirrored alongside it, so if the metadata DB is lost you can point a fresh one
-  at the surviving object store and `origo fsck --rebuild` to recover every committed
+  at the surviving object store and `origofs fsck --rebuild` to recover every committed
   file, directory, and branch — chunking and all. (Blame and the audit log live
   only in the DB, so back that up — Postgres PITR or SQLite replication.)
 
@@ -293,25 +293,25 @@ versioning, and integrity hold no matter where bytes live.
 - **Encryption at rest** — wrap any backend so content is encrypted
   (XChaCha20-Poly1305) before it touches disk or the network, transparently to
   the engine. The address stays the plaintext hash, so **dedup still works**
-  (convergent encryption). Set `ORIGO_ENCRYPTION_KEY` or use
+  (convergent encryption). Set `ORIGOFS_ENCRYPTION_KEY` or use
   `Workspace::open_local_encrypted`.
 
 Content is addressed and never overwritten, so churn leaves orphaned chunks
 behind; mark-and-sweep garbage collection reclaims them:
 
 ```bash
-origo --workspace "$WS" gc     # run when idle — not safe alongside active writers
+origofs --workspace "$WS" gc     # run when idle — not safe alongside active writers
 ```
 
 ## Interfaces
 
 | Surface | Use it for |
 |---|---|
-| **`origo` CLI** | Scripting and day-to-day workspace operations |
-| **Rust SDK** (`origo-sdk`) | Embedding origo in a Rust service |
-| **Python** (`origo-py`) | Async-native PyO3 bindings — FastAPI-ready, resolve identity yourself |
-| **HTTP API** (`origo-api`) | Any language / any client over JSON |
-| **MCP** (`origo-mcp`) | Agents calling filesystem tools directly, attributed |
+| **`origofs` CLI** | Scripting and day-to-day workspace operations |
+| **Rust SDK** (`origofs-sdk`) | Embedding origofs in a Rust service |
+| **Python** (`origofs-py`) | Async-native PyO3 bindings — FastAPI-ready, resolve identity yourself |
+| **HTTP API** (`origofs-api`) | Any language / any client over JSON |
+| **MCP** (`origofs-mcp`) | Agents calling filesystem tools directly, attributed |
 | **Overlay mount** | Running an agent live in a fast native mount |
 | **FUSE / NFS** | Mounting the workspace as a POSIX filesystem |
 
@@ -319,9 +319,9 @@ Python, for example, keeps every I/O method awaitable so it composes with
 FastAPI, and lets you inject the user/agent behind each write:
 
 ```python
-import origo
-ws  = await origo.Workspace.open_local("meta.db", "cas")   # or open_pg(dsn, cas)
-ctx = origo.WriteCtx.session(actor_id, session_id)          # your resolved identity
+import origofs
+ws  = await origofs.Workspace.open_local("meta.db", "cas")   # or open_pg(dsn, cas)
+ctx = origofs.WriteCtx.session(actor_id, session_id)          # your resolved identity
 await ws.write_as(ctx, "/notes.txt", b"hello")            # attributed → blame + audit
 ```
 
@@ -332,21 +332,21 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
-The Postgres backend tests self-skip unless `ORIGO_PG_TEST_URL` points at a
+The Postgres backend tests self-skip unless `ORIGOFS_PG_TEST_URL` points at a
 reachable database:
 
 ```bash
-ORIGO_PG_TEST_URL="host=127.0.0.1 port=5432 user=postgres dbname=origo" cargo test --workspace
+ORIGOFS_PG_TEST_URL="host=127.0.0.1 port=5432 user=postgres dbname=origofs" cargo test --workspace
 ```
 
 ### Performance
 
 Criterion micro-benchmarks cover the hot paths (chunk + BLAKE3 write, whole-file
 read, commit/tree building, encryption overhead) over an in-memory store, so they
-reflect origo's own CPU cost rather than disk or network:
+reflect origofs's own CPU cost rather than disk or network:
 
 ```bash
-cargo bench -p origo-core
+cargo bench -p origofs-core
 ```
 
 Indicative single-threaded numbers (release, in-memory store): writes chunk + hash
@@ -357,7 +357,7 @@ at ~1.3 GiB/s and reads reassemble at ~10 GiB/s; encryption at rest costs roughl
 
 The full design and rationale — the metadata/content split, the versioning model,
 attribution, and the failure-surface work — live in
-[`docs/DESIGN.md`](docs/DESIGN.md). origo was inspired by
+[`docs/DESIGN.md`](docs/DESIGN.md). origofs was inspired by
 [`tursodatabase/agentfs`](https://github.com/tursodatabase/agentfs).
 
 ## License

@@ -3,7 +3,7 @@
 // Markdown; each change a `suggestion_change` element with word-level
 // insert/delete marks). You Keep or Discard each change in place, then Apply.
 //
-// Keep-all applies through origo's native accept (atomic, credits the agent). A
+// Keep-all applies through origofs's native accept (atomic, credits the agent). A
 // partial keep is reconstructed server-side and written *as the agent*, so the
 // agent stays credited for its lines — the reviewer only ever chooses which
 // changes, never authors them.
@@ -12,7 +12,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Plate, PlateContent, usePlateEditor } from "platejs/react";
 import { BasicBlocksPlugin, BasicMarksPlugin } from "@platejs/basic-nodes/react";
 import { useSession } from "../session";
-import { OrigoError } from "../lib/origoClient";
+import { OrigoFSError } from "../lib/origofsClient";
 import { ActorChip } from "../components/ActorBadge";
 import { DiffText } from "../panels/DiffText";
 import { buildSuggestionValue } from "./buildSuggestionValue";
@@ -110,7 +110,7 @@ export function ReviewOverlay({
       );
     } catch (e) {
       setError(
-        e instanceof OrigoError && e.status === 409
+        e instanceof OrigoFSError && e.status === 409
           ? "The document changed since this was proposed (stale base). Ask the agent to re-propose."
           : e instanceof Error
             ? e.message

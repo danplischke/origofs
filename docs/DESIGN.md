@@ -1,4 +1,4 @@
-# origo — an agent-and-human filesystem with object storage, Postgres, Gitflow versioning, and edit attribution
+# origofs — an agent-and-human filesystem with object storage, Postgres, Gitflow versioning, and edit attribution
 
 > Design & implementation plan. This document specifies a custom, ground-up build inspired by
 > [`tursodatabase/agentfs`](https://github.com/tursodatabase/agentfs), extended with the four capabilities
@@ -42,7 +42,7 @@ flowchart TB
     API["HTTP/gRPC control API"]
   end
 
-  subgraph Core["origo core (library)"]
+  subgraph Core["origofs core (library)"]
     VFS["VFS / working-tree engine\n(POSIX ops, index materialization)"]
     ACT["Actor & session context\n(who is calling)"]
     VER["Version engine\n(commits, branches, merge)"]
@@ -92,7 +92,7 @@ POSIX inodes/dentries are a *mutable working-tree view* materialized on top of a
 keep mutable inode tables as primary and snapshot them; that loses cheap history and dedup.
 
 **Versioning is opt-in.** A workspace runs in one of three modes: `versioning = off` (just the mutable working
-tree + attribution — a plain shared sandbox, no commits), `native` (origo's own content-addressed commit DAG), or
+tree + attribution — a plain shared sandbox, no commits), `native` (origofs's own content-addressed commit DAG), or
 `git` (git-compatible objects you can drive with the actual `git` CLI). The rest of this section describes the
 model that powers `native`/`git`; when versioning is `off`, only the working-tree half applies and the object
 store is used purely as a chunk store. See §4c for the modes and the git-interop layer.
@@ -234,7 +234,7 @@ shared sandbox + attribution. The `workspace.versioning` setting selects:
 
 - `off` — no commits. The working tree (§3) is the whole story: a plain shared filesystem with attribution.
   Cheapest; good for ephemeral agent sandboxes.
-- `native` — origo's own content-addressed commit DAG (below). Best for **large files + object storage**: sub-file
+- `native` — origofs's own content-addressed commit DAG (below). Best for **large files + object storage**: sub-file
   chunk dedup, cheap snapshots, chunk-granular binary merges. The default when versioning is on.
 - `git` — **interoperate with the real `git`** (see the interop block at the end of this section). History is
   expressible as genuine git objects so the actual `git` CLI, `git blame`, and hosts like GitHub work against
@@ -283,24 +283,24 @@ walking manifests and diffing chunk lists (and, for text, line diffs).
 parents' blame maps plus line-movement tracking (§4d): a merged line keeps the actor from whichever parent
 introduced it; conflict resolutions are attributed to the resolving actor.
 
-**Git interoperability (opt-in `git` mode).** So teams can keep their existing tooling, origo can present its
+**Git interoperability (opt-in `git` mode).** So teams can keep their existing tooling, origofs can present its
 history as real git:
 
 1. **Git-compatible object encoding.** In `git` mode, commits/trees/blobs are serialized in git's own object
    format (**SHA-256 git objects**, for a clean 256-bit hash story) and stored in the content store. A
    read-only, on-demand **`.git` view** lets the actual `git` binary run `log`/`blame`/`diff`/`checkout`
    against a workspace.
-2. **`git-remote-origo` remote helper.** `git clone origo://host/workspace`, `git pull`, and `git push` work by
-   translating git's pack protocol to origo commits/refs, so an ordinary external git repo (including on GitHub)
-   stays bidirectionally in sync with an origo workspace.
+2. **`git-remote-origofs` remote helper.** `git clone origofs://host/workspace`, `git pull`, and `git push` work by
+   translating git's pack protocol to origofs commits/refs, so an ordinary external git repo (including on GitHub)
+   stays bidirectionally in sync with an origofs workspace.
 3. **Large files via git-LFS.** Files above a threshold are represented to git as **git-LFS pointer files**; the
    LFS object is our content-addressed, chunked blob in object storage. Real git clients clone quickly and never
    inline multi-GB blobs, and we keep sub-file dedup + S3 backing. This is the honest reconciliation of
    "git blob = whole file" with our chunk model.
 4. **Attribution vs. git blame.** git expresses only *commit-granular* authorship, so `git blame` shows the
-   committing actor; origo's finer **range-granular, multi-actor-per-commit** blame (§4d) stays available through
-   the origo API/xattr even in `git` mode. Where an origo commit mixes human and agent edits, the git view attributes
-   the commit to the committer while origo retains the per-range truth.
+   committing actor; origofs's finer **range-granular, multi-actor-per-commit** blame (§4d) stays available through
+   the origofs API/xattr even in `git` mode. Where an origofs commit mixes human and agent edits, the git view attributes
+   the commit to the committer while origofs retains the per-range truth.
 
 Net: use `native` mode for maximum large-file / object-store efficiency; flip on `git` mode when you want the
 real git ecosystem — and a workspace can do both.
@@ -360,7 +360,7 @@ recording the rebasing actor as committer.
 **Shared human+agent differentiation — the payoff:** because `actor.kind` distinguishes human/agent and each
 range carries an `actor_id`, a single file edited by a person and an agent yields a blame map like
 `bytes 0..1200 = human:alice, 1200..1800 = agent:claude(session 9, tool_call 42), 1800..2000 = human:alice`.
-The FUSE/SDK exposes this via an xattr (`user.origo.blame`) and an API endpoint, and the MCP server can hand an
+The FUSE/SDK exposes this via an xattr (`user.origofs.blame`) and an API endpoint, and the MCP server can hand an
 agent "show me only the human-authored regions" or "revert everything the agent wrote in this session."
 
 ### 4e. Access & live collaboration
@@ -520,7 +520,7 @@ ranges with zero manual bookkeeping.
   the bucket alone — chunking is transparent because a file's manifest object lists its ordered chunks. The one
   thing the graph lacks is the mutable ref table, which otherwise lives only in the DB; we mirror it into the
   store as a `RefSnapshot` object on every ref change (kept as a GC root; superseded snapshots are reclaimed).
-  `origo fsck [--rebuild]` (SDK `Workspace::rebuild`/`scan`) scans the store, recovers branch names + tips from the
+  `origofs fsck [--rebuild]` (SDK `Workspace::rebuild`/`scan`) scans the store, recovers branch names + tips from the
   mirror — or by inferring heads if none exists — and materializes the working tree onto a fresh DB. Attribution
   (blame/audit/actors) and uncommitted edits are **not** recoverable: they live only in the DB, so it remains the
   component to back up (Postgres PITR/replica; SQLite continuous replication).
@@ -553,7 +553,7 @@ each write is, and a storage engine that agents point at untrusted code and untr
   can't be wrapped in encryption and made to reuse an (key, nonce) pair; and passphrase keys are derived with
   **Argon2id** (memory-hard) over a per-store random salt kept beside the content store — a weak passphrase is
   expensive to brute-force offline and the same passphrase never derives the same key across two stores.
-- **Running untrusted agent code (sandbox boundary):** `origo sandbox` / `origo overlay` are **edit-capture, not a
+- **Running untrusted agent code (sandbox boundary):** `origofs sandbox` / `origofs overlay` are **edit-capture, not a
   security boundary by default** — the child runs with your privileges over a copy-on-write view, so the host FS
   (incl. `meta.db`/`cas`) stays reachable; run only trusted code. Passing `--isolate` runs the command under
   **bubblewrap** in a fresh tmpfs root that hides the host filesystem (`meta.db`/`cas`, home, credentials) — a
@@ -587,7 +587,7 @@ each write is, and a storage engine that agents point at untrusted code and untr
 | **M2 — Postgres backend** | `MetadataStore` for Postgres; dialect layer; migrations; pooling; `LISTEN/NOTIFY` | **Pluggable DB + multi-writer** foundation (goal 2) |
 | **M3 — Versioning core (opt-in)** | commit/tree/blob objects; refs + reflog; `commit`/`log`/`checkout`/`diff`; overlay working tree over a base commit; per-workspace `versioning = off \| native \| git` switch | Real history + branches, opt-in (goal 3, part 1) |
 | **M4 — Merge** | merge base (LCA); diff3 text merge; conflict model; binary lock/both-kept policy; rebase/squash | **Gitflow branch + three-way merge** (goal 3, part 2) |
-| **M5 — Git interoperability (opt-in)** | git-compatible object mode (SHA-256 git objects); `git-remote-origo` remote helper; git-LFS pointer bridge to the chunk store; import/export a real `.git` | **Drive origo with the actual `git` CLI + GitHub** (goal 3, interop) |
+| **M5 — Git interoperability (opt-in)** | git-compatible object mode (SHA-256 git objects); `git-remote-origofs` remote helper; git-LFS pointer bridge to the chunk store; import/export a real `.git` | **Drive origofs with the actual `git` CLI + GitHub** (goal 3, interop) |
 | **M6 — Attribution** | actor/session registry; `edit_op` capture wired through the write path; `blame` index; blame API + xattr; merge/rebase blame survival | **Per-actor attribution + blame** (goal 4) |
 | **M7 — Access surfaces** | FUSE mount; MCP server (auto-attributed tool calls); HTTP/gRPC control API; NFS for macOS | Agents + humans actually use it as a filesystem |
 | **M8 — Live collaboration** | shared working tree with advisory-lock coordination; `watch`/NOTIFY; opt-in CRDT co-editing; offline solo + reconnect-merge | **Shared human+agent live workspace** (goal 4, live) |
@@ -608,15 +608,15 @@ Each milestone is independently demoable; M1+M2+M3 in either order after M0.
   support and the remote-helper/LFS bridge performance on very large histories, and whether a workspace should be
   able to switch `native`↔`git` in place or only export/import.
 
-## 11. Mapping: agentfs → origo
+## 11. Mapping: agentfs → origofs
 
-| agentfs | origo |
+| agentfs | origofs |
 |---|---|
 | `fs_inode` / `fs_dentry` | `inode` / `dentry` — but a **mutable working-tree overlay over a base commit** |
 | `fs_data` (4 KB BLOB chunks in DB) | **content store**: FastCDC chunks, BLAKE3-addressed, in S3/local/inline; DB holds only `manifest_hash` |
 | `fs_whiteout` / `fs_origin` (overlay CoW) | same overlay idea, but base = an **immutable commit tree** |
 | snapshot = `cp agent.db` | **opt-in versioning**: `off` / `native` (chunked commit DAG) / `git`; branches = `ref` |
-| git not involved | **opt-in `git` mode**: SHA-256 git-compatible objects, `git-remote-origo`, git-LFS bridge — usable with the real `git` CLI / GitHub |
+| git not involved | **opt-in `git` mode**: SHA-256 git-compatible objects, `git-remote-origofs`, git-LFS bridge — usable with the real `git` CLI / GitHub |
 | `agentfs sync` (libSQL whole-DB) | content is content-addressed & remote by default; metadata via Postgres/replicas; branches merge |
 | `tool_calls` (audit) | retained `tool_calls` **+** `edit_op` op-log **+** `blame` index tying edits to **actors** |
 | SQLite/libSQL only | `MetadataStore` trait: **Postgres** (multi-writer) or SQLite (solo/offline) |

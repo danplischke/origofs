@@ -2,7 +2,7 @@
 //
 // When a suggestion is pending for the open document, a banner offers to review
 // it; "Review" swaps the editor for the inline diff (ReviewOverlay). This is the
-// VSCode "agent proposed edits — keep/discard" flow, backed by origo's suggestion
+// VSCode "agent proposed edits — keep/discard" flow, backed by origofs's suggestion
 // queue.
 
 import { useCallback, useEffect, useState } from "react";

@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/origo-core", "crates/origo-sdk", "crates/origo-cli", "crates/origo-sandbox", "crates/origo-fuse", "crates/origo-mcp", "crates/origo-git", "crates/origo-api", "crates/origo-nfs", "crates/origo-py"]
+members = ["crates/origofs-core", "crates/origofs-sdk", "crates/origofs-cli", "crates/origofs-sandbox", "crates/origofs-fuse", "crates/origofs-mcp", "crates/origofs-git", "crates/origofs-api", "crates/origofs-nfs", "crates/origofs-py"]
 
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/danplischke/origo"
-description = "origo — an agent-and-human filesystem: content-addressed storage, pluggable metadata DB, opt-in Git-style versioning, and per-actor edit attribution"
+repository = "https://github.com/danplischke/origofs"
+description = "origofs — an agent-and-human filesystem: content-addressed storage, pluggable metadata DB, opt-in Git-style versioning, and per-actor edit attribution"
 
 # Milestone M0: skeleton + core traits (MetadataStore, ContentStore),
 # a SQLite metadata backend, a local content-addressed store, and the

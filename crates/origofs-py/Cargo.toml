@@ -1,0 +1,36 @@
+[package]
+name = "origofs-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for origofs (agent filesystem)"
+
+[lib]
+# The extension is imported as `origofs._origofs` (mixed layout: pure-Python `origofs`
+# package under python/, compiled core as its `_origofs` submodule).
+name = "_origofs"
+# cdylib -> the importable Python extension module; rlib -> lets the workspace
+# build/test it against a real libpython (extension-module is maturin-only).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+origofs-core = { version = "0.1.0", path = "../origofs-core" }
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
+pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
+
+# FUSE mount + NFS serving are Unix-only; gating them here lets the extension
+# build on Windows (exposing the portable surface: files, versioning,
+# attribution, suggestions, the feed, and every backend). The mount/serve_nfs
+# methods raise a clear error on platforms without them.
+[target.'cfg(unix)'.dependencies]
+origofs-fuse = { version = "0.0.0", path = "../origofs-fuse" }
+origofs-nfs = { version = "0.0.0", path = "../origofs-nfs" }
+fuser = "0.17"
+
+[features]
+# Enabled only when building the wheel (see pyproject.toml). Off during
+# `cargo build/test`, so pyo3 links libpython and the workspace suite works.
+extension-module = ["pyo3/extension-module"]
