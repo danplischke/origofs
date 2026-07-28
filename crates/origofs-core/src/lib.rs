@@ -11,6 +11,8 @@
 pub mod attribution;
 pub mod chunk;
 pub mod clock;
+#[cfg(feature = "coedit")]
+pub mod coedit;
 pub mod collab;
 pub mod content;
 pub mod encrypt;
@@ -36,6 +38,8 @@ pub mod vfs;
 pub use attribution::{Actor, ActorInit, ActorKind, BlameRange, EditOp, ToolCallInit, WriteCtx};
 pub use chunk::{AVG_CHUNK, ChunkRef, MAX_CHUNK, MIN_CHUNK, Manifest};
 pub use clock::{Clock, SystemClock};
+#[cfg(feature = "coedit")]
+pub use coedit::CoeditDoc;
 pub use collab::{EVENT_CHANNEL, Event, EventInit, PRESENCE_WINDOW_SECS, Presence};
 pub use content::{ContentStore, LocalCasStore, MemStore, TieredStore, VerifyingStore};
 pub use encrypt::EncryptedStore;
