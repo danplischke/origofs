@@ -36,6 +36,17 @@ Actor (human | agent | system)   ← attribution identity, scoped to a tenant
   `DESIGN.md`: a metadata store paired with a content store. The tenant is the
   grouping that carries the security boundary, the content keyspace, the
   encryption key, and the quota — *not* a new thing files live in.
+- **A workspace is _not_ a security boundary — the tenant is.** This is the ruling
+  that makes many-workspaces-per-tenant cheap. Because the cross-tenant wall is the
+  store itself, a workspace is just a unit of organization *inside* an already-
+  resolved tenant (a project, a repo, an agent's scratch area). So — unlike the
+  tenant, which is always resolved from the credential — a workspace **may be named
+  in the request** (a path prefix or header), scoped under the resolved tenant.
+  Naming the wrong workspace inside your own tenant is not a leak; naming another
+  tenant's is impossible by construction. Whether a given actor may *reach* a given
+  workspace is an optional intra-tenant authorization choice (§7), never an
+  isolation requirement. Realized with **no engine change**: N workspaces = N
+  store-pairs the registry tracks under `(TenantId, workspace) → locator` (§6, §10).
 - **Actors** (the `actor` table, `DESIGN.md` §4d) belong to a tenant. Attribution
   truth stays exactly where it is today — in the tenant's own metadata DB — so
   blame and the op-log need no new columns in the silo model.
@@ -243,14 +254,20 @@ Sketch (illustrative, not final):
 /// Opaque, server-assigned tenant handle. Never parsed from client input.
 pub struct TenantId(String);
 
-/// Control-plane record: how to reach a tenant and its policy.
+/// Control-plane record: a tenant's policy + its set of workspaces.
 pub struct TenantRecord {
-    pub id: TenantId,
+    pub id:         TenantId,
+    pub key_ref:    Option<KeyRef>,  // per-tenant encryption key (KMS/keyring handle)
+    pub state:      TenantState,     // Active | Suspended | Deleting
+    pub quota:      Quota,           // bytes, rate, connection share (whole tenant)
+    pub workspaces: Map<WorkspaceName, WorkspaceLocator>,  // >= 1; "default" if unnamed
+}
+
+/// How to reach one workspace's stores. Two workspaces of one tenant may share a
+/// content locator (safe intra-tenant dedup) or keep separate ones.
+pub struct WorkspaceLocator {
     pub metadata: MetadataLocator,   // DSN | sqlite path | (cluster, schema)
-    pub content:  ContentLocator,    // bucket/prefix/root
-    pub key_ref:  Option<KeyRef>,    // per-tenant encryption key (KMS/keyring handle)
-    pub state:    TenantState,       // Active | Suspended | Deleting
-    pub quota:    Quota,             // bytes, rate, connection share
+    pub content:  ContentLocator,    // bucket/prefix/root (may be shared within the tenant)
 }
 
 /// Resolves a verified credential to the tenant + actor it acts as.
@@ -260,17 +277,23 @@ pub trait TenantResolver: Send + Sync {
     async fn resolve(&self, headers: &HeaderMap) -> Option<(TenantId, ActorRef)>;
 }
 
-/// Opens (once) and caches a Workspace per tenant. Enforces `state`
-/// (reject Suspended/Deleting) and applies the per-tenant content prefix + key.
-pub struct TenantRouter { /* registry + LRU<TenantId, Arc<Workspace>> */ }
+/// Opens (once) and caches a Workspace per (tenant, workspace). Enforces `state`
+/// (reject Suspended/Deleting) and applies the tenant key + the workspace's content
+/// locator. The workspace name comes from the request; the tenant never does.
+pub struct TenantRouter { /* registry + LRU<(TenantId, WorkspaceName), Arc<Workspace>> */ }
 ```
 
 Design constraints on the router:
 
-- **Tenant is resolved, never routed by URL.** `GET /files/...` keeps the same
-  path shape; the tenant comes from the credential. A `?tenant=` or `/t/{id}/...`
-  scheme is rejected as an invariant violation — it is the storage-layer analogue
-  of trusting a client-named actor.
+- **Tenant is resolved, never routed by URL.** The tenant comes from the
+  credential. A `?tenant=` or `/t/{id}/...` scheme is rejected as an invariant
+  violation — it is the storage-layer analogue of trusting a client-named actor.
+- **The _workspace_, by contrast, may be named in the request.** Because it is not
+  a security boundary (§1), the surface reads it from a path prefix
+  (`/w/{workspace}/files/...`) or an `Origofs-Workspace` header, defaulting to
+  `default`. It is looked up in the *already-resolved* tenant's workspace set, so a
+  client can only ever name a workspace of its own tenant. The workspace is the one
+  thing a client may select; the tenant is the one thing it may not.
 - **Lazy open + bounded cache.** Workspaces open on first use and live in an LRU
   of `Arc<Workspace>` handles (cheap to clone — they are `Arc` pairs, §
   `crates/origofs-sdk/src/lib.rs`). This bounds connection-pool sprawl in the silo
@@ -304,6 +327,12 @@ is meaningless in tenant B.
   bounded trust gate (an untrusted agent's writes route through the suggestion
   queue). Cross-tenant admin roles (who may provision/suspend/delete a tenant) live
   in the registry, not in any tenant's DB.
+- **Workspace access is intra-tenant authorization, not isolation.** All of a
+  tenant's actors may reach all of its workspaces by default; a deployment that
+  wants per-workspace scoping (project A's agent can't touch project B) enforces it
+  in the resolver/router as a policy check *after* the tenant is resolved. Getting
+  it wrong is a within-tenant authz bug, never a cross-tenant breach — the store
+  wall still holds.
 - **The invariant, stated once:** *origofs trusts neither a client-named actor nor a
   client-named tenant; both are resolved server-side from a verified credential.*
   This is a one-line extension of the rule already enforced in `build_api_auth`.
@@ -401,10 +430,16 @@ Deltas, smallest-first. MT1 (the useful milestone) touches no core trait.
 - New `TenantResolver` trait in `origofs-api`; the existing `Authenticator` becomes
   its actor half. `router`/`serve` gain a `router_multitenant(registry, resolver)`
   variant; the single-tenant `router(ws, auth)` stays for the loopback/dev path
-  (mapped to a built-in `default` tenant).
-- `Workspace::open_*` grow content-locator plumbing: a per-tenant **prefix** on the
+  (mapped to a built-in `default` tenant + `default` workspace). The router reads the
+  **workspace name** from a path prefix or header (defaulting to `default`) and keys
+  its handle cache by `(TenantId, workspace)`.
+- `Workspace::open_*` grow content-locator plumbing: a per-workspace **prefix** on the
   object/local store and an optional per-tenant **key** (`open_pg_s3_for_tenant(...)`
-  thin wrappers, or a `ContentLocator` the router applies). No new engine API.
+  thin wrappers, or a `ContentLocator` the router applies). No new engine API — a
+  tenant's N workspaces are N `open_*` calls, so **multi-workspace needs no schema
+  change**. (Optional PG density: keep one connection pool per *tenant* by putting
+  each workspace in its own **schema** of the tenant's database via `search_path` — a
+  small, contained addition to `PostgresMetadataStore::connect`, not an engine change.)
 - A **migration fan-out** runner: `migrate` today is per-store
   (`Workspace::migrate`); add a control-plane loop that applies pending migrations
   across all active tenants on deploy.
@@ -430,7 +465,7 @@ a grouping within a tenant). Silo/Bridge need neither column; only MT3 adds them
 | Milestone | Deliverable | Unlocks |
 |---|---|---|
 | **MT0 — Model & registry** | `TenantId`/`TenantRecord`/`TenantState`/`Quota`; `TenantRegistry` trait over its own metadata store; the server-side-tenant invariant written down and tested | The vocabulary + control-plane data model; no hot-path change |
-| **MT1 — Silo runtime** | `TenantResolver` + `TenantRouter` in front of the HTTP API & MCP; per-tenant `open_*` (content prefix + per-tenant key); migration fan-out | **One process hosts many hard-isolated tenants** with no core schema change |
+| **MT1 — Silo runtime** | `TenantResolver` + `TenantRouter` in front of the HTTP API & MCP; workspace selected per request (`(TenantId, workspace)` handle cache); per-workspace `open_*` (content prefix + per-tenant key); migration fan-out | **One process hosts many hard-isolated tenants, each with many workspaces** — no core schema change |
 | **MT2 — Lifecycle & accounting** | provision / suspend / delete (drop DB + crypto-shred); per-tenant GC; quotas, metering, per-tenant pool cap + rate limit; per-tenant backup/restore | Operable as a service: onboarding, erasure, billing, noisy-neighbor safety |
 | **MT3 — Density tier (optional)** | schema-per-tenant (bridge) and/or shared-schema `tenant_id` + Postgres RLS behind `TenantScoped`; tenant-keyed convergent dedup | Many small tenants per cluster without per-tenant DB overhead |
 
@@ -441,9 +476,15 @@ be skipped by deployments with few, large tenants.
 
 ## 12. Open questions
 
-- **Default grain of a tenant's workspaces.** One workspace per tenant (simplest)
-  vs. many (an org with many projects/repos). The model supports many; the router
-  and registry need a `(TenantId, workspace_name)` → locator map if we expose it.
+- **Density of workspaces _within_ a tenant.** Decided: a tenant owns **many
+  workspaces** (§1), each its own store-pair, routed by `(TenantId, workspace)` — no
+  schema change. The remaining sub-question is how to keep that cheap when one tenant
+  has *many* workspaces: separate databases (one pool each — simplest, heaviest),
+  separate **schemas** in the tenant's database (one pool per tenant, `DROP SCHEMA`
+  to delete a workspace — the recommended Postgres default), or shared tables with a
+  `workspace_id` column (densest, invasive — the §5 sketch, worth it only at extreme
+  workspace counts). Start with separate stores; add schema-per-workspace when pool
+  count bites.
 - **Bridge vs. pool as the density tier.** Schema-per-tenant is simpler and keeps
   most of silo's isolation; shared-schema+RLS is denser but one predicate away from
   a leak. Pick one primary; possibly offer both.
