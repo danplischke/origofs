@@ -21,6 +21,7 @@ use origofs_sdk::{
     Actor, BlameRange, CommitInfo, DiffEntry, DiffStatus, DirEntry, Event, EventSubscription,
     GcsConfig as CoreGcsConfig, Inode, Presence, RebuildReport, S3Config as CoreS3Config,
     Suggestion, SuggestionStatus, Workspace as CoreWorkspace, WriteCtx as CoreWriteCtx,
+    WriteOutcome as CoreWriteOutcome, WritePolicy as CoreWritePolicy,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::{
@@ -252,6 +253,28 @@ impl WriteCtx {
             "WriteCtx(actor={}, session={:?})",
             self.inner.actor, self.inner.session
         )
+    }
+}
+
+/// The outcome of a policy-governed write (see `Workspace.write_or_propose`).
+#[pyclass(frozen)]
+struct WriteOutcome {
+    /// True if the actor writes directly and the edit landed in the working tree.
+    #[pyo3(get)]
+    wrote: bool,
+    /// The suggestion id if the actor is propose-only and the edit was queued for
+    /// review; `None` when it was written directly.
+    #[pyo3(get)]
+    suggestion_id: Option<i64>,
+}
+
+#[pymethods]
+impl WriteOutcome {
+    fn __repr__(&self) -> String {
+        match self.suggestion_id {
+            Some(id) => format!("WriteOutcome(proposed suggestion #{id})"),
+            None => "WriteOutcome(wrote)".to_string(),
+        }
     }
 }
 
@@ -905,6 +928,64 @@ impl Workspace {
         future_into_py(py, async move {
             ws.write_as(c, &path, &data).await.map_err(to_pyerr)?;
             Ok(())
+        })
+    }
+
+    /// Set an actor's write policy: `"direct"` (writes land) or `"propose"` (writes
+    /// are routed through the suggestion queue for review by a different actor). A
+    /// bounded, actor-agnostic trust gate; the default is `"direct"`.
+    fn set_write_policy<'py>(
+        &self,
+        py: Python<'py>,
+        actor_id: i64,
+        policy: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let p = CoreWritePolicy::parse(&policy).ok_or_else(|| {
+                to_pyerr(origofs_sdk::OrigoFSError::InvalidArgument(format!(
+                    "unknown write policy {policy:?} (expected `direct` or `propose`)"
+                )))
+            })?;
+            ws.set_write_policy(actor_id, p).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Submit an edit governed by the actor's write policy: a direct actor writes
+    /// straight to the working tree; a propose-only actor's edit is queued as a
+    /// suggestion for review. Returns a `WriteOutcome`. The entry point an untrusted
+    /// surface routes writes through so a propose-only actor can't land an
+    /// unreviewed edit.
+    #[pyo3(signature = (ctx, path, data, summary=None))]
+    fn write_or_propose<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        data: Vec<u8>,
+        summary: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let outcome = ws
+                .write_or_propose(c, &path, &data, summary.as_deref())
+                .await
+                .map_err(to_pyerr)?;
+            let (wrote, suggestion_id) = match outcome {
+                CoreWriteOutcome::Wrote => (true, None),
+                CoreWriteOutcome::Proposed(id) => (false, Some(id)),
+            };
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    WriteOutcome {
+                        wrote,
+                        suggestion_id,
+                    },
+                )
+            })
         })
     }
 
@@ -1704,6 +1785,7 @@ fn fuse_mountable() -> bool {
 fn _origofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Workspace>()?;
     m.add_class::<WriteCtx>()?;
+    m.add_class::<WriteOutcome>()?;
     m.add_class::<S3Config>()?;
     m.add_class::<GcsConfig>()?;
     m.add_class::<Subscription>()?;

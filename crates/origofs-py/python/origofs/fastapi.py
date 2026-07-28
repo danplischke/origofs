@@ -342,8 +342,12 @@ def build_router(
         parent, _, _ = p.rpartition("/")
         if parent:  # create intermediate dirs, like the Rust HTTP API does
             await _run(ws.mkdir_p(parent))
-        await _run(ws.write_as(ctx, p, body))
-        return {"path": p, "written": len(body)}
+        # Governed by the principal's write policy: a direct actor writes straight
+        # through; a propose-only actor's edit is queued for review instead.
+        outcome = await _run(ws.write_or_propose(ctx, p, body, None))
+        if outcome.wrote:
+            return {"path": p, "written": len(body)}
+        return {"path": p, "proposed": outcome.suggestion_id}
 
     @router.delete("/files/{path:path}")
     async def remove_file(path: str, _ctx: Any = Depends(authn)):
