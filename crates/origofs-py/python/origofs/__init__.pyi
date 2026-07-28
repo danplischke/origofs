@@ -65,6 +65,44 @@ class Subscription:
     """A push subscription to the change feed (Postgres LISTEN/NOTIFY)."""
     async def recv(self) -> list[dict[str, Any]]: ...
 
+class CoeditSyncReply:
+    """The routing for one processed y-sync payload (see ``CoeditDoc.handle_sync``)."""
+    @property
+    def reply(self) -> bytes:
+        """Frames to send back to the originating connection (``b""`` if none)."""
+        ...
+    @property
+    def broadcast(self) -> bytes:
+        """Frames to fan out to the room's other connections (``b""`` if none)."""
+        ...
+
+class CoeditDoc:
+    """A live co-edited document (roadmap M8): a Yjs-compatible CRDT whose inserts
+    are attributed per byte range. Obtain a server-side room doc from
+    ``Workspace.open_coedit`` and drive it with the Yjs y-sync wire protocol via
+    ``handle_sync`` so an unmodified editor (PlateJS, ``y-websocket``) collaborates
+    directly; land it with ``Workspace.checkpoint_coedit``. Safe to share one
+    instance across many concurrent WebSocket handlers."""
+    def __init__(self) -> None:
+        """A fresh, empty document (for a Python-side agent or a test client)."""
+        ...
+    async def insert(self, ctx: WriteCtx, index: int, chunk: str) -> None:
+        """Insert ``chunk`` at character ``index`` (UTF-16 offset), attributed to ``ctx``."""
+        ...
+    async def remove(self, index: int, length: int) -> None:
+        """Remove ``length`` characters starting at ``index`` (UTF-16 offsets)."""
+        ...
+    async def sync_start(self) -> bytes:
+        """The y-sync ``SyncStep1`` frame to greet a new client with."""
+        ...
+    async def handle_sync(self, ctx: WriteCtx, data: bytes) -> CoeditSyncReply:
+        """Handle one inbound y-sync payload from a connection authenticated as
+        ``ctx``; its content is attributed to ``ctx`` server-side."""
+        ...
+    async def text(self) -> str:
+        """The full current text."""
+        ...
+
 class Workspace:
     # --- constructors (async) ---
     @staticmethod
@@ -132,7 +170,13 @@ class Workspace:
     async def find_or_create_human(self, auth_subject: str, display_name: str) -> int: ...
     async def find_or_create_agent(self, auth_subject: str, display_name: str, model: str, controller: Optional[int] = None) -> int: ...
     async def create_session(self, actor_id: int, client: Optional[str] = None) -> int: ...
+    # Each blame span is a dict with `byte_start`/`byte_end` (the ground-truth byte
+    # range), the derived `line_start`/`line_end`, `session`, and `actor`.
     async def blame(self, path: str) -> list[dict[str, Any]]: ...
+
+    # --- live co-editing (M8) ---
+    async def open_coedit(self, ctx: WriteCtx, path: str) -> CoeditDoc: ...
+    async def checkpoint_coedit(self, ctx: WriteCtx, path: str, doc: CoeditDoc) -> None: ...
 
     # --- live collaboration ---
     async def watch(self, after_seq: int = 0) -> list[dict[str, Any]]: ...

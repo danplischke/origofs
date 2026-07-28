@@ -17,6 +17,8 @@ its own extra dependencies only when used):
 from ._origofs import (
     OrigoFSError,
     ConflictError,
+    CoeditDoc,
+    CoeditSyncReply,
     GcsConfig,
     Mount,
     S3Config,
@@ -29,6 +31,8 @@ from ._origofs import (
 __all__ = [
     "OrigoFSError",
     "ConflictError",
+    "CoeditDoc",
+    "CoeditSyncReply",
     "GcsConfig",
     "Mount",
     "S3Config",
