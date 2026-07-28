@@ -117,10 +117,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .map(|(_, name, _)| name))
     }
 
-    /// The hash of the live ref-mirror snapshot, if any (a GC root).
-    pub(crate) async fn refs_mirror_hash(&self) -> Result<Option<Hash>> {
-        Ok(self
-            .meta
+    /// The ref-mirror snapshot hash recorded in a *specific* workspace's config.
+    /// GC needs this per workspace: the mirror pointer lives in the workspace-scoped
+    /// `config`, so marking only the calling workspace's mirror would sweep every
+    /// other workspace's recovery snapshot out of the shared content store.
+    pub(crate) async fn mirror_hash_of(meta: &dyn MetadataStore) -> Result<Option<Hash>> {
+        Ok(meta
             .get_config(REFS_MIRROR_HASH)
             .await?
             .and_then(|s| Hash::from_hex(&s)))

@@ -1346,8 +1346,13 @@ impl MetadataStore for PostgresMetadataStore {
 
     async fn reap_presence(&self, older_than: i64) -> Result<u64> {
         let c = self.client().await?;
+        // Scoped to this workspace (see the SQLite twin): a store-wide reap would
+        // evict other workspaces' presence rows, including their live sessions.
         let n = c
-            .execute("DELETE FROM presence WHERE last_seen < $1", &[&older_than])
+            .execute(
+                "DELETE FROM presence WHERE workspace_id = $1 AND last_seen < $2",
+                &[&self.workspace_id, &older_than],
+            )
             .await?;
         Ok(n)
     }

@@ -573,6 +573,137 @@ async fn concurrent_writers_across_workspaces_dont_interfere() {
     }
 }
 
+/// Reaping presence in one workspace must not evict another workspace's rows.
+/// Regression: `reap_presence` issued a store-wide `DELETE FROM presence` with no
+/// `workspace_id` predicate, so one workspace's cleanup deleted every workspace's
+/// presence — including live sessions — whenever it used a shorter cutoff.
+#[tokio::test]
+async fn reap_presence_is_workspace_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let beta = ws.workspace("beta").await.unwrap();
+    let actor = ws.create_human("worker", None).await.unwrap();
+
+    // A freshly-heartbeated session in each workspace (distinct sessions → distinct
+    // presence rows, both with last_seen ≈ now).
+    let sa = alpha.create_session(actor, Some("cli")).await.unwrap();
+    let sb = beta.create_session(actor, Some("cli")).await.unwrap();
+    alpha.touch(actor, sa, Some("/a.txt")).await.unwrap();
+    beta.touch(actor, sb, Some("/b.txt")).await.unwrap();
+
+    // alpha reaps aggressively (a negative grace pushes the cutoff into the future,
+    // so every alpha row qualifies). It must reap exactly its own one row.
+    let reaped = alpha.reap_presence(-100).await.unwrap();
+    assert_eq!(
+        reaped, 1,
+        "alpha's reap must delete only alpha's presence row"
+    );
+
+    // alpha's session is gone; beta's live session is untouched.
+    assert!(
+        alpha
+            .presence(3600)
+            .await
+            .unwrap()
+            .iter()
+            .all(|p| p.session_id != sa)
+    );
+    assert!(
+        beta.presence(3600)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.session_id == sb),
+        "beta's presence must survive alpha's reap"
+    );
+}
+
+/// GC in one workspace must not reclaim another workspace's pending-suggestion
+/// content. Regression: the suggestions GC root was marked only for the calling
+/// workspace, so `beta.gc()` swept `alpha`'s proposed bytes out of the shared CAS
+/// and a later `alpha.accept_suggestion` failed with `ContentMissing`.
+#[tokio::test]
+async fn gc_preserves_other_workspaces_pending_suggestions() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let beta = ws.workspace("beta").await.unwrap();
+    let author = ws.create_human("author", None).await.unwrap();
+    let reviewer = ws.create_human("reviewer", None).await.unwrap();
+
+    // A pending proposal in alpha: its bytes live only in the CAS until accepted.
+    let sid = alpha
+        .suggest(
+            WriteCtx::actor(author),
+            "/x.txt",
+            b"proposed body",
+            Some("x"),
+        )
+        .await
+        .unwrap();
+
+    // GC driven from a *different* workspace must not touch alpha's proposal.
+    beta.gc().await.unwrap();
+
+    // alpha can still accept it (the proposed content survived the sweep).
+    alpha
+        .accept_suggestion(sid, WriteCtx::actor(reviewer))
+        .await
+        .expect("accept must succeed: gc from beta must not reclaim alpha's proposed bytes");
+    assert_eq!(&alpha.read("/x.txt").await.unwrap()[..], b"proposed body");
+}
+
+/// GC in one workspace must not destroy another workspace's disaster-recovery
+/// mirror. Regression: the ref-mirror GC root was marked only for the calling
+/// workspace, so `gc()` swept every *other* workspace's recovery snapshot — leaving
+/// their committed data in the CAS but un-recoverable as named workspaces. This is
+/// the gc-then-rebuild composition the separate gc/rebuild tests never exercised.
+#[tokio::test]
+async fn gc_preserves_other_workspaces_recovery_mirror() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = dir.path().join("cas");
+
+    // Committed history in three workspaces, then GC driven from the default one.
+    {
+        let ws = Workspace::open_local(dir.path().join("db1.sqlite"), &cas)
+            .await
+            .unwrap();
+        ws.write("/root.txt", b"in-default").await.unwrap();
+        ws.commit("t", "default").await.unwrap();
+        let alpha = ws.workspace("alpha").await.unwrap();
+        alpha.write("/a.txt", b"in-alpha").await.unwrap();
+        alpha.commit("t", "alpha").await.unwrap();
+        let beta = ws.workspace("beta").await.unwrap();
+        beta.write("/b.txt", b"in-beta").await.unwrap();
+        beta.commit("t", "beta").await.unwrap();
+
+        // GC from the default workspace: must keep alpha's & beta's mirrors alive.
+        ws.gc().await.unwrap();
+    }
+
+    // Catastrophe after the GC: rebuild a fresh DB from the swept content store.
+    let ws = Workspace::open_local(dir.path().join("db2.sqlite"), &cas)
+        .await
+        .unwrap();
+    let report = ws.rebuild().await.unwrap();
+    assert_eq!(
+        report.extra_workspaces, 2,
+        "alpha + beta mirrors must survive a gc() run in another workspace"
+    );
+    let mut ws_names = ws.workspaces().await.unwrap();
+    ws_names.sort();
+    assert_eq!(ws_names, vec!["alpha", "beta", "default"]);
+    let alpha = ws.workspace("alpha").await.unwrap();
+    assert_eq!(&alpha.read("/a.txt").await.unwrap()[..], b"in-alpha");
+    let beta = ws.workspace("beta").await.unwrap();
+    assert_eq!(&beta.read("/b.txt").await.unwrap()[..], b"in-beta");
+}
+
 /// The sorted-by-insertion entry names directly under a workspace's root.
 async fn names(ws: &Workspace) -> Vec<String> {
     ws.ls("/")

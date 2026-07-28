@@ -929,9 +929,12 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn reap_presence(&self, older_than: i64) -> Result<u64> {
         let conn = self.lock();
+        // Scoped to this workspace: a store-wide reap would evict other workspaces'
+        // presence (including live sessions) whenever one workspace uses a shorter
+        // cutoff. `touch_presence`/`active_presence` are both workspace-scoped too.
         let n = conn.execute(
-            "DELETE FROM presence WHERE last_seen < ?1",
-            params![older_than],
+            "DELETE FROM presence WHERE workspace_id = ?1 AND last_seen < ?2",
+            params![self.workspace_id, older_than],
         )?;
         Ok(n as u64)
     }
