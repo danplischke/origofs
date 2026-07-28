@@ -33,6 +33,7 @@ Requires FastAPI: ``pip install "origofs[fastapi]"``.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union
 
 try:
@@ -163,8 +164,9 @@ class _Room:
         self.doc: "origofs.CoeditDoc" = doc
         self.conns: set[_Conn] = set()
 
-    def fanout(self, sender: _Conn, frame: bytes) -> None:
-        """Queue `frame` for every connection except the one it came from."""
+    def fanout(self, sender: Optional[_Conn], frame: bytes) -> None:
+        """Queue `frame` for every connection except `sender` (pass ``None`` to
+        reach all, e.g. for a frame relayed from another worker)."""
         for conn in self.conns:
             if conn is not sender:
                 conn.out.put_nowait(frame)
@@ -192,23 +194,78 @@ class _Rooms:
     one path share one CRDT, instead of each request opening its own view.
 
     The registry is per **process**. Under a single worker that is the whole story.
-    Across multiple workers it is not shared — pin a document to one worker (sticky
-    routing by path) or run the co-editing endpoint as its own single-process
-    service, exactly as an in-memory ``y-websocket`` server would. State stays
-    durable and consistent regardless, because every checkpoint lands through the
-    shared workspace.
+    Across multiple workers, when the workspace is **Postgres**-backed, rooms are
+    bridged over the cross-worker relay: every attributed delta is published, and a
+    background task applies peers' deltas to this worker's rooms and fans them out
+    to its sockets, so all replicas converge. A joining room replays recent ops to
+    catch up. On SQLite (single-writer) the relay is simply off. Either way state
+    stays durable through the shared workspace's checkpoints.
     """
 
     def __init__(self, ws: Any) -> None:
         self._ws = ws
         self._rooms: dict[str, _Room] = {}
         self._lock = asyncio.Lock()
+        # This worker's id, tagged on every published op to skip our own echo.
+        self._origin = uuid.uuid4().hex
+        self._relay = bool(getattr(ws, "is_postgres", lambda: False)())
+        self._drain_task: Optional["asyncio.Task[None]"] = None
+
+    def ensure_relay(self) -> None:
+        """Start the cross-worker drain task once (a no-op without Postgres, or
+        after the first call). Called on the first socket, in async context."""
+        if self._relay and self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._drain())
+
+    async def _drain(self) -> None:
+        """Apply peers' published deltas to the rooms this worker hosts and fan
+        them out to its sockets, until the relay connection closes."""
+        try:
+            sub = await self._ws.coedit_subscribe()
+        except Exception:
+            return  # not Postgres (or setup failed): single-worker mode
+        while True:
+            try:
+                notes = await sub.recv()
+            except Exception:
+                break
+            if not notes:
+                break  # connection closed
+            for note in notes:
+                if note.origin == self._origin:
+                    continue  # our own op — already applied + fanned out locally
+                room = self._rooms.get(note.path)
+                if room is None:
+                    continue  # not hosting this document here
+                try:
+                    await room.doc.apply_relayed(note.delta)
+                except Exception:
+                    continue
+                room.fanout(None, note.delta)  # to every local socket
+
+    async def publish(self, path: str, frame: bytes) -> None:
+        """Publish a local edit's delta to peer workers (a no-op without the relay)."""
+        if not self._relay:
+            return
+        try:
+            await self._ws.coedit_publish(path, self._origin, frame)
+        except Exception:
+            pass  # relay is best-effort; local editing continues regardless
 
     async def join(self, path: str, ctx: Any, conn: _Conn) -> _Room:
         async with self._lock:
             room = self._rooms.get(path)
             if room is None:
                 doc = await self._ws.open_coedit(ctx, path)
+                if self._relay:
+                    # Ensure the relay table exists, then replay recent ops so this
+                    # room catches up to peers before its first socket syncs.
+                    try:
+                        await self._ws.coedit_relay_init()
+                        for note in await self._ws.coedit_replay(path):
+                            await doc.apply_relayed(note.delta)
+                    except Exception:
+                        pass
                 room = _Room(doc)
                 self._rooms[path] = room
             room.conns.add(conn)
@@ -423,6 +480,7 @@ def build_router(
         """
         p = _abs(path)
         await websocket.accept()
+        rooms.ensure_relay()  # idempotent; starts the cross-worker drain on first use
         conn = _Conn(websocket)
         room = await rooms.join(p, ctx, conn)
 
@@ -440,7 +498,8 @@ def build_router(
                 if reply.reply:
                     conn.out.put_nowait(reply.reply)
                 if reply.broadcast:
-                    room.fanout(conn, reply.broadcast)
+                    room.fanout(conn, reply.broadcast)  # local sockets
+                    await rooms.publish(p, reply.broadcast)  # peer workers
         except WebSocketDisconnect:
             pass
         finally:

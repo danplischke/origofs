@@ -238,6 +238,238 @@ impl EventSubscription {
     }
 }
 
+// --- co-editing cross-worker relay (M8) -------------------------------------
+//
+// Live co-editing rooms are per-process: every socket editing one path shares one
+// CRDT within a worker. Across workers that isn't enough — two users on different
+// workers would edit divergent copies. This relay is the cross-worker bus: a
+// worker publishes each attributed update delta, and every other worker applies
+// it to its own room and fans it out to its local sockets, so all replicas of a
+// document converge (the CRDT merge is commutative + idempotent).
+//
+// It reuses the change-feed shape: a durable append-only `coedit_op` table is the
+// source of truth, and `NOTIFY` is only a coalesced wakeup — so a dropped or
+// merged notification never loses an op (the next drain reads it from the table).
+// The table is ephemeral scratch space (GC'd on a TTL), not durable workspace
+// data, so it lives outside the versioned migrations, created on demand.
+
+/// The Postgres channel co-edit workers wake each other on.
+#[cfg(feature = "coedit")]
+pub const COEDIT_CHANNEL: &str = "origofs_coedit";
+
+/// Advisory-lock key serializing concurrent creation of the relay table, so many
+/// workers calling `coedit_relay_init` at once don't race the `CREATE TABLE`.
+#[cfg(feature = "coedit")]
+const COEDIT_RELAY_LOCK_KEY: i64 = 0x0af5_0000_c0ed;
+
+/// How long a relayed op lingers in the table before GC. Generous enough to cover
+/// the gap between a room's checkpoints, so a worker that starts hosting a document
+/// can replay recent ops and catch up to the current state.
+#[cfg(feature = "coedit")]
+const COEDIT_OP_TTL_SECS: i64 = 300;
+
+/// GC runs on roughly 1-in-N publishes (keyed off the op's `seq`), so the table
+/// stays small without a DELETE on every write.
+#[cfg(feature = "coedit")]
+const COEDIT_GC_EVERY: i64 = 256;
+
+/// Max relayed ops a single `recv` drains at once.
+#[cfg(feature = "coedit")]
+const COEDIT_DRAIN_BATCH: i64 = 1024;
+
+/// One relayed update: the attributed delta `origin` produced for `path`.
+#[cfg(feature = "coedit")]
+#[derive(Clone, Debug)]
+pub struct CoeditRelayNote {
+    pub seq: i64,
+    pub origin: String,
+    pub path: String,
+    pub delta: Vec<u8>,
+}
+
+#[cfg(feature = "coedit")]
+impl PostgresMetadataStore {
+    /// Create the ephemeral relay table if it's missing (idempotent). The relay is
+    /// scratch space for cross-worker fan-out, not durable workspace data, so it
+    /// sits outside the versioned migrations.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` alone races under concurrency in Postgres (two
+    /// sessions passing the existence check at once error out), and every worker
+    /// calls this on startup — so serialize on a transaction-scoped advisory lock,
+    /// the same way schema bootstrap does. Whoever wins creates it; the rest wait
+    /// and no-op.
+    pub async fn coedit_relay_init(&self) -> Result<()> {
+        let c = self.client().await?;
+        c.batch_execute(&format!(
+            "BEGIN;
+             SELECT pg_advisory_xact_lock({COEDIT_RELAY_LOCK_KEY});
+             CREATE TABLE IF NOT EXISTS coedit_op (
+                 seq        BIGSERIAL PRIMARY KEY,
+                 path       TEXT   NOT NULL,
+                 origin     TEXT   NOT NULL,
+                 delta      BYTEA  NOT NULL,
+                 created_at BIGINT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS coedit_op_created ON coedit_op (created_at);
+             COMMIT;"
+        ))
+        .await
+        .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Publish an attributed `delta` for `path` from worker `origin`: persist it
+    /// and wake every listening worker. Occasionally GCs expired ops.
+    pub async fn coedit_publish(&self, path: &str, origin: &str, delta: &[u8]) -> Result<()> {
+        let c = self.client().await?;
+        let seq: i64 = c
+            .query_one(
+                "INSERT INTO coedit_op (path, origin, delta, created_at)
+                 VALUES ($1, $2, $3, $4) RETURNING seq",
+                &[&path, &origin, &delta, &now_secs()],
+            )
+            .await?
+            .get(0);
+        // A bare wakeup: the table is the source of truth, so the payload carries
+        // nothing and a coalesced NOTIFY never loses an op.
+        c.execute("SELECT pg_notify($1, '')", &[&COEDIT_CHANNEL])
+            .await?;
+        if seq % COEDIT_GC_EVERY == 0 {
+            let cutoff = now_secs() - COEDIT_OP_TTL_SECS;
+            let _ = c
+                .execute("DELETE FROM coedit_op WHERE created_at < $1", &[&cutoff])
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Every relayed op currently held for `path` (within the TTL), oldest first —
+    /// for a worker that has just started hosting `path` to replay and catch up to
+    /// the state its peers already share. Applying is idempotent, so replaying ops
+    /// already folded into the checkpoint is harmless.
+    pub async fn coedit_replay(&self, path: &str) -> Result<Vec<CoeditRelayNote>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT seq, origin, path, delta FROM coedit_op
+                 WHERE path = $1 ORDER BY seq",
+                &[&path],
+            )
+            .await?;
+        Ok(rows.iter().map(row_to_relay_note).collect())
+    }
+
+    /// Subscribe to the relay: a dedicated `LISTEN` connection (pooled connections
+    /// can't surface notifications), mirroring [`Self::subscribe`]. The returned
+    /// [`CoeditRelaySub`] drains every worker's ops in `seq` order; the caller skips
+    /// its own (`origin`) and any path it isn't hosting.
+    pub async fn coedit_subscribe(&self) -> Result<CoeditRelaySub> {
+        self.coedit_relay_init().await?;
+        let (client, mut connection) = tokio_postgres::connect(&self.dsn, NoTls)
+            .await
+            .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
+
+        // Coalescing capacity-1 wakeups: a wake only means "re-drain", so a burst
+        // collapses into one and the drained query stays the source of truth.
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+        let driver = tokio::spawn(async move {
+            let mut stream =
+                futures::stream::poll_fn(move |cx| Pin::new(&mut connection).poll_message(cx));
+            while let Some(msg) = stream.next().await {
+                match msg {
+                    Ok(AsyncMessage::Notification(_)) => match tx.try_send(()) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => break,
+                    },
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        client
+            .batch_execute(&format!("LISTEN {COEDIT_CHANNEL}"))
+            .await
+            .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
+
+        // Start from 0 so the first drain reads ops already in the table — a
+        // subscriber that came up just after a publish (or after its NOTIFY) still
+        // sees it, closing the subscribe/publish race. Ops for paths this worker
+        // isn't hosting are skipped by the caller, and re-applying one it has is a
+        // no-op, so replaying the (TTL-bounded) backlog is cheap and safe.
+        Ok(CoeditRelaySub {
+            client,
+            wakeups: rx,
+            cursor: 0,
+            driver,
+        })
+    }
+}
+
+/// A live `LISTEN`-backed subscription to the co-edit relay. Dropping it tears
+/// down the dedicated connection and the forwarder task.
+#[cfg(feature = "coedit")]
+pub struct CoeditRelaySub {
+    client: tokio_postgres::Client,
+    wakeups: tokio::sync::mpsc::Receiver<()>,
+    cursor: i64,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "coedit")]
+impl Drop for CoeditRelaySub {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+
+#[cfg(feature = "coedit")]
+impl CoeditRelaySub {
+    /// Block until at least one new op is published, then return the batch (in
+    /// `seq` order) and advance the cursor. Returns `Ok(vec![])` only once the
+    /// underlying connection has closed.
+    pub async fn recv(&mut self) -> Result<Vec<CoeditRelayNote>> {
+        loop {
+            let batch = self.drain().await?;
+            if !batch.is_empty() {
+                return Ok(batch);
+            }
+            if self.wakeups.recv().await.is_none() {
+                return Ok(Vec::new());
+            }
+        }
+    }
+
+    async fn drain(&mut self) -> Result<Vec<CoeditRelayNote>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT seq, origin, path, delta FROM coedit_op
+                 WHERE seq > $1 ORDER BY seq LIMIT $2",
+                &[&self.cursor, &COEDIT_DRAIN_BATCH],
+            )
+            .await
+            .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
+        let notes: Vec<CoeditRelayNote> = rows.iter().map(row_to_relay_note).collect();
+        if let Some(last) = notes.last() {
+            self.cursor = last.seq;
+        }
+        Ok(notes)
+    }
+}
+
+/// Decode a `coedit_op` row (columns: seq, origin, path, delta).
+#[cfg(feature = "coedit")]
+fn row_to_relay_note(r: &Row) -> CoeditRelayNote {
+    CoeditRelayNote {
+        seq: r.get(0),
+        origin: r.get(1),
+        path: r.get(2),
+        delta: r.get(3),
+    }
+}
+
 /// Decode a `fs_event` row (columns: seq, actor_id, session_id, kind, path,
 /// detail, ts, branch) into an [`Event`].
 fn row_to_event(r: &Row) -> Event {

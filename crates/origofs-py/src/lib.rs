@@ -563,6 +563,17 @@ impl CoeditDoc {
         })
     }
 
+    /// Merge a y-sync frame relayed from another worker (already attributed by its
+    /// origin) *without* re-attribution — the cross-worker relay's apply path.
+    /// Idempotent. Client input must instead go through `handle_sync`.
+    fn apply_relayed<'py>(&self, py: Python<'py>, frame: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.lock().await.apply_relayed(&frame).map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
     /// The full current text (handy for inspection and tests).
     fn text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -574,6 +585,78 @@ impl CoeditDoc {
 
     fn __repr__(&self) -> String {
         "CoeditDoc()".to_string()
+    }
+}
+
+/// One relayed co-editing update from another worker: the attributed `delta`
+/// (a y-sync frame) `origin` produced for `path`, ordered by `seq`.
+#[pyclass(frozen)]
+struct CoeditRelayNote {
+    #[pyo3(get)]
+    seq: i64,
+    #[pyo3(get)]
+    origin: String,
+    #[pyo3(get)]
+    path: String,
+    delta: Vec<u8>,
+}
+
+#[pymethods]
+impl CoeditRelayNote {
+    /// The update payload (a y-sync frame) to feed `CoeditDoc.apply_relayed`.
+    #[getter]
+    fn delta<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.delta)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CoeditRelayNote(seq={}, origin={:?}, path={:?}, delta={} bytes)",
+            self.seq,
+            self.origin,
+            self.path,
+            self.delta.len()
+        )
+    }
+}
+
+/// A live subscription to the cross-worker co-editing relay (Postgres
+/// `LISTEN/NOTIFY`). `await sub.recv()` blocks until peers publish, then returns
+/// their updates in order. Returned by `Workspace.coedit_subscribe`.
+#[pyclass]
+struct CoeditRelaySub {
+    inner: Arc<tokio::sync::Mutex<origofs_sdk::CoeditRelaySub>>,
+}
+
+#[pymethods]
+impl CoeditRelaySub {
+    /// Block until at least one relayed op arrives, then return the batch (in
+    /// `seq` order). Returns `[]` once the relay connection has closed. The caller
+    /// skips its own `origin` and any path it isn't hosting.
+    fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let sub = self.inner.clone();
+        future_into_py(py, async move {
+            let notes = {
+                let mut guard = sub.lock().await;
+                guard.recv().await.map_err(to_pyerr)?
+            };
+            Python::attach(|py| {
+                notes
+                    .into_iter()
+                    .map(|n| {
+                        Py::new(
+                            py,
+                            CoeditRelayNote {
+                                seq: n.seq,
+                                origin: n.origin,
+                                path: n.path,
+                                delta: n.delta,
+                            },
+                        )
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
     }
 }
 
@@ -1223,6 +1306,84 @@ impl Workspace {
         })
     }
 
+    /// Whether this workspace is Postgres-backed (multi-writer). The cross-worker
+    /// co-editing relay is available exactly when this is true; on SQLite a single
+    /// worker holds every room, so no relay is needed.
+    fn is_postgres(&self) -> bool {
+        self.inner.is_postgres()
+    }
+
+    /// Ensure the cross-worker relay's backing table exists (idempotent). Call it
+    /// before a room accepts edits. Requires the Postgres backend.
+    fn coedit_relay_init<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.coedit_relay_init().await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Publish a co-editing update `delta` (a y-sync frame) for `path` to peer
+    /// workers, tagged with this worker's `origin` id. Requires the Postgres backend.
+    fn coedit_publish<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        origin: String,
+        delta: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.coedit_publish(&path, &origin, &delta)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Every relayed op currently held for `path` (as `CoeditRelayNote`s), for a
+    /// worker that just started hosting it to replay and catch up (idempotent).
+    /// Requires the Postgres backend.
+    fn coedit_replay<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let notes = ws.coedit_replay(&path).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                notes
+                    .into_iter()
+                    .map(|n| {
+                        Py::new(
+                            py,
+                            CoeditRelayNote {
+                                seq: n.seq,
+                                origin: n.origin,
+                                path: n.path,
+                                delta: n.delta,
+                            },
+                        )
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// Subscribe to the cross-worker co-editing relay. Returns a `CoeditRelaySub`
+    /// whose `recv()` yields peers' updates in order. Requires the Postgres backend.
+    fn coedit_subscribe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let sub = ws.coedit_subscribe().await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    CoeditRelaySub {
+                        inner: Arc::new(tokio::sync::Mutex::new(sub)),
+                    },
+                )
+            })
+        })
+    }
+
     // --- live collaboration -------------------------------------------------
 
     /// Change-feed events strictly after `after_seq` (oldest first).
@@ -1548,6 +1709,8 @@ fn _origofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Subscription>()?;
     m.add_class::<CoeditDoc>()?;
     m.add_class::<CoeditSyncReply>()?;
+    m.add_class::<CoeditRelayNote>()?;
+    m.add_class::<CoeditRelaySub>()?;
     #[cfg(unix)]
     m.add_class::<Mount>()?;
     m.add_function(wrap_pyfunction!(fuse_mountable, m)?)?;

@@ -55,6 +55,8 @@ pub use objectgraph::{
 };
 pub use objectstore::{GcsConfig, ObjectContentStore, S3Config};
 pub use pack::{DEFAULT_PACK_SIZE, PackStore};
+#[cfg(feature = "coedit")]
+pub use postgres::{CoeditRelayNote, CoeditRelaySub};
 pub use postgres::{EventSubscription, PostgresMetadataStore};
 pub use recover::RebuildReport;
 pub use sqlite::SqliteMetadataStore;

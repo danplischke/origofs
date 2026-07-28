@@ -14,8 +14,6 @@ use std::sync::Arc;
 
 pub use bytes::Bytes;
 pub use futures::stream::BoxStream;
-#[cfg(feature = "coedit")]
-pub use origofs_core::CoeditDoc;
 pub use origofs_core::{
     Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DiffEntry, DiffStatus, DirEntry,
     EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind, GcStats, GcsConfig,
@@ -23,6 +21,8 @@ pub use origofs_core::{
     RebuildReport, S3Config, Suggestion, SuggestionContent, SuggestionInit, SuggestionStatus,
     TieredStore, ToolCallInit, VerifyingStore, VersioningMode, WriteCtx,
 };
+#[cfg(feature = "coedit")]
+pub use origofs_core::{CoeditDoc, CoeditRelayNote, CoeditRelaySub};
 
 type Meta = Arc<dyn MetadataStore>;
 type Content = Arc<dyn ContentStore>;
@@ -707,6 +707,25 @@ impl Workspace {
         }
     }
 
+    /// Whether this workspace is backed by Postgres (multi-writer). The
+    /// Postgres-only features — the push `subscribe` feed and the cross-worker
+    /// co-edit relay — are available exactly when this is true.
+    pub fn is_postgres(&self) -> bool {
+        self.pg.is_some()
+    }
+
+    /// The Postgres store, or an error naming `op` as Postgres-only — the shared
+    /// gate for the multi-writer/multi-worker features (the co-edit relay).
+    #[cfg(feature = "coedit")]
+    fn require_pg(&self, op: &str) -> Result<&Arc<origofs_core::PostgresMetadataStore>> {
+        self.pg.as_ref().ok_or_else(|| {
+            OrigoFSError::InvalidArgument(format!(
+                "{op} requires the Postgres backend (multi-worker); a single-worker \
+                 deployment needs no cross-worker relay"
+            ))
+        })
+    }
+
     /// Open a live co-editing document for `path` (roadmap M8): resume the CRDT
     /// from its persisted sidecar if one exists, else promote the file's current
     /// text into a fresh document attributed to `ctx`. Drive it over the Yjs wire
@@ -729,6 +748,47 @@ impl Workspace {
         doc: &CoeditDoc,
     ) -> Result<()> {
         self.fs.checkpoint_coedit(ctx, path, doc).await
+    }
+
+    /// Ensure the cross-worker relay's backing table exists (idempotent). Call it
+    /// before a room starts accepting edits, so the first publish can't race the
+    /// table into existence. Requires the Postgres backend + the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn coedit_relay_init(&self) -> Result<()> {
+        self.require_pg("coedit_relay_init")?
+            .coedit_relay_init()
+            .await
+    }
+
+    /// Publish a co-editing update `delta` for `path` to the cross-worker relay,
+    /// tagged with this worker's `origin` id (so it can skip its own echo). Every
+    /// other worker hosting `path` applies it and fans it out to its sockets, so
+    /// replicas across workers converge. Requires the Postgres backend (a
+    /// single-worker deployment needs no relay); errors otherwise, like
+    /// [`subscribe`](Self::subscribe). Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn coedit_publish(&self, path: &str, origin: &str, delta: &[u8]) -> Result<()> {
+        self.require_pg("coedit_publish")?
+            .coedit_publish(path, origin, delta)
+            .await
+    }
+
+    /// Every relayed op currently held for `path` — for a worker that has just
+    /// started hosting `path` to replay and catch up to its peers' state (applying
+    /// is idempotent). Requires the Postgres backend + the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn coedit_replay(&self, path: &str) -> Result<Vec<CoeditRelayNote>> {
+        self.require_pg("coedit_replay")?.coedit_replay(path).await
+    }
+
+    /// Subscribe to the cross-worker co-editing relay: `recv()` on the returned
+    /// [`CoeditRelaySub`] yields every worker's update deltas in order. Requires
+    /// the Postgres backend + the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn coedit_subscribe(&self) -> Result<CoeditRelaySub> {
+        self.require_pg("coedit_subscribe")?
+            .coedit_subscribe()
+            .await
     }
 
     /// Record an arbitrary event on the change feed.

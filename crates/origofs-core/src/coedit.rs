@@ -167,6 +167,26 @@ impl CoeditDoc {
         Ok(self.doc.transact().encode_state_as_update_v1(&sv_before))
     }
 
+    /// Merge a y-sync frame relayed from another worker — content another replica
+    /// already attributed — *without* re-attribution. This is the cross-worker
+    /// relay's apply path; client input must instead go through
+    /// [`handle_sync`](Self::handle_sync), which attributes. Idempotent: a frame
+    /// already merged (or folded into a checkpoint) is a no-op.
+    pub fn apply_relayed(&self, frame: &[u8]) -> Result<()> {
+        let mut decoder = DecoderV1::new(Cursor::new(frame));
+        let reader = MessageReader::new(&mut decoder);
+        for msg in reader {
+            let msg =
+                msg.map_err(|e| OrigoFSError::InvalidArgument(format!("bad relayed frame: {e}")))?;
+            // Only content messages carry state; awareness/etc. are ignored on the
+            // relay (presence is gossiped between the clients on each worker).
+            if let Message::Sync(SyncMessage::Update(u) | SyncMessage::SyncStep2(u)) = msg {
+                self.apply_update(&u)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The y-sync frame to greet a freshly-connected client with: a `SyncStep1`
     /// carrying our state vector, so the client sends back (as `SyncStep2`)
     /// whatever we're missing. Pair with [`handle_sync`](Self::handle_sync), which
