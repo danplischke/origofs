@@ -88,6 +88,46 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V10_SQLITE,
         postgres: V10_POSTGRES,
     },
+    // V11 — multi-workspace in one store (`docs/MULTI_TENANCY.md`). A `workspace`
+    // registry table (each workspace has its own root inode), a `workspace_id` tag
+    // on `inode` so a per-workspace `truncate_tree`/checkout clears only its own
+    // tree, and `workspace_id` folded into the primary keys of the namespace-keyed
+    // tables (`ref`, `config`, `conflict`, `file_lock`) whose bare name/path keys
+    // would otherwise collide across workspaces (every workspace has its own `HEAD`
+    // and `refs/heads/main`). `dentry`/`symlink` need no column: inodes share one
+    // global id sequence, so a workspace's subtree is reachable only from its own
+    // root. Backfill maps every existing row to a `default` workspace (id 1, root
+    // `INO_ROOT`), so the migration is non-breaking. (`blob_blame` is scoped later,
+    // in V13.) SQLite rebuilds the four PK-changed tables (no `ALTER … PRIMARY KEY`);
+    // Postgres alters them in place.
+    Migration {
+        version: 11,
+        sqlite: V11_SQLITE,
+        postgres: V11_POSTGRES,
+    },
+    // V12 — workspace-scope the per-location activity + attribution tables so they
+    // isolate like the working tree does (`docs/MULTI_TENANCY.md` §8). Without this
+    // the suggestion queue, change feed, op-log, and presence were store-wide: a
+    // suggestion made in one workspace was visible — and acceptable into the wrong
+    // tree — from another. A plain `workspace_id` tag on each (their surrogate-id/seq
+    // PKs don't collide, so no table rebuild), backfilled to the `default` workspace.
+    // `actor`/`session`/`tool_calls` stay store-wide (identity is tenant-wide).
+    Migration {
+        version: 12,
+        sqlite: V12_SQLITE,
+        postgres: V12_POSTGRES,
+    },
+    // V13 — workspace-scope `blob_blame`: re-key it on `(workspace_id, content_hash)`
+    // instead of `content_hash` alone, so blame is per workspace and identical content
+    // in two workspaces carries each workspace's own authorship (not a shared map).
+    // Within a workspace this keeps V8's property — blame keyed by content survives
+    // checkout/merge — because the workspace_id is stable there. A PK change, so the
+    // same rebuild (SQLite) / alter (Postgres) shape as V11; backfilled to `default`.
+    Migration {
+        version: 13,
+        sqlite: V13_SQLITE,
+        postgres: V13_POSTGRES,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -121,6 +161,147 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_actor_auth_subject
 const V10_SQLITE: &str = "ALTER TABLE actor ADD COLUMN write_policy INTEGER NOT NULL DEFAULT 0;";
 const V10_POSTGRES: &str =
     "ALTER TABLE actor ADD COLUMN IF NOT EXISTS write_policy BIGINT NOT NULL DEFAULT 0;";
+
+// V11 — multi-workspace in one store (see the migration entry above). SQLite has no
+// `ALTER TABLE … ADD PRIMARY KEY`, so the four namespace-keyed tables are rebuilt
+// (create-copy-drop-rename); the `ADD COLUMN`s ride the runner's duplicate-column
+// tolerance on re-apply.
+const V11_SQLITE: &str = "
+CREATE TABLE IF NOT EXISTS workspace(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    root_ino   INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO workspace(id, name, root_ino, created_at) VALUES (1, 'default', 1, 0);
+
+ALTER TABLE inode ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_inode_workspace ON inode(workspace_id);
+
+CREATE TABLE ref_v11(
+    workspace_id INTEGER NOT NULL DEFAULT 1,
+    name  TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, name)
+);
+INSERT INTO ref_v11(workspace_id, name, value) SELECT 1, name, value FROM ref;
+DROP TABLE ref;
+ALTER TABLE ref_v11 RENAME TO ref;
+
+CREATE TABLE config_v11(
+    workspace_id INTEGER NOT NULL DEFAULT 1,
+    key   TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, key)
+);
+INSERT INTO config_v11(workspace_id, key, value) SELECT 1, key, value FROM config;
+DROP TABLE config;
+ALTER TABLE config_v11 RENAME TO config;
+
+CREATE TABLE conflict_v11(
+    workspace_id INTEGER NOT NULL DEFAULT 1,
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, path)
+);
+INSERT INTO conflict_v11(workspace_id, path, kind) SELECT 1, path, kind FROM conflict;
+DROP TABLE conflict;
+ALTER TABLE conflict_v11 RENAME TO conflict;
+
+CREATE TABLE file_lock_v11(
+    workspace_id INTEGER NOT NULL DEFAULT 1,
+    path        TEXT NOT NULL,
+    owner       TEXT NOT NULL,
+    acquired_at BIGINT NOT NULL,
+    PRIMARY KEY(workspace_id, path)
+);
+INSERT INTO file_lock_v11(workspace_id, path, owner, acquired_at)
+    SELECT 1, path, owner, acquired_at FROM file_lock;
+DROP TABLE file_lock;
+ALTER TABLE file_lock_v11 RENAME TO file_lock;
+";
+
+// V11 — Postgres alters the four tables in place (`DROP CONSTRAINT … ADD PRIMARY
+// KEY`). Explicitly inserting the `default` workspace at id 1 does not advance the
+// identity sequence, so `setval` bumps it past 1.
+const V11_POSTGRES: &str = "
+CREATE TABLE IF NOT EXISTS workspace(
+    id         BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    root_ino   BIGINT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+INSERT INTO workspace(id, name, root_ino, created_at) VALUES (1, 'default', 1, 0)
+    ON CONFLICT DO NOTHING;
+SELECT setval(pg_get_serial_sequence('workspace', 'id'),
+              GREATEST((SELECT MAX(id) FROM workspace), 1));
+
+ALTER TABLE inode ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_inode_workspace ON inode(workspace_id);
+
+ALTER TABLE ref       ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE ref       DROP CONSTRAINT IF EXISTS ref_pkey;
+ALTER TABLE ref       ADD PRIMARY KEY(workspace_id, name);
+
+ALTER TABLE config    ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE config    DROP CONSTRAINT IF EXISTS config_pkey;
+ALTER TABLE config    ADD PRIMARY KEY(workspace_id, key);
+
+ALTER TABLE conflict  ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE conflict  DROP CONSTRAINT IF EXISTS conflict_pkey;
+ALTER TABLE conflict  ADD PRIMARY KEY(workspace_id, path);
+
+ALTER TABLE file_lock ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE file_lock DROP CONSTRAINT IF EXISTS file_lock_pkey;
+ALTER TABLE file_lock ADD PRIMARY KEY(workspace_id, path);
+";
+
+// V12 — workspace-scope the activity/attribution tables (see the migration entry
+// above). Plain `ADD COLUMN` (surrogate-id/seq PKs don't collide), so no rebuild;
+// the `ADD COLUMN`s ride the runner's duplicate-column tolerance on re-apply.
+const V12_SQLITE: &str = "
+ALTER TABLE suggestion ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE edit_op    ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE fs_event   ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE presence   ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_suggestion_workspace ON suggestion(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_edit_op_workspace ON edit_op(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_fs_event_workspace ON fs_event(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_presence_workspace ON presence(workspace_id);
+";
+
+const V12_POSTGRES: &str = "
+ALTER TABLE suggestion ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE edit_op    ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE fs_event   ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE presence   ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_suggestion_workspace ON suggestion(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_edit_op_workspace ON edit_op(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_fs_event_workspace ON fs_event(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_presence_workspace ON presence(workspace_id);
+";
+
+// V13 — per-workspace blame (see the migration entry above). SQLite rebuilds the
+// table to change the PK (`content_hash` -> `(workspace_id, content_hash)`);
+// Postgres alters it in place. Existing blame backfills to the `default` workspace.
+const V13_SQLITE: &str = "
+CREATE TABLE blob_blame_v13(
+    workspace_id INTEGER NOT NULL DEFAULT 1,
+    content_hash TEXT NOT NULL,
+    runs         TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, content_hash)
+);
+INSERT INTO blob_blame_v13(workspace_id, content_hash, runs)
+    SELECT 1, content_hash, runs FROM blob_blame;
+DROP TABLE blob_blame;
+ALTER TABLE blob_blame_v13 RENAME TO blob_blame;
+";
+
+const V13_POSTGRES: &str = "
+ALTER TABLE blob_blame ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE blob_blame DROP CONSTRAINT IF EXISTS blob_blame_pkey;
+ALTER TABLE blob_blame ADD PRIMARY KEY(workspace_id, content_hash);
+";
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS`; the migration runner tolerates a
 // re-applied ADD COLUMN (duplicate-column) so a re-run is idempotent. Postgres

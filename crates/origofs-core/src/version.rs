@@ -16,7 +16,7 @@ use crate::objectgraph::{
     Commit, CommitInfo, DiffEntry, DiffStatus, RefSnapshot, Tree, TreeEntry, TreeKind,
     VersioningMode,
 };
-use crate::types::{FileKind, Hash, INO_ROOT, Ino, InodeInit};
+use crate::types::{FileKind, Hash, Ino, InodeInit};
 use async_recursion::async_recursion;
 use std::collections::BTreeMap;
 
@@ -81,7 +81,15 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // distinct, strictly increasing generation, so a recovery scan can pick
         // the newest snapshot unambiguously — no read-then-write race (audit #21).
         let generation = self.meta.bump_counter(REFS_MIRROR_GEN).await? as u64;
-        let refs = self.meta.list_refs().await?;
+        let mut refs = self.meta.list_refs().await?;
+        // Tag the snapshot with this workspace's name (resolved from its root inode
+        // via the registry), so a rebuild after a metadata-DB loss can recover each
+        // workspace of a multi-workspace store into the right place
+        // (`docs/MULTI_TENANCY.md`). Reuses the refs vec — no object-format change;
+        // the recovery side skips this reserved key like it skips HEAD/MERGE_HEAD.
+        if let Some(name) = self.workspace_name().await? {
+            refs.push((crate::recover::WORKSPACE_MIRROR_KEY.to_string(), name));
+        }
         let hash = self
             .content
             .put(&RefSnapshot { generation, refs }.encode())
@@ -95,10 +103,26 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(())
     }
 
-    /// The hash of the live ref-mirror snapshot, if any (a GC root).
-    pub(crate) async fn refs_mirror_hash(&self) -> Result<Option<Hash>> {
+    /// This engine's workspace name, resolved from its root inode via the registry
+    /// (`"default"` for the root workspace). `None` only if no registry row matches
+    /// the root — e.g. a pre-`workspace`-table store — in which case the mirror is
+    /// left untagged and recovery treats it as the default workspace.
+    pub(crate) async fn workspace_name(&self) -> Result<Option<String>> {
         Ok(self
             .meta
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .find(|(_, _, root)| *root == self.root_ino)
+            .map(|(_, name, _)| name))
+    }
+
+    /// The ref-mirror snapshot hash recorded in a *specific* workspace's config.
+    /// GC needs this per workspace: the mirror pointer lives in the workspace-scoped
+    /// `config`, so marking only the calling workspace's mirror would sweep every
+    /// other workspace's recovery snapshot out of the shared content store.
+    pub(crate) async fn mirror_hash_of(meta: &dyn MetadataStore) -> Result<Option<Hash>> {
+        Ok(meta
             .get_config(REFS_MIRROR_HASH)
             .await?
             .and_then(|s| Hash::from_hex(&s)))
@@ -149,7 +173,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             parents.push(mh);
         }
 
-        let tree = self.build_tree(INO_ROOT).await?;
+        let tree = self.build_tree(self.root_ino).await?;
         let commit = Commit {
             tree,
             parents,
@@ -273,7 +297,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub(crate) async fn replace_working_tree(&self, tree_hash: Hash) -> Result<()> {
         let mut txn = self.meta.begin().await?;
         txn.truncate_tree().await?;
-        self.materialize_into_txn(&mut *txn, tree_hash, INO_ROOT)
+        self.materialize_into_txn(&mut *txn, tree_hash, self.root_ino)
             .await?;
         txn.commit().await?;
         Ok(())
@@ -354,7 +378,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             None => BTreeMap::new(),
         };
         let mut work = BTreeMap::new();
-        self.flatten_working(INO_ROOT, String::new(), &mut work)
+        self.flatten_working(self.root_ino, String::new(), &mut work)
             .await?;
         Ok(diff_maps(&base, &work))
     }

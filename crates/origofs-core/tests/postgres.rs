@@ -532,3 +532,140 @@ async fn postgres_concurrent_appends_deliver_every_event_once() {
         assert!(w[1] > w[0], "delivered in strictly increasing seq order");
     }
 }
+
+/// The multi-workspace migrations on **Postgres** use a different mechanism than
+/// SQLite: V11/V13 `ALTER TABLE … DROP CONSTRAINT … ADD PRIMARY KEY` (not a
+/// table rebuild) and a `setval` on the workspace-id sequence. Those DDL paths run
+/// only against a *populated* store and are never exercised by the fresh-store PG
+/// tests. This drives a real V10→latest upgrade of a data-bearing PG database and
+/// asserts every row survives, backfilled into the default workspace, and that both
+/// the workspace and inode identity sequences were advanced past the existing rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_upgrade_preserves_data_and_backfills_default_workspace() {
+    let Some(dsn) = dsn() else {
+        eprintln!(
+            "skipping postgres_upgrade_preserves_data_and_backfills_default_workspace: ORIGOFS_PG_TEST_URL unset"
+        );
+        return;
+    };
+    let _guard = pg_lock().lock().await;
+    reset(&dsn).await;
+
+    // Bring a clean DB to schema V10 by hand: apply each ≤V10 Postgres migration
+    // and record it, exactly as the runner would but stopping short of V11.
+    {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS schema_meta(version BIGINT PRIMARY KEY, applied_at BIGINT NOT NULL);",
+            )
+            .await
+            .unwrap();
+        for m in origofs_core::migrations::MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= 10)
+        {
+            client.batch_execute(m.postgres).await.unwrap();
+            client
+                .execute(
+                    "INSERT INTO schema_meta(version, applied_at) VALUES ($1, 0)",
+                    &[&m.version],
+                )
+                .await
+                .unwrap();
+        }
+        // Old-shape rows (pre-V11: no workspace_id). One per table the migrations
+        // touch — especially the ones V11/V13 rekey via ALTER … ADD PRIMARY KEY.
+        client
+            .batch_execute(
+                "INSERT INTO inode(ino, kind, mode, nlink, size, content_hash, mtime, ctime)
+                     VALUES (1, 'dir', 16877, 1, 0, NULL, 0, 0);
+                 INSERT INTO inode(ino, kind, mode, nlink, size, content_hash, mtime, ctime)
+                     VALUES (2, 'file', 33188, 1, 3, 'hash-x', 7, 7);
+                 INSERT INTO ref(name, value) VALUES ('refs/heads/main', 'commit-abc');
+                 INSERT INTO config(key, value) VALUES ('versioning', 'native');
+                 INSERT INTO conflict(path, kind) VALUES ('/c.txt', 'text');
+                 INSERT INTO file_lock(path, owner, acquired_at) VALUES ('/l.bin', 'bob', 42);
+                 INSERT INTO blob_blame(content_hash, runs) VALUES ('hash-x', 'blame-runs');
+                 INSERT INTO suggestion(actor_id, path, status, created_ts)
+                     VALUES (5, '/s.txt', 'pending', 9);",
+            )
+            .await
+            .unwrap();
+        drop(client);
+        let _ = handle.await;
+    }
+
+    // Run the remaining migrations (V11–V13) through the real store init.
+    let meta = PostgresMetadataStore::connect(&dsn).await.unwrap();
+    meta.init().await.unwrap();
+    meta.init().await.unwrap(); // idempotent
+    assert_eq!(
+        meta.schema_version().await.unwrap(),
+        origofs_core::latest_schema_version()
+    );
+
+    // Every row survived the ALTER path, tagged into the default workspace (id 1).
+    let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    for sql in [
+        "SELECT workspace_id FROM ref WHERE name='refs/heads/main'", // V11 rekey
+        "SELECT workspace_id FROM config WHERE key='versioning'",    // V11 rekey
+        "SELECT workspace_id FROM conflict WHERE path='/c.txt'",     // V11 rekey
+        "SELECT workspace_id FROM file_lock WHERE path='/l.bin'",    // V11 rekey
+        "SELECT workspace_id FROM blob_blame WHERE content_hash='hash-x'", // V13 rekey
+        "SELECT workspace_id FROM inode WHERE ino=2",                // V11 ADD COLUMN
+        "SELECT workspace_id FROM suggestion WHERE path='/s.txt'",   // V12 ADD COLUMN
+    ] {
+        let ws: i64 = client.query_one(sql, &[]).await.unwrap().get(0);
+        assert_eq!(ws, 1, "row not backfilled to default workspace: {sql}");
+    }
+    // Values, not just the new column, are intact through the table ALTERs.
+    let v: String = client
+        .query_one("SELECT value FROM ref WHERE name='refs/heads/main'", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(v, "commit-abc");
+    let runs: String = client
+        .query_one(
+            "SELECT runs FROM blob_blame WHERE content_hash='hash-x'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(runs, "blame-runs");
+    // The default workspace registry row now exists at id 1.
+    let name: String = client
+        .query_one("SELECT name FROM workspace WHERE id=1", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(name, "default");
+    drop(client);
+    let _ = handle.await;
+
+    // The sequence fixes: the next workspace gets id 2 (setval bumped the workspace
+    // id sequence past the explicit default row), and its root inode is a fresh id
+    // past the hand-inserted max (2) — both identity sequences advanced, so neither
+    // collides with pre-migration rows.
+    let (id, root) = meta.create_workspace("second").await.unwrap();
+    assert_eq!(
+        id, 2,
+        "workspace id sequence was not advanced past the default row"
+    );
+    assert!(
+        root > 2,
+        "new workspace root inode {root} collided with a pre-migration inode"
+    );
+}

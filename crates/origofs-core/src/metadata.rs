@@ -100,6 +100,26 @@ pub trait MetadataStore: Send + Sync {
     /// each get a distinct, strictly increasing value — unlike a read-then-write.
     async fn bump_counter(&self, key: &str) -> Result<i64>;
 
+    // --- workspaces (multi-workspace in one store) -----------------------
+
+    /// Return a handle to this same store bound to `workspace_id`, sharing the
+    /// underlying connection/pool. The workspace-scoped ops — inodes, the working
+    /// tree, refs, config, conflicts, and locks — then apply to that workspace;
+    /// the registry ops below and the shared tables (actors, sessions, blame,
+    /// audit, events) are store-wide regardless. A freshly opened store is bound
+    /// to the `default` workspace (id 1). See `docs/MULTI_TENANCY.md`.
+    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore>;
+
+    /// Create a workspace named `name` with its own fresh root directory inode,
+    /// returning `(id, root_ino)`. Errors with `AlreadyExists` if the name exists.
+    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)>;
+
+    /// Resolve a workspace by name to `(id, root_ino)`, or `None` if absent.
+    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>>;
+
+    /// Every workspace as `(id, name, root_ino)`, oldest first.
+    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>>;
+
     // --- working tree ----------------------------------------------------
 
     /// Clear the entire working tree (all dentries, symlinks, and inodes except
@@ -324,6 +344,18 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn bump_counter(&self, key: &str) -> Result<i64> {
         (**self).bump_counter(key).await
+    }
+    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore> {
+        (**self).with_workspace(workspace_id)
+    }
+    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)> {
+        (**self).create_workspace(name).await
+    }
+    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>> {
+        (**self).lookup_workspace(name).await
+    }
+    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>> {
+        (**self).list_workspaces().await
     }
     async fn truncate_tree(&self) -> Result<()> {
         (**self).truncate_tree().await

@@ -24,9 +24,17 @@ use std::sync::Arc;
 
 const DIR_MODE: i64 = 0o040755;
 
+/// The workspace every store is bound to until re-scoped with `with_workspace`;
+/// its root is [`INO_ROOT`]. Backfilled by migration V11 (`docs/MULTI_TENANCY.md`).
+const DEFAULT_WORKSPACE: i64 = 1;
+
 /// A metadata store backed by a single SQLite database.
 pub struct SqliteMetadataStore {
     conn: Arc<Mutex<Connection>>,
+    /// The workspace this handle is bound to (default = 1). Workspace-scoped
+    /// statements stamp/filter by it; [`SqliteMetadataStore::with_workspace`]
+    /// rebinds a handle that shares this connection (`docs/MULTI_TENANCY.md`).
+    workspace_id: i64,
 }
 
 impl SqliteMetadataStore {
@@ -47,6 +55,7 @@ impl SqliteMetadataStore {
         )?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            workspace_id: DEFAULT_WORKSPACE,
         })
     }
 
@@ -56,6 +65,7 @@ impl SqliteMetadataStore {
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            workspace_id: DEFAULT_WORKSPACE,
         })
     }
 
@@ -100,6 +110,26 @@ fn is_duplicate_column(e: &rusqlite::Error) -> bool {
     e.to_string().contains("duplicate column name")
 }
 
+/// Clear only workspace `ws`'s working tree (checkout/merge/rebuild). `dentry` and
+/// `symlink` carry no `workspace_id`, so they are cleared via inode ownership; the
+/// workspace's own root inode is kept. Blame (keyed by content hash) is untouched.
+fn truncate_workspace_tree(conn: &Connection, ws: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM dentry WHERE parent_ino IN (SELECT ino FROM inode WHERE workspace_id = ?1)",
+        params![ws],
+    )?;
+    conn.execute(
+        "DELETE FROM symlink WHERE ino IN (SELECT ino FROM inode WHERE workspace_id = ?1)",
+        params![ws],
+    )?;
+    conn.execute(
+        "DELETE FROM inode WHERE workspace_id = ?1
+           AND ino <> (SELECT root_ino FROM workspace WHERE id = ?1)",
+        params![ws],
+    )?;
+    Ok(())
+}
+
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
     async fn init(&self) -> Result<()> {
@@ -139,9 +169,9 @@ impl MetadataStore for SqliteMetadataStore {
             tx.commit()?;
         }
         conn.execute(
-            "INSERT OR IGNORE INTO inode(ino, kind, mode, nlink, size, content_hash, mtime, ctime)
-             VALUES (?1, 'dir', ?2, 1, 0, NULL, ?3, ?3)",
-            params![INO_ROOT, DIR_MODE, now],
+            "INSERT OR IGNORE INTO inode(ino, workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+             VALUES (?1, ?2, 'dir', ?3, 1, 0, NULL, ?4, ?4)",
+            params![INO_ROOT, DEFAULT_WORKSPACE, DIR_MODE, now],
         )?;
         Ok(())
     }
@@ -171,7 +201,10 @@ impl MetadataStore for SqliteMetadataStore {
         // first write, so a second writer waits (up to `busy_timeout`) instead
         // of failing partway through.
         guard.execute_batch("BEGIN IMMEDIATE")?;
-        Ok(Box::new(SqliteTxn { guard: Some(guard) }))
+        Ok(Box::new(SqliteTxn {
+            guard: Some(guard),
+            workspace_id: self.workspace_id,
+        }))
     }
 
     async fn get_inode(&self, ino: Ino) -> Result<Option<Inode>> {
@@ -205,9 +238,9 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.lock();
         let now = now_secs();
         conn.execute(
-            "INSERT INTO inode(kind, mode, nlink, size, content_hash, mtime, ctime)
-             VALUES (?1, ?2, 1, 0, NULL, ?3, ?3)",
-            params![init.kind.as_str(), init.mode as i64, now],
+            "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+             VALUES (?1, ?2, ?3, 1, 0, NULL, ?4, ?4)",
+            params![self.workspace_id, init.kind.as_str(), init.mode as i64, now],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -332,8 +365,8 @@ impl MetadataStore for SqliteMetadataStore {
     async fn get_ref(&self, name: &str) -> Result<Option<String>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT value FROM ref WHERE name = ?1",
-            params![name],
+            "SELECT value FROM ref WHERE workspace_id = ?1 AND name = ?2",
+            params![self.workspace_id, name],
             |r| r.get::<_, String>(0),
         )
         .optional()
@@ -343,9 +376,9 @@ impl MetadataStore for SqliteMetadataStore {
     async fn set_ref(&self, name: &str, value: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO ref(name, value) VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
-            params![name, value],
+            "INSERT INTO ref(workspace_id, name, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id, name) DO UPDATE SET value = excluded.value",
+            params![self.workspace_id, name, value],
         )?;
         Ok(())
     }
@@ -354,12 +387,13 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.lock();
         let changed = match expect {
             None => conn.execute(
-                "INSERT INTO ref(name, value) VALUES (?1, ?2) ON CONFLICT(name) DO NOTHING",
-                params![name, new],
+                "INSERT INTO ref(workspace_id, name, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(workspace_id, name) DO NOTHING",
+                params![self.workspace_id, name, new],
             )?,
             Some(v) => conn.execute(
-                "UPDATE ref SET value = ?1 WHERE name = ?2 AND value = ?3",
-                params![new, name, v],
+                "UPDATE ref SET value = ?1 WHERE workspace_id = ?2 AND name = ?3 AND value = ?4",
+                params![new, self.workspace_id, name, v],
             )?,
         };
         Ok(changed == 1)
@@ -367,14 +401,20 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn delete_ref(&self, name: &str) -> Result<()> {
         let conn = self.lock();
-        conn.execute("DELETE FROM ref WHERE name = ?1", params![name])?;
+        conn.execute(
+            "DELETE FROM ref WHERE workspace_id = ?1 AND name = ?2",
+            params![self.workspace_id, name],
+        )?;
         Ok(())
     }
 
     async fn list_refs(&self) -> Result<Vec<(String, String)>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT name, value FROM ref ORDER BY name")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut stmt =
+            conn.prepare("SELECT name, value FROM ref WHERE workspace_id = ?1 ORDER BY name")?;
+        let rows = stmt.query_map(params![self.workspace_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -385,8 +425,8 @@ impl MetadataStore for SqliteMetadataStore {
     async fn get_config(&self, key: &str) -> Result<Option<String>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT value FROM config WHERE key = ?1",
-            params![key],
+            "SELECT value FROM config WHERE workspace_id = ?1 AND key = ?2",
+            params![self.workspace_id, key],
             |r| r.get::<_, String>(0),
         )
         .optional()
@@ -396,9 +436,9 @@ impl MetadataStore for SqliteMetadataStore {
     async fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO config(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
+            "INSERT INTO config(workspace_id, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id, key) DO UPDATE SET value = excluded.value",
+            params![self.workspace_id, key, value],
         )?;
         Ok(())
     }
@@ -407,41 +447,106 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.lock();
         // One atomic upsert: create at 1, else increment the stored integer.
         let v: i64 = conn.query_row(
-            "INSERT INTO config(key, value) VALUES (?1, '1')
-             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+            "INSERT INTO config(workspace_id, key, value) VALUES (?1, ?2, '1')
+             ON CONFLICT(workspace_id, key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
              RETURNING CAST(value AS INTEGER)",
-            params![key],
+            params![self.workspace_id, key],
             |r| r.get(0),
         )?;
         Ok(v)
     }
 
+    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore> {
+        Arc::new(SqliteMetadataStore {
+            conn: self.conn.clone(),
+            workspace_id,
+        })
+    }
+
+    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)> {
+        let mut conn = self.lock();
+        let now = now_secs();
+        let tx = conn.transaction()?;
+        // Reserve the row (fails on a duplicate name), give it its own root
+        // directory inode, then point the row at that inode — all atomic.
+        match tx.execute(
+            "INSERT INTO workspace(name, root_ino, created_at) VALUES (?1, 0, ?2)",
+            params![name, now],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(OrigoFSError::AlreadyExists(format!("workspace {name}")));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+             VALUES (?1, 'dir', ?2, 1, 0, NULL, ?3, ?3)",
+            params![id, DIR_MODE, now],
+        )?;
+        let root_ino = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE workspace SET root_ino = ?1 WHERE id = ?2",
+            params![root_ino, id],
+        )?;
+        tx.commit()?;
+        Ok((id, root_ino))
+    }
+
+    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, root_ino FROM workspace WHERE name = ?1",
+            params![name],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id, name, root_ino FROM workspace ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     async fn truncate_tree(&self) -> Result<()> {
         let conn = self.lock();
-        // Blame is keyed by content hash (blob_blame), not by inode, so it is
-        // deliberately *not* cleared here — the rematerialized tree points its
-        // inodes back at the same content and its blame comes with it.
-        conn.execute_batch(
-            "DELETE FROM dentry; DELETE FROM symlink;
-             DELETE FROM inode WHERE ino <> 1;",
-        )?;
+        truncate_workspace_tree(&conn, self.workspace_id)?;
         Ok(())
     }
 
     async fn set_conflict(&self, path: &str, kind: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO conflict(path, kind) VALUES (?1, ?2)
-             ON CONFLICT(path) DO UPDATE SET kind = excluded.kind",
-            params![path, kind],
+            "INSERT INTO conflict(workspace_id, path, kind) VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id, path) DO UPDATE SET kind = excluded.kind",
+            params![self.workspace_id, path, kind],
         )?;
         Ok(())
     }
 
     async fn list_conflicts(&self) -> Result<Vec<(String, String)>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT path, kind FROM conflict ORDER BY path")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut stmt =
+            conn.prepare("SELECT path, kind FROM conflict WHERE workspace_id = ?1 ORDER BY path")?;
+        let rows = stmt.query_map(params![self.workspace_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -451,16 +556,19 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn clear_conflicts(&self) -> Result<()> {
         let conn = self.lock();
-        conn.execute("DELETE FROM conflict", [])?;
+        conn.execute(
+            "DELETE FROM conflict WHERE workspace_id = ?1",
+            params![self.workspace_id],
+        )?;
         Ok(())
     }
 
     async fn acquire_lock(&self, path: &str, owner: &str, at: i64) -> Result<bool> {
         let conn = self.lock();
         let changed = conn.execute(
-            "INSERT INTO file_lock(path, owner, acquired_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(path) DO NOTHING",
-            params![path, owner, at],
+            "INSERT INTO file_lock(workspace_id, path, owner, acquired_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(workspace_id, path) DO NOTHING",
+            params![self.workspace_id, path, owner, at],
         )?;
         Ok(changed == 1)
     }
@@ -468,17 +576,18 @@ impl MetadataStore for SqliteMetadataStore {
     async fn release_lock(&self, path: &str, owner: &str) -> Result<bool> {
         let conn = self.lock();
         let changed = conn.execute(
-            "DELETE FROM file_lock WHERE path = ?1 AND owner = ?2",
-            params![path, owner],
+            "DELETE FROM file_lock WHERE workspace_id = ?1 AND path = ?2 AND owner = ?3",
+            params![self.workspace_id, path, owner],
         )?;
         Ok(changed == 1)
     }
 
     async fn list_locks(&self) -> Result<Vec<(String, String, i64)>> {
         let conn = self.lock();
-        let mut stmt =
-            conn.prepare("SELECT path, owner, acquired_at FROM file_lock ORDER BY path")?;
-        let rows = stmt.query_map([], |r| {
+        let mut stmt = conn.prepare(
+            "SELECT path, owner, acquired_at FROM file_lock WHERE workspace_id = ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![self.workspace_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -671,10 +780,10 @@ impl MetadataStore for SqliteMetadataStore {
     async fn append_edit_op(&self, op: EditOpInit) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO edit_op(session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO edit_op(workspace_id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                op.session_id, op.actor_id, op.tool_call_id, op.ino, op.path, op.op,
+                self.workspace_id, op.session_id, op.actor_id, op.tool_call_id, op.ino, op.path, op.op,
                 op.byte_start, op.byte_len, op.pre_hash, op.post_hash, op.ts
             ],
         )?;
@@ -685,9 +794,9 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts
-             FROM edit_op WHERE actor_id = ?1 AND (?2 IS NULL OR session_id = ?2) ORDER BY id",
+             FROM edit_op WHERE workspace_id = ?1 AND actor_id = ?2 AND (?3 IS NULL OR session_id = ?3) ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![actor_id, session_id], |r| {
+        let rows = stmt.query_map(params![self.workspace_id, actor_id, session_id], |r| {
             Ok(EditOp {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -713,9 +822,9 @@ impl MetadataStore for SqliteMetadataStore {
     async fn set_blob_blame(&self, content: &Hash, runs: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO blob_blame(content_hash, runs) VALUES (?1, ?2)
-             ON CONFLICT(content_hash) DO UPDATE SET runs = excluded.runs",
-            params![content.to_hex(), runs],
+            "INSERT INTO blob_blame(workspace_id, content_hash, runs) VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id, content_hash) DO UPDATE SET runs = excluded.runs",
+            params![self.workspace_id, content.to_hex(), runs],
         )?;
         Ok(())
     }
@@ -723,8 +832,8 @@ impl MetadataStore for SqliteMetadataStore {
     async fn get_blob_blame(&self, content: &Hash) -> Result<Option<String>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT runs FROM blob_blame WHERE content_hash = ?1",
-            params![content.to_hex()],
+            "SELECT runs FROM blob_blame WHERE workspace_id = ?1 AND content_hash = ?2",
+            params![self.workspace_id, content.to_hex()],
             |r| r.get::<_, String>(0),
         )
         .optional()
@@ -734,9 +843,10 @@ impl MetadataStore for SqliteMetadataStore {
     async fn append_event(&self, ev: EventInit, ts: i64) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO fs_event(actor_id, session_id, kind, path, detail, ts, branch)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO fs_event(workspace_id, actor_id, session_id, kind, path, detail, ts, branch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
+                self.workspace_id,
                 ev.actor_id,
                 ev.session_id,
                 ev.kind,
@@ -753,9 +863,9 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT seq, actor_id, session_id, kind, path, detail, ts, branch FROM fs_event
-             WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+             WHERE workspace_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![after_seq, limit], |r| {
+        let rows = stmt.query_map(params![self.workspace_id, after_seq, limit], |r| {
             Ok(Event {
                 seq: r.get(0)?,
                 actor_id: r.get(1)?,
@@ -783,10 +893,11 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO presence(session_id, actor_id, path, last_seen) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO presence(session_id, workspace_id, actor_id, path, last_seen) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(session_id) DO UPDATE SET
-                 actor_id = excluded.actor_id, path = excluded.path, last_seen = excluded.last_seen",
-            params![session_id, actor_id, path, at],
+                 workspace_id = excluded.workspace_id, actor_id = excluded.actor_id,
+                 path = excluded.path, last_seen = excluded.last_seen",
+            params![session_id, self.workspace_id, actor_id, path, at],
         )?;
         Ok(())
     }
@@ -796,9 +907,9 @@ impl MetadataStore for SqliteMetadataStore {
         let mut stmt = conn.prepare(
             "SELECT p.session_id, p.actor_id, a.display_name, a.kind, p.path, p.last_seen
              FROM presence p JOIN actor a ON a.id = p.actor_id
-             WHERE p.last_seen >= ?1 ORDER BY p.last_seen DESC",
+             WHERE p.workspace_id = ?1 AND p.last_seen >= ?2 ORDER BY p.last_seen DESC",
         )?;
-        let rows = stmt.query_map(params![since_ts], |r| {
+        let rows = stmt.query_map(params![self.workspace_id, since_ts], |r| {
             let kind: String = r.get(3)?;
             Ok(Presence {
                 session_id: r.get(0)?,
@@ -818,9 +929,12 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn reap_presence(&self, older_than: i64) -> Result<u64> {
         let conn = self.lock();
+        // Scoped to this workspace: a store-wide reap would evict other workspaces'
+        // presence (including live sessions) whenever one workspace uses a shorter
+        // cutoff. `touch_presence`/`active_presence` are both workspace-scoped too.
         let n = conn.execute(
-            "DELETE FROM presence WHERE last_seen < ?1",
-            params![older_than],
+            "DELETE FROM presence WHERE workspace_id = ?1 AND last_seen < ?2",
+            params![self.workspace_id, older_than],
         )?;
         Ok(n as u64)
     }
@@ -828,10 +942,11 @@ impl MetadataStore for SqliteMetadataStore {
     async fn create_suggestion(&self, init: SuggestionInit, ts: i64) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO suggestion(actor_id, session_id, branch, path, base_hash,
+            "INSERT INTO suggestion(workspace_id, actor_id, session_id, branch, path, base_hash,
                  proposed_hash, summary, status, created_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
+                self.workspace_id,
                 init.actor_id,
                 init.session_id,
                 init.branch,
@@ -851,8 +966,8 @@ impl MetadataStore for SqliteMetadataStore {
         conn.query_row(
             "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
                  summary, status, created_ts, resolved_ts, resolved_by
-             FROM suggestion WHERE id = ?1",
-            params![id],
+             FROM suggestion WHERE id = ?1 AND workspace_id = ?2",
+            params![id, self.workspace_id],
             row_to_suggestion,
         )
         .optional()
@@ -869,10 +984,13 @@ impl MetadataStore for SqliteMetadataStore {
             "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
                  summary, status, created_ts, resolved_ts, resolved_by
              FROM suggestion
-             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR path = ?2)
+             WHERE workspace_id = ?1 AND (?2 IS NULL OR status = ?2) AND (?3 IS NULL OR path = ?3)
              ORDER BY id DESC",
         )?;
-        let rows = stmt.query_map(params![status.map(|s| s.as_str()), path], row_to_suggestion)?;
+        let rows = stmt.query_map(
+            params![self.workspace_id, status.map(|s| s.as_str()), path],
+            row_to_suggestion,
+        )?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -890,8 +1008,8 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.lock();
         let n = conn.execute(
             "UPDATE suggestion SET status = ?1, resolved_by = ?2, resolved_ts = ?3
-             WHERE id = ?4 AND status = 'pending'",
-            params![status.as_str(), resolved_by, ts, id],
+             WHERE id = ?4 AND workspace_id = ?5 AND status = 'pending'",
+            params![status.as_str(), resolved_by, ts, id, self.workspace_id],
         )?;
         Ok(n == 1)
     }
@@ -907,6 +1025,8 @@ struct SqliteTxn {
     /// exactly once. An *owned* `Arc` guard so it is `Send` and can be held
     /// across the engine's `.await`s.
     guard: Option<ArcMutexGuard<RawMutex, Connection>>,
+    /// The workspace this txn is scoped to (inherited from the store handle).
+    workspace_id: i64,
 }
 
 impl SqliteTxn {
@@ -919,11 +1039,12 @@ impl SqliteTxn {
 #[async_trait]
 impl MetaTxn for SqliteTxn {
     async fn create_inode(&mut self, init: InodeInit) -> Result<Ino> {
+        let ws = self.workspace_id;
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO inode(kind, mode, nlink, size, content_hash, mtime, ctime)
-             VALUES (?1, ?2, 1, 0, NULL, ?3, ?3)",
-            params![init.kind.as_str(), init.mode as i64, now_secs()],
+            "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+             VALUES (?1, ?2, ?3, 1, 0, NULL, ?4, ?4)",
+            params![ws, init.kind.as_str(), init.mode as i64, now_secs()],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -1007,21 +1128,23 @@ impl MetaTxn for SqliteTxn {
     }
 
     async fn set_blob_blame(&mut self, content: &Hash, runs: &str) -> Result<()> {
+        let ws = self.workspace_id;
         self.conn().execute(
-            "INSERT INTO blob_blame(content_hash, runs) VALUES (?1, ?2)
-             ON CONFLICT(content_hash) DO UPDATE SET runs = excluded.runs",
-            params![content.to_hex(), runs],
+            "INSERT INTO blob_blame(workspace_id, content_hash, runs) VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id, content_hash) DO UPDATE SET runs = excluded.runs",
+            params![ws, content.to_hex(), runs],
         )?;
         Ok(())
     }
 
     async fn append_edit_op(&mut self, op: EditOpInit) -> Result<i64> {
+        let ws = self.workspace_id;
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO edit_op(session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO edit_op(workspace_id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                op.session_id, op.actor_id, op.tool_call_id, op.ino, op.path, op.op,
+                ws, op.session_id, op.actor_id, op.tool_call_id, op.ino, op.path, op.op,
                 op.byte_start, op.byte_len, op.pre_hash, op.post_hash, op.ts
             ],
         )?;
@@ -1030,10 +1153,8 @@ impl MetaTxn for SqliteTxn {
 
     async fn truncate_tree(&mut self) -> Result<()> {
         // Same as MetadataStore::truncate_tree, staged in this transaction.
-        self.conn().execute_batch(
-            "DELETE FROM dentry; DELETE FROM symlink;
-             DELETE FROM inode WHERE ino <> 1;",
-        )?;
+        let ws = self.workspace_id;
+        truncate_workspace_tree(self.conn(), ws)?;
         Ok(())
     }
 
@@ -1143,5 +1264,100 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    // The multi-workspace migrations (V11 rebuilds ref/config/conflict/file_lock,
+    // V13 rebuilds blob_blame; V11/V12 ADD COLUMN the rest) must PRESERVE existing
+    // data on a real upgrade of a populated store — every row must survive and land
+    // in the `default` workspace (id 1), never be dropped by a bad copy. Simulate a
+    // store stopped at schema V10, fill its old-shape tables, then migrate.
+    #[tokio::test]
+    async fn upgrade_preserves_data_and_backfills_default_workspace() {
+        let store = SqliteMetadataStore::open_in_memory().unwrap();
+        {
+            let conn = store.lock();
+            // Bring a fresh DB to schema V10 by hand: apply each ≤V10 migration and
+            // record it, exactly as the runner would, but without V11+.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);",
+            )
+            .unwrap();
+            for m in MIGRATIONS.iter().filter(|m| m.version <= 10) {
+                conn.execute_batch(m.sqlite).unwrap();
+                conn.execute(
+                    "INSERT INTO schema_meta(version, applied_at) VALUES (?1, 0)",
+                    params![m.version],
+                )
+                .unwrap();
+            }
+            // Old-shape rows (no `workspace_id` column yet). Includes the root inode
+            // a real V10 store would already have, plus one of each table the
+            // migrations touch — especially the ones V11/V13 rebuild.
+            conn.execute_batch(
+                "INSERT INTO inode(ino, kind, mode, nlink, size, content_hash, mtime, ctime)
+                     VALUES (1, 'dir', 16877, 1, 0, NULL, 0, 0);
+                 INSERT INTO inode(ino, kind, mode, nlink, size, content_hash, mtime, ctime)
+                     VALUES (2, 'file', 33188, 1, 3, 'hash-x', 7, 7);
+                 INSERT INTO ref(name, value) VALUES ('refs/heads/main', 'commit-abc');
+                 INSERT INTO config(key, value) VALUES ('versioning', 'native');
+                 INSERT INTO conflict(path, kind) VALUES ('/c.txt', 'text');
+                 INSERT INTO file_lock(path, owner, acquired_at) VALUES ('/l.bin', 'bob', 42);
+                 INSERT INTO blob_blame(content_hash, runs) VALUES ('hash-x', 'blame-runs');
+                 INSERT INTO suggestion(actor_id, path, status, created_ts)
+                     VALUES (5, '/s.txt', 'pending', 9);",
+            )
+            .unwrap();
+        }
+        assert_eq!(store.schema_version().await.unwrap(), 10);
+
+        // Run the remaining migrations (V11–V13).
+        store.init().await.unwrap();
+        assert_eq!(
+            store.schema_version().await.unwrap(),
+            crate::latest_schema_version()
+        );
+
+        // Every row survived, now tagged into the default workspace (id 1).
+        let conn = store.lock();
+        let row = |sql: &str| -> (i64, String) {
+            conn.query_row(sql, [], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .unwrap()
+        };
+        // V11 rebuilds.
+        assert_eq!(
+            row("SELECT workspace_id, value FROM ref WHERE name='refs/heads/main'"),
+            (1, "commit-abc".into())
+        );
+        assert_eq!(
+            row("SELECT workspace_id, value FROM config WHERE key='versioning'"),
+            (1, "native".into())
+        );
+        assert_eq!(
+            row("SELECT workspace_id, kind FROM conflict WHERE path='/c.txt'"),
+            (1, "text".into())
+        );
+        assert_eq!(
+            row("SELECT workspace_id, owner FROM file_lock WHERE path='/l.bin'"),
+            (1, "bob".into())
+        );
+        // V13 rebuild.
+        assert_eq!(
+            row("SELECT workspace_id, runs FROM blob_blame WHERE content_hash='hash-x'"),
+            (1, "blame-runs".into())
+        );
+        // ADD-COLUMN tables backfill to 1 too.
+        let ws_of = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(ws_of("SELECT workspace_id FROM inode WHERE ino=2"), 1);
+        assert_eq!(
+            ws_of("SELECT workspace_id FROM suggestion WHERE path='/s.txt'"),
+            1
+        );
+        // And the default workspace registry row now exists.
+        let wname: String = conn
+            .query_row("SELECT name FROM workspace WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(wname, "default");
     }
 }
