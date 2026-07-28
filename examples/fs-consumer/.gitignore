@@ -1,0 +1,10 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# consumer artifacts (cursor + sink output)
+*.jsonl
+.origofs-cursor.json
+*-cursor.json
