@@ -310,6 +310,63 @@ async fn rebuild_recovers_all_workspaces() {
     assert_eq!(&beta.read("/d/b.txt").await.unwrap()[..], b"in-beta");
 }
 
+/// Blame is per workspace (migration V13): identical content in two workspaces —
+/// which dedups to one object in the shared content store — still carries each
+/// workspace's own authorship, not a single shared map. (Pre-V13 the second write
+/// would overwrite the first's blame, since it was keyed by content hash alone.)
+#[tokio::test]
+async fn blame_is_workspace_isolated() {
+    use std::collections::HashSet;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let beta = ws.workspace("beta").await.unwrap();
+
+    // Two distinct authors (actors are store-wide).
+    let author_a = ws.create_human("author-a", None).await.unwrap();
+    let author_b = ws.create_human("author-b", None).await.unwrap();
+
+    // The SAME bytes to the SAME path in both workspaces (content dedups in the
+    // shared store), attributed to different authors.
+    let content = b"line one\nline two\nline three\n";
+    alpha
+        .write_as(WriteCtx::actor(author_a), "/f.txt", content)
+        .await
+        .unwrap();
+    beta.write_as(WriteCtx::actor(author_b), "/f.txt", content)
+        .await
+        .unwrap();
+
+    // Each workspace's blame credits only its own author.
+    let a_authors: HashSet<i64> = alpha
+        .blame("/f.txt")
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.actor.id)
+        .collect();
+    let b_authors: HashSet<i64> = beta
+        .blame("/f.txt")
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.actor.id)
+        .collect();
+    assert_eq!(
+        a_authors,
+        HashSet::from([author_a]),
+        "alpha blame must credit only author-a"
+    );
+    assert_eq!(
+        b_authors,
+        HashSet::from([author_b]),
+        "beta blame must credit only author-b"
+    );
+}
+
 /// The sorted-by-insertion entry names directly under a workspace's root.
 async fn names(ws: &Workspace) -> Vec<String> {
     ws.ls("/")

@@ -1222,9 +1222,9 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let hex = content.to_hex();
         c.execute(
-            "INSERT INTO blob_blame(content_hash, runs) VALUES ($1, $2)
-             ON CONFLICT (content_hash) DO UPDATE SET runs = EXCLUDED.runs",
-            &[&hex, &runs],
+            "INSERT INTO blob_blame(workspace_id, content_hash, runs) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, content_hash) DO UPDATE SET runs = EXCLUDED.runs",
+            &[&self.workspace_id, &hex, &runs],
         )
         .await?;
         Ok(())
@@ -1235,8 +1235,8 @@ impl MetadataStore for PostgresMetadataStore {
         let hex = content.to_hex();
         let row = c
             .query_opt(
-                "SELECT runs FROM blob_blame WHERE content_hash = $1",
-                &[&hex],
+                "SELECT runs FROM blob_blame WHERE workspace_id = $1 AND content_hash = $2",
+                &[&self.workspace_id, &hex],
             )
             .await?;
         Ok(row.map(|r| r.get(0)))
@@ -1558,12 +1558,13 @@ impl MetaTxn for PostgresTxn {
     }
 
     async fn set_blob_blame(&mut self, content: &Hash, runs: &str) -> Result<()> {
+        let ws = self.workspace_id;
         let hex = content.to_hex();
         self.conn()
             .execute(
-                "INSERT INTO blob_blame(content_hash, runs) VALUES ($1, $2)
-                 ON CONFLICT (content_hash) DO UPDATE SET runs = EXCLUDED.runs",
-                &[&hex, &runs],
+                "INSERT INTO blob_blame(workspace_id, content_hash, runs) VALUES ($1, $2, $3)
+                 ON CONFLICT (workspace_id, content_hash) DO UPDATE SET runs = EXCLUDED.runs",
+                &[&ws, &hex, &runs],
             )
             .await?;
         Ok(())

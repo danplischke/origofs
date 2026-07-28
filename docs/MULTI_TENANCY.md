@@ -24,10 +24,12 @@
 > at a per-workspace inode; `Workspace::workspace(name)` / `workspaces()` open and list
 > workspaces; GC marks across all of them; and **disaster recovery (`rebuild`) restores
 > every workspace** from the content store (each workspace's ref mirror is tagged with
-> its name). `actor`/`session`/`tool_calls` stay store-wide (identity is tenant-wide),
-> and `blob_blame` stays keyed by content hash (shared by content). `dentry`/`symlink`
-> need no column — inodes share one id sequence, so a subtree is reachable only from
-> its own root. See `crates/origofs-sdk/tests/multi_workspace.rs` and the multi-workspace
+> its name). `actor`/`session`/`tool_calls` stay store-wide (identity is tenant-wide);
+> `blob_blame` is re-keyed on `(workspace_id, content_hash)` (V13) so blame is
+> per-workspace — identical content in two workspaces carries each one's own authorship
+> — while still surviving checkout/merge *within* a workspace. `dentry`/`symlink` need
+> no column — inodes share one id sequence, so a subtree is reachable only from its own
+> root. See `crates/origofs-sdk/tests/multi_workspace.rs` and the multi-workspace
 > invariants in `crates/origofs-core/tests/simulation.rs`. The **tenant layer (MT2+)
 > remains a concept** described below.
 
@@ -73,9 +75,9 @@ Actor (human | agent | system)   ← attribution identity, scoped to a tenant
 - **Actors** (the `actor` table, `DESIGN.md` §4d) belong to a tenant and are
   **shared across that tenant's workspaces** — Alice is one actor in every project,
   and the audit trail is one table per tenant. Attribution truth stays in the
-  tenant's store; the op-log gains only a `workspace_id` tag for per-workspace
-  history, and blame stays keyed by content hash (so it is shared by content across
-  workspaces — §6, §12).
+  tenant's store; the op-log and blame are workspace-scoped (blame by
+  `(workspace_id, content_hash)`, so per-workspace but still surviving checkout/merge
+  within a workspace — §6, §10).
 - Terminology note: `DESIGN.md` §5 sketches a `workspace_id` column on every table,
   anticipating many workspaces in one store; the current implementation hasn't built
   it yet (**one store == one workspace, no discriminator column** — see §2). This
@@ -368,10 +370,12 @@ the migration/trait specifics):
   concrete store: `for_workspace(id)` returns a handle sharing the same connection/pool
   that scopes every statement. The engine binds one workspace by holding that scoped
   handle + its root inode; a store-level handle serves the registry and GC.
-- **Actors, sessions, and the op-log are tenant-wide** (shared across the store's
-  workspaces); `blob_blame` stays keyed by content hash, so identical content shares
-  blame across workspaces — consistent with blame-following-content (`DESIGN.md` V8),
-  and de-shareable as `(workspace_id, content_hash)` if a deployment wants it (§12).
+- **Actors, sessions, and the identity tables are tenant-wide** (shared across the
+  store's workspaces — Alice is one actor in every project). The suggestion queue,
+  change feed, op-log, and presence are workspace-scoped (V12), and `blob_blame` is
+  keyed by `(workspace_id, content_hash)` (V13) — so blame is per-workspace (identical
+  content in two workspaces carries each one's own authorship) while still surviving
+  checkout/merge *within* a workspace, since the `workspace_id` is stable there.
 - **Content is one shared store per tenant**, so cross-workspace dedup is automatic —
   which makes **GC per-store (per-tenant)**: it marks from *every* workspace's refs
   before sweeping. Deleting one workspace is metadata-only (its content is reclaimed by
@@ -510,9 +514,10 @@ The **tenant** layer is purely additive.
   tables (`ref`, `config`, `conflict`, `file_lock`) and added as a tag column on
   `inode` (**V11**), then on the per-location activity/attribution tables
   `suggestion`, `fs_event`, `edit_op`, `presence` (**V12**) so the suggestion queue,
-  change feed, op-log, and presence isolate too. `dentry`/`symlink` (keyed by the
-  global `ino`), `blob_blame` (keyed by content hash — deliberately shared, §12), and
-  the store-wide identity tables `actor`/`session`/`tool_calls` are untouched. Backfill
+  change feed, op-log, and presence isolate too, and finally re-keying `blob_blame` on
+  `(workspace_id, content_hash)` (**V13**) so blame is per-workspace. `dentry`/`symlink`
+  (keyed by the global `ino`) and the store-wide identity tables
+  `actor`/`session`/`tool_calls` are untouched. Backfill
   maps every existing row to a `default` workspace (id 1, root = `INO_ROOT`), so the
   migration is **non-breaking** — an existing single-workspace store just becomes a
   store with one workspace. The V11 PK changes are a table-rebuild on SQLite
@@ -583,12 +588,11 @@ skipped by deployments with few, large tenants.
 ## 12. Open questions
 
 - **Workspace layout — decided.** Many workspaces share **one store** via
-  `workspace_id` (§6, §10); store-per-workspace is not used. Remaining sub-question:
-  **blame sharing.** `blob_blame` keyed by content hash shares blame across workspaces
-  that hold identical content — free, and consistent with blame-follows-content
-  (`DESIGN.md` V8) — but couples those workspaces. Keep it shared (default, within one
-  tenant), or key it `(workspace_id, content_hash)` for workspace-isolated blame at
-  the cost of that dedup.
+  `workspace_id` (§6, §10); store-per-workspace is not used. **Blame — decided
+  (V13):** `blob_blame` is keyed by `(workspace_id, content_hash)`, so blame is
+  per-workspace — identical content in two workspaces carries each one's own
+  authorship — while still surviving checkout/merge *within* a workspace (the
+  `workspace_id` is stable there, so `DESIGN.md` V8's content-keyed survival holds).
 - **Bridge vs. pool as the density tier.** Schema-per-tenant is simpler and keeps
   most of silo's isolation; shared-schema+RLS is denser but one predicate away from
   a leak. Pick one primary; possibly offer both.

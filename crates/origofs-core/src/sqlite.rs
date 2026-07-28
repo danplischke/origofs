@@ -822,9 +822,9 @@ impl MetadataStore for SqliteMetadataStore {
     async fn set_blob_blame(&self, content: &Hash, runs: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO blob_blame(content_hash, runs) VALUES (?1, ?2)
-             ON CONFLICT(content_hash) DO UPDATE SET runs = excluded.runs",
-            params![content.to_hex(), runs],
+            "INSERT INTO blob_blame(workspace_id, content_hash, runs) VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id, content_hash) DO UPDATE SET runs = excluded.runs",
+            params![self.workspace_id, content.to_hex(), runs],
         )?;
         Ok(())
     }
@@ -832,8 +832,8 @@ impl MetadataStore for SqliteMetadataStore {
     async fn get_blob_blame(&self, content: &Hash) -> Result<Option<String>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT runs FROM blob_blame WHERE content_hash = ?1",
-            params![content.to_hex()],
+            "SELECT runs FROM blob_blame WHERE workspace_id = ?1 AND content_hash = ?2",
+            params![self.workspace_id, content.to_hex()],
             |r| r.get::<_, String>(0),
         )
         .optional()
@@ -1125,10 +1125,11 @@ impl MetaTxn for SqliteTxn {
     }
 
     async fn set_blob_blame(&mut self, content: &Hash, runs: &str) -> Result<()> {
+        let ws = self.workspace_id;
         self.conn().execute(
-            "INSERT INTO blob_blame(content_hash, runs) VALUES (?1, ?2)
-             ON CONFLICT(content_hash) DO UPDATE SET runs = excluded.runs",
-            params![content.to_hex(), runs],
+            "INSERT INTO blob_blame(workspace_id, content_hash, runs) VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id, content_hash) DO UPDATE SET runs = excluded.runs",
+            params![ws, content.to_hex(), runs],
         )?;
         Ok(())
     }

@@ -97,9 +97,9 @@ pub const MIGRATIONS: &[Migration] = &[
     // and `refs/heads/main`). `dentry`/`symlink` need no column: inodes share one
     // global id sequence, so a workspace's subtree is reachable only from its own
     // root. Backfill maps every existing row to a `default` workspace (id 1, root
-    // `INO_ROOT`), so the migration is non-breaking. `blob_blame` stays keyed by
-    // content hash (shared by content across workspaces). SQLite rebuilds the four
-    // PK-changed tables (no `ALTER … PRIMARY KEY`); Postgres alters them in place.
+    // `INO_ROOT`), so the migration is non-breaking. (`blob_blame` is scoped later,
+    // in V13.) SQLite rebuilds the four PK-changed tables (no `ALTER … PRIMARY KEY`);
+    // Postgres alters them in place.
     Migration {
         version: 11,
         sqlite: V11_SQLITE,
@@ -111,12 +111,22 @@ pub const MIGRATIONS: &[Migration] = &[
     // suggestion made in one workspace was visible — and acceptable into the wrong
     // tree — from another. A plain `workspace_id` tag on each (their surrogate-id/seq
     // PKs don't collide, so no table rebuild), backfilled to the `default` workspace.
-    // `blob_blame` deliberately stays keyed by content hash (shared by content, V8);
     // `actor`/`session`/`tool_calls` stay store-wide (identity is tenant-wide).
     Migration {
         version: 12,
         sqlite: V12_SQLITE,
         postgres: V12_POSTGRES,
+    },
+    // V13 — workspace-scope `blob_blame`: re-key it on `(workspace_id, content_hash)`
+    // instead of `content_hash` alone, so blame is per workspace and identical content
+    // in two workspaces carries each workspace's own authorship (not a shared map).
+    // Within a workspace this keeps V8's property — blame keyed by content survives
+    // checkout/merge — because the workspace_id is stable there. A PK change, so the
+    // same rebuild (SQLite) / alter (Postgres) shape as V11; backfilled to `default`.
+    Migration {
+        version: 13,
+        sqlite: V13_SQLITE,
+        postgres: V13_POSTGRES,
     },
 ];
 
@@ -269,6 +279,28 @@ CREATE INDEX IF NOT EXISTS idx_suggestion_workspace ON suggestion(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_edit_op_workspace ON edit_op(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_fs_event_workspace ON fs_event(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_presence_workspace ON presence(workspace_id);
+";
+
+// V13 — per-workspace blame (see the migration entry above). SQLite rebuilds the
+// table to change the PK (`content_hash` -> `(workspace_id, content_hash)`);
+// Postgres alters it in place. Existing blame backfills to the `default` workspace.
+const V13_SQLITE: &str = "
+CREATE TABLE blob_blame_v13(
+    workspace_id INTEGER NOT NULL DEFAULT 1,
+    content_hash TEXT NOT NULL,
+    runs         TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, content_hash)
+);
+INSERT INTO blob_blame_v13(workspace_id, content_hash, runs)
+    SELECT 1, content_hash, runs FROM blob_blame;
+DROP TABLE blob_blame;
+ALTER TABLE blob_blame_v13 RENAME TO blob_blame;
+";
+
+const V13_POSTGRES: &str = "
+ALTER TABLE blob_blame ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE blob_blame DROP CONSTRAINT IF EXISTS blob_blame_pkey;
+ALTER TABLE blob_blame ADD PRIMARY KEY(workspace_id, content_hash);
 ";
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS`; the migration runner tolerates a
