@@ -36,6 +36,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+#[cfg(feature = "coedit")]
+mod coedit;
+#[cfg(feature = "coedit")]
+pub use coedit::Coordinator;
+
 type Shared = Arc<Workspace>;
 
 // --- authentication ---------------------------------------------------------
@@ -131,6 +136,10 @@ impl Authenticator for LocalDevAuth {
 struct AppState {
     ws: Arc<Workspace>,
     auth: Arc<dyn Authenticator>,
+    /// The live co-editing room registry (roadmap M8). Shared across sockets, so
+    /// it lives on the state rather than being opened per request like the rest.
+    #[cfg(feature = "coedit")]
+    coedit: Coordinator,
 }
 
 impl FromRef<AppState> for Shared {
@@ -176,7 +185,12 @@ pub fn router(ws: Shared, auth: Arc<dyn Authenticator>) -> Router {
 
 /// Like [`router`], with [`ApiOptions`] (e.g. `gate_reads`).
 pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions) -> Router {
-    let state = AppState { ws, auth };
+    let state = AppState {
+        #[cfg(feature = "coedit")]
+        coedit: Coordinator::new(ws.clone()),
+        ws,
+        auth,
+    };
     let mut app = Router::new()
         .route(
             "/files/{*path}",
@@ -210,7 +224,13 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
         // Mutations already enforce it in-handler; this closes reads too.
         app = app.route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     }
-    // `/health` is registered after the gate, so it stays open regardless.
+    // The co-editing WebSocket authenticates itself (it accepts a `?token=` query
+    // param a browser can't send as a header), so it sits outside the read gate,
+    // alongside `/health`, which stays open regardless.
+    #[cfg(feature = "coedit")]
+    {
+        app = app.route("/coedit/{*path}", get(coedit::coedit_ws));
+    }
     app.route("/health", get(health)).with_state(state)
 }
 

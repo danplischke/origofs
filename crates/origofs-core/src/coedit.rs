@@ -59,6 +59,15 @@ impl Default for CoeditDoc {
     }
 }
 
+// A live-editing room shares one `CoeditDoc` across every connected socket's task
+// (behind a lock), so this must hold. `yrs::Doc`/`TextRef` assert it via their own
+// `unsafe impl`s; pin it here so a future change that breaks it fails at compile
+// time in `origofs-core`, not deep in a transport crate.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CoeditDoc>();
+};
+
 impl CoeditDoc {
     /// A fresh, empty document.
     pub fn new() -> Self {
