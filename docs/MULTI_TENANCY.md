@@ -7,9 +7,12 @@
 > *what* changes in the code — grounded in what the engine actually does today,
 > not the DDL sketch in `DESIGN.md` §5.
 >
-> It introduces no breaking change to the core `MetadataStore` / `ContentStore`
-> traits for the default (silo) model; the invasive schema work is deferred to an
-> optional density tier (MT3) that most deployments never need.
+> Two boundaries, each sized to the threat. **Tenants** are isolated *structurally*
+> — a separate metadata store + content namespace per tenant. **Workspaces** share
+> their tenant's one store and are separated by a `workspace_id` discriminator — the
+> layout `DESIGN.md` §5 sketched from the start. The `MetadataStore` / `ContentStore`
+> *traits* stay unchanged (the `workspace_id` is ambient on the concrete store handle,
+> §6); the schema gains the discriminator column and a per-workspace root inode.
 
 ---
 
@@ -36,25 +39,32 @@ Actor (human | agent | system)   ← attribution identity, scoped to a tenant
   `DESIGN.md`: a metadata store paired with a content store. The tenant is the
   grouping that carries the security boundary, the content keyspace, the
   encryption key, and the quota — *not* a new thing files live in.
-- **A workspace is _not_ a security boundary — the tenant is.** This is the ruling
-  that makes many-workspaces-per-tenant cheap. Because the cross-tenant wall is the
-  store itself, a workspace is just a unit of organization *inside* an already-
-  resolved tenant (a project, a repo, an agent's scratch area). So — unlike the
-  tenant, which is always resolved from the credential — a workspace **may be named
-  in the request** (a path prefix or header), scoped under the resolved tenant.
-  Naming the wrong workspace inside your own tenant is not a leak; naming another
-  tenant's is impossible by construction. Whether a given actor may *reach* a given
-  workspace is an optional intra-tenant authorization choice (§7), never an
-  isolation requirement. Realized with **no engine change**: N workspaces = N
-  store-pairs the registry tracks under `(TenantId, workspace) → locator` (§6, §10).
-- **Actors** (the `actor` table, `DESIGN.md` §4d) belong to a tenant. Attribution
-  truth stays exactly where it is today — in the tenant's own metadata DB — so
-  blame and the op-log need no new columns in the silo model.
+- **A workspace is _not_ a security boundary — the tenant is.** That ruling sizes
+  the isolation. Because the cross-tenant wall is the store itself, a workspace does
+  not need its own store; it is a unit of organization *inside* a resolved tenant (a
+  project, a repo, an agent's scratch area). So **all of a tenant's workspaces live
+  in that tenant's one metadata store and one content store, separated by a
+  `workspace_id`** — the `DESIGN.md` §5 layout. Precisely: cross-**tenant** isolation
+  is *structural* (separate stores, cannot leak by construction); cross-**workspace**
+  isolation is a *soft predicate* inside the store (a `workspace_id` filter + a
+  per-workspace root inode), where a bug is a within-tenant mix-up, never a customer
+  breach. And — unlike the tenant, always resolved from the credential — a workspace
+  **may be named in the request** (a path prefix or header), looked up in the
+  already-resolved tenant's store; naming another tenant's is impossible. Whether an
+  actor may *reach* a given workspace is an optional intra-tenant authorization
+  choice (§7). The mechanism is in §6; the code delta in §10.
+- **Actors** (the `actor` table, `DESIGN.md` §4d) belong to a tenant and are
+  **shared across that tenant's workspaces** — Alice is one actor in every project,
+  and the audit trail is one table per tenant. Attribution truth stays in the
+  tenant's store; the op-log gains only a `workspace_id` tag for per-workspace
+  history, and blame stays keyed by content hash (so it is shared by content across
+  workspaces — §6, §12).
 - Terminology note: `DESIGN.md` §5 sketches a `workspace_id` column on every table,
-  anticipating many workspaces in one store. The implementation went the other way
-  — **one store == one workspace, no discriminator column** (see §2). Multi-tenancy
-  therefore introduces `TenantId` *above* the workspace rather than reviving
-  `workspace_id`; §10 reconciles the two if we ever pool tenants onto shared tables.
+  anticipating many workspaces in one store; the current implementation hasn't built
+  it yet (**one store == one workspace, no discriminator column** — see §2). This
+  concept **builds that sketch** at the workspace grain and adds `TenantId` *above*
+  it as the structural boundary. `tenant_id` becomes a column only if a deployment
+  later pools multiple tenants into one store too (§10, the optional MT4 tier).
 
 Non-goals: this is about *isolating* tenants, not about cross-tenant sharing
 features (org-to-org file sharing, a public read-only tenant) — those are a
@@ -177,9 +187,14 @@ side is where the interesting privacy trade-off lives (the question `DESIGN.md`
 
 | Model | Mechanism | Isolation | Density | Migration cost | Best for |
 |---|---|---|---|---|---|
-| **Silo — DB per tenant** | one SQLite file or one Postgres database per tenant; router picks the DSN | **Hard** (no query can cross tenants; a leak requires connecting to the wrong DB) | Low | **None** — matches today's one-store-per-workspace | Enterprise / few large tenants; the default |
+| **Silo — DB per tenant** | one SQLite file or one Postgres database per tenant; router picks the DSN | **Hard** (no query can cross tenants; a leak requires connecting to the wrong DB) | Low | **None** for the tenant boundary (matches today's single-store model) | Enterprise / few large tenants; the default |
 | **Bridge — schema per tenant** | one Postgres cluster, `search_path`/schema per tenant | Strong (schema `GRANT`s + search_path) | Medium | Small — set `search_path` on checkout from the pool | Many medium tenants on one cluster |
 | **Pool — shared tables + `tenant_id`** | every row carries `tenant_id`; enforced by Postgres **Row-Level Security** | Conditional (only as strong as RLS + the mandatory predicate) | High | **Large** — add `tenant_id` to every table + a `TenantScoped` store | Very many small tenants |
+
+> This table is the **tenant** boundary — the security wall, and the default is silo.
+> *Within* a tenant, workspaces are always the **pool** row: one store, a
+> `workspace_id` discriminator (§6). That is deliberate and right-sized — a workspace
+> is not a security boundary (§1), so it takes a soft predicate, not its own store.
 
 ### 5b. Content isolation (strongest → densest)
 
@@ -205,11 +220,13 @@ writing the same bytes and observing whether the `put` deduped (via timing, a
 
 Three reasons this is the right default for *this* codebase specifically:
 
-1. **It needs no core change.** The engine is already one-store-per-workspace with
-   no tenant column; silo tenancy is reachable with a router + a registry and the
-   existing `open_*` constructors. The most invasive option (pooled `tenant_id` +
-   RLS) is exactly the schema the implementation deliberately does *not* have — so
-   it belongs in an opt-in tier, not the default.
+1. **The tenant boundary needs no core change.** Isolating tenants is store-per-tenant
+   + a router + a registry over the existing `open_*` constructors; no query gains a
+   `tenant` argument. (The *workspace* layer inside a tenant does add the `workspace_id`
+   column + per-workspace root inode — §6, §10 — but keeps the `MetadataStore` trait
+   unchanged.) The most invasive option, pooling *tenants* onto shared tables with
+   `tenant_id` + RLS, is exactly what the schema deliberately lacks — so it stays an
+   opt-in tier (MT4), not the default.
 2. **It makes the dangerous operations tractable.** `gc` is mark-and-sweep from
    live refs and is explicitly *unsafe alongside active writers* (`CLAUDE.md`).
    Per-tenant content namespaces make GC and "delete this tenant" per-tenant and
@@ -254,21 +271,18 @@ Sketch (illustrative, not final):
 /// Opaque, server-assigned tenant handle. Never parsed from client input.
 pub struct TenantId(String);
 
-/// Control-plane record: a tenant's policy + its set of workspaces.
+/// Control-plane record: one store + one content namespace + policy, per tenant.
 pub struct TenantRecord {
-    pub id:         TenantId,
-    pub key_ref:    Option<KeyRef>,  // per-tenant encryption key (KMS/keyring handle)
-    pub state:      TenantState,     // Active | Suspended | Deleting
-    pub quota:      Quota,           // bytes, rate, connection share (whole tenant)
-    pub workspaces: Map<WorkspaceName, WorkspaceLocator>,  // >= 1; "default" if unnamed
+    pub id:       TenantId,
+    pub metadata: MetadataLocator,   // the tenant's ONE store (DSN | sqlite path | schema)
+    pub content:  ContentLocator,    // the tenant's ONE content namespace (bucket/prefix)
+    pub key_ref:  Option<KeyRef>,    // per-tenant encryption key (KMS/keyring handle)
+    pub state:    TenantState,       // Active | Suspended | Deleting
+    pub quota:    Quota,             // bytes, rate, connection share (whole tenant)
 }
-
-/// How to reach one workspace's stores. Two workspaces of one tenant may share a
-/// content locator (safe intra-tenant dedup) or keep separate ones.
-pub struct WorkspaceLocator {
-    pub metadata: MetadataLocator,   // DSN | sqlite path | (cluster, schema)
-    pub content:  ContentLocator,    // bucket/prefix/root (may be shared within the tenant)
-}
+// Workspaces are NOT enumerated here — they are rows in the tenant's own store
+// (the `workspace` table, §10). The router resolves a workspace *name* against that
+// store and binds a `workspace_id`-scoped handle over the one shared connection/pool.
 
 /// Resolves a verified credential to the tenant + actor it acts as.
 /// The tenant half is the new invariant; the actor half already exists (§2).
@@ -277,9 +291,10 @@ pub trait TenantResolver: Send + Sync {
     async fn resolve(&self, headers: &HeaderMap) -> Option<(TenantId, ActorRef)>;
 }
 
-/// Opens (once) and caches a Workspace per (tenant, workspace). Enforces `state`
-/// (reject Suspended/Deleting) and applies the tenant key + the workspace's content
-/// locator. The workspace name comes from the request; the tenant never does.
+/// Opens the tenant's store once, then binds a `workspace_id`-scoped Workspace
+/// handle over it per (tenant, workspace). Enforces `state` (reject
+/// Suspended/Deleting) and applies the tenant key + content namespace. The workspace
+/// name comes from the request; the tenant never does.
 pub struct TenantRouter { /* registry + LRU<(TenantId, WorkspaceName), Arc<Workspace>> */ }
 ```
 
@@ -294,16 +309,56 @@ Design constraints on the router:
   `default`. It is looked up in the *already-resolved* tenant's workspace set, so a
   client can only ever name a workspace of its own tenant. The workspace is the one
   thing a client may select; the tenant is the one thing it may not.
-- **Lazy open + bounded cache.** Workspaces open on first use and live in an LRU
-  of `Arc<Workspace>` handles (cheap to clone — they are `Arc` pairs, §
-  `crates/origofs-sdk/src/lib.rs`). This bounds connection-pool sprawl in the silo
-  model (the main silo cost) and gives idle tenants near-zero footprint.
+- **Lazy open + bounded cache.** A tenant's store opens on first use; per-workspace
+  handles are `for_workspace`-scoped clones sharing that one store's connection/pool,
+  held in an LRU (cheap — `Arc` pairs, `crates/origofs-sdk/src/lib.rs`). So pool
+  sprawl is **per-tenant, not per-workspace**, and idle tenants have near-zero
+  footprint.
 - **State gate.** `Suspended` → 403; `Deleting` → 404/410. Checked at
   get-or-open, before any op reaches the engine.
 - **Extends, doesn't replace, `Authenticator`.** The existing `Authenticator`/
   `Principal` (`origofs-api`) becomes the actor half of `TenantResolver`; the tenant
-  half wraps it. `LocalDevAuth` maps to a single built-in `default` tenant so the
-  loopback dev path is unchanged.
+  half wraps it. `LocalDevAuth` maps to a built-in `default` tenant + `default`
+  workspace so the loopback dev path is unchanged.
+
+### Workspaces share one store — the `workspace_id` model
+
+**Ruling** (this is the decision that drives §10): within a tenant, **all workspaces
+live in the tenant's single metadata store and single content store, separated by a
+`workspace_id`** — the layout `DESIGN.md` §5 drew. Store-per-workspace is *not* used.
+It is the right size for the threat model — a workspace is not a security boundary
+(§1) — and it buys one DB to operate, one connection pool, one migration run, one
+change feed, one actor registry, and free cross-workspace content dedup.
+
+| Boundary | Kind | Mechanism | A bug here is |
+|---|---|---|---|
+| Cross-**tenant** | Hard / structural | separate store + content namespace per tenant (§5) | a customer-data breach — must never happen |
+| Cross-**workspace** (same tenant) | Soft / predicate | `workspace_id` filter + per-workspace root inode, inside the tenant's store | a within-tenant mix-up — bounded, not a breach |
+
+How it works in this codebase (the honest delta — more than the router; see §10 for
+the migration/trait specifics):
+
+- **A `workspace` registry table** in the store — `workspace(id PK, name UNIQUE,
+  root_ino, …)` — and each workspace gets its **own root inode**, replacing the single
+  `INO_ROOT` constant. Inodes share one global `ino` sequence, so workspaces' inode/
+  dentry subtrees are naturally disjoint; `workspace_id` is defense-in-depth plus fast
+  per-workspace enumeration and `truncate_tree`.
+- **`workspace_id` on the namespace-keyed tables** (`ref`, `config`, `conflict`,
+  `file_lock`) — every workspace has its own `HEAD` and `refs/heads/main`, which would
+  collide otherwise — and as a tag on `fs_event`/`suggestion` (which already carry
+  `branch`). `symlink` (keyed by the global `ino`) needs nothing.
+- **The `MetadataStore` trait is unchanged.** The `workspace_id` is *ambient* on the
+  concrete store: `for_workspace(id)` returns a handle sharing the same connection/pool
+  that scopes every statement. The engine binds one workspace by holding that scoped
+  handle + its root inode; a store-level handle serves the registry and GC.
+- **Actors, sessions, and the op-log are tenant-wide** (shared across the store's
+  workspaces); `blob_blame` stays keyed by content hash, so identical content shares
+  blame across workspaces — consistent with blame-following-content (`DESIGN.md` V8),
+  and de-shareable as `(workspace_id, content_hash)` if a deployment wants it (§12).
+- **Content is one shared store per tenant**, so cross-workspace dedup is automatic —
+  which makes **GC per-store (per-tenant)**: it marks from *every* workspace's refs
+  before sweeping. Deleting one workspace is metadata-only (its content is reclaimed by
+  the next store GC).
 
 ---
 
@@ -341,10 +396,12 @@ is meaningless in tenant B.
 
 ## 8. Cross-cutting subsystems under multi-tenancy
 
-**Refs / branches / working tree.** Per-store today, so per-tenant for free in the
-silo/bridge models. Only the pooled model (MT3) needs `tenant_id` folded into the
-`ref` primary key and the inode/dentry rows — the point at which `DESIGN.md` §5's
-sketch finally gets built, promoted one level to `tenant_id`.
+**Refs / branches / working tree.** Now **workspace-scoped within the tenant's
+store**: `ref`, `config`, `conflict`, and `file_lock` gain `workspace_id` in their
+keys (every workspace has its own `HEAD` and `refs/heads/main`), and inode/dentry
+rows carry a `workspace_id` tag with each workspace rooted at its own inode (§6, §10).
+Across tenants they stay separated by the store boundary. This is exactly
+`DESIGN.md` §5's `workspace_id` sketch, built.
 
 **Attribution, blame, audit — the compliance win.** In the silo model a tenant's
 `edit_op` log, `blob_blame`, `tool_calls`, and `actor` rows never share a table
@@ -353,16 +410,17 @@ for (SOC 2 / ISO 27001 / GDPR data-subject export & erasure): a tenant's entire
 attribution history is one DB you can export, or drop, atomically. This is a
 genuine reason to prefer silo beyond mere caution.
 
-**GC & tenant deletion.** `gc` is mark-and-sweep from live refs and unsafe with
-active writers (`CLAUDE.md`). Per-tenant content namespaces make it per-tenant:
-mark from *this* tenant's refs, sweep *this* tenant's prefix, during *this*
-tenant's maintenance window — no cross-tenant reachability analysis. **Deleting a
-tenant** becomes: set `state = Deleting` (router stops serving it) → drop its
-metadata DB (crown-jewel data gone, including all attribution) → delete its content
-prefix (or, with per-tenant keys, just destroy the key = **crypto-shred**, leaving
-the ciphertext unreadable and reclaimable lazily). With a *globally shared
-convergent* store none of this is safe — another tenant may hold the identical
-chunk — which is the fourth argument for the ruling.
+**GC & deletion.** `gc` is mark-and-sweep from live refs and unsafe with active
+writers (`CLAUDE.md`). Because workspaces share a store's content, GC is **per-store
+(per-tenant)**: mark from *every* workspace's refs, then sweep — never per-workspace,
+or you would delete a chunk another workspace still references. **Deleting one
+workspace** is metadata-only: drop its `workspace`/`ref`/`config`/lock rows and
+`truncate_tree` its inodes; its uniquely-referenced content is reclaimed by the next
+store GC. **Deleting a tenant** stays structural: set `state = Deleting` (router stops
+serving it) → drop the tenant's store (crown-jewel data + all attribution gone) →
+delete its content prefix, or destroy its per-tenant key = **crypto-shred**. The
+cross-tenant hazards of a *globally shared convergent* store — a chunk still live for
+another tenant — are exactly what the per-tenant store + namespace avoid.
 
 **Encryption & key management.** `ORIGOFS_ENCRYPTION_KEY` is per-workspace/global
 today and kept out of argv (`CLAUDE.md`). Multi-tenancy makes it **per-tenant**,
@@ -402,7 +460,8 @@ payload filter) so a subscriber only ever sees its own tenant's events.
 
 | Threat | Mitigation | Weakest model that holds |
 |---|---|---|
-| Cross-tenant **read/write** of files/metadata | Tenant resolved server-side → separate store per tenant; pooled model needs RLS + mandatory predicate | Silo/Bridge by construction; Pool only with RLS |
+| Cross-tenant **read/write** of files/metadata | Tenant resolved server-side → separate store per tenant; the MT4 collapse tier would need RLS + mandatory predicate | Silo by construction; MT4 only with RLS |
+| Cross-**workspace** read/write (same tenant) | `workspace_id` predicate on the tenant's store + per-workspace root inode; optional intra-tenant authz (§7) | Within-tenant only — never a cross-customer breach |
 | **Tenant spoofing** (client names a tenant) | Tenant comes from the verified credential, never a path/body — extends the existing "never trust client-named actor" rule | All models |
 | Cross-tenant **attribution forgery** | Actor ids are tenant-local; resolver binds `(tenant, actor)` from one credential | All models |
 | **Existence oracle** via shared dedup | Per-tenant content namespace, or tenant-keyed convergent addressing (domain separation) | Namespace-per-tenant / per-tenant-key |
@@ -412,51 +471,70 @@ payload filter) so a subscriber only ever sees its own tenant's events.
 | **Incomplete erasure** (right-to-be-forgotten) | Drop tenant DB + delete prefix, or destroy per-tenant key (crypto-shred) | Silo + per-tenant key |
 | **Key confusion across tenants** | One DEK per tenant behind a `KeyRef`; wrong key fails closed (AEAD tag), never returns another tenant's plaintext | All (per-tenant key) |
 
-**Guarantee (silo default):** absent a bug in the ~200-line router, a request
-authenticated as tenant A can reach only tenant A's metadata DB and content
-namespace. No engine query can cross tenants because no engine query takes a
-tenant argument — the isolation is structural, not predicate-enforced.
+**Guarantee.** The **tenant** boundary is *structural*: a request authenticated as
+tenant A reaches only A's store and content namespace, because no engine query takes
+a tenant argument (separate stores). The **workspace** boundary *within* a tenant is
+the one predicate-enforced seam — a `workspace_id` filter on the tenant's store plus a
+per-workspace root inode — so a router/handle bug there is a within-tenant mix-up,
+never a cross-customer breach. Size review accordingly: the ~200-line router and the
+`for_workspace` scoping guard the workspace seam; the store split is the tenant wall.
 
 ---
 
 ## 10. What changes in the code
 
-Deltas, smallest-first. MT1 (the useful milestone) touches no core trait.
+Two layers, and they differ in cost. The **workspace** layer adds `workspace_id` to
+the schema and the two backend impls but keeps the `MetadataStore` *trait* unchanged.
+The **tenant** layer is purely additive.
 
-**MT1 — silo, additive only:**
-- New crate/module `origofs-tenant` (or `origofs-sdk::tenant`): `TenantId`,
-  `TenantRecord`, `TenantState`, `Quota`, a `TenantRegistry` trait (backed by its
-  own `MetadataStore`), and `TenantRouter` with the LRU workspace cache.
-- New `TenantResolver` trait in `origofs-api`; the existing `Authenticator` becomes
-  its actor half. `router`/`serve` gain a `router_multitenant(registry, resolver)`
-  variant; the single-tenant `router(ws, auth)` stays for the loopback/dev path
-  (mapped to a built-in `default` tenant + `default` workspace). The router reads the
-  **workspace name** from a path prefix or header (defaulting to `default`) and keys
-  its handle cache by `(TenantId, workspace)`.
-- `Workspace::open_*` grow content-locator plumbing: a per-workspace **prefix** on the
-  object/local store and an optional per-tenant **key** (`open_pg_s3_for_tenant(...)`
-  thin wrappers, or a `ContentLocator` the router applies). No new engine API — a
-  tenant's N workspaces are N `open_*` calls, so **multi-workspace needs no schema
-  change**. (Optional PG density: keep one connection pool per *tenant* by putting
-  each workspace in its own **schema** of the tenant's database via `search_path` — a
-  small, contained addition to `PostgresMetadataStore::connect`, not an engine change.)
-- A **migration fan-out** runner: `migrate` today is per-store
-  (`Workspace::migrate`); add a control-plane loop that applies pending migrations
-  across all active tenants on deploy.
+**Workspace layer — many workspaces in one store (`workspace_id`):**
+- **Migration** (V11+): a `workspace(id PK, name UNIQUE, root_ino, created_at, …)`
+  registry table; `workspace_id` folded into the primary keys of the namespace-keyed
+  tables (`ref`, `config`, `conflict`, `file_lock`) and added as a filter/tag column
+  on `inode`, `dentry`, `fs_event`, `suggestion`, `edit_op`. `symlink` (keyed by the
+  global `ino`) and `blob_blame` (keyed by content hash — deliberately shared, §12)
+  are untouched. Backfill maps every existing row to a `default` workspace (id 1,
+  root = `INO_ROOT`), so the migration is **non-breaking** — an existing single-
+  workspace store just becomes a store with one workspace. The PK changes are a
+  table-rebuild on SQLite (create/copy/drop/rename in the migration), a
+  `DROP/ADD CONSTRAINT` on Postgres.
+- **Ambient `workspace_id` on the concrete stores — trait unchanged.** Rather than add
+  a parameter to ~40 trait methods, `SqliteMetadataStore`/`PostgresMetadataStore` gain
+  a `workspace_id` field and a `for_workspace(id)` that clones the handle sharing the
+  same connection/pool but scopes every statement (`… WHERE workspace_id = self.id`,
+  stamped on inserts). Trait object-safety and the content-store decorator stack are
+  untouched. Defense-in-depth: the scoped handle also filters `get_inode` by
+  `workspace_id`, so a stray/hostile `ino` can't read another workspace's row.
+- **Per-workspace root inode — the one engine change.** `Fs` holds a `root_ino`
+  instead of assuming the `INO_ROOT` constant; path resolution starts there.
+  `Workspace::open` resolves/creates the named workspace and binds `Fs` to
+  `(meta.for_workspace(id), root_ino)`. A store-level (unscoped) handle serves the
+  `workspace` registry and GC only.
+- **GC becomes per-store (per-tenant):** mark from *every* workspace's refs before
+  sweeping the shared content (§8). Deleting one workspace is metadata-only.
 
-**MT3 — density tier, invasive (optional):**
-- Add `tenant_id` to the metadata schema (finally realizing `DESIGN.md` §5,
-  promoted to the tenant grain) *behind a `TenantScoped<M: MetadataStore>`
-  decorator* that injects the predicate, plus Postgres **RLS** as the enforcement
-  backstop. Ships as a new backend choice, not a change to the existing SQLite/PG
-  stores.
-- Tenant-keyed convergent content addressing for a shared bucket with
-  intra-tenant-only dedup (§5b model 2).
+**Tenant layer — additive, no core trait change:**
+- New module `origofs-tenant`: `TenantId`, `TenantRecord`, `TenantState`, `Quota`, a
+  `TenantRegistry` trait (its own small store), and `TenantRouter` (LRU of
+  `(TenantId, workspace)` → `for_workspace`-scoped `Workspace` handles over the
+  tenant's one store).
+- New `TenantResolver` in `origofs-api`; the existing `Authenticator` is its actor
+  half. `router`/`serve` gain `router_multitenant(registry, resolver)`; the
+  single-tenant `router(ws, auth)` stays for loopback/dev (a built-in `default`
+  tenant + `default` workspace). The workspace name is read from a path prefix/header.
+- `Workspace::open_*` grow a per-tenant content **prefix** + optional per-tenant
+  **key** (a `ContentLocator` the router applies) — one store + one content namespace
+  per tenant.
+- **Migration fan-out:** extend `Workspace::migrate` with a control-plane loop that
+  applies pending migrations across all active tenant stores on deploy.
 
-Reconciliation with `DESIGN.md` §5: the sketch's `workspace_id` was a *workspace*
-discriminator. The security boundary is the **tenant**, so the pooled discriminator
-should be `tenant_id` (coarse, the boundary) and *optionally* `workspace_id` (fine,
-a grouping within a tenant). Silo/Bridge need neither column; only MT3 adds them.
+Reconciliation with `DESIGN.md` §5: the sketch's `workspace_id` is **now built, at the
+workspace grain, exactly as drawn** — one store, many workspaces, a `workspace_id`
+discriminator. The security boundary sits one level up at the **tenant** (a separate
+store), so `tenant_id` never needs to be a column *unless* a deployment later pools
+multiple tenants into one store too (the optional MT4 collapse tier) — the identical
+mechanism generalized upward, at which point the tenant boundary becomes
+predicate-enforced and requires Postgres **RLS** as the backstop.
 
 ---
 
@@ -464,27 +542,27 @@ a grouping within a tenant). Silo/Bridge need neither column; only MT3 adds them
 
 | Milestone | Deliverable | Unlocks |
 |---|---|---|
-| **MT0 — Model & registry** | `TenantId`/`TenantRecord`/`TenantState`/`Quota`; `TenantRegistry` trait over its own metadata store; the server-side-tenant invariant written down and tested | The vocabulary + control-plane data model; no hot-path change |
-| **MT1 — Silo runtime** | `TenantResolver` + `TenantRouter` in front of the HTTP API & MCP; workspace selected per request (`(TenantId, workspace)` handle cache); per-workspace `open_*` (content prefix + per-tenant key); migration fan-out | **One process hosts many hard-isolated tenants, each with many workspaces** — no core schema change |
-| **MT2 — Lifecycle & accounting** | provision / suspend / delete (drop DB + crypto-shred); per-tenant GC; quotas, metering, per-tenant pool cap + rate limit; per-tenant backup/restore | Operable as a service: onboarding, erasure, billing, noisy-neighbor safety |
-| **MT3 — Density tier (optional)** | schema-per-tenant (bridge) and/or shared-schema `tenant_id` + Postgres RLS behind `TenantScoped`; tenant-keyed convergent dedup | Many small tenants per cluster without per-tenant DB overhead |
+| **MT0 — Model & registry** | `TenantId`/`TenantRecord`/`TenantState`/`Quota`; `TenantRegistry` trait; the two-tier isolation ruling (structural tenant / predicate workspace) written down and tested | Vocabulary + control-plane data model; no hot-path change |
+| **MT1 — Workspaces in one store** | `workspace` registry table; `workspace_id` migration (non-breaking backfill to `default`); ambient-`workspace_id` store handle (trait unchanged); per-workspace root inode; per-request workspace routing; GC-across-workspaces | **Many workspaces per store, one DB to operate** — the `DESIGN.md` §5 layout, built |
+| **MT2 — Tenant silo runtime** | `TenantResolver` + `TenantRouter` in front of the HTTP API & MCP; store-per-tenant + per-tenant content namespace + per-tenant key; migration fan-out | **Many hard-isolated tenants, each holding many workspaces** |
+| **MT3 — Lifecycle & accounting** | provision / suspend / delete (drop store + crypto-shred); per-tenant GC; quotas, metering, pool cap + rate limit; per-tenant backup/restore | Operable as a service: onboarding, erasure, billing, noisy-neighbor safety |
+| **MT4 — Tenant-collapse tier (optional)** | pool multiple tenants into one store: `tenant_id` column + Postgres **RLS** (the MT1 mechanism, one level up); tenant-keyed convergent dedup | Very many small tenants per cluster without per-tenant store overhead |
 
-MT1 is the point of first value; MT2 makes it a product; MT3 is for scale and can
-be skipped by deployments with few, large tenants.
+MT1 delivers the shared-store multi-workspace layout; MT2 wraps hard tenant isolation
+around it; MT3 makes it operable; MT4 is only for extreme tenant counts and can be
+skipped by deployments with few, large tenants.
 
 ---
 
 ## 12. Open questions
 
-- **Density of workspaces _within_ a tenant.** Decided: a tenant owns **many
-  workspaces** (§1), each its own store-pair, routed by `(TenantId, workspace)` — no
-  schema change. The remaining sub-question is how to keep that cheap when one tenant
-  has *many* workspaces: separate databases (one pool each — simplest, heaviest),
-  separate **schemas** in the tenant's database (one pool per tenant, `DROP SCHEMA`
-  to delete a workspace — the recommended Postgres default), or shared tables with a
-  `workspace_id` column (densest, invasive — the §5 sketch, worth it only at extreme
-  workspace counts). Start with separate stores; add schema-per-workspace when pool
-  count bites.
+- **Workspace layout — decided.** Many workspaces share **one store** via
+  `workspace_id` (§6, §10); store-per-workspace is not used. Remaining sub-question:
+  **blame sharing.** `blob_blame` keyed by content hash shares blame across workspaces
+  that hold identical content — free, and consistent with blame-follows-content
+  (`DESIGN.md` V8) — but couples those workspaces. Keep it shared (default, within one
+  tenant), or key it `(workspace_id, content_hash)` for workspace-isolated blame at
+  the cost of that dedup.
 - **Bridge vs. pool as the density tier.** Schema-per-tenant is simpler and keeps
   most of silo's isolation; shared-schema+RLS is denser but one predicate away from
   a leak. Pick one primary; possibly offer both.
