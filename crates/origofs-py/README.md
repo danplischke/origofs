@@ -110,6 +110,18 @@ and server-owns-identity discipline as the rest of origofs. Ranged reads go thro
 default (an origofs working tree is live and multi-writer). Needs the `fsspec` extra
 (`pip install "origofs[fsspec]"`).
 
+**Pathlib API** — because it's a well-behaved filesystem, it also works with
+[universal-pathlib](https://github.com/fsspec/universal_pathlib) as a first-class,
+explicitly-registered protocol (`pip install "origofs[upath]"`):
+
+```python
+from upath import UPath
+root = UPath("origofs:///", db_path="meta.db", cas_dir="cas")   # or storage_options=…
+(root / "notes.txt").write_text("hello")
+for child in root.iterdir():
+    print(child, child.stat().st_size)
+```
+
 ## Live change feed (push)
 
 On Postgres, `subscribe` gives a real push feed (LISTEN/NOTIFY) — `await recv()`
@@ -210,4 +222,5 @@ failed). The DB stays the thing to back up — so also run Postgres PITR / a rep
 `mount` · `serve_nfs`. Plus `WriteCtx`, `S3Config`, `Mount`, `fuse_mountable()`.
 
 Integrations (own extras): `origofs.fastapi` (HTTP router) · `origofs.fsspec`
-(`OrigoFileSystem`, the fsspec filesystem) · `origofs.overlay` (agent overlay).
+(`OrigoFileSystem`, the fsspec filesystem — also a `UPath("origofs://…")` via
+universal-pathlib) · `origofs.overlay` (agent overlay).
