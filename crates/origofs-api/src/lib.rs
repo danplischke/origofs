@@ -699,11 +699,19 @@ async fn checkout(
 
 // --- attribution ------------------------------------------------------------
 
+/// One blame span. `byte_start`/`byte_end` are the exact `[start, end)` byte
+/// range — the design's ground truth — so a client can render sub-line,
+/// character-level authorship (two authors on one line are two spans sharing a
+/// line number). `line_start`/`line_end` are the inclusive 1-based lines the span
+/// touches, kept for line-oriented UIs.
 #[derive(Serialize)]
 struct BlameDto {
+    byte_start: u64,
+    byte_end: u64,
     line_start: u32,
     line_end: u32,
     actor: String,
+    session: Option<i64>,
     kind: String,
 }
 
@@ -716,9 +724,12 @@ async fn blame(
         .await?
         .into_iter()
         .map(|r| BlameDto {
+            byte_start: r.byte_start,
+            byte_end: r.byte_end,
             line_start: r.line_start,
             line_end: r.line_end,
             actor: r.actor.display_name,
+            session: r.session,
             kind: r.actor.kind.as_str().to_string(),
         })
         .collect();

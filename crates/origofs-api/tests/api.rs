@@ -371,12 +371,18 @@ async fn attributed_write_shows_up_in_blame_and_feed() {
     .await;
     assert_eq!(st, StatusCode::OK);
 
-    // blame attributes it to the agent
+    // blame attributes it to the agent, over the exact byte range (the ground
+    // truth the design blames by) as well as the derived line range.
     let (st, body) = send(app, get("/blame/notes.txt")).await;
     assert_eq!(st, StatusCode::OK);
     let blame = as_json(&body);
     assert_eq!(blame[0]["kind"], "agent");
     assert_eq!(blame[0]["actor"], "claude");
+    assert_eq!(blame[0]["byte_start"], 0);
+    assert_eq!(blame[0]["byte_end"], 18); // "line one\nline two\n"
+    assert_eq!(blame[0]["line_start"], 1);
+    assert_eq!(blame[0]["line_end"], 2);
+    assert!(blame[0]["session"].is_number());
 
     // the write is on the change feed, attributed to the token's actor + session
     let (st, body) = send(app, get("/events")).await;
