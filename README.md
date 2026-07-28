@@ -34,7 +34,11 @@ enough. You need to answer questions a directory of files can't:
   every file it touched, keeping everyone else's edits intact.
 - **Can I review before it lands?** Agents can *propose* edits into a review
   queue instead of applying them; a human accepts (credited to the agent) or
-  rejects.
+  rejects. An actor can even be made *propose-only*, so its writes are gated into
+  that queue automatically.
+- **Can people and agents edit together, live?** Opt-in CRDT co-editing lets
+  humans, agents, and browser editors type into the same document at once and
+  converge — with every character still attributed to whoever wrote it.
 - **Will it hold up for a team?** The Postgres backend is built for many
   concurrent writers — humans and agents — sharing one workspace, with a live
   change feed and presence so every client sees edits as they happen.
@@ -126,6 +130,23 @@ origofs --workspace "$WS" accept 1 --actor "$HUMAN"      # applies it, credited 
 `accept` lands the edit **attributed to the authoring agent** (so blame stays
 honest) and records the approver; it refuses if the file moved since the proposal
 (a stale base). `reject` discards it.
+
+The queue is **actor-agnostic** — it's a change-request workflow between people
+just as much as an agent-proposal one. Whether an actor *must* propose (rather
+than write directly) is its **write policy**: a bounded trust gate that's a
+property of the actor, not its kind. A trusted agent stays `direct`; an untrusted
+contributor is set `propose`-only and every write it makes — on *any* surface — is
+routed into the review queue instead of landing:
+
+```bash
+origofs --workspace "$WS" write-policy "$AGENT" propose   # now its writes must be reviewed
+```
+
+Over **MCP**, an agent gets the whole loop as tools — `origofs_read`,
+`origofs_write`, `origofs_edit` (exact string search-and-replace), `origofs_suggest`,
+`origofs_suggestion_diff`, `origofs_accept`, `origofs_reject` — under the same
+server-side attribution and policy enforcement (and it can't accept its own
+proposals).
 
 ## Know who did what
 
@@ -232,6 +253,31 @@ branch. From Rust, `PostgresMetadataStore::subscribe(after_seq, branch)` returns
 a blocking `LISTEN`-backed subscription whose `recv()` wakes on every committed
 change — a real push, not a poll.
 
+### Live co-editing (CRDT)
+
+Opt-in (the `coedit` feature): humans, agents, and browser editors type into the
+same document **concurrently** and converge — a CRDT (`yrs`) under the hood, with
+authorship tracked per character. It speaks the Yjs **y-sync** protocol, so an
+*unmodified* Yjs editor — PlateJS, `y-websocket` — connects to the co-editing
+WebSocket and collaborates directly, no custom client.
+
+The server stays the sole authority on **who wrote what**: whatever a client's
+bytes claim, each inserted run is attributed to the *authenticated* actor. When a
+session checkpoints, that character-level, interleaved authorship lands in the
+*same* byte-range blame index as ordinary writes — so two people editing one line
+show up as two spans, not one collapsed line.
+
+```rust
+let doc = ws.open_coedit(ctx, "/notes.md").await?;    // resume the live CRDT
+// … clients exchange y-sync updates over the WebSocket …
+ws.checkpoint_coedit(ctx, "/notes.md", &doc).await?;  // crystallize into blame
+```
+
+Across workers it stays consistent: when a document is edited on two processes at
+once (behind a load balancer), a Postgres `LISTEN/NOTIFY` relay fans each update
+out so every worker's replica converges. The co-editing endpoint is served as a
+WebSocket at `GET /coedit/{path}` by both the HTTP API and the FastAPI router.
+
 ### HTTP API
 
 Every operation is available over HTTP/JSON — files as raw bytes, everything else
@@ -249,7 +295,7 @@ curl 'http://127.0.0.1:8080/events?since=0'                      # the change fe
 
 An attributed write is `PUT /files/x?actor=<id>&session=<id>`. Full routes cover
 files, dirs, stat, blame, rename, commit/log, branches/checkout, events,
-presence, actors, sessions, diff, and suggestions.
+presence, actors, sessions, diff, suggestions, and the live co-editing WebSocket.
 
 ## Built to not lose or corrupt data
 
