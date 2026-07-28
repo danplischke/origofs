@@ -32,6 +32,17 @@
 > root. See `crates/origofs-sdk/tests/multi_workspace.rs` and the multi-workspace
 > invariants in `crates/origofs-core/tests/simulation.rs`. The **tenant layer (MT2+)
 > remains a concept** described below.
+>
+> **Maintenance-operation scoping (correctness invariant).** The isolation predicate
+> must hold on the *bulk/maintenance* paths too, not only ordinary reads/writes: (a)
+> `reap_presence` deletes only the calling workspace's presence rows; (b) `gc` marks
+> **every** workspace's roots before sweeping the shared content — its refs, its
+> working tree, its *pending-suggestion* proposed bytes, and its *ref-mirror* snapshot
+> (the last two are per-workspace GC roots, so marking only the caller's would sweep
+> another workspace's recoverable/pending content); (c) `rebuild` adopts an existing
+> registry row so it is idempotent; and (d) `Workspace::workspace(name)` validates the
+> name and adopts the winner of a concurrent create race. These are regression-tested
+> (including gc-then-rebuild composition and negative controls).
 
 ---
 
