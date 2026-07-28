@@ -12,7 +12,7 @@
 //!
 //! Enabled by the `coedit` feature.
 
-use crate::attribution::WriteCtx;
+use crate::attribution::{BlameRange, WriteCtx};
 use crate::content::ContentStore;
 use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
@@ -269,6 +269,38 @@ impl CoeditDoc {
         Ok(this)
     }
 
+    /// Rebuild a document from flat `text` and its per-span `(actor, session,
+    /// byte_len)` authorship — the structural inverse of [`snapshot`](Self::snapshot).
+    /// Used to resurrect a live doc from the durable truth (the file plus its blame)
+    /// when the persisted CRDT sidecar has fallen out of sync with the file — after
+    /// an accepted suggestion, a branch merge, or any plain write changed the bytes
+    /// underneath. A span with actor `0` is inserted unattributed. `spans` must tile
+    /// `text` on char boundaries (as blame does); a boundary mid-character errors
+    /// rather than panicking.
+    pub fn from_blamed(text: &str, spans: &[(i64, i64, u64)]) -> Result<Self> {
+        let this = Self::new();
+        let mut txn = this.doc.transact_mut();
+        let mut byte_off = 0usize;
+        let mut u16_idx = 0u32;
+        for &(actor, session, byte_len) in spans {
+            let end = byte_off + byte_len as usize;
+            let piece = text.get(byte_off..end).ok_or_else(|| {
+                OrigoFSError::InvalidArgument("co-edit rebuild: span not on a char boundary".into())
+            })?;
+            if actor != 0 {
+                let attrs = Self::author_attrs(WriteCtx::session(actor, session));
+                this.text
+                    .insert_with_attributes(&mut txn, u16_idx, piece, attrs);
+            } else {
+                this.text.insert(&mut txn, u16_idx, piece);
+            }
+            byte_off = end;
+            u16_idx += utf16_len(piece);
+        }
+        drop(txn);
+        Ok(this)
+    }
+
     /// The current text together with its per-span `(actor, session, byte_len)`
     /// authorship, both walked from one CRDT diff so they always agree. A run with
     /// no recorded author (which should not occur — every insert is attributed)
@@ -369,6 +401,54 @@ fn coedit_sidecar_path(path: &str) -> String {
     format!("{COEDIT_SIDECAR_DIR}/{}", hex::encode(path.as_bytes()))
 }
 
+/// Framing tag for the sidecar blob: `[SIDECAR_MAGIC][32-byte BLAKE3 of the flat
+/// text it crystallized][ydoc state update]`. The embedded hash is the coherence
+/// marker — [`open_coedit`](Fs::open_coedit) resumes the CRDT only if the file
+/// still hashes to it, else rebuilds from the file.
+const SIDECAR_MAGIC: u8 = 1;
+
+/// Split a framed sidecar blob into `(flat_hash, ydoc_state)`, or `None` if it
+/// isn't in the current format (a legacy or corrupt blob — the caller then rebuilds
+/// from the flat file, which is always safe).
+fn parse_sidecar(blob: &[u8]) -> Option<(&[u8], &[u8])> {
+    if blob.len() >= 33 && blob[0] == SIDECAR_MAGIC {
+        Some((&blob[1..33], &blob[33..]))
+    } else {
+        None
+    }
+}
+
+/// Tile `text` into consecutive `(actor, session, byte_len)` spans from its blame
+/// `ranges`, attributing any byte no range covers to `fallback` (the actor bringing
+/// the file into co-editing). Walks by character so every span lands on a char
+/// boundary even if a stale range boundary wouldn't.
+fn blame_to_spans(
+    text: &str,
+    mut ranges: Vec<BlameRange>,
+    fallback: (i64, i64),
+) -> Vec<(i64, i64, u64)> {
+    ranges.sort_by_key(|r| r.byte_start);
+    let mut spans: Vec<(i64, i64, u64)> = Vec::new();
+    let mut ri = 0usize;
+    for (byte_off, ch) in text.char_indices() {
+        let b = byte_off as u64;
+        // Advance past ranges we've moved beyond (blame tiles left-to-right).
+        while ri < ranges.len() && ranges[ri].byte_end <= b {
+            ri += 1;
+        }
+        let (actor, session) = match ranges.get(ri) {
+            Some(r) if r.byte_start <= b && b < r.byte_end => (r.actor.id, r.session.unwrap_or(0)),
+            _ => fallback, // a gap between/after ranges: un-blamed text
+        };
+        let clen = ch.len_utf8() as u64;
+        match spans.last_mut() {
+            Some(last) if last.0 == actor && last.1 == session => last.2 += clen,
+            _ => spans.push((actor, session, clen)),
+        }
+    }
+    spans
+}
+
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Checkpoint a co-edited document into `path`: materialize its text and land
     /// it with per-span authorship via [`write_as_blamed`](Self::write_as_blamed),
@@ -393,30 +473,66 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // Persist the CRDT itself as a sidecar blob so the session is durable and
         // resumable: a checkpoint of only the flat text would drop the op history
         // needed to keep co-editing. Per #33, the ydoc sidecar rides in the same
-        // content store, pinned to the commit like any tree file.
+        // content store, pinned to the commit like any tree file. It's framed with
+        // the flat text's hash so a later open can tell whether the file changed
+        // underneath (an accepted suggestion, a merge, a plain write) and rebuild
+        // instead of resuming a stale CRDT.
         self.mkdir_p(COEDIT_SIDECAR_DIR).await?;
-        self.write(&coedit_sidecar_path(path), &doc.state_update())
-            .await?;
+        let state = doc.state_update();
+        let mut blob = Vec::with_capacity(1 + 32 + state.len());
+        blob.push(SIDECAR_MAGIC);
+        blob.extend_from_slice(blake3::hash(text.as_bytes()).as_bytes());
+        blob.extend_from_slice(&state);
+        self.write(&coedit_sidecar_path(path), &blob).await?;
         Ok(())
     }
 
     /// Open a co-edited document for `path`: restore the live CRDT from its
-    /// persisted sidecar if one exists — resuming exactly where co-editing left
-    /// off — otherwise promote the file's current text into a fresh document
-    /// attributed to `ctx` (an empty document if the file is absent or binary).
+    /// persisted sidecar — but only if the sidecar is still **coherent** with the
+    /// file (the file hashes to what the sidecar crystallized). If the file moved on
+    /// underneath — an accepted suggestion, a branch merge, a plain write — the
+    /// sidecar is stale, so rebuild the live doc from the durable truth (the file's
+    /// text + its blame) instead, losing no change and preserving authorship. With
+    /// no sidecar at all, likewise promote the file (an empty document if it's
+    /// absent or binary).
     pub async fn open_coedit(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
         match self.read(&coedit_sidecar_path(path)).await {
-            Ok(bytes) => return CoeditDoc::load(&bytes),
+            Ok(blob) => {
+                if let Some((flat_hash, ydoc)) = parse_sidecar(&blob) {
+                    let current = match self.read(path).await {
+                        Ok(b) => b,
+                        Err(OrigoFSError::NotFound(_)) => bytes::Bytes::new(),
+                        Err(e) => return Err(e),
+                    };
+                    if blake3::hash(&current).as_bytes().as_slice() == flat_hash {
+                        return CoeditDoc::load(ydoc); // coherent: resume the CRDT
+                    }
+                }
+                // Stale or unparseable sidecar — fall through to rebuild.
+            }
             Err(OrigoFSError::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
-        let doc = CoeditDoc::new();
-        if let Ok(bytes) = self.read(path).await
-            && let Ok(text) = std::str::from_utf8(&bytes)
-            && !text.is_empty()
-        {
-            doc.insert(ctx, 0, text);
+        self.rebuild_coedit(ctx, path).await
+    }
+
+    /// Build a live doc from the durable truth — the file's current text plus its
+    /// blame — attributing any un-blamed text to `ctx`. The fallback for both a
+    /// never-co-edited file and a sidecar gone stale.
+    async fn rebuild_coedit(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
+        let bytes = match self.read(path).await {
+            Ok(b) => b,
+            Err(OrigoFSError::NotFound(_)) => return Ok(CoeditDoc::new()),
+            Err(e) => return Err(e),
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Ok(CoeditDoc::new()); // binary: nothing to co-edit as text
+        };
+        if text.is_empty() {
+            return Ok(CoeditDoc::new());
         }
-        Ok(doc)
+        let ranges = self.blame(path).await.unwrap_or_default();
+        let spans = blame_to_spans(text, ranges, (ctx.actor, ctx.session.unwrap_or(0)));
+        CoeditDoc::from_blamed(text, &spans)
     }
 }

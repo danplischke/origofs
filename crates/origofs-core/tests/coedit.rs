@@ -246,3 +246,107 @@ fn coedit_vanilla_yjs_client_is_attributed() {
     assert_eq!(by_actor.get(&5), Some(&7));
     assert_eq!(by_actor.get(&2), Some(&5));
 }
+
+// `from_blamed` is the exact structural inverse of `snapshot`: rebuild a doc from
+// a snapshot's text + spans and it snapshots identically — text and per-span
+// authorship. This is what lets a stale sidecar be discarded and the live doc
+// resurrected from the durable truth (the file + its blame) without loss.
+#[test]
+fn coedit_from_blamed_round_trips_snapshot() {
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(1, 10), 0, "hello ");
+    doc.insert(WriteCtx::session(2, 20), 6, "world");
+    let (text, spans) = doc.snapshot();
+
+    let rebuilt = CoeditDoc::from_blamed(&text, &spans).unwrap();
+    assert_eq!(rebuilt.text(), "hello world");
+    assert_eq!(rebuilt.snapshot(), (text, spans)); // authorship preserved exactly
+}
+
+// The gap the sidecar-coherence check closes: a change made to a co-edited file by
+// another mechanism (here an accepted suggestion — an attributed write outside the
+// CRDT) must not be silently reverted when the doc is reopened. The stale sidecar
+// is detected and discarded, the live doc rebuilt from the file + blame, and a
+// further checkpoint keeps the suggestion (credited to its proposer) rather than
+// resurrecting the pre-suggestion text.
+#[tokio::test]
+async fn coedit_reopen_after_accepted_suggestion_rebuilds_from_file() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let bob = fs.create_human("bob", None).await.unwrap();
+    let s_a = fs.create_session(alice, None).await.unwrap();
+    let s_b = fs.create_session(bob, None).await.unwrap();
+
+    // Alice co-edits "hello" and checkpoints (flat text + a sidecar hashing "hello").
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(alice, s_a), 0, "hello");
+    fs.checkpoint_coedit(WriteCtx::session(alice, s_a), "/doc", &doc)
+        .await
+        .unwrap();
+
+    // Bob proposes replacing it; alice (a different reviewer) accepts. The accept
+    // writes "HELLO WORLD" to /doc attributed to bob — outside the CRDT, so the
+    // sidecar is now stale.
+    let sid = fs
+        .suggest(
+            WriteCtx::session(bob, s_b),
+            "/doc",
+            b"HELLO WORLD",
+            Some("shout"),
+        )
+        .await
+        .unwrap();
+    fs.accept_suggestion(sid, WriteCtx::session(alice, s_a))
+        .await
+        .unwrap();
+    assert_eq!(&fs.read("/doc").await.unwrap()[..], b"HELLO WORLD");
+
+    // Reopen: the live doc reflects the accepted suggestion, not the stale "hello".
+    let reopened = fs
+        .open_coedit(WriteCtx::session(alice, s_a), "/doc")
+        .await
+        .unwrap();
+    assert_eq!(reopened.text(), "HELLO WORLD");
+
+    // A further checkpoint keeps the suggestion — credited to bob (its proposer),
+    // recovered from blame — instead of reverting to "hello".
+    fs.checkpoint_coedit(WriteCtx::session(alice, s_a), "/doc", &reopened)
+        .await
+        .unwrap();
+    assert_eq!(&fs.read("/doc").await.unwrap()[..], b"HELLO WORLD");
+    let b = fs.blame("/doc").await.unwrap();
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].actor.id, bob);
+    assert_eq!((b[0].byte_start, b[0].byte_end), (0, 11));
+}
+
+// With no prior sidecar, opening an existing file promotes its text — preserving
+// whatever authorship the file already carries (a prior attributed write), not
+// re-crediting it to whoever opens it.
+#[tokio::test]
+async fn coedit_open_existing_file_preserves_prior_authorship() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let bob = fs.create_human("bob", None).await.unwrap();
+    let s_a = fs.create_session(alice, None).await.unwrap();
+    let s_b = fs.create_session(bob, None).await.unwrap();
+
+    // Alice writes the file directly (attributed) — never co-edited, no sidecar.
+    fs.write_as(WriteCtx::session(alice, s_a), "/notes", b"alice wrote this")
+        .await
+        .unwrap();
+
+    // Bob opens it for co-editing and checkpoints: alice's authorship is preserved,
+    // not reassigned to bob.
+    let doc = fs
+        .open_coedit(WriteCtx::session(bob, s_b), "/notes")
+        .await
+        .unwrap();
+    assert_eq!(doc.text(), "alice wrote this");
+    fs.checkpoint_coedit(WriteCtx::session(bob, s_b), "/notes", &doc)
+        .await
+        .unwrap();
+    let b = fs.blame("/notes").await.unwrap();
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].actor.id, alice);
+}
