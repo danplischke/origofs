@@ -155,7 +155,13 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             if name == DEFAULT_WS_NAME {
                 continue;
             }
-            let (id, root) = self.meta.create_workspace(name).await?;
+            // Adopt an existing registry row so rebuild is idempotent: a second pass,
+            // or a rebuild onto a store that already knows this workspace, must
+            // re-materialize its tree rather than fail on a duplicate-name insert.
+            let (id, root) = match self.meta.lookup_workspace(name).await? {
+                Some(existing) => existing,
+                None => self.meta.create_workspace(name).await?,
+            };
             let scoped: Arc<dyn MetadataStore> = self.meta.with_workspace(id);
             // A sibling engine bound to the recovered workspace, sharing this one's
             // content store + clock (built directly — the scoped handle is a trait

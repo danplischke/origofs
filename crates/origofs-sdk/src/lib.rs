@@ -245,10 +245,37 @@ impl Workspace {
     /// The metadata connection/pool, content store, and any Postgres push-feed
     /// handle are shared with `self`, so this is cheap.
     pub async fn workspace(&self, name: &str) -> Result<Self> {
-        let (id, root) = match self.fs.meta.lookup_workspace(name).await? {
-            Some(existing) => existing,
-            None => self.fs.meta.create_workspace(name).await?,
-        };
+        // Validate the name at the user entry point: it becomes a registry key and
+        // the recovery mirror's tag, and surfaces in listings/URLs. Reject the same
+        // set `validate_component` rejects for path components (empty, `.`/`..`,
+        // path separators, NUL) so a workspace name can't be empty or path-like.
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\0')
+        {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "invalid workspace name: {name:?}"
+            )));
+        }
+        let (id, root) =
+            match self.fs.meta.lookup_workspace(name).await? {
+                Some(existing) => existing,
+                None => match self.fs.meta.create_workspace(name).await {
+                    Ok(created) => created,
+                    // Lost a concurrent first-time create race: the other caller's row
+                    // is now committed, so adopt it instead of surfacing AlreadyExists
+                    // (matches how `mkdir_p`/`write` adopt the winner). UNIQUE(name)
+                    // guarantees there is exactly one row to find.
+                    Err(OrigoFSError::AlreadyExists(_)) => {
+                        self.fs.meta.lookup_workspace(name).await?.ok_or_else(|| {
+                            OrigoFSError::AlreadyExists(format!("workspace {name}"))
+                        })?
+                    }
+                    Err(e) => return Err(e),
+                },
+            };
         let scoped = self.fs.meta.with_workspace(id);
         let fs = self.fs.rebind(scoped, root);
         // Give a freshly created workspace its versioning refs/config; idempotent

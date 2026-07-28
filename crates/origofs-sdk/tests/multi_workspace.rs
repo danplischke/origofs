@@ -808,6 +808,157 @@ async fn gc_keeps_content_shared_across_workspaces() {
     assert_eq!(&beta.read("/b.txt").await.unwrap()[..], shared);
 }
 
+/// Workspace names are validated at the entry point: a name becomes a registry
+/// key, the recovery mirror tag, and a listing entry, so empty / path-like / NUL
+/// names are rejected — while ordinary names (spaces, unicode, dashes) are allowed.
+#[tokio::test]
+async fn workspace_names_are_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    for bad in ["", ".", "..", "a/b", "x\0y"] {
+        assert!(
+            matches!(
+                ws.workspace(bad).await,
+                Err(OrigoFSError::InvalidArgument(_))
+            ),
+            "workspace name {bad:?} must be rejected"
+        );
+    }
+    // A name with spaces / unicode / punctuation is fine.
+    assert!(ws.workspace("My Project — 2026").await.is_ok());
+    // The rejected names never made it into the registry.
+    assert_eq!(ws.workspaces().await.unwrap().len(), 2); // default + the valid one
+}
+
+/// Opening the same new workspace name concurrently must resolve to one workspace,
+/// never a spurious `AlreadyExists` or a duplicate registry row: the loser of the
+/// create race adopts the winner's row (UNIQUE(name) guarantees a single row).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reopening_a_workspace_is_idempotent_even_concurrently() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let (w1, w2) = tokio::join!(ws.workspace("shared"), ws.workspace("shared"));
+    let (w1, w2) = (w1.unwrap(), w2.unwrap());
+    assert_eq!(
+        w1.stat("/").await.unwrap().ino,
+        w2.stat("/").await.unwrap().ino,
+        "concurrent opens of one name must resolve to the same workspace"
+    );
+    assert_eq!(
+        ws.workspaces()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|n| *n == "shared")
+            .count(),
+        1,
+        "concurrent create must not mint a duplicate registry row"
+    );
+}
+
+/// Blame is keyed by `(workspace_id, content_hash)` since V13, so the V8 property —
+/// blame follows the checked-out content across a checkout — must still hold inside
+/// a NAMED workspace (id != 1), not only the default one it was first proven on.
+#[tokio::test]
+async fn named_workspace_blame_survives_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    assert_ne!(
+        alpha.stat("/").await.unwrap().ino,
+        1,
+        "alpha is not default"
+    );
+    let a = ws.create_human("a", None).await.unwrap();
+    let b = ws.create_human("b", None).await.unwrap();
+
+    // v1 on main: `a` writes two lines; branch `dev` off v1.
+    alpha
+        .write_as(WriteCtx::actor(a), "/f", b"one\ntwo\n")
+        .await
+        .unwrap();
+    alpha.commit("a", "v1").await.unwrap();
+    alpha.create_branch("dev").await.unwrap();
+    // v2 on main: `b` appends a third line.
+    alpha
+        .write_as(WriteCtx::actor(b), "/f", b"one\ntwo\nthree\n")
+        .await
+        .unwrap();
+    alpha.commit("b", "v2").await.unwrap();
+
+    // main (v2): a on lines 1-2, b on line 3.
+    let bl = alpha.blame("/f").await.unwrap();
+    assert_eq!(bl.len(), 2);
+    assert_eq!(
+        (bl[0].actor.id, bl[0].line_start, bl[0].line_end),
+        (a, 1, 2)
+    );
+    assert_eq!(
+        (bl[1].actor.id, bl[1].line_start, bl[1].line_end),
+        (b, 3, 3)
+    );
+
+    // Checkout dev (v1): blame follows the checked-out content — all `a`, no stale
+    // `b` run carried over, inside this named workspace.
+    alpha.checkout("dev").await.unwrap();
+    assert_eq!(&alpha.read("/f").await.unwrap()[..], b"one\ntwo\n");
+    let bl = alpha.blame("/f").await.unwrap();
+    assert_eq!(bl.len(), 1);
+    assert_eq!(
+        (bl[0].actor.id, bl[0].line_start, bl[0].line_end),
+        (a, 1, 2)
+    );
+}
+
+/// Rebuild must be idempotent and recover a named workspace's *full* branch set.
+/// Regression: recovery called `create_workspace` unconditionally, so a second
+/// `rebuild()` failed with `AlreadyExists`; it now adopts the existing registry row.
+#[tokio::test]
+async fn rebuild_is_idempotent_and_recovers_named_workspace_branches() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = dir.path().join("cas");
+    {
+        let ws = Workspace::open_local(dir.path().join("db1.sqlite"), &cas)
+            .await
+            .unwrap();
+        ws.write("/root.txt", b"d").await.unwrap();
+        ws.commit("t", "default").await.unwrap();
+        let alpha = ws.workspace("alpha").await.unwrap();
+        alpha.write("/a.txt", b"v1").await.unwrap();
+        alpha.commit("t", "a1").await.unwrap();
+        alpha.create_branch("feature").await.unwrap();
+        alpha.write("/a.txt", b"v2").await.unwrap();
+        alpha.commit("t", "a2").await.unwrap(); // feature @ v2, main @ v1
+    }
+
+    let ws = Workspace::open_local(dir.path().join("db2.sqlite"), &cas)
+        .await
+        .unwrap();
+    let r1 = ws.rebuild().await.unwrap();
+    assert_eq!(r1.extra_workspaces, 1);
+    // A second pass must not error now that recovery adopts an existing row.
+    let r2 = ws.rebuild().await.unwrap();
+    assert_eq!(r2.extra_workspaces, 1, "second rebuild must be idempotent");
+
+    // alpha came back with BOTH branches, not just the checked-out one.
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let mut branches: Vec<String> = alpha
+        .list_branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    branches.sort();
+    assert_eq!(branches, vec!["feature", "main"]);
+}
+
 /// The sorted-by-insertion entry names directly under a workspace's root.
 async fn names(ws: &Workspace) -> Vec<String> {
     ws.ls("/")
