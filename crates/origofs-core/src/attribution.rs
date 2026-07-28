@@ -173,41 +173,68 @@ impl WriteCtx {
     }
 }
 
-/// One coalesced authorship run over consecutive lines.
+/// One coalesced authorship run over a consecutive byte span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BlameRun {
     actor: i64,
     session: i64,
-    lines: u32,
+    /// Byte length of the span this run covers.
+    len: u64,
 }
 
-/// A file's line-authorship map, stored as `actor,session,lines;...`.
+/// A file's byte-range authorship map (`docs/DESIGN.md` §5 — blame is
+/// per-byte-range, not per-line), stored as `actor,session,len;...`. Ordinary
+/// line-based writes produce runs whose spans align to line boundaries; a
+/// co-edited CRDT checkpoint (roadmap M8) attributes sub-line, character-level
+/// spans through the same map, losslessly.
 #[derive(Clone, Debug, Default)]
 struct BlameMap {
     runs: Vec<BlameRun>,
 }
 
 impl BlameMap {
-    fn from_per_line(authors: &[(i64, i64)]) -> Self {
+    /// Build from `(actor, session, byte_len)` spans, coalescing adjacent runs of
+    /// the same author. Zero-length spans are dropped.
+    fn from_spans(spans: &[(i64, i64, u64)]) -> Self {
         let mut runs: Vec<BlameRun> = Vec::new();
-        for &(actor, session) in authors {
+        for &(actor, session, len) in spans {
+            if len == 0 {
+                continue;
+            }
             match runs.last_mut() {
-                Some(r) if r.actor == actor && r.session == session => r.lines += 1,
+                Some(r) if r.actor == actor && r.session == session => r.len += len,
                 _ => runs.push(BlameRun {
                     actor,
                     session,
-                    lines: 1,
+                    len,
                 }),
             }
         }
         BlameMap { runs }
     }
 
-    fn per_line(&self) -> Vec<(i64, i64)> {
+    /// Total number of bytes this map covers.
+    fn total(&self) -> u64 {
+        self.runs.iter().map(|r| r.len).sum()
+    }
+
+    /// The `(actor, session, len)` spans covering byte range `[start, start+len)`,
+    /// clipped to that window (returned lengths sum to the overlap).
+    fn slice(&self, start: u64, len: u64) -> Vec<(i64, i64, u64)> {
+        let end = start + len;
         let mut out = Vec::new();
+        let mut pos = 0u64;
         for r in &self.runs {
-            for _ in 0..r.lines {
-                out.push((r.actor, r.session));
+            let rstart = pos;
+            let rend = pos + r.len;
+            pos = rend;
+            let s = rstart.max(start);
+            let e = rend.min(end);
+            if s < e {
+                out.push((r.actor, r.session, e - s));
+            }
+            if rend >= end {
+                break;
             }
         }
         out
@@ -216,7 +243,7 @@ impl BlameMap {
     fn encode(&self) -> String {
         self.runs
             .iter()
-            .map(|r| format!("{},{},{}", r.actor, r.session, r.lines))
+            .map(|r| format!("{},{},{}", r.actor, r.session, r.len))
             .collect::<Vec<_>>()
             .join(";")
     }
@@ -230,7 +257,7 @@ impl BlameMap {
                 Some(BlameRun {
                     actor: it.next()?.parse().ok()?,
                     session: it.next()?.parse().ok()?,
-                    lines: it.next()?.parse().ok()?,
+                    len: it.next()?.parse().ok()?,
                 })
             })
             .collect();
@@ -238,11 +265,17 @@ impl BlameMap {
     }
 }
 
-/// One blame result: an inclusive 1-based line range and its author.
+/// One blame result: a contiguous same-author span. `byte_start`/`byte_end` are
+/// the exact `[start, end)` byte range; `line_start`/`line_end` are the inclusive
+/// 1-based lines it touches (for a line-oriented UI). Sub-line, character-level
+/// authorship from co-editing is representable — two authors on one line are two
+/// ranges that share that line number.
 #[derive(Clone, Debug)]
 pub struct BlameRange {
     pub line_start: u32,
     pub line_end: u32,
+    pub byte_start: u64,
+    pub byte_end: u64,
     pub actor: Actor,
     pub session: Option<i64>,
 }
@@ -356,7 +389,42 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Write `data` to `path`, attributing the change to `ctx`'s actor and
     /// updating per-line authorship. Creates the file if needed.
     pub async fn write_as(&self, ctx: WriteCtx, path: &str, data: &[u8]) -> Result<()> {
-        self.write_as_inner(ctx, path, data, None).await
+        self.write_as_inner(ctx, path, data, None, None).await
+    }
+
+    /// Write `data`, attributing byte spans to explicit `(actor_id, session_id,
+    /// byte_len)` authors rather than deriving authorship with the [`diff_spans`]
+    /// heuristic. This is the CRDT/editor-authoritative path (roadmap M8): a
+    /// co-edited document knows each character run's true author, so a checkpoint
+    /// lands losslessly — sub-line and interleaved authorship is preserved exactly,
+    /// which the line diff cannot recover across moves, duplication, or in-line
+    /// edits (audit #34 M10).
+    ///
+    /// `ctx` is the actor performing the write (recorded in the op-log as the
+    /// checkpoint author); `spans` drives the blame index and its `byte_len`s must
+    /// sum to `data.len()` (contiguous, in order). The explicit map replaces prior
+    /// authorship wholesale. Requires UTF-8 text.
+    pub async fn write_as_blamed(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        data: &[u8],
+        spans: &[(i64, i64, u64)],
+    ) -> Result<()> {
+        if !is_text(data) {
+            return Err(OrigoFSError::InvalidArgument(
+                "write_as_blamed requires UTF-8 text".into(),
+            ));
+        }
+        let covered: u64 = spans.iter().map(|&(_, _, len)| len).sum();
+        if covered != data.len() as u64 {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "write_as_blamed: spans cover {covered} bytes for {}-byte content",
+                data.len()
+            )));
+        }
+        self.write_as_inner(ctx, path, data, None, Some(BlameMap::from_spans(spans)))
+            .await
     }
 
     /// Like [`write_as`](Self::write_as), but applies the write only if `path`'s
@@ -371,7 +439,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         data: &[u8],
         expected: Option<Hash>,
     ) -> Result<()> {
-        self.write_as_inner(ctx, path, data, Some(expected)).await
+        self.write_as_inner(ctx, path, data, Some(expected), None)
+            .await
     }
 
     async fn write_as_inner(
@@ -380,6 +449,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         path: &str,
         data: &[u8],
         expect: Option<Option<Hash>>,
+        blame_override: Option<BlameMap>,
     ) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
@@ -401,8 +471,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             let existing = self.lookup_file(parent, name, path).await?;
 
             // Prior content + authorship (reads, before the txn). A new file
-            // starts from empty bytes and no authorship.
-            let (pre_hash, old_bytes, old_authors) = match existing {
+            // starts from empty bytes and an empty authorship map.
+            let (pre_hash, old_bytes, old_map) = match existing {
                 Some(ino) => {
                     let inode = self
                         .meta
@@ -416,26 +486,30 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                     };
                     // Prior authorship comes from the *content* the inode points
                     // at, so it survives checkout/merge and never desyncs (M9).
-                    let authors = match &pre {
+                    let map = match &pre {
                         Some(h) => match self.meta.get_blob_blame(h).await? {
-                            Some(s) => BlameMap::decode(&s).per_line(),
-                            None => Vec::new(),
+                            Some(s) => BlameMap::decode(&s),
+                            None => BlameMap::default(),
                         },
-                        None => Vec::new(),
+                        None => BlameMap::default(),
                     };
-                    (pre, bytes, authors)
+                    (pre, bytes, map)
                 }
-                None => (None, Vec::new(), Vec::new()),
+                None => (None, Vec::new(), BlameMap::default()),
             };
 
-            // Compute the new line authorship against whatever is there now.
-            let blame = if is_text(&old_bytes) && is_text(data) {
-                let new_authors =
-                    diff_authors(&old_bytes, data, &old_authors, (ctx.actor, ctx.sid()));
-                BlameMap::from_per_line(&new_authors)
+            // Compute the new byte-range authorship. An explicit map (the
+            // CRDT/editor path via `write_as_blamed`) is authoritative and replaces
+            // prior authorship wholesale; otherwise derive it against whatever is
+            // there now — move/whitespace-aware for text (carrying unchanged lines'
+            // exact sub-line spans), file-level for binary.
+            let blame = if let Some(explicit) = &blame_override {
+                explicit.clone()
+            } else if is_text(&old_bytes) && is_text(data) {
+                diff_spans(&old_bytes, &old_map, data, (ctx.actor, ctx.sid()))
             } else {
-                // Binary: file-level attribution (single unit).
-                BlameMap::from_per_line(&[(ctx.actor, ctx.sid())])
+                // Binary: file-level attribution (single span).
+                BlameMap::from_spans(&[(ctx.actor, ctx.sid(), data.len() as u64)])
             };
 
             let mut tx = self.meta.begin().await?;
@@ -502,7 +576,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     // --- queries ----------------------------------------------------------
 
-    /// Per-line-range authorship for `path`, distinguishing human vs agent.
+    /// Per-range authorship for `path`, distinguishing human vs agent. Each result
+    /// is a contiguous same-author byte span with its `[byte_start, byte_end)` and
+    /// the 1-based line range it touches — so a line co-authored at character
+    /// granularity (M8) yields one range per author instead of one collapsed line.
     pub async fn blame(&self, path: &str) -> Result<Vec<BlameRange>> {
         let ino = self.resolve(path).await?;
         // Blame lives with the content version the inode points at (M9); an empty
@@ -519,21 +596,40 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             Some(s) => BlameMap::decode(&s),
             None => return Ok(Vec::new()),
         };
+        // Map byte offsets to 1-based line numbers by walking the content once
+        // alongside the (in-order) runs: a byte is on line `1 + newlines before it`.
+        let bytes = self.read_body(&content).await?;
         let mut out = Vec::new();
-        let mut line: u32 = 1;
+        let mut pos: u64 = 0; // byte offset at the start of the current run
+        let mut line: u32 = 1; // line number at `pos`
         for r in &map.runs {
+            let start = pos;
+            let end = pos + r.len;
+            let slice = &bytes[start as usize..end as usize];
+            // `line_end` is the line of the run's last byte (end-exclusive, so we
+            // count newlines strictly before that final byte).
+            let newlines_before_last = slice
+                .split_last()
+                .map(|(_, head)| head.iter().filter(|&&b| b == b'\n').count())
+                .unwrap_or(0) as u32;
+            let line_start = line;
+            let line_end = line_start + newlines_before_last;
+            line += slice.iter().filter(|&&b| b == b'\n').count() as u32;
+            pos = end;
+
             let actor = self
                 .meta
                 .get_actor(r.actor)
                 .await?
                 .ok_or_else(|| OrigoFSError::NotFound(format!("actor {}", r.actor)))?;
             out.push(BlameRange {
-                line_start: line,
-                line_end: line + r.lines - 1,
+                line_start,
+                line_end,
+                byte_start: start,
+                byte_end: end,
                 actor,
                 session: (r.session != 0).then_some(r.session),
             });
-            line += r.lines;
         }
         Ok(out)
     }
@@ -570,27 +666,37 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             let Some(map_s) = self.meta.get_blob_blame(&content_hash).await? else {
                 continue;
             };
-            let authors = BlameMap::decode(&map_s).per_line();
-            let Ok(current) =
-                std::str::from_utf8(&self.read_body(&content_hash).await?).map(str::to_owned)
-            else {
+            let map = BlameMap::decode(&map_s);
+            let bytes = self.read_body(&content_hash).await?;
+            let Ok(current) = std::str::from_utf8(&bytes).map(str::to_owned) else {
                 continue; // binary: skip line-revert
             };
-            let lines: Vec<&str> = split_lines(&current);
-            if lines.len() != authors.len() {
+            if map.total() != bytes.len() as u64 {
                 continue; // out of sync; skip conservatively
             }
 
+            // Drop each line the actor's session *solely* authored; keep every
+            // other line with its exact byte spans (a line co-authored at sub-line
+            // granularity is kept intact — byte-precise revert of interleaved
+            // co-edits is future work, #33).
             let mut kept_body = String::new();
-            let mut kept_authors: Vec<(i64, i64)> = Vec::new();
+            let mut kept_spans: Vec<(i64, i64, u64)> = Vec::new();
             let mut removed = false;
-            for (line, &(a, s)) in lines.iter().zip(authors.iter()) {
-                if a == actor_id && s == session_id {
-                    removed = true; // drop this line
+            let mut off: u64 = 0;
+            for line in split_lines(&current) {
+                let len = line.len() as u64;
+                let spans = map.slice(off, len);
+                let solely_target = !spans.is_empty()
+                    && spans
+                        .iter()
+                        .all(|&(a, s, _)| a == actor_id && s == session_id);
+                if solely_target {
+                    removed = true;
                 } else {
                     kept_body.push_str(line);
-                    kept_authors.push((a, s));
+                    kept_spans.extend(spans);
                 }
+                off += len;
             }
             if !removed {
                 continue;
@@ -602,7 +708,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             let mut tx = self.meta.begin().await?;
             tx.set_content(ino, mhash, size).await?;
             if let Some(h) = mhash {
-                tx.set_blob_blame(&h, &BlameMap::from_per_line(&kept_authors).encode())
+                tx.set_blob_blame(&h, &BlameMap::from_spans(&kept_spans).encode())
                     .await?;
             }
             tx.append_edit_op(EditOpInit {
@@ -632,60 +738,95 @@ fn split_lines(s: &str) -> Vec<&str> {
     s.split_inclusive('\n').collect()
 }
 
-/// Compute per-new-line authorship. Unchanged lines keep their prior author. A
-/// line that only *moved* or was re-indented keeps its author too: its
-/// whitespace-normalized content is matched against the lines deleted in the
-/// same diff, so a reorder or a pure re-indent isn't credited to the current
-/// writer (M10). Genuinely new lines are attributed to `new_author`.
-fn diff_authors(
-    old: &[u8],
-    new: &[u8],
-    old_authors: &[(i64, i64)],
-    new_author: (i64, i64),
-) -> Vec<(i64, i64)> {
+/// Derive byte-range authorship for `new` against `old` (whose authorship is
+/// `old_map`). Unchanged lines carry their prior spans verbatim — including
+/// sub-line, character-level authorship from a co-edited checkpoint. A line that
+/// only *moved* or was re-indented reclaims its origin author too: its
+/// whitespace-normalized content is matched against a line deleted in the same
+/// diff, so a reorder or a pure re-indent isn't credited to the current writer
+/// (M10). Genuinely new lines are attributed to `new_author`.
+fn diff_spans(old: &[u8], old_map: &BlameMap, new: &[u8], new_author: (i64, i64)) -> BlameMap {
     let old_s = std::str::from_utf8(old).unwrap_or("");
     let new_s = std::str::from_utf8(new).unwrap_or("");
     let diff = TextDiff::from_lines(old_s, new_s);
 
-    // Index the deleted lines by normalized content -> queue of their authors, so
-    // a matching inserted line (a move, or a whitespace-only change) reclaims the
-    // original author instead of being credited to the current writer.
-    let mut moved: HashMap<String, VecDeque<(i64, i64)>> = HashMap::new();
+    // Old lines with their byte offsets, so a matched old-line index maps to the
+    // exact byte span whose authorship we carry forward.
+    let old_lines: Vec<&str> = split_lines(old_s);
+    let mut old_offsets: Vec<u64> = Vec::with_capacity(old_lines.len());
+    let mut acc = 0u64;
+    for l in &old_lines {
+        old_offsets.push(acc);
+        acc += l.len() as u64;
+    }
+    let old_span = |i: usize| -> (u64, u64) { (old_offsets[i], old_lines[i].len() as u64) };
+    // Carry an old byte range's authorship into `len` new bytes, padding any part
+    // the old map didn't cover (e.g. the prior content was written unattributed)
+    // with the current writer — so a carried line always covers exactly `len`
+    // bytes and the map stays in lockstep with the content.
+    let carry = |start: u64, len: u64| -> Vec<(i64, i64, u64)> {
+        let mut v = old_map.slice(start, len);
+        let covered: u64 = v.iter().map(|&(_, _, l)| l).sum();
+        if covered < len {
+            v.push((new_author.0, new_author.1, len - covered));
+        }
+        v
+    };
+
+    // Deleted lines by normalized content -> queue of their old indices, so a
+    // matching inserted line reclaims that line's spans (a move / re-indent).
+    let mut moved: HashMap<String, VecDeque<usize>> = HashMap::new();
     for change in diff.iter_all_changes() {
         if change.tag() == ChangeTag::Delete
             && let Some(i) = change.old_index()
         {
-            let author = old_authors.get(i).copied().unwrap_or(new_author);
             moved
                 .entry(normalize_line(change.value()))
                 .or_default()
-                .push_back(author);
+                .push_back(i);
         }
     }
 
-    let mut out: Vec<(i64, i64)> = Vec::new();
+    let mut spans: Vec<(i64, i64, u64)> = Vec::new();
     for change in diff.iter_all_changes() {
         match change.tag() {
-            ChangeTag::Equal => {
-                let author = change
-                    .old_index()
-                    .and_then(|i| old_authors.get(i).copied())
-                    .unwrap_or(new_author);
-                out.push(author);
-            }
+            ChangeTag::Equal => match change.old_index() {
+                // Unchanged line: carry its exact prior spans.
+                Some(i) => {
+                    let (start, len) = old_span(i);
+                    spans.extend(carry(start, len));
+                }
+                None => spans.push((new_author.0, new_author.1, change.value().len() as u64)),
+            },
             ChangeTag::Insert => {
-                // A moved / re-indented line reclaims its author; a genuinely new
-                // line belongs to the current writer.
-                let author = moved
+                let blen = change.value().len() as u64;
+                match moved
                     .get_mut(&normalize_line(change.value()))
                     .and_then(|q| q.pop_front())
-                    .unwrap_or(new_author);
-                out.push(author);
+                {
+                    // Pure move (same bytes): carry the prior spans. Re-indent
+                    // (different bytes): keep the origin author over the new line.
+                    Some(i) => {
+                        let (start, len) = old_span(i);
+                        if len == blen {
+                            spans.extend(carry(start, len));
+                        } else {
+                            let (a, s) = old_map
+                                .slice(start, len)
+                                .first()
+                                .map(|&(a, s, _)| (a, s))
+                                .unwrap_or(new_author);
+                            spans.push((a, s, blen));
+                        }
+                    }
+                    // Genuinely new line: the current writer.
+                    None => spans.push((new_author.0, new_author.1, blen)),
+                }
             }
             ChangeTag::Delete => {}
         }
     }
-    out
+    BlameMap::from_spans(&spans)
 }
 
 /// A line's content with surrounding whitespace (and its newline) stripped, so a

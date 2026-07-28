@@ -11,6 +11,12 @@ getrandom = "0.2"
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 
+[features]
+# Opt-in CRDT co-editing (roadmap M8): re-exports `CoeditDoc` and the
+# `open_coedit` / `checkpoint_coedit` workspace methods, forwarding to the
+# `coedit`-gated engine surface in origofs-core.
+coedit = ["origofs-core/coedit"]
+
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["time"] }

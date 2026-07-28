@@ -48,6 +48,20 @@ jobs:
       - name: Test
         run: cargo test --workspace --no-fail-fast
 
+      # The opt-in `coedit` feature (yrs-backed CRDT co-editing, roadmap M8) is
+      # off by default for the core/sdk/api crates, so exercise it — clippy +
+      # tests — explicitly across each. (origofs-py enables it unconditionally, so
+      # the default workspace build already covers its compilation; its live
+      # co-editing is tested in the Python job.)
+      - name: Test coedit feature
+        run: |
+          cargo clippy -p origofs-core --features coedit --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features coedit --all-targets -- -D warnings
+          cargo clippy -p origofs-api --features coedit --all-targets -- -D warnings
+          cargo test -p origofs-core --features coedit --no-fail-fast
+          cargo test -p origofs-sdk --features coedit --no-fail-fast
+          cargo test -p origofs-api --features coedit --no-fail-fast
+
   python:
     name: Python bindings (maturin + pytest)
     runs-on: ubuntu-latest

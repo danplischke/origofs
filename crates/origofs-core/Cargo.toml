@@ -25,11 +25,23 @@ similar = "3.1.1"
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
 tokio-postgres = "0.7"
+# Opt-in CRDT co-editing (roadmap M8): a Yjs-in-Rust document whose per-span
+# authorship checkpoints through `write_as_blamed`. Gated so non-collab builds
+# don't pull it in.
+yrs = { version = "0.23", optional = true }
+
+[features]
+coedit = ["dep:yrs"]
 
 [dev-dependencies]
 criterion = "0.5.1"
 tempfile = "3.27.0"
 tokio-postgres = "0.7"
+# The coedit tests drive a *vanilla* Yjs client (a raw `yrs::Doc` + the stock
+# y-sync `DefaultProtocol`, no origofs authorship) against our server handler, to
+# prove an unmodified editor connects and is attributed server-side. Dev-only;
+# the library still pulls `yrs` in solely through the `coedit` feature.
+yrs = "0.23"
 
 [[bench]]
 name = "engine"

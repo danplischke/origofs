@@ -16,7 +16,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 origofs-core = { version = "0.1.0", path = "../origofs-core" }
-origofs-sdk = { version = "0.1.0", path = "../origofs-sdk" }
+# `coedit` is always on for the Python bindings: a wheel is one artifact, so live
+# co-editing (CoeditDoc + the y-sync surface) ships in every build rather than
+# hiding behind a Cargo feature a `pip install` couldn't select.
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk", features = ["coedit"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync"] }
 pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
 pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }

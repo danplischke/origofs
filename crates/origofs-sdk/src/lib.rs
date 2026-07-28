@@ -21,6 +21,8 @@ pub use origofs_core::{
     RebuildReport, S3Config, Suggestion, SuggestionContent, SuggestionInit, SuggestionStatus,
     TieredStore, ToolCallInit, VerifyingStore, VersioningMode, WriteCtx,
 };
+#[cfg(feature = "coedit")]
+pub use origofs_core::{CoeditDoc, CoeditRelayNote, CoeditRelaySub};
 
 type Meta = Arc<dyn MetadataStore>;
 type Content = Arc<dyn ContentStore>;
@@ -585,6 +587,25 @@ impl Workspace {
         Ok(())
     }
 
+    /// Attributed write with **explicit** byte-range authorship — the CRDT/editor
+    /// checkpoint path (roadmap M8). `spans` holds `(actor_id, session_id,
+    /// byte_len)` runs summing to `data.len()`, so co-edited content lands with
+    /// each collaborator's character-level spans attributed exactly (sub-line,
+    /// interleaved), bypassing the line-diff heuristic. `ctx` is the actor
+    /// performing the checkpoint (recorded on the op-log and the feed).
+    pub async fn write_as_blamed(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        data: &[u8],
+        spans: &[(i64, i64, u64)],
+    ) -> Result<()> {
+        self.fs.write_as_blamed(ctx, path, data, spans).await?;
+        self.emit("write", path, None, Some(ctx.actor), ctx.session)
+            .await;
+        Ok(())
+    }
+
     /// Propose an edit to `path` for human review instead of applying it. The
     /// bytes are stored now; the working tree changes only on accept. Returns
     /// the suggestion id. (Records a `suggest` event on the feed.)
@@ -684,6 +705,90 @@ impl Workspace {
                 "subscribe requires the Postgres backend; use watch() to poll".into(),
             )),
         }
+    }
+
+    /// Whether this workspace is backed by Postgres (multi-writer). The
+    /// Postgres-only features — the push `subscribe` feed and the cross-worker
+    /// co-edit relay — are available exactly when this is true.
+    pub fn is_postgres(&self) -> bool {
+        self.pg.is_some()
+    }
+
+    /// The Postgres store, or an error naming `op` as Postgres-only — the shared
+    /// gate for the multi-writer/multi-worker features (the co-edit relay).
+    #[cfg(feature = "coedit")]
+    fn require_pg(&self, op: &str) -> Result<&Arc<origofs_core::PostgresMetadataStore>> {
+        self.pg.as_ref().ok_or_else(|| {
+            OrigoFSError::InvalidArgument(format!(
+                "{op} requires the Postgres backend (multi-worker); a single-worker \
+                 deployment needs no cross-worker relay"
+            ))
+        })
+    }
+
+    /// Open a live co-editing document for `path` (roadmap M8): resume the CRDT
+    /// from its persisted sidecar if one exists, else promote the file's current
+    /// text into a fresh document attributed to `ctx`. Drive it over the Yjs wire
+    /// protocol with [`CoeditDoc::handle_sync`], then land it with
+    /// [`checkpoint_coedit`](Self::checkpoint_coedit). Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn open_coedit(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
+        self.fs.open_coedit(ctx, path).await
+    }
+
+    /// Checkpoint a live co-editing document into `path`, landing each
+    /// collaborator's exact character spans in the byte-range blame index and
+    /// persisting the CRDT sidecar so the session is durable and resumable. `ctx`
+    /// is the actor performing the checkpoint. Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn checkpoint_coedit(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditDoc,
+    ) -> Result<()> {
+        self.fs.checkpoint_coedit(ctx, path, doc).await
+    }
+
+    /// Ensure the cross-worker relay's backing table exists (idempotent). Call it
+    /// before a room starts accepting edits, so the first publish can't race the
+    /// table into existence. Requires the Postgres backend + the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn coedit_relay_init(&self) -> Result<()> {
+        self.require_pg("coedit_relay_init")?
+            .coedit_relay_init()
+            .await
+    }
+
+    /// Publish a co-editing update `delta` for `path` to the cross-worker relay,
+    /// tagged with this worker's `origin` id (so it can skip its own echo). Every
+    /// other worker hosting `path` applies it and fans it out to its sockets, so
+    /// replicas across workers converge. Requires the Postgres backend (a
+    /// single-worker deployment needs no relay); errors otherwise, like
+    /// [`subscribe`](Self::subscribe). Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn coedit_publish(&self, path: &str, origin: &str, delta: &[u8]) -> Result<()> {
+        self.require_pg("coedit_publish")?
+            .coedit_publish(path, origin, delta)
+            .await
+    }
+
+    /// Every relayed op currently held for `path` — for a worker that has just
+    /// started hosting `path` to replay and catch up to its peers' state (applying
+    /// is idempotent). Requires the Postgres backend + the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn coedit_replay(&self, path: &str) -> Result<Vec<CoeditRelayNote>> {
+        self.require_pg("coedit_replay")?.coedit_replay(path).await
+    }
+
+    /// Subscribe to the cross-worker co-editing relay: `recv()` on the returned
+    /// [`CoeditRelaySub`] yields every worker's update deltas in order. Requires
+    /// the Postgres backend + the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn coedit_subscribe(&self) -> Result<CoeditRelaySub> {
+        self.require_pg("coedit_subscribe")?
+            .coedit_subscribe()
+            .await
     }
 
     /// Record an arbitrary event on the change feed.

@@ -65,6 +65,73 @@ class Subscription:
     """A push subscription to the change feed (Postgres LISTEN/NOTIFY)."""
     async def recv(self) -> list[dict[str, Any]]: ...
 
+class CoeditSyncReply:
+    """The routing for one processed y-sync payload (see ``CoeditDoc.handle_sync``)."""
+    @property
+    def reply(self) -> bytes:
+        """Frames to send back to the originating connection (``b""`` if none)."""
+        ...
+    @property
+    def broadcast(self) -> bytes:
+        """Frames to fan out to the room's other connections (``b""`` if none)."""
+        ...
+
+class CoeditDoc:
+    """A live co-edited document (roadmap M8): a Yjs-compatible CRDT whose inserts
+    are attributed per byte range. Obtain a server-side room doc from
+    ``Workspace.open_coedit`` and drive it with the Yjs y-sync wire protocol via
+    ``handle_sync`` so an unmodified editor (PlateJS, ``y-websocket``) collaborates
+    directly; land it with ``Workspace.checkpoint_coedit``. Safe to share one
+    instance across many concurrent WebSocket handlers."""
+    def __init__(self) -> None:
+        """A fresh, empty document (for a Python-side agent or a test client)."""
+        ...
+    async def insert(self, ctx: WriteCtx, index: int, chunk: str) -> None:
+        """Insert ``chunk`` at character ``index`` (UTF-16 offset), attributed to ``ctx``."""
+        ...
+    async def remove(self, index: int, length: int) -> None:
+        """Remove ``length`` characters starting at ``index`` (UTF-16 offsets)."""
+        ...
+    async def sync_start(self) -> bytes:
+        """The y-sync ``SyncStep1`` frame to greet a new client with."""
+        ...
+    async def handle_sync(self, ctx: WriteCtx, data: bytes) -> CoeditSyncReply:
+        """Handle one inbound y-sync payload from a connection authenticated as
+        ``ctx``; its content is attributed to ``ctx`` server-side."""
+        ...
+    async def apply_relayed(self, frame: bytes) -> None:
+        """Merge a y-sync frame relayed from another worker (already attributed by
+        its origin) without re-attribution — the cross-worker relay's apply path.
+        Idempotent."""
+        ...
+    async def text(self) -> str:
+        """The full current text."""
+        ...
+
+class CoeditRelayNote:
+    """One relayed co-editing update from another worker (see
+    ``Workspace.coedit_subscribe`` / ``coedit_replay``)."""
+    @property
+    def seq(self) -> int: ...
+    @property
+    def origin(self) -> str:
+        """The publishing worker's id (skip your own)."""
+        ...
+    @property
+    def path(self) -> str: ...
+    @property
+    def delta(self) -> bytes:
+        """The update payload (a y-sync frame) to feed ``CoeditDoc.apply_relayed``."""
+        ...
+
+class CoeditRelaySub:
+    """A live subscription to the cross-worker co-editing relay (Postgres
+    LISTEN/NOTIFY). Returned by ``Workspace.coedit_subscribe``."""
+    async def recv(self) -> list[CoeditRelayNote]:
+        """Block until peers publish, then return their updates in ``seq`` order
+        (``[]`` once the connection closes)."""
+        ...
+
 class Workspace:
     # --- constructors (async) ---
     @staticmethod
@@ -132,7 +199,19 @@ class Workspace:
     async def find_or_create_human(self, auth_subject: str, display_name: str) -> int: ...
     async def find_or_create_agent(self, auth_subject: str, display_name: str, model: str, controller: Optional[int] = None) -> int: ...
     async def create_session(self, actor_id: int, client: Optional[str] = None) -> int: ...
+    # Each blame span is a dict with `byte_start`/`byte_end` (the ground-truth byte
+    # range), the derived `line_start`/`line_end`, `session`, and `actor`.
     async def blame(self, path: str) -> list[dict[str, Any]]: ...
+
+    # --- live co-editing (M8) ---
+    async def open_coedit(self, ctx: WriteCtx, path: str) -> CoeditDoc: ...
+    async def checkpoint_coedit(self, ctx: WriteCtx, path: str, doc: CoeditDoc) -> None: ...
+    # Cross-worker relay (Postgres-backed workspaces). `is_postgres` gates it.
+    def is_postgres(self) -> bool: ...
+    async def coedit_relay_init(self) -> None: ...
+    async def coedit_publish(self, path: str, origin: str, delta: bytes) -> None: ...
+    async def coedit_replay(self, path: str) -> list[CoeditRelayNote]: ...
+    async def coedit_subscribe(self) -> CoeditRelaySub: ...
 
     # --- live collaboration ---
     async def watch(self, after_seq: int = 0) -> list[dict[str, Any]]: ...

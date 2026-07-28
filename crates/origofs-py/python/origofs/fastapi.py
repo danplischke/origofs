@@ -3,9 +3,11 @@
 origofs deliberately has no built-in authentication: an attributed write is only as
 trustworthy as the identity behind it, and *you* own that. This module gives you
 every workspace endpoint (files, blame, versioning, diff, suggestions, the change
-feed, presence) wired up, and lets you plug in your own auth as an ordinary
-FastAPI dependency that resolves a request to the actor it should be attributed
-to.
+feed, presence) wired up — plus a live co-editing WebSocket (``/coedit/{path}``)
+that speaks the Yjs y-sync protocol, so an unmodified editor (PlateJS,
+``y-websocket``) collaborates in real time — and lets you plug in your own auth as
+an ordinary FastAPI dependency that resolves a request to the actor it should be
+attributed to.
 
     from fastapi import FastAPI, Header, HTTPException
     import origofs
@@ -30,16 +32,30 @@ Requires FastAPI: ``pip install "origofs[fastapi]"``.
 """
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Optional, Union
+import asyncio
+import uuid
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union
 
 try:
-    from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
+    from fastapi import (
+        APIRouter,
+        Body,
+        Depends,
+        HTTPException,
+        Query,
+        Response,
+        WebSocket,
+        WebSocketDisconnect,
+    )
     from fastapi.responses import PlainTextResponse
     from pydantic import BaseModel, Field
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
         "origofs.fastapi requires FastAPI. Install it with: pip install \"origofs[fastapi]\""
     ) from exc
+
+if TYPE_CHECKING:  # import only for type checkers; the module loads without the ext
+    import origofs
 
 # A dependency that resolves a request to the WriteCtx a change is attributed to.
 # It may be sync or async and may declare its own FastAPI dependencies/params.
@@ -123,6 +139,151 @@ def _abs(path: str) -> str:
     return path if path.startswith("/") else "/" + path
 
 
+# --- live co-editing rooms --------------------------------------------------
+
+
+class _Conn:
+    """One connected socket and its **own** outbound queue. Every byte written to
+    a socket goes through its queue and single writer task, so a peer's fan-out
+    never races the socket's own replies."""
+
+    __slots__ = ("socket", "out")
+
+    def __init__(self, socket: WebSocket) -> None:
+        self.socket: WebSocket = socket
+        self.out: "asyncio.Queue[bytes]" = asyncio.Queue()
+
+
+class _Room:
+    """One live document shared by every socket editing it: the attributed CRDT
+    plus the set of connected sockets to fan edits out to."""
+
+    __slots__ = ("doc", "conns")
+
+    def __init__(self, doc: "origofs.CoeditDoc") -> None:
+        self.doc: "origofs.CoeditDoc" = doc
+        self.conns: set[_Conn] = set()
+
+    def fanout(self, sender: Optional[_Conn], frame: bytes) -> None:
+        """Queue `frame` for every connection except `sender` (pass ``None`` to
+        reach all, e.g. for a frame relayed from another worker)."""
+        for conn in self.conns:
+            if conn is not sender:
+                conn.out.put_nowait(frame)
+
+
+async def _finalize(writer_task: "asyncio.Task[None]", rooms: "_Rooms", path: str, ctx: Any, conn: "_Conn") -> None:
+    """Tear a connection down: stop its writer and leave the room (which
+    checkpoints on the last leave). Run this under :func:`asyncio.shield` — the
+    socket closing tends to cancel the endpoint task, and the checkpoint must still
+    complete."""
+    writer_task.cancel()
+    try:
+        await writer_task
+    except BaseException:  # noqa: BLE001 - already-cancelled writer; nothing to do
+        pass
+    await rooms.leave(path, ctx, conn)
+
+
+class _Rooms:
+    """Per-process registry of live co-editing rooms, keyed by path.
+
+    A room is created on the first join (opening the document) and, when the last
+    socket leaves, checkpointed into the byte-range blame index and evicted. This
+    is the shared, long-lived state that makes co-editing efficient: all sockets on
+    one path share one CRDT, instead of each request opening its own view.
+
+    The registry is per **process**. Under a single worker that is the whole story.
+    Across multiple workers, when the workspace is **Postgres**-backed, rooms are
+    bridged over the cross-worker relay: every attributed delta is published, and a
+    background task applies peers' deltas to this worker's rooms and fans them out
+    to its sockets, so all replicas converge. A joining room replays recent ops to
+    catch up. On SQLite (single-writer) the relay is simply off. Either way state
+    stays durable through the shared workspace's checkpoints.
+    """
+
+    def __init__(self, ws: Any) -> None:
+        self._ws = ws
+        self._rooms: dict[str, _Room] = {}
+        self._lock = asyncio.Lock()
+        # This worker's id, tagged on every published op to skip our own echo.
+        self._origin = uuid.uuid4().hex
+        self._relay = bool(getattr(ws, "is_postgres", lambda: False)())
+        self._drain_task: Optional["asyncio.Task[None]"] = None
+
+    def ensure_relay(self) -> None:
+        """Start the cross-worker drain task once (a no-op without Postgres, or
+        after the first call). Called on the first socket, in async context."""
+        if self._relay and self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._drain())
+
+    async def _drain(self) -> None:
+        """Apply peers' published deltas to the rooms this worker hosts and fan
+        them out to its sockets, until the relay connection closes."""
+        try:
+            sub = await self._ws.coedit_subscribe()
+        except Exception:
+            return  # not Postgres (or setup failed): single-worker mode
+        while True:
+            try:
+                notes = await sub.recv()
+            except Exception:
+                break
+            if not notes:
+                break  # connection closed
+            for note in notes:
+                if note.origin == self._origin:
+                    continue  # our own op — already applied + fanned out locally
+                room = self._rooms.get(note.path)
+                if room is None:
+                    continue  # not hosting this document here
+                try:
+                    await room.doc.apply_relayed(note.delta)
+                except Exception:
+                    continue
+                room.fanout(None, note.delta)  # to every local socket
+
+    async def publish(self, path: str, frame: bytes) -> None:
+        """Publish a local edit's delta to peer workers (a no-op without the relay)."""
+        if not self._relay:
+            return
+        try:
+            await self._ws.coedit_publish(path, self._origin, frame)
+        except Exception:
+            pass  # relay is best-effort; local editing continues regardless
+
+    async def join(self, path: str, ctx: Any, conn: _Conn) -> _Room:
+        async with self._lock:
+            room = self._rooms.get(path)
+            if room is None:
+                doc = await self._ws.open_coedit(ctx, path)
+                if self._relay:
+                    # Ensure the relay table exists, then replay recent ops so this
+                    # room catches up to peers before its first socket syncs.
+                    try:
+                        await self._ws.coedit_relay_init()
+                        for note in await self._ws.coedit_replay(path):
+                            await doc.apply_relayed(note.delta)
+                    except Exception:
+                        pass
+                room = _Room(doc)
+                self._rooms[path] = room
+            room.conns.add(conn)
+            return room
+
+    async def leave(self, path: str, ctx: Any, conn: _Conn) -> None:
+        async with self._lock:
+            room = self._rooms.get(path)
+            if room is None:
+                return
+            room.conns.discard(conn)
+            if not room.conns:
+                # Final checkpoint under the registry lock so a concurrent join
+                # can't fork a fresh room off a half-written sidecar.
+                await self._ws.checkpoint_coedit(ctx, path, room.doc)
+                del self._rooms[path]
+
+
 # --- router factory ---------------------------------------------------------
 
 
@@ -156,6 +317,9 @@ def build_router(
         router-wide ``dependencies=[...]``, …).
     """
     router = APIRouter(**router_kwargs)
+
+    # Shared, long-lived co-editing rooms — created once here, not per request.
+    rooms = _Rooms(ws)
 
     # Read-route gate: a dependency whose value we don't use. When no `reader`
     # is given, a no-op keeps the signature uniform.
@@ -301,5 +465,49 @@ def build_router(
             raise HTTPException(status_code=400, detail="presence requires a session (WriteCtx.session)")
         await _run(ws.touch(ctx.actor_id, ctx.session_id, _abs(req.path) if req.path else None))
         return {"ok": True}
+
+    # --- live co-editing (Yjs y-sync) ---------------------------------------
+
+    @router.websocket("/coedit/{path:path}")
+    async def coedit(websocket: WebSocket, path: str, ctx: Any = Depends(authn)) -> None:
+        """Live co-editing over the Yjs y-sync binary protocol.
+
+        Authentication reuses ``authn`` — the same dependency as every mutating
+        route — so it resolves the socket to the actor its edits are attributed to.
+        Since browsers can't set headers on a WebSocket, have ``authn`` read a
+        ``?token=`` query param (it can, like any FastAPI dependency); content is
+        attributed server-side regardless of what the client's bytes claim.
+        """
+        p = _abs(path)
+        await websocket.accept()
+        rooms.ensure_relay()  # idempotent; starts the cross-worker drain on first use
+        conn = _Conn(websocket)
+        room = await rooms.join(p, ctx, conn)
+
+        async def writer() -> None:
+            while True:
+                await websocket.send_bytes(await conn.out.get())
+
+        # Greet the client with SyncStep1, then let the writer own all sends.
+        conn.out.put_nowait(await room.doc.sync_start())
+        writer_task = asyncio.create_task(writer())
+        try:
+            while True:
+                data = await websocket.receive_bytes()
+                reply = await room.doc.handle_sync(ctx, data)
+                if reply.reply:
+                    conn.out.put_nowait(reply.reply)
+                if reply.broadcast:
+                    room.fanout(conn, reply.broadcast)  # local sockets
+                    await rooms.publish(p, reply.broadcast)  # peer workers
+        except WebSocketDisconnect:
+            pass
+        finally:
+            # Shielded so the last-leave checkpoint completes even though closing
+            # the socket cancels this endpoint task.
+            try:
+                await asyncio.shield(_finalize(writer_task, rooms, p, ctx, conn))
+            except asyncio.CancelledError:
+                pass
 
     return router
