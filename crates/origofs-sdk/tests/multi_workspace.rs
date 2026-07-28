@@ -573,6 +573,72 @@ async fn concurrent_writers_across_workspaces_dont_interfere() {
     }
 }
 
+/// Actual contention (not just the disjoint-workspace case above): many writers on
+/// the SAME workspace, plus a concurrent reader, all sharing one Postgres pool.
+/// This stresses the genuinely shared state — the global inode-id sequence and the
+/// dentry rows under one root — that the disjoint test never touches. Every distinct
+/// file must land exactly once, uncorrupted, with no lost update or deadlock.
+/// Self-skips unless `ORIGOFS_PG_TEST_URL` is set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_same_workspace_dont_corrupt() {
+    let Ok(dsn) = std::env::var("ORIGOFS_PG_TEST_URL") else {
+        eprintln!(
+            "skipping concurrent_writers_same_workspace_dont_corrupt: ORIGOFS_PG_TEST_URL unset"
+        );
+        return;
+    };
+    let ws = Workspace::open_pg(&dsn, std::sync::Arc::new(MemStore::new()))
+        .await
+        .unwrap();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let w = ws.workspace(&format!("cs_{nonce}")).await.unwrap();
+    let n = 16usize;
+
+    // N writers, each a distinct file (no same-name race), into the one workspace.
+    let mut tasks = Vec::new();
+    for i in 0..n {
+        let h = w.clone();
+        tasks.push(tokio::spawn(async move {
+            h.write(&format!("/f{i}.txt"), format!("v{i}").as_bytes())
+                .await
+                .unwrap();
+        }));
+    }
+    // A reader hammering the same root concurrently must never observe corruption
+    // or panic (it may see a partial set mid-flight — that's fine).
+    let hr = w.clone();
+    let reader = tokio::spawn(async move {
+        for _ in 0..40 {
+            let entries = hr.ls("/").await.unwrap();
+            assert!(
+                entries.len() <= n,
+                "reader saw more entries than were written"
+            );
+        }
+    });
+    for t in tasks {
+        t.await.unwrap();
+    }
+    reader.await.unwrap();
+
+    // Every write landed exactly once, with the right bytes.
+    assert_eq!(
+        w.ls("/").await.unwrap().len(),
+        n,
+        "same-workspace concurrent writers lost or duplicated a file"
+    );
+    for i in 0..n {
+        assert_eq!(
+            &w.read(&format!("/f{i}.txt")).await.unwrap()[..],
+            format!("v{i}").as_bytes(),
+            "/f{i}.txt content corrupted under contention"
+        );
+    }
+}
+
 /// Reaping presence in one workspace must not evict another workspace's rows.
 /// Regression: `reap_presence` issued a store-wide `DELETE FROM presence` with no
 /// `workspace_id` predicate, so one workspace's cleanup deleted every workspace's
@@ -702,6 +768,44 @@ async fn gc_preserves_other_workspaces_recovery_mirror() {
     assert_eq!(&alpha.read("/a.txt").await.unwrap()[..], b"in-alpha");
     let beta = ws.workspace("beta").await.unwrap();
     assert_eq!(&beta.read("/b.txt").await.unwrap()[..], b"in-beta");
+}
+
+/// The named data-loss path: content deduped across workspaces must survive a GC
+/// that runs after *one* workspace stops referencing it. GC marks the union of
+/// every workspace's reachability, so beta's copy of shared bytes is protected even
+/// when alpha drops its own reference — while a genuinely-orphaned object is swept.
+#[tokio::test]
+async fn gc_keeps_content_shared_across_workspaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let beta = ws.workspace("beta").await.unwrap();
+
+    // The SAME bytes in both workspaces dedup to ONE object in the shared CAS.
+    let shared = b"shared bytes that both workspaces hold and dedup to one object";
+    alpha.write("/a.txt", shared).await.unwrap();
+    beta.write("/b.txt", shared).await.unwrap();
+
+    // An object only alpha ever referenced, then orphaned — genuine sweep fodder so
+    // we know GC actually ran a sweep (not a no-op that trivially "preserves" beta).
+    alpha
+        .write("/tmp.txt", b"garbage only alpha ever referenced")
+        .await
+        .unwrap();
+    alpha.remove("/tmp.txt").await.unwrap();
+    // alpha also stops referencing the shared bytes; only beta still holds them.
+    alpha.remove("/a.txt").await.unwrap();
+
+    let stats = alpha.gc().await.unwrap();
+    assert!(
+        stats.deleted >= 1,
+        "gc should have swept alpha's orphaned object, else the test proves nothing"
+    );
+    // beta's copy of the shared content survived despite alpha dropping it and
+    // driving the collection.
+    assert_eq!(&beta.read("/b.txt").await.unwrap()[..], shared);
 }
 
 /// The sorted-by-insertion entry names directly under a workspace's root.

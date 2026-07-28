@@ -661,19 +661,8 @@ async fn build_workspaces(
     wss
 }
 
-/// Snapshot every workspace except `skip` — the per-op non-interference check: an
-/// op on `skip` must leave all the others identical.
-async fn snapshots_except(wss: &[SimFs], skip: usize) -> Vec<Snapshot> {
-    let mut out = Vec::new();
-    for (i, fs) in wss.iter().enumerate() {
-        if i != skip {
-            out.push(snapshot(fs).await);
-        }
-    }
-    out
-}
-
-/// Snapshot every workspace, in order.
+/// Snapshot every workspace, in order (tree + head; what content-recovery must
+/// reproduce). Used by the rebuild + determinism tests.
 async fn all_snapshots(wss: &[SimFs]) -> Vec<Snapshot> {
     let mut out = Vec::new();
     for fs in wss {
@@ -682,13 +671,85 @@ async fn all_snapshots(wss: &[SimFs]) -> Vec<Snapshot> {
     out
 }
 
-/// **Cross-workspace non-interference + GC safety.** Each op
-/// (write/remove/commit/branch/checkout) runs on a random workspace and must leave
-/// *every other* workspace identical — the store-wide `truncate` a checkout does,
-/// or a branch's ref write, must never reach another workspace. Then one `gc()`
-/// over the shared content must keep every workspace readable (the data-loss path)
-/// and be complete + idempotent. Branches make GC mark *every workspace's branches*,
-/// not just its working tree.
+/// The *full* observable per-workspace state a cross-workspace op must never
+/// disturb — not just files+head, but every ref/branch, every lock, every recorded
+/// conflict, and the versioning mode. `Snapshot` (tree+head) is deliberately narrow
+/// because it also has to round-trip through content on rebuild; non-interference
+/// has no such constraint, so it checks *everything* a leak could touch.
+#[derive(Debug, PartialEq, Eq)]
+struct FullState {
+    tree: BTreeMap<String, String>,
+    refs: BTreeMap<String, String>,
+    locks: BTreeMap<String, String>,
+    conflicts: BTreeMap<String, String>,
+    versioning: String,
+}
+
+async fn full_state(fs: &SimFs) -> FullState {
+    let mut tree = BTreeMap::new();
+    for &p in PATHS {
+        if let Ok(inode) = fs.stat(p).await {
+            let v = inode
+                .content
+                .map(|h| h.to_hex())
+                .unwrap_or_else(|| "<empty>".to_string());
+            tree.insert(p.to_string(), v);
+        }
+    }
+    let refs = fs
+        .list_branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(n, h)| (n, h.to_hex()))
+        .collect();
+    let locks = fs
+        .locks()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(p, o, _)| (p, o))
+        .collect();
+    let conflicts = fs.conflicts().await.unwrap().into_iter().collect();
+    let versioning = format!("{:?}", fs.versioning_mode().await.unwrap());
+    FullState {
+        tree,
+        refs,
+        locks,
+        conflicts,
+        versioning,
+    }
+}
+
+/// The full state of every workspace except `skip` — the per-op non-interference
+/// check: an op on `skip` must leave all the others byte-identical.
+async fn full_states_except(wss: &[SimFs], skip: usize) -> Vec<FullState> {
+    let mut out = Vec::new();
+    for (i, fs) in wss.iter().enumerate() {
+        if i != skip {
+            out.push(full_state(fs).await);
+        }
+    }
+    out
+}
+
+/// The full state of every workspace, in order.
+async fn all_full_states(wss: &[SimFs]) -> Vec<FullState> {
+    let mut out = Vec::new();
+    for fs in wss {
+        out.push(full_state(fs).await);
+    }
+    out
+}
+
+/// **Cross-workspace non-interference + GC safety.** Each op (write / remove /
+/// commit / branch / checkout / lock / unlock) runs on a random workspace and must
+/// leave *every other* workspace's **full state** identical — not just its files,
+/// but its branches, its locks, its conflicts, and its versioning mode. A store-wide
+/// `truncate` from a checkout, a leaked ref write, or an unscoped lock would all
+/// surface here. Then one `gc()` over the shared content must keep every workspace
+/// readable (the data-loss path), leave every workspace's full state untouched, and
+/// be complete + idempotent.
 #[tokio::test]
 async fn gc_and_isolation_hold_across_workspaces() {
     for seed in 0..32u64 {
@@ -702,8 +763,11 @@ async fn gc_and_isolation_hold_across_workspaces() {
 
         for _ in 0..(16 + rng.below(30)) {
             let w = rng.below(n_ws as u64) as usize;
-            let before = snapshots_except(&wss, w).await;
-            match rng.below(12) {
+            // Lock owners are tagged with the workspace index, so a lock leaking into
+            // another workspace's `locks()` is not just visible but attributable.
+            let owner = format!("owner{w}");
+            let before = full_states_except(&wss, w).await;
+            match rng.below(16) {
                 0..=6 => {
                     let path = PATHS[rng.below(PATHS.len() as u64) as usize];
                     let len = 1 + rng.below(4096) as usize;
@@ -724,7 +788,7 @@ async fn gc_and_isolation_hold_across_workspaces() {
                         let _ = wss[w].create_branch(&format!("b{branch_seq}")).await;
                     }
                 }
-                _ => {
+                11..=12 => {
                     // Check out a random existing branch of w — exercises the scoped
                     // truncate/materialize, which must not touch other workspaces.
                     let branches = wss[w].list_branches().await.unwrap();
@@ -735,19 +799,29 @@ async fn gc_and_isolation_hold_across_workspaces() {
                         let _ = wss[w].checkout(&b).await;
                     }
                 }
+                13..=14 => {
+                    // Lock a random path (per-workspace lock space, V11).
+                    let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+                    let _ = wss[w].lock(path, &owner).await;
+                }
+                _ => {
+                    // Release a lock this workspace may hold.
+                    let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+                    let _ = wss[w].unlock(path, &owner).await;
+                }
             }
-            let after = snapshots_except(&wss, w).await;
+            let after = full_states_except(&wss, w).await;
             assert_eq!(
                 before, after,
-                "seed {seed}: an op on ws{w} changed another workspace"
+                "seed {seed}: an op on ws{w} changed another workspace's full state"
             );
         }
 
-        // GC safety: it may not change any workspace's observable state, and every
-        // file that still stats must still read (its content wasn't swept).
-        let pre = all_snapshots(&wss).await;
+        // GC safety: it may not change any workspace's full observable state, and
+        // every file that still stats must still read (its content wasn't swept).
+        let pre = all_full_states(&wss).await;
         let stats = wss[0].gc().await.unwrap();
-        let post = all_snapshots(&wss).await;
+        let post = all_full_states(&wss).await;
         assert_eq!(pre, post, "seed {seed}: gc changed a workspace's state");
         for (w, fs) in wss.iter().enumerate() {
             for &p in PATHS {
