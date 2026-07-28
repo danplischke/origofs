@@ -16,6 +16,14 @@ dynamic = ["version"]
 [project.optional-dependencies]
 # The `origofs.fastapi` router integration (and the examples under examples/).
 fastapi = ["fastapi", "uvicorn"]
+# The `origofs.fsspec` filesystem (pandas/Dask/PyArrow/Zarr can read origofs paths).
+fsspec = ["fsspec>=2023.9.0"]
+
+# Register the "origofs://" protocol so `fsspec.filesystem("origofs", ...)` and
+# `pandas.read_*("origofs://…", storage_options=…)` resolve to our filesystem
+# without an explicit `import origofs.fsspec` first.
+[project.entry-points."fsspec.specs"]
+origofs = "origofs.fsspec:OrigoFileSystem"
 
 [tool.maturin]
 # Build the importable extension module (pyo3 resolves libpython at import).
