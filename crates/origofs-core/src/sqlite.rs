@@ -1262,4 +1262,99 @@ mod tests {
             .await
             .unwrap();
     }
+
+    // The multi-workspace migrations (V11 rebuilds ref/config/conflict/file_lock,
+    // V13 rebuilds blob_blame; V11/V12 ADD COLUMN the rest) must PRESERVE existing
+    // data on a real upgrade of a populated store — every row must survive and land
+    // in the `default` workspace (id 1), never be dropped by a bad copy. Simulate a
+    // store stopped at schema V10, fill its old-shape tables, then migrate.
+    #[tokio::test]
+    async fn upgrade_preserves_data_and_backfills_default_workspace() {
+        let store = SqliteMetadataStore::open_in_memory().unwrap();
+        {
+            let conn = store.lock();
+            // Bring a fresh DB to schema V10 by hand: apply each ≤V10 migration and
+            // record it, exactly as the runner would, but without V11+.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);",
+            )
+            .unwrap();
+            for m in MIGRATIONS.iter().filter(|m| m.version <= 10) {
+                conn.execute_batch(m.sqlite).unwrap();
+                conn.execute(
+                    "INSERT INTO schema_meta(version, applied_at) VALUES (?1, 0)",
+                    params![m.version],
+                )
+                .unwrap();
+            }
+            // Old-shape rows (no `workspace_id` column yet). Includes the root inode
+            // a real V10 store would already have, plus one of each table the
+            // migrations touch — especially the ones V11/V13 rebuild.
+            conn.execute_batch(
+                "INSERT INTO inode(ino, kind, mode, nlink, size, content_hash, mtime, ctime)
+                     VALUES (1, 'dir', 16877, 1, 0, NULL, 0, 0);
+                 INSERT INTO inode(ino, kind, mode, nlink, size, content_hash, mtime, ctime)
+                     VALUES (2, 'file', 33188, 1, 3, 'hash-x', 7, 7);
+                 INSERT INTO ref(name, value) VALUES ('refs/heads/main', 'commit-abc');
+                 INSERT INTO config(key, value) VALUES ('versioning', 'native');
+                 INSERT INTO conflict(path, kind) VALUES ('/c.txt', 'text');
+                 INSERT INTO file_lock(path, owner, acquired_at) VALUES ('/l.bin', 'bob', 42);
+                 INSERT INTO blob_blame(content_hash, runs) VALUES ('hash-x', 'blame-runs');
+                 INSERT INTO suggestion(actor_id, path, status, created_ts)
+                     VALUES (5, '/s.txt', 'pending', 9);",
+            )
+            .unwrap();
+        }
+        assert_eq!(store.schema_version().await.unwrap(), 10);
+
+        // Run the remaining migrations (V11–V13).
+        store.init().await.unwrap();
+        assert_eq!(
+            store.schema_version().await.unwrap(),
+            crate::latest_schema_version()
+        );
+
+        // Every row survived, now tagged into the default workspace (id 1).
+        let conn = store.lock();
+        let row = |sql: &str| -> (i64, String) {
+            conn.query_row(sql, [], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .unwrap()
+        };
+        // V11 rebuilds.
+        assert_eq!(
+            row("SELECT workspace_id, value FROM ref WHERE name='refs/heads/main'"),
+            (1, "commit-abc".into())
+        );
+        assert_eq!(
+            row("SELECT workspace_id, value FROM config WHERE key='versioning'"),
+            (1, "native".into())
+        );
+        assert_eq!(
+            row("SELECT workspace_id, kind FROM conflict WHERE path='/c.txt'"),
+            (1, "text".into())
+        );
+        assert_eq!(
+            row("SELECT workspace_id, owner FROM file_lock WHERE path='/l.bin'"),
+            (1, "bob".into())
+        );
+        // V13 rebuild.
+        assert_eq!(
+            row("SELECT workspace_id, runs FROM blob_blame WHERE content_hash='hash-x'"),
+            (1, "blame-runs".into())
+        );
+        // ADD-COLUMN tables backfill to 1 too.
+        let ws_of = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(ws_of("SELECT workspace_id FROM inode WHERE ino=2"), 1);
+        assert_eq!(
+            ws_of("SELECT workspace_id FROM suggestion WHERE path='/s.txt'"),
+            1
+        );
+        // And the default workspace registry row now exists.
+        let wname: String = conn
+            .query_row("SELECT name FROM workspace WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(wname, "default");
+    }
 }

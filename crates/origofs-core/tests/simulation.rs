@@ -661,92 +661,103 @@ async fn build_workspaces(
     wss
 }
 
-/// Compare a workspace's live tree against its ground truth: a missing live file
-/// means GC dropped it; an unexpected present file means an op leaked across the
-/// workspace boundary.
-async fn check_tree(
-    fs: &SimFs,
-    truth: &BTreeMap<String, Vec<u8>>,
-    seed: u64,
-    w: usize,
-    when: &str,
-) {
-    for &p in PATHS {
-        match (fs.read(p).await, truth.get(p)) {
-            (Ok(got), Some(want)) => assert_eq!(
-                &got[..],
-                &want[..],
-                "seed {seed} ws{w} {when}: {p} content mismatch"
-            ),
-            (Err(OrigoFSError::NotFound(_)), None) => {}
-            (Ok(_), None) => {
-                panic!("seed {seed} ws{w} {when}: {p} present but not in ground truth (leak?)")
-            }
-            (Err(OrigoFSError::NotFound(_)), Some(_)) => {
-                panic!("seed {seed} ws{w} {when}: {p} missing (gc dropped a live file?)")
-            }
-            (Err(e), _) => panic!("seed {seed} ws{w} {when}: {p} unexpected error {e}"),
+/// Snapshot every workspace except `skip` — the per-op non-interference check: an
+/// op on `skip` must leave all the others identical.
+async fn snapshots_except(wss: &[SimFs], skip: usize) -> Vec<Snapshot> {
+    let mut out = Vec::new();
+    for (i, fs) in wss.iter().enumerate() {
+        if i != skip {
+            out.push(snapshot(fs).await);
         }
     }
+    out
 }
 
-/// Drive seeded churn across 2–4 workspaces sharing one store, tracking each
-/// workspace's live content as ground truth. Returns (store, handles, truth).
-async fn run_multi_ws_sim(
-    seed: u64,
-) -> (
-    Arc<FaultyContentStore>,
-    Vec<SimFs>,
-    Vec<BTreeMap<String, Vec<u8>>>,
-) {
-    let mut rng = Rng::new(seed);
-    let store = Arc::new(FaultyContentStore::new(true, HashSet::new()));
-    let clock: Arc<dyn Clock> = Arc::new(SimClock::new(1_000_000 + seed as i64));
-    let base: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
-    let n_ws = 2 + rng.below(3) as usize; // 2..=4 workspaces
-    let wss = build_workspaces(&base, &store, &clock, n_ws).await;
-    let mut truth: Vec<BTreeMap<String, Vec<u8>>> = vec![BTreeMap::new(); n_ws];
-
-    for _ in 0..(12 + rng.below(30)) {
-        let w = rng.below(n_ws as u64) as usize;
-        let path = PATHS[rng.below(PATHS.len() as u64) as usize];
-        match rng.below(10) {
-            0..=6 => {
-                let len = 1 + rng.below(4096) as usize;
-                let data = rng.bytes(len);
-                wss[w].write(path, &data).await.unwrap();
-                truth[w].insert(path.to_string(), data);
-            }
-            7..=8 => {
-                let _ = wss[w].remove(path).await;
-                truth[w].remove(path);
-            }
-            _ => {
-                let _ = wss[w].commit("sim", "snap").await;
-            }
-        }
+/// Snapshot every workspace, in order.
+async fn all_snapshots(wss: &[SimFs]) -> Vec<Snapshot> {
+    let mut out = Vec::new();
+    for fs in wss {
+        out.push(snapshot(fs).await);
     }
-    (store, wss, truth)
+    out
 }
 
-/// GC over the shared content store must be **safe** and **complete** across
-/// workspaces: churn spread over several workspaces, then one `gc()` that may not
-/// drop any workspace's live content (the data-loss path), plus **non-interference**
-/// — no op in one workspace ever altered another's tree.
+/// **Cross-workspace non-interference + GC safety.** Each op
+/// (write/remove/commit/branch/checkout) runs on a random workspace and must leave
+/// *every other* workspace identical — the store-wide `truncate` a checkout does,
+/// or a branch's ref write, must never reach another workspace. Then one `gc()`
+/// over the shared content must keep every workspace readable (the data-loss path)
+/// and be complete + idempotent. Branches make GC mark *every workspace's branches*,
+/// not just its working tree.
 #[tokio::test]
 async fn gc_and_isolation_hold_across_workspaces() {
     for seed in 0..32u64 {
-        let (store, wss, truth) = run_multi_ws_sim(seed).await;
+        let mut rng = Rng::new(seed);
+        let store = Arc::new(FaultyContentStore::new(true, HashSet::new()));
+        let clock: Arc<dyn Clock> = Arc::new(SimClock::new(1_000_000 + seed as i64));
+        let base: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
+        let n_ws = 2 + rng.below(3) as usize; // 2..=4
+        let wss = build_workspaces(&base, &store, &clock, n_ws).await;
+        let mut branch_seq = 0u64;
 
-        // Non-interference: before collecting, every workspace equals its truth.
-        for (w, fs) in wss.iter().enumerate() {
-            check_tree(fs, &truth[w], seed, w, "pre-gc").await;
+        for _ in 0..(16 + rng.below(30)) {
+            let w = rng.below(n_ws as u64) as usize;
+            let before = snapshots_except(&wss, w).await;
+            match rng.below(12) {
+                0..=6 => {
+                    let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+                    let len = 1 + rng.below(4096) as usize;
+                    let data = rng.bytes(len);
+                    wss[w].write(path, &data).await.unwrap();
+                }
+                7 => {
+                    let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+                    let _ = wss[w].remove(path).await;
+                }
+                8..=9 => {
+                    let _ = wss[w].commit("sim", "snap").await;
+                }
+                10 => {
+                    // Branch at the current head (needs a commit).
+                    if wss[w].head_commit().await.ok().flatten().is_some() {
+                        branch_seq += 1;
+                        let _ = wss[w].create_branch(&format!("b{branch_seq}")).await;
+                    }
+                }
+                _ => {
+                    // Check out a random existing branch of w — exercises the scoped
+                    // truncate/materialize, which must not touch other workspaces.
+                    let branches = wss[w].list_branches().await.unwrap();
+                    if !branches.is_empty() {
+                        let b = branches[rng.below(branches.len() as u64) as usize]
+                            .0
+                            .clone();
+                        let _ = wss[w].checkout(&b).await;
+                    }
+                }
+            }
+            let after = snapshots_except(&wss, w).await;
+            assert_eq!(
+                before, after,
+                "seed {seed}: an op on ws{w} changed another workspace"
+            );
         }
 
-        // Safe: GC keeps every workspace's live content.
+        // GC safety: it may not change any workspace's observable state, and every
+        // file that still stats must still read (its content wasn't swept).
+        let pre = all_snapshots(&wss).await;
         let stats = wss[0].gc().await.unwrap();
+        let post = all_snapshots(&wss).await;
+        assert_eq!(pre, post, "seed {seed}: gc changed a workspace's state");
         for (w, fs) in wss.iter().enumerate() {
-            check_tree(fs, &truth[w], seed, w, "post-gc").await;
+            for &p in PATHS {
+                if fs.stat(p).await.is_ok() {
+                    assert!(
+                        fs.read(p).await.is_ok(),
+                        "seed {seed} ws{w}: gc dropped content for {p}"
+                    );
+                }
+            }
         }
         // Complete + idempotent over the shared store.
         assert_eq!(
@@ -762,13 +773,137 @@ async fn gc_and_isolation_hold_across_workspaces() {
     }
 }
 
+/// **Durability barrier across workspaces.** Attributed churn spread over several
+/// workspaces on a fault-injecting store, then a crash drops un-flushed writes: no
+/// *committed* reference in *any* workspace may dangle. Reading every path surfaces
+/// a lost committed body as `ContentMissing`, and one store-wide `gc()` mark loads
+/// every workspace's reachable objects.
+#[tokio::test]
+async fn durability_barrier_holds_across_workspaces() {
+    for seed in 0..32u64 {
+        let mut rng = Rng::new(seed);
+        let n_ops = 10 + rng.below(24) as usize;
+        let mut fail_flush_at = HashSet::new();
+        for i in 0..(n_ops as u64 * 2 + 4) {
+            if rng.below(100) < 15 {
+                fail_flush_at.insert(i);
+            }
+        }
+        let store = Arc::new(FaultyContentStore::new(true, fail_flush_at));
+        let clock: Arc<dyn Clock> = Arc::new(SimClock::new(1_000_000 + seed as i64));
+        let base: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
+        let n_ws = 2 + rng.below(3) as usize;
+        let wss = build_workspaces(&base, &store, &clock, n_ws).await;
+        let actor = wss[0].create_human("sim", None).await.unwrap();
+        let ctx = WriteCtx::actor(actor);
+        let crash_at: usize = 1 + rng.below(n_ops as u64) as usize;
+
+        for op_i in 0..n_ops {
+            if op_i == crash_at {
+                store.crash();
+            }
+            let w = rng.below(n_ws as u64) as usize;
+            let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+            match rng.below(10) {
+                0..=6 => {
+                    let len = 1 + rng.below(4096) as usize;
+                    let data = rng.bytes(len);
+                    let _ = wss[w].write_as(ctx, path, &data).await;
+                }
+                7..=8 => {
+                    let _ = wss[w].remove(path).await;
+                }
+                _ => {
+                    let _ = wss[w].commit("sim", "snap").await;
+                }
+            }
+        }
+
+        for (w, fs) in wss.iter().enumerate() {
+            for &p in PATHS {
+                match fs.read(p).await {
+                    Ok(_) | Err(OrigoFSError::NotFound(_)) => {}
+                    Err(e) => panic!("seed {seed} ws{w}: durability barrier violated on {p}: {e}"),
+                }
+            }
+        }
+        wss[0]
+            .gc()
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}: gc found a dangling reference: {e}"));
+    }
+}
+
+/// Recovery restores **every** workspace from the content store alone, across
+/// randomized multi-workspace histories: give each workspace committed history,
+/// then a fresh DB over the same content rebuilds every workspace's tree.
+#[tokio::test]
+async fn rebuild_round_trips_all_workspaces() {
+    for seed in 0..24u64 {
+        let mut rng = Rng::new(seed);
+        let store = Arc::new(FaultyContentStore::new(true, HashSet::new()));
+        let clock1: Arc<dyn Clock> = Arc::new(SimClock::new(1_000_000 + seed as i64));
+        let base1: Arc<dyn MetadataStore> =
+            Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
+        let n_ws = 2 + rng.below(3) as usize;
+        let wss = build_workspaces(&base1, &store, &clock1, n_ws).await;
+
+        // Give every workspace at least one commit (so each has a recoverable
+        // tagged mirror), then a few more seeded rounds; each round ends in a
+        // commit, so a workspace's working tree == its last commit.
+        for (i, fs) in wss.iter().enumerate() {
+            let len = 1 + rng.below(512) as usize;
+            let data = rng.bytes(len);
+            fs.write(PATHS[i % PATHS.len()], &data).await.unwrap();
+            fs.commit("sim", "init").await.unwrap();
+        }
+        for _ in 0..(2 + rng.below(5)) {
+            let w = rng.below(n_ws as u64) as usize;
+            for _ in 0..(1 + rng.below(3)) {
+                let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+                let len = 1 + rng.below(2048) as usize;
+                let data = rng.bytes(len);
+                wss[w].write(path, &data).await.unwrap();
+            }
+            wss[w].commit("sim", "round").await.unwrap();
+        }
+        let committed = all_snapshots(&wss).await;
+
+        // Catastrophe: a fresh DB over the SAME content store rebuilds every ws.
+        let clock2: Arc<dyn Clock> = Arc::new(SimClock::new(2_000_000 + seed as i64));
+        let base2: Arc<dyn MetadataStore> =
+            Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
+        let root2 = Fs::with_clock(base2.clone(), store.clone(), clock2);
+        root2.init().await.unwrap();
+        root2.rebuild_from_content().await.unwrap();
+
+        for (i, want) in committed.iter().enumerate() {
+            let fs = if i == 0 {
+                root2.clone()
+            } else {
+                let (id, root) = base2
+                    .lookup_workspace(&format!("ws{i}"))
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("seed {seed}: ws{i} not recovered"));
+                root2.rebind(base2.with_workspace(id), root)
+            };
+            assert_eq!(
+                &snapshot(&fs).await,
+                want,
+                "seed {seed}: workspace {i} not recovered to its committed state"
+            );
+        }
+    }
+}
+
 /// Determinism holds with multiple workspaces: the same seed reproduces every
 /// workspace's tree, including commit hashes (the clock seam).
 #[tokio::test]
 async fn multi_workspace_runs_are_reproducible() {
     for seed in [3u64, 11, 29, 77, 500] {
-        let (_s1, w1, _t1) = run_multi_ws_sim(seed).await;
-        let (_s2, w2, _t2) = run_multi_ws_sim(seed).await;
+        let (_s1, w1) = run_multi_ws_sim(seed).await;
+        let (_s2, w2) = run_multi_ws_sim(seed).await;
         assert_eq!(w1.len(), w2.len(), "seed {seed}: workspace count diverged");
         for (i, (a, b)) in w1.iter().zip(w2.iter()).enumerate() {
             assert_eq!(
@@ -778,4 +913,34 @@ async fn multi_workspace_runs_are_reproducible() {
             );
         }
     }
+}
+
+/// Drive seeded write/remove/commit churn across 2–4 workspaces sharing one store
+/// (the determinism driver). Returns (store, handles).
+async fn run_multi_ws_sim(seed: u64) -> (Arc<FaultyContentStore>, Vec<SimFs>) {
+    let mut rng = Rng::new(seed);
+    let store = Arc::new(FaultyContentStore::new(true, HashSet::new()));
+    let clock: Arc<dyn Clock> = Arc::new(SimClock::new(1_000_000 + seed as i64));
+    let base: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
+    let n_ws = 2 + rng.below(3) as usize; // 2..=4 workspaces
+    let wss = build_workspaces(&base, &store, &clock, n_ws).await;
+
+    for _ in 0..(12 + rng.below(30)) {
+        let w = rng.below(n_ws as u64) as usize;
+        let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+        match rng.below(10) {
+            0..=6 => {
+                let len = 1 + rng.below(4096) as usize;
+                let data = rng.bytes(len);
+                wss[w].write(path, &data).await.unwrap();
+            }
+            7..=8 => {
+                let _ = wss[w].remove(path).await;
+            }
+            _ => {
+                let _ = wss[w].commit("sim", "snap").await;
+            }
+        }
+    }
+    (store, wss)
 }

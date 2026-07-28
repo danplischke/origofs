@@ -4,7 +4,7 @@
 //! are shared. These tests pin the isolation, independent versioning, and
 //! persistence guarantees.
 
-use origofs_sdk::{MemStore, OrigoFSError, Workspace, WriteCtx};
+use origofs_sdk::{MemStore, OrigoFSError, VersioningMode, Workspace, WriteCtx};
 
 /// Files, directory listings, and reads are isolated per workspace, and each
 /// workspace roots at its own inode (only the `default` workspace is `INO_ROOT`).
@@ -365,6 +365,212 @@ async fn blame_is_workspace_isolated() {
         HashSet::from([author_b]),
         "beta blame must credit only author-b"
     );
+}
+
+/// Exclusive file locks (LFS-style) are per workspace (V11): the same path can be
+/// locked independently in two workspaces, and each sees only its own lock.
+#[tokio::test]
+async fn locks_are_workspace_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let beta = ws.workspace("beta").await.unwrap();
+
+    // alpha locks /shared.bin; beta locks the SAME path — not blocked (separate
+    // lock space).
+    assert!(alpha.lock("/shared.bin", "alice").await.unwrap());
+    assert!(
+        beta.lock("/shared.bin", "bob").await.unwrap(),
+        "beta's lock on the same path must not be blocked by alpha's"
+    );
+
+    // Each workspace sees only its own lock.
+    let names_owners = |v: Vec<(String, String, i64)>| -> Vec<(String, String)> {
+        v.into_iter().map(|(p, o, _)| (p, o)).collect()
+    };
+    assert_eq!(
+        names_owners(alpha.locks().await.unwrap()),
+        vec![("/shared.bin".to_string(), "alice".to_string())]
+    );
+    assert_eq!(
+        names_owners(beta.locks().await.unwrap()),
+        vec![("/shared.bin".to_string(), "bob".to_string())]
+    );
+
+    // Releasing alpha's lock leaves beta's intact.
+    assert!(alpha.unlock("/shared.bin", "alice").await.unwrap());
+    assert!(alpha.locks().await.unwrap().is_empty());
+    assert_eq!(beta.locks().await.unwrap().len(), 1);
+}
+
+/// Versioning mode is a per-workspace config (V11): one workspace can run `off`
+/// while another stays `native`.
+#[tokio::test]
+async fn versioning_mode_is_workspace_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let beta = ws.workspace("beta").await.unwrap();
+
+    // Both default to native; flip alpha to off.
+    alpha
+        .set_versioning_mode(VersioningMode::Off)
+        .await
+        .unwrap();
+    assert_eq!(alpha.versioning_mode().await.unwrap(), VersioningMode::Off);
+    // beta and the default workspace are unaffected.
+    assert_eq!(
+        beta.versioning_mode().await.unwrap(),
+        VersioningMode::Native
+    );
+    assert_eq!(ws.versioning_mode().await.unwrap(), VersioningMode::Native);
+}
+
+/// Presence is per workspace (V12): a session heartbeating in one workspace does
+/// not appear in another's presence list.
+#[tokio::test]
+async fn presence_is_workspace_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let beta = ws.workspace("beta").await.unwrap();
+    let actor = ws.create_human("worker", None).await.unwrap();
+    let session = alpha.create_session(actor, Some("cli")).await.unwrap();
+
+    alpha.touch(actor, session, Some("/wip.txt")).await.unwrap();
+
+    // alpha sees the presence; beta does not.
+    assert!(
+        alpha
+            .presence(3600)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.session_id == session)
+    );
+    assert!(
+        beta.presence(3600)
+            .await
+            .unwrap()
+            .iter()
+            .all(|p| p.session_id != session)
+    );
+}
+
+/// A merge conflict recorded in one workspace is invisible in another (the
+/// `conflict` table is per workspace, V11): building a conflicting merge in `alpha`
+/// leaves `beta`'s refs, tree, and (empty) conflict set intact.
+#[tokio::test]
+async fn merge_conflicts_are_workspace_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let beta = ws.workspace("beta").await.unwrap();
+
+    // beta does independent committed work.
+    beta.write("/b.txt", b"beta-content").await.unwrap();
+    beta.commit("t", "beta base").await.unwrap();
+
+    // alpha builds a conflicting merge: a base, then divergent edits to /f.txt on
+    // two branches.
+    alpha.write("/f.txt", b"base\n").await.unwrap();
+    alpha.commit("t", "base").await.unwrap();
+    alpha.create_branch("feature").await.unwrap();
+    alpha.write("/f.txt", b"main edit\n").await.unwrap();
+    alpha.commit("t", "main").await.unwrap();
+    alpha.checkout("feature").await.unwrap();
+    alpha.write("/f.txt", b"feature edit\n").await.unwrap();
+    alpha.commit("t", "feature").await.unwrap();
+    alpha.checkout("main").await.unwrap();
+    let outcome = alpha.merge_branch("feature", "t", "merge").await.unwrap();
+
+    // alpha recorded a conflict; beta sees none and is otherwise untouched.
+    assert!(
+        !alpha.conflicts().await.unwrap().is_empty(),
+        "alpha's merge should have conflicted, got {outcome:?}"
+    );
+    assert!(
+        beta.conflicts().await.unwrap().is_empty(),
+        "beta must not see alpha's merge conflict"
+    );
+    assert_eq!(&beta.read("/b.txt").await.unwrap()[..], b"beta-content");
+    let beta_branches: Vec<String> = beta
+        .list_branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(!beta_branches.contains(&"feature".to_string()));
+}
+
+/// The "one store, many workspaces" model under concurrent load on Postgres:
+/// writers on *different* workspaces sharing one database/pool must not interfere
+/// or deadlock — each workspace ends with exactly its own files. Self-skips unless
+/// `ORIGOFS_PG_TEST_URL` is set; uniquely-named workspaces avoid shared-DB clashes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_across_workspaces_dont_interfere() {
+    let Ok(dsn) = std::env::var("ORIGOFS_PG_TEST_URL") else {
+        eprintln!(
+            "skipping concurrent_writers_across_workspaces_dont_interfere: ORIGOFS_PG_TEST_URL unset"
+        );
+        return;
+    };
+    let ws = Workspace::open_pg(&dsn, std::sync::Arc::new(MemStore::new()))
+        .await
+        .unwrap();
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let n_ws = 6usize;
+    let files_per = 12usize;
+
+    // Open a handle per workspace up front (sequential create; concurrent writes).
+    let mut handles = Vec::new();
+    for i in 0..n_ws {
+        handles.push(ws.workspace(&format!("cw_{nonce}_{i}")).await.unwrap());
+    }
+
+    // Each task writes its own workspace concurrently.
+    let mut tasks = Vec::new();
+    for (i, h) in handles.iter().cloned().enumerate() {
+        tasks.push(tokio::spawn(async move {
+            for f in 0..files_per {
+                h.write(&format!("/f{f}.txt"), format!("ws{i}-file{f}").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    // Each workspace has exactly its own files, uncorrupted by the others.
+    for (i, h) in handles.iter().enumerate() {
+        assert_eq!(
+            h.ls("/").await.unwrap().len(),
+            files_per,
+            "ws{i}: wrong file count — cross-workspace interference"
+        );
+        for f in 0..files_per {
+            assert_eq!(
+                &h.read(&format!("/f{f}.txt")).await.unwrap()[..],
+                format!("ws{i}-file{f}").as_bytes(),
+                "ws{i}: /f{f}.txt content wrong"
+            );
+        }
+    }
 }
 
 /// The sorted-by-insertion entry names directly under a workspace's root.
