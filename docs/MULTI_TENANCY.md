@@ -13,6 +13,13 @@
 > layout `DESIGN.md` §5 sketched from the start. The `MetadataStore` / `ContentStore`
 > *traits* stay unchanged (the `workspace_id` is ambient on the concrete store handle,
 > §6); the schema gains the discriminator column and a per-workspace root inode.
+>
+> **Implementation status.** The **workspace layer (MT1) is implemented** — migration
+> V11 adds the `workspace` registry + `workspace_id`; the SQLite and Postgres backends
+> scope by it (via an ambient `for_workspace` handle); `Fs` roots at a per-workspace
+> inode; `Workspace::workspace(name)` / `workspaces()` open and list workspaces in one
+> store; and GC marks across all of them. See `crates/origofs-sdk/tests/multi_workspace.rs`.
+> The **tenant layer (MT2+) remains a concept** described below.
 
 ---
 
@@ -543,7 +550,7 @@ predicate-enforced and requires Postgres **RLS** as the backstop.
 | Milestone | Deliverable | Unlocks |
 |---|---|---|
 | **MT0 — Model & registry** | `TenantId`/`TenantRecord`/`TenantState`/`Quota`; `TenantRegistry` trait; the two-tier isolation ruling (structural tenant / predicate workspace) written down and tested | Vocabulary + control-plane data model; no hot-path change |
-| **MT1 — Workspaces in one store** | `workspace` registry table; `workspace_id` migration (non-breaking backfill to `default`); ambient-`workspace_id` store handle (trait unchanged); per-workspace root inode; per-request workspace routing; GC-across-workspaces | **Many workspaces per store, one DB to operate** — the `DESIGN.md` §5 layout, built |
+| **MT1 — Workspaces in one store** ✅ *implemented* | `workspace` registry table; `workspace_id` migration V11 (non-breaking backfill to `default`); ambient-`workspace_id` store handle (trait unchanged); per-workspace root inode; `Workspace::workspace(name)`/`workspaces()`; GC-across-workspaces | **Many workspaces per store, one DB to operate** — the `DESIGN.md` §5 layout, built |
 | **MT2 — Tenant silo runtime** | `TenantResolver` + `TenantRouter` in front of the HTTP API & MCP; store-per-tenant + per-tenant content namespace + per-tenant key; migration fan-out | **Many hard-isolated tenants, each holding many workspaces** |
 | **MT3 — Lifecycle & accounting** | provision / suspend / delete (drop store + crypto-shred); per-tenant GC; quotas, metering, pool cap + rate limit; per-tenant backup/restore | Operable as a service: onboarding, erasure, billing, noisy-neighbor safety |
 | **MT4 — Tenant-collapse tier (optional)** | pool multiple tenants into one store: `tenant_id` column + Postgres **RLS** (the MT1 mechanism, one level up); tenant-keyed convergent dedup | Very many small tenants per cluster without per-tenant store overhead |

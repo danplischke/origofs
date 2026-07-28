@@ -22,10 +22,15 @@ use async_trait::async_trait;
 use deadpool_postgres::{Manager, Object, Pool};
 use futures::StreamExt;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{AsyncMessage, NoTls, Row};
 
 const DIR_MODE: i64 = 0o040755;
+
+/// The workspace every store is bound to until re-scoped with `with_workspace`;
+/// its root is inode 1. Backfilled by migration V11 (`docs/MULTI_TENANCY.md`).
+const DEFAULT_WORKSPACE: i64 = 1;
 
 /// Advisory-lock key that serializes concurrent schema bootstraps (`init`).
 const MIGRATION_LOCK_KEY: i64 = 0x0af5_0000_dbdb;
@@ -45,6 +50,10 @@ pub struct PostgresMetadataStore {
     /// Kept so [`Self::subscribe`] can open a dedicated `LISTEN` connection
     /// (pooled connections can't surface async notifications).
     dsn: String,
+    /// The workspace this handle is bound to (default = 1). Workspace-scoped
+    /// statements stamp/filter by it; [`PostgresMetadataStore::with_workspace`]
+    /// rebinds a handle sharing this pool (`docs/MULTI_TENANCY.md`).
+    workspace_id: i64,
 }
 
 impl PostgresMetadataStore {
@@ -68,6 +77,7 @@ impl PostgresMetadataStore {
         Ok(Self {
             pool,
             dsn: dsn.to_string(),
+            workspace_id: DEFAULT_WORKSPACE,
         })
     }
 
@@ -510,6 +520,29 @@ fn row_to_inode(r: &Row) -> Result<Inode> {
     })
 }
 
+/// Clear only workspace `ws`'s working tree (checkout/merge/rebuild). Mirrors the
+/// SQLite helper: `dentry`/`symlink` carry no `workspace_id`, so they are cleared
+/// via inode ownership; the workspace's own root inode is kept.
+async fn truncate_workspace_tree_pg(c: &tokio_postgres::Client, ws: i64) -> Result<()> {
+    c.execute(
+        "DELETE FROM dentry WHERE parent_ino IN (SELECT ino FROM inode WHERE workspace_id = $1)",
+        &[&ws],
+    )
+    .await?;
+    c.execute(
+        "DELETE FROM symlink WHERE ino IN (SELECT ino FROM inode WHERE workspace_id = $1)",
+        &[&ws],
+    )
+    .await?;
+    c.execute(
+        "DELETE FROM inode WHERE workspace_id = $1
+           AND ino <> (SELECT root_ino FROM workspace WHERE id = $1)",
+        &[&ws],
+    )
+    .await?;
+    Ok(())
+}
+
 #[async_trait]
 impl MetadataStore for PostgresMetadataStore {
     async fn init(&self) -> Result<()> {
@@ -546,8 +579,8 @@ impl MetadataStore for PostgresMetadataStore {
         }
         // Root directory (ino=1), then advance the identity sequence past it.
         tx.execute(
-            "INSERT INTO inode(ino, kind, mode, nlink, size, content_hash, mtime, ctime)
-             VALUES (1, 'dir', $1, 1, 0, NULL, $2, $2) ON CONFLICT (ino) DO NOTHING",
+            "INSERT INTO inode(ino, workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+             VALUES (1, 1, 'dir', $1, 1, 0, NULL, $2, $2) ON CONFLICT (ino) DO NOTHING",
             &[&DIR_MODE, &now],
         )
         .await?;
@@ -579,7 +612,10 @@ impl MetadataStore for PostgresMetadataStore {
         // the pool only on commit or rollback.
         let obj = self.client().await?;
         obj.batch_execute("BEGIN").await?;
-        Ok(Box::new(PostgresTxn { obj: Some(obj) }))
+        Ok(Box::new(PostgresTxn {
+            obj: Some(obj),
+            workspace_id: self.workspace_id,
+        }))
     }
 
     async fn get_inode(&self, ino: Ino) -> Result<Option<Inode>> {
@@ -603,9 +639,9 @@ impl MetadataStore for PostgresMetadataStore {
         let mode = init.mode as i64;
         let row = c
             .query_one(
-                "INSERT INTO inode(kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES ($1, $2, 1, 0, NULL, $3, $3) RETURNING ino",
-                &[&init.kind.as_str(), &mode, &now],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4) RETURNING ino",
+                &[&self.workspace_id, &init.kind.as_str(), &mode, &now],
             )
             .await?;
         Ok(row.get(0))
@@ -739,7 +775,10 @@ impl MetadataStore for PostgresMetadataStore {
     async fn get_ref(&self, name: &str) -> Result<Option<String>> {
         let c = self.client().await?;
         let row = c
-            .query_opt("SELECT value FROM ref WHERE name = $1", &[&name])
+            .query_opt(
+                "SELECT value FROM ref WHERE workspace_id = $1 AND name = $2",
+                &[&self.workspace_id, &name],
+            )
             .await?;
         Ok(row.map(|r| r.get(0)))
     }
@@ -747,9 +786,9 @@ impl MetadataStore for PostgresMetadataStore {
     async fn set_ref(&self, name: &str, value: &str) -> Result<()> {
         let c = self.client().await?;
         c.execute(
-            "INSERT INTO ref(name, value) VALUES ($1, $2)
-             ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
-            &[&name, &value],
+            "INSERT INTO ref(workspace_id, name, value) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, name) DO UPDATE SET value = EXCLUDED.value",
+            &[&self.workspace_id, &name, &value],
         )
         .await?;
         Ok(())
@@ -760,15 +799,16 @@ impl MetadataStore for PostgresMetadataStore {
         let changed = match expect {
             None => {
                 c.execute(
-                    "INSERT INTO ref(name, value) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
-                    &[&name, &new],
+                    "INSERT INTO ref(workspace_id, name, value) VALUES ($1, $2, $3)
+                     ON CONFLICT (workspace_id, name) DO NOTHING",
+                    &[&self.workspace_id, &name, &new],
                 )
                 .await?
             }
             Some(v) => {
                 c.execute(
-                    "UPDATE ref SET value = $1 WHERE name = $2 AND value = $3",
-                    &[&new, &name, &v],
+                    "UPDATE ref SET value = $1 WHERE workspace_id = $2 AND name = $3 AND value = $4",
+                    &[&new, &self.workspace_id, &name, &v],
                 )
                 .await?
             }
@@ -778,15 +818,21 @@ impl MetadataStore for PostgresMetadataStore {
 
     async fn delete_ref(&self, name: &str) -> Result<()> {
         let c = self.client().await?;
-        c.execute("DELETE FROM ref WHERE name = $1", &[&name])
-            .await?;
+        c.execute(
+            "DELETE FROM ref WHERE workspace_id = $1 AND name = $2",
+            &[&self.workspace_id, &name],
+        )
+        .await?;
         Ok(())
     }
 
     async fn list_refs(&self) -> Result<Vec<(String, String)>> {
         let c = self.client().await?;
         let rows = c
-            .query("SELECT name, value FROM ref ORDER BY name", &[])
+            .query(
+                "SELECT name, value FROM ref WHERE workspace_id = $1 ORDER BY name",
+                &[&self.workspace_id],
+            )
             .await?;
         Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
     }
@@ -794,7 +840,10 @@ impl MetadataStore for PostgresMetadataStore {
     async fn get_config(&self, key: &str) -> Result<Option<String>> {
         let c = self.client().await?;
         let row = c
-            .query_opt("SELECT value FROM config WHERE key = $1", &[&key])
+            .query_opt(
+                "SELECT value FROM config WHERE workspace_id = $1 AND key = $2",
+                &[&self.workspace_id, &key],
+            )
             .await?;
         Ok(row.map(|r| r.get(0)))
     }
@@ -802,9 +851,9 @@ impl MetadataStore for PostgresMetadataStore {
     async fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let c = self.client().await?;
         c.execute(
-            "INSERT INTO config(key, value) VALUES ($1, $2)
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            &[&key, &value],
+            "INSERT INTO config(workspace_id, key, value) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, key) DO UPDATE SET value = EXCLUDED.value",
+            &[&self.workspace_id, &key, &value],
         )
         .await?;
         Ok(())
@@ -815,34 +864,94 @@ impl MetadataStore for PostgresMetadataStore {
         // One atomic upsert: create at 1, else increment the stored integer.
         let row = c
             .query_one(
-                "INSERT INTO config(key, value) VALUES ($1, '1')
-                 ON CONFLICT (key) DO UPDATE SET value = (config.value::bigint + 1)::text
+                "INSERT INTO config(workspace_id, key, value) VALUES ($1, $2, '1')
+                 ON CONFLICT (workspace_id, key) DO UPDATE SET value = (config.value::bigint + 1)::text
                  RETURNING value::bigint",
-                &[&key],
+                &[&self.workspace_id, &key],
             )
             .await?;
         Ok(row.get(0))
     }
 
-    async fn truncate_tree(&self) -> Result<()> {
-        let c = self.client().await?;
-        // Blame is keyed by content hash (blob_blame), not by inode, so it is
-        // deliberately not cleared here — a rematerialized tree points its inodes
-        // back at the same content and its blame comes with it.
-        c.batch_execute(
-            "DELETE FROM dentry; DELETE FROM symlink;
-             DELETE FROM inode WHERE ino <> 1;",
+    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore> {
+        Arc::new(PostgresMetadataStore {
+            pool: self.pool.clone(),
+            dsn: self.dsn.clone(),
+            workspace_id,
+        })
+    }
+
+    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)> {
+        let mut c = self.client().await?;
+        let now = now_secs();
+        let tx = c.transaction().await?;
+        // Reserve the row (fails on a duplicate name), give it its own root
+        // directory inode, then point the row at that inode — all atomic.
+        let id: i64 = match tx
+            .query_one(
+                "INSERT INTO workspace(name, root_ino, created_at) VALUES ($1, 0, $2) RETURNING id",
+                &[&name, &now],
+            )
+            .await
+        {
+            Ok(row) => row.get(0),
+            Err(e) if e.code() == Some(&SqlState::UNIQUE_VIOLATION) => {
+                return Err(OrigoFSError::AlreadyExists(format!("workspace {name}")));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mode = DIR_MODE;
+        let root_ino: i64 = tx
+            .query_one(
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+                 VALUES ($1, 'dir', $2, 1, 0, NULL, $3, $3) RETURNING ino",
+                &[&id, &mode, &now],
+            )
+            .await?
+            .get(0);
+        tx.execute(
+            "UPDATE workspace SET root_ino = $1 WHERE id = $2",
+            &[&root_ino, &id],
         )
         .await?;
+        tx.commit().await?;
+        Ok((id, root_ino))
+    }
+
+    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT id, root_ino FROM workspace WHERE name = $1",
+                &[&name],
+            )
+            .await?;
+        Ok(row.map(|r| (r.get(0), r.get(1))))
+    }
+
+    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>> {
+        let c = self.client().await?;
+        let rows = c
+            .query("SELECT id, name, root_ino FROM workspace ORDER BY id", &[])
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
+    }
+
+    async fn truncate_tree(&self) -> Result<()> {
+        let c = self.client().await?;
+        truncate_workspace_tree_pg(&c, self.workspace_id).await?;
         Ok(())
     }
 
     async fn set_conflict(&self, path: &str, kind: &str) -> Result<()> {
         let c = self.client().await?;
         c.execute(
-            "INSERT INTO conflict(path, kind) VALUES ($1, $2)
-             ON CONFLICT (path) DO UPDATE SET kind = EXCLUDED.kind",
-            &[&path, &kind],
+            "INSERT INTO conflict(workspace_id, path, kind) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, path) DO UPDATE SET kind = EXCLUDED.kind",
+            &[&self.workspace_id, &path, &kind],
         )
         .await?;
         Ok(())
@@ -851,14 +960,21 @@ impl MetadataStore for PostgresMetadataStore {
     async fn list_conflicts(&self) -> Result<Vec<(String, String)>> {
         let c = self.client().await?;
         let rows = c
-            .query("SELECT path, kind FROM conflict ORDER BY path", &[])
+            .query(
+                "SELECT path, kind FROM conflict WHERE workspace_id = $1 ORDER BY path",
+                &[&self.workspace_id],
+            )
             .await?;
         Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
     async fn clear_conflicts(&self) -> Result<()> {
         let c = self.client().await?;
-        c.execute("DELETE FROM conflict", &[]).await?;
+        c.execute(
+            "DELETE FROM conflict WHERE workspace_id = $1",
+            &[&self.workspace_id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -866,9 +982,9 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let changed = c
             .execute(
-                "INSERT INTO file_lock(path, owner, acquired_at) VALUES ($1, $2, $3)
-                 ON CONFLICT (path) DO NOTHING",
-                &[&path, &owner, &at],
+                "INSERT INTO file_lock(workspace_id, path, owner, acquired_at) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (workspace_id, path) DO NOTHING",
+                &[&self.workspace_id, &path, &owner, &at],
             )
             .await?;
         Ok(changed == 1)
@@ -878,8 +994,8 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let changed = c
             .execute(
-                "DELETE FROM file_lock WHERE path = $1 AND owner = $2",
-                &[&path, &owner],
+                "DELETE FROM file_lock WHERE workspace_id = $1 AND path = $2 AND owner = $3",
+                &[&self.workspace_id, &path, &owner],
             )
             .await?;
         Ok(changed == 1)
@@ -889,8 +1005,8 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let rows = c
             .query(
-                "SELECT path, owner, acquired_at FROM file_lock ORDER BY path",
-                &[],
+                "SELECT path, owner, acquired_at FROM file_lock WHERE workspace_id = $1 ORDER BY path",
+                &[&self.workspace_id],
             )
             .await?;
         Ok(rows
@@ -1297,6 +1413,8 @@ impl MetadataStore for PostgresMetadataStore {
 struct PostgresTxn {
     /// `Some` while open; `commit`/`Drop` take it to close exactly once.
     obj: Option<Object>,
+    /// The workspace this txn is scoped to (inherited from the store handle).
+    workspace_id: i64,
 }
 
 impl PostgresTxn {
@@ -1310,12 +1428,13 @@ impl MetaTxn for PostgresTxn {
     async fn create_inode(&mut self, init: InodeInit) -> Result<Ino> {
         let now = now_secs();
         let mode = init.mode as i64;
+        let ws = self.workspace_id;
         let row = self
             .conn()
             .query_one(
-                "INSERT INTO inode(kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES ($1, $2, 1, 0, NULL, $3, $3) RETURNING ino",
-                &[&init.kind.as_str(), &mode, &now],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4) RETURNING ino",
+                &[&ws, &init.kind.as_str(), &mode, &now],
             )
             .await?;
         Ok(row.get(0))
@@ -1444,12 +1563,8 @@ impl MetaTxn for PostgresTxn {
 
     async fn truncate_tree(&mut self) -> Result<()> {
         // Same as MetadataStore::truncate_tree, staged in this transaction.
-        self.conn()
-            .batch_execute(
-                "DELETE FROM dentry; DELETE FROM symlink;
-                 DELETE FROM inode WHERE ino <> 1;",
-            )
-            .await?;
+        let ws = self.workspace_id;
+        truncate_workspace_tree_pg(self.conn(), ws).await?;
         Ok(())
     }
 

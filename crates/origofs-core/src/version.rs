@@ -16,7 +16,7 @@ use crate::objectgraph::{
     Commit, CommitInfo, DiffEntry, DiffStatus, RefSnapshot, Tree, TreeEntry, TreeKind,
     VersioningMode,
 };
-use crate::types::{FileKind, Hash, INO_ROOT, Ino, InodeInit};
+use crate::types::{FileKind, Hash, Ino, InodeInit};
 use async_recursion::async_recursion;
 use std::collections::BTreeMap;
 
@@ -149,7 +149,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             parents.push(mh);
         }
 
-        let tree = self.build_tree(INO_ROOT).await?;
+        let tree = self.build_tree(self.root_ino).await?;
         let commit = Commit {
             tree,
             parents,
@@ -273,7 +273,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub(crate) async fn replace_working_tree(&self, tree_hash: Hash) -> Result<()> {
         let mut txn = self.meta.begin().await?;
         txn.truncate_tree().await?;
-        self.materialize_into_txn(&mut *txn, tree_hash, INO_ROOT)
+        self.materialize_into_txn(&mut *txn, tree_hash, self.root_ino)
             .await?;
         txn.commit().await?;
         Ok(())
@@ -354,7 +354,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             None => BTreeMap::new(),
         };
         let mut work = BTreeMap::new();
-        self.flatten_working(INO_ROOT, String::new(), &mut work)
+        self.flatten_working(self.root_ino, String::new(), &mut work)
             .await?;
         Ok(diff_maps(&base, &work))
     }

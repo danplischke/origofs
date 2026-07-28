@@ -236,6 +236,43 @@ impl Workspace {
         &self.fs
     }
 
+    // --- workspaces (multi-workspace in one store) -----------------------
+
+    /// Open (creating on first use) another **workspace** inside this same store,
+    /// returning a `Workspace` bound to it. Workspaces share the store's content
+    /// and identity (actors/blame/audit) and are separated by a `workspace_id`;
+    /// each has its own root, refs, and working tree (`docs/MULTI_TENANCY.md`).
+    /// The metadata connection/pool, content store, and any Postgres push-feed
+    /// handle are shared with `self`, so this is cheap.
+    pub async fn workspace(&self, name: &str) -> Result<Self> {
+        let (id, root) = match self.fs.meta.lookup_workspace(name).await? {
+            Some(existing) => existing,
+            None => self.fs.meta.create_workspace(name).await?,
+        };
+        let scoped = self.fs.meta.with_workspace(id);
+        let fs = self.fs.rebind(scoped, root);
+        // Give a freshly created workspace its versioning refs/config; idempotent
+        // for one that already exists.
+        fs.init().await?;
+        Ok(Self {
+            fs,
+            pg: self.pg.clone(),
+        })
+    }
+
+    /// The names of every workspace in this store — `default` plus any opened via
+    /// [`Self::workspace`], oldest first.
+    pub async fn workspaces(&self) -> Result<Vec<String>> {
+        Ok(self
+            .fs
+            .meta
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .map(|(_id, name, _root)| name)
+            .collect())
+    }
+
     /// Record a collaboration event (best-effort: a feed hiccup never fails the
     /// underlying operation, which has already succeeded).
     async fn emit(

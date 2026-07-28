@@ -22,7 +22,7 @@ use crate::error::Result;
 use crate::metadata::MetadataStore;
 use crate::objectgraph::TreeKind;
 use crate::suggest::SuggestionStatus;
-use crate::types::{FileKind, Hash, INO_ROOT, Ino};
+use crate::types::{FileKind, Hash, Ino};
 use async_recursion::async_recursion;
 use std::collections::HashSet;
 
@@ -42,16 +42,24 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub async fn gc(&self) -> Result<GcStats> {
         let mut marked: HashSet<Hash> = HashSet::new();
 
-        // Roots 1: every ref. Branch refs and MERGE_HEAD hold commit hashes;
-        // the symbolic HEAD ("ref:<branch>") isn't a hash and is skipped.
-        for (_name, value) in self.meta.list_refs().await? {
-            if let Some(commit) = Hash::from_hex(&value) {
-                self.mark_commit(commit, &mut marked).await?;
+        // Content is shared across every workspace in the store, so GC marks from
+        // ALL of them — a per-workspace sweep would delete another workspace's live
+        // content (`docs/MULTI_TENANCY.md`). Refs are workspace-scoped, so mark
+        // them through each workspace's handle; the working tree is walked from
+        // each workspace's own root inode (dentry/inode reads are keyed by ino, so
+        // the default handle traverses any root correctly).
+        for (id, _name, root_ino) in self.meta.list_workspaces().await? {
+            let ws = self.meta.with_workspace(id);
+            // Roots 1: every ref. Branch refs and MERGE_HEAD hold commit hashes;
+            // the symbolic HEAD ("ref:<branch>") isn't a hash and is skipped.
+            for (_name, value) in ws.list_refs().await? {
+                if let Some(commit) = Hash::from_hex(&value) {
+                    self.mark_commit(commit, &mut marked).await?;
+                }
             }
+            // Roots 2: the live working tree (uncommitted bodies aren't committed).
+            self.mark_working(root_ino, &mut marked).await?;
         }
-
-        // Roots 2: the live working tree (uncommitted bodies aren't in any commit).
-        self.mark_working(INO_ROOT, &mut marked).await?;
 
         // Roots 3: pending suggestions. A proposed body lives only in the CAS
         // until the suggestion is accepted — referenced by no ref and no working
