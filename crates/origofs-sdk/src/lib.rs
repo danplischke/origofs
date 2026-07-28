@@ -256,7 +256,9 @@ impl Workspace {
         fs.init().await?;
         Ok(Self {
             fs,
-            pg: self.pg.clone(),
+            // Re-scope the Postgres push-feed handle to this workspace, so
+            // `subscribe` tails only this workspace's change feed.
+            pg: self.pg.as_ref().map(|p| p.for_workspace(id)),
         })
     }
 

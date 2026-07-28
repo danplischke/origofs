@@ -81,7 +81,15 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // distinct, strictly increasing generation, so a recovery scan can pick
         // the newest snapshot unambiguously — no read-then-write race (audit #21).
         let generation = self.meta.bump_counter(REFS_MIRROR_GEN).await? as u64;
-        let refs = self.meta.list_refs().await?;
+        let mut refs = self.meta.list_refs().await?;
+        // Tag the snapshot with this workspace's name (resolved from its root inode
+        // via the registry), so a rebuild after a metadata-DB loss can recover each
+        // workspace of a multi-workspace store into the right place
+        // (`docs/MULTI_TENANCY.md`). Reuses the refs vec — no object-format change;
+        // the recovery side skips this reserved key like it skips HEAD/MERGE_HEAD.
+        if let Some(name) = self.workspace_name().await? {
+            refs.push((crate::recover::WORKSPACE_MIRROR_KEY.to_string(), name));
+        }
         let hash = self
             .content
             .put(&RefSnapshot { generation, refs }.encode())
@@ -93,6 +101,20 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .set_config(REFS_MIRROR_HASH, &hash.to_hex())
             .await?;
         Ok(())
+    }
+
+    /// This engine's workspace name, resolved from its root inode via the registry
+    /// (`"default"` for the root workspace). `None` only if no registry row matches
+    /// the root — e.g. a pre-`workspace`-table store — in which case the mirror is
+    /// left untagged and recovery treats it as the default workspace.
+    pub(crate) async fn workspace_name(&self) -> Result<Option<String>> {
+        Ok(self
+            .meta
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .find(|(_, _, root)| *root == self.root_ino)
+            .map(|(_, name, _)| name))
     }
 
     /// The hash of the live ref-mirror snapshot, if any (a GC root).

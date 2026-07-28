@@ -27,10 +27,18 @@ use crate::objectgraph::{Commit, RefSnapshot, Tree, TreeKind};
 use crate::types::Hash;
 use async_recursion::async_recursion;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 const HEAD: &str = "HEAD";
 const DEFAULT_BRANCH: &str = "main";
 const MERGE_HEAD: &str = "MERGE_HEAD";
+/// The reserved ref key a ref-mirror snapshot carries its workspace name under, so
+/// a rebuild can recover each workspace of a multi-workspace store into the right
+/// place (`docs/MULTI_TENANCY.md`; written by [`Fs::mirror_refs`]). Recovery skips
+/// it as a "ref" the same way it skips `HEAD`/`MERGE_HEAD`.
+pub(crate) const WORKSPACE_MIRROR_KEY: &str = "\0origofs.workspace";
+/// The name of the store's root workspace (recovered into the rebuild target).
+const DEFAULT_WS_NAME: &str = "default";
 
 /// What a recovery scan found and (for [`Fs::rebuild_from_content`]) restored.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -50,16 +58,21 @@ pub struct RebuildReport {
     /// would be (a dry-run scan).
     pub checked_out: Option<String>,
     /// Directories, files, and symlinks materialized into the working tree.
-    /// Populated by a rebuild; left zero by a read-only scan.
+    /// Populated by a rebuild; left zero by a read-only scan. Aggregated across
+    /// every workspace recovered.
     pub dirs: usize,
     pub files: usize,
     pub symlinks: usize,
+    /// Additional (non-`default`) workspaces recovered from tagged ref mirrors — a
+    /// multi-workspace store restores each of its workspaces (`docs/MULTI_TENANCY.md`).
+    pub extra_workspaces: usize,
 }
 
-/// The commit DAG + newest ref mirror recovered from a content-store scan.
+/// The commit DAG + the newest ref-mirror snapshot recovered *per workspace* from a
+/// content-store scan (keyed by workspace name; `default` for the root workspace).
 struct Scan {
     commits: HashMap<Hash, Commit>,
-    newest_mirror: Option<RefSnapshot>,
+    mirrors: HashMap<String, RefSnapshot>,
 }
 
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
@@ -69,70 +82,105 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub async fn scan_content(&self) -> Result<RebuildReport> {
         let mut report = RebuildReport::default();
         let scan = self.scan(&mut report).await?;
-        let (branches, head_target, used_mirror) = resolve_refs(&scan);
-        report.used_mirror = used_mirror;
-        report.branches = branches
-            .iter()
-            .map(|(n, h)| (n.clone(), h.to_hex()))
-            .collect();
-        report.checked_out = pick_checkout(&branches, head_target);
+        if scan.mirrors.is_empty() {
+            // No mirror: infer a single (default) workspace from head commits.
+            let branches = infer_heads(&scan.commits);
+            report.branches = branches
+                .iter()
+                .map(|(n, h)| (n.clone(), h.to_hex()))
+                .collect();
+            report.checked_out = pick_checkout(&branches, None);
+            return Ok(report);
+        }
+        report.used_mirror = true;
+        // Aggregate what every workspace's mirror would restore (dry run).
+        let mut names: Vec<&String> = scan.mirrors.keys().collect();
+        names.sort();
+        for name in names {
+            let (branches, head) = resolve_mirror(&scan.mirrors[name], &scan.commits);
+            for (n, h) in &branches {
+                report.branches.push((n.clone(), h.to_hex()));
+            }
+            if name == DEFAULT_WS_NAME {
+                report.checked_out = pick_checkout(&branches, head);
+            } else {
+                report.extra_workspaces += 1;
+            }
+        }
         Ok(report)
     }
 
-    /// Rebuild refs and the working tree from the object graph in the content
+    /// Rebuild refs and the working tree(s) from the object graph in the content
     /// store. Call on a freshly [`init`](Fs::init)ed workspace whose DB is empty
     /// but whose content store is the surviving one. Returns a [`RebuildReport`].
+    ///
+    /// A multi-workspace store restores **each** of its workspaces: the `default`
+    /// workspace into `self`, and every other tagged workspace into a freshly
+    /// created registry entry of its own (`docs/MULTI_TENANCY.md`).
     ///
     /// This **resets the working tree** to the recovered commit, so run it for
     /// recovery, not against a live DB with uncommitted work. Attribution is not
     /// recovered (it lives only in the DB). Reading every object also
     /// integrity-checks it: a corrupt object is skipped and counted.
-    pub async fn rebuild_from_content(&self) -> Result<RebuildReport> {
+    pub async fn rebuild_from_content(&self) -> Result<RebuildReport>
+    where
+        C: Clone,
+    {
         let mut report = RebuildReport::default();
         let scan = self.scan(&mut report).await?;
-        let (branches, head_target, used_mirror) = resolve_refs(&scan);
-        report.used_mirror = used_mirror;
 
-        // Write the branch refs.
-        for (name, h) in &branches {
-            self.meta.set_ref(name, &h.to_hex()).await?;
-            report.branches.push((name.clone(), h.to_hex()));
+        if scan.mirrors.is_empty() {
+            // No usable mirror: infer a single default workspace (synthetic branch
+            // names). Multi-workspace recovery relies on the tagged mirrors.
+            let synthetic = RefSnapshot {
+                generation: 0,
+                refs: infer_heads(&scan.commits)
+                    .into_iter()
+                    .map(|(n, h)| (n, h.to_hex()))
+                    .collect(),
+            };
+            recover_into(self, &synthetic, &scan.commits, &mut report).await?;
+            return Ok(report);
         }
 
-        // Materialize the checked-out branch's tree into the working tree.
-        if let Some(branch) = pick_checkout(&branches, head_target) {
-            let tip = branches
-                .iter()
-                .find(|(n, _)| *n == branch)
-                .map(|(_, h)| *h)
-                .expect("checkout branch is one we just recovered");
-            let tree = scan
-                .commits
-                .get(&tip)
-                .expect("branch tip is a scanned commit")
-                .tree;
-            self.replace_working_tree(tree).await?;
-            self.meta.set_ref(HEAD, &format!("ref:{branch}")).await?;
-            self.tally_tree(tree, &mut report).await?;
-            report.checked_out = Some(branch);
+        report.used_mirror = true;
+        // The `default` workspace recovers into `self`; the rest into new registry
+        // entries. Deterministic order: default first, then names sorted.
+        if let Some(def) = scan.mirrors.get(DEFAULT_WS_NAME) {
+            recover_into(self, def, &scan.commits, &mut report).await?;
         }
-
-        // Re-establish a fresh ref mirror so the recovered workspace is protected
-        // again (and superseded snapshots become collectable).
-        if !branches.is_empty() {
-            self.mirror_refs().await?;
+        let mut names: Vec<&String> = scan.mirrors.keys().collect();
+        names.sort();
+        for name in names {
+            if name == DEFAULT_WS_NAME {
+                continue;
+            }
+            let (id, root) = self.meta.create_workspace(name).await?;
+            let scoped: Arc<dyn MetadataStore> = self.meta.with_workspace(id);
+            // A sibling engine bound to the recovered workspace, sharing this one's
+            // content store + clock (built directly — the scoped handle is a trait
+            // object, not necessarily `M`).
+            let sub: Fs<Arc<dyn MetadataStore>, C> = Fs {
+                meta: scoped,
+                content: self.content.clone(),
+                clock: self.clock.clone(),
+                root_ino: root,
+            };
+            recover_into(&sub, &scan.mirrors[name], &scan.commits, &mut report).await?;
+            report.extra_workspaces += 1;
         }
         Ok(report)
     }
 
-    /// Scan every object, classifying commits and the newest ref-mirror snapshot.
-    /// Trees, manifests, chunks, and symlink targets are followed on demand during
-    /// materialization, so they're ignored here. Fills the scan counters on
-    /// `report`. Reading each object integrity-checks it; corrupt objects are
-    /// skipped and counted.
+    /// Scan every object, classifying commits and keeping the newest ref-mirror
+    /// snapshot **per workspace** (from its `WORKSPACE_MIRROR_KEY` tag; `default`
+    /// when untagged). Trees, manifests, chunks, and symlink targets are followed
+    /// on demand during materialization, so they're ignored here. Fills the scan
+    /// counters on `report`. Reading each object integrity-checks it; corrupt
+    /// objects are skipped and counted.
     async fn scan(&self, report: &mut RebuildReport) -> Result<Scan> {
         let mut commits: HashMap<Hash, Commit> = HashMap::new();
-        let mut newest_mirror: Option<RefSnapshot> = None;
+        let mut mirrors: HashMap<String, RefSnapshot> = HashMap::new();
         let all = self.content.list().await?;
         report.objects_scanned = all.len();
         for hash in all {
@@ -149,19 +197,23 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 if self.content.has(&commit.tree).await.unwrap_or(false) {
                     commits.insert(hash, commit);
                 }
-            } else if let Ok(snap) = RefSnapshot::decode(&bytes)
-                && newest_mirror
-                    .as_ref()
+            } else if let Ok(snap) = RefSnapshot::decode(&bytes) {
+                let ws = snap
+                    .refs
+                    .iter()
+                    .find(|(k, _)| k == WORKSPACE_MIRROR_KEY)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| DEFAULT_WS_NAME.to_string());
+                if mirrors
+                    .get(&ws)
                     .is_none_or(|s| snap.generation > s.generation)
-            {
-                newest_mirror = Some(snap);
+                {
+                    mirrors.insert(ws, snap);
+                }
             }
         }
         report.commits_found = commits.len();
-        Ok(Scan {
-            commits,
-            newest_mirror,
-        })
+        Ok(Scan { commits, mirrors })
     }
 
     /// Count the dirs/files/symlinks reachable from a tree (for the report).
@@ -182,42 +234,82 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 }
 
-/// Resolve the recovered ref set: prefer the newest mirror snapshot; otherwise
-/// infer heads (commits that are no other commit's parent). Returns the branch
-/// list, the mirrored HEAD target branch (if any), and whether the mirror was
-/// used. Pure — no I/O — so both the dry-run scan and the rebuild share it.
-fn resolve_refs(scan: &Scan) -> (Vec<(String, Hash)>, Option<String>, bool) {
+/// Recover one workspace `target` from its ref-mirror `snap`: write its branch
+/// refs, materialize the checked-out branch's tree, restore `HEAD`, and re-mirror.
+/// Generic over the target's metadata handle so it serves both `self` (the default
+/// workspace) and the freshly-created sibling workspaces.
+async fn recover_into<M: MetadataStore, C: ContentStore>(
+    target: &Fs<M, C>,
+    snap: &RefSnapshot,
+    commits: &HashMap<Hash, Commit>,
+    report: &mut RebuildReport,
+) -> Result<()> {
+    let (branches, head_target) = resolve_mirror(snap, commits);
+    for (name, h) in &branches {
+        target.meta.set_ref(name, &h.to_hex()).await?;
+        report.branches.push((name.clone(), h.to_hex()));
+    }
+    if let Some(branch) = pick_checkout(&branches, head_target) {
+        let tip = branches
+            .iter()
+            .find(|(n, _)| *n == branch)
+            .map(|(_, h)| *h)
+            .expect("checkout branch is one we just recovered");
+        let tree = commits
+            .get(&tip)
+            .expect("branch tip is a scanned commit")
+            .tree;
+        target.replace_working_tree(tree).await?;
+        target.meta.set_ref(HEAD, &format!("ref:{branch}")).await?;
+        target.tally_tree(tree, report).await?;
+        // The first workspace recovered (the default) sets the report's checkout.
+        report.checked_out.get_or_insert(branch);
+    }
+    // Re-establish a fresh ref mirror so the recovered workspace is protected again
+    // (and superseded snapshots become collectable).
+    if !branches.is_empty() {
+        target.mirror_refs().await?;
+    }
+    Ok(())
+}
+
+/// Resolve one workspace's mirror into its branch list + mirrored HEAD target.
+/// Skips `HEAD`, an in-progress `MERGE_HEAD`, and the reserved workspace-name tag;
+/// keeps only branches whose tip commit was actually scanned. Pure (no I/O).
+fn resolve_mirror(
+    snap: &RefSnapshot,
+    commits: &HashMap<Hash, Commit>,
+) -> (Vec<(String, Hash)>, Option<String>) {
     let mut head_target = None;
     let mut branches: Vec<(String, Hash)> = Vec::new();
-    if let Some(snap) = &scan.newest_mirror {
-        for (name, value) in &snap.refs {
-            if name == HEAD {
-                head_target = value.strip_prefix("ref:").map(str::to_string);
-            } else if name == MERGE_HEAD {
-                continue; // don't resurrect an in-progress merge
-            } else if let Some(h) = Hash::from_hex(value)
-                && scan.commits.contains_key(&h)
-            {
-                branches.push((name.clone(), h));
-            }
+    for (name, value) in &snap.refs {
+        if name == HEAD {
+            head_target = value.strip_prefix("ref:").map(str::to_string);
+        } else if name == MERGE_HEAD || name == WORKSPACE_MIRROR_KEY {
+            continue; // an in-progress merge / the workspace-name tag, not a branch
+        } else if let Some(h) = Hash::from_hex(value)
+            && commits.contains_key(&h)
+        {
+            branches.push((name.clone(), h));
         }
     }
-    if !branches.is_empty() {
-        return (branches, head_target, true);
-    }
+    (branches, head_target)
+}
 
-    // No usable mirror: infer heads = commits nothing else has as a parent.
+/// No usable mirror: infer heads (commits nothing else has as a parent) as a
+/// single default workspace's branches, with synthetic names.
+fn infer_heads(commits: &HashMap<Hash, Commit>) -> Vec<(String, Hash)> {
     let mut parents: HashSet<Hash> = HashSet::new();
-    for c in scan.commits.values() {
+    for c in commits.values() {
         parents.extend(c.parents.iter().copied());
     }
-    let mut heads: Vec<Hash> = scan
-        .commits
+    let mut heads: Vec<Hash> = commits
         .keys()
         .copied()
         .filter(|h| !parents.contains(h))
         .collect();
     heads.sort_by_key(|h| h.to_hex()); // deterministic naming
+    let mut branches = Vec::new();
     if heads.len() == 1 {
         branches.push((DEFAULT_BRANCH.to_string(), heads[0]));
     } else {
@@ -225,7 +317,7 @@ fn resolve_refs(scan: &Scan) -> (Vec<(String, Hash)>, Option<String>, bool) {
             branches.push((format!("recovered-{}", i + 1), h));
         }
     }
-    (branches, None, false)
+    branches
 }
 
 /// Pick the branch to check out: the mirrored HEAD if it names a recovered

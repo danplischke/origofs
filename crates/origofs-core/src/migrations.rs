@@ -105,6 +105,19 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V11_SQLITE,
         postgres: V11_POSTGRES,
     },
+    // V12 — workspace-scope the per-location activity + attribution tables so they
+    // isolate like the working tree does (`docs/MULTI_TENANCY.md` §8). Without this
+    // the suggestion queue, change feed, op-log, and presence were store-wide: a
+    // suggestion made in one workspace was visible — and acceptable into the wrong
+    // tree — from another. A plain `workspace_id` tag on each (their surrogate-id/seq
+    // PKs don't collide, so no table rebuild), backfilled to the `default` workspace.
+    // `blob_blame` deliberately stays keyed by content hash (shared by content, V8);
+    // `actor`/`session`/`tool_calls` stay store-wide (identity is tenant-wide).
+    Migration {
+        version: 12,
+        sqlite: V12_SQLITE,
+        postgres: V12_POSTGRES,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -231,6 +244,31 @@ ALTER TABLE conflict  ADD PRIMARY KEY(workspace_id, path);
 ALTER TABLE file_lock ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE file_lock DROP CONSTRAINT IF EXISTS file_lock_pkey;
 ALTER TABLE file_lock ADD PRIMARY KEY(workspace_id, path);
+";
+
+// V12 — workspace-scope the activity/attribution tables (see the migration entry
+// above). Plain `ADD COLUMN` (surrogate-id/seq PKs don't collide), so no rebuild;
+// the `ADD COLUMN`s ride the runner's duplicate-column tolerance on re-apply.
+const V12_SQLITE: &str = "
+ALTER TABLE suggestion ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE edit_op    ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE fs_event   ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE presence   ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_suggestion_workspace ON suggestion(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_edit_op_workspace ON edit_op(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_fs_event_workspace ON fs_event(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_presence_workspace ON presence(workspace_id);
+";
+
+const V12_POSTGRES: &str = "
+ALTER TABLE suggestion ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE edit_op    ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE fs_event   ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE presence   ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_suggestion_workspace ON suggestion(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_edit_op_workspace ON edit_op(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_fs_event_workspace ON fs_event(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_presence_workspace ON presence(workspace_id);
 ";
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS`; the migration runner tolerates a

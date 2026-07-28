@@ -28,7 +28,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use origofs_core::{
-    Clock, ContentStore, Fs, Hash, OrigoFSError, Result, SqliteMetadataStore, WriteCtx,
+    Clock, ContentStore, Fs, Hash, MetadataStore, OrigoFSError, Result, SqliteMetadataStore,
+    WriteCtx,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -204,7 +205,9 @@ impl ContentStore for FaultyContentStore {
 
 // --- the simulation ---------------------------------------------------------
 
-type SimFs = Fs<SqliteMetadataStore, Arc<FaultyContentStore>>;
+// A trait-object metadata handle so one alias covers both the `default` workspace
+// and the `with_workspace`-scoped handles the multi-workspace tests build.
+type SimFs = Fs<Arc<dyn MetadataStore>, Arc<FaultyContentStore>>;
 
 /// A small, fixed path space so writes overwrite each other (churn → orphaned
 /// chunks → a real reachability/GC surface).
@@ -257,11 +260,8 @@ async fn run_sim(
 
     let store = Arc::new(FaultyContentStore::new(promote_on_flush, fail_flush_at));
     let clock: Arc<dyn Clock> = Arc::new(SimClock::new(1_000_000 + seed as i64));
-    let fs = Fs::with_clock(
-        SqliteMetadataStore::open_in_memory().unwrap(),
-        store.clone(),
-        clock,
-    );
+    let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
+    let fs = Fs::with_clock(meta, store.clone(), clock);
     fs.init().await.unwrap();
     let actor = fs.create_human("sim", None).await.unwrap();
     let ctx = WriteCtx::actor(actor);
@@ -630,5 +630,152 @@ async fn rebuild_round_trips_committed_state_from_content() {
             branches2, branches1,
             "seed {seed}: recovered branch names differ"
         );
+    }
+}
+
+// --- multi-workspace invariants (docs/MULTI_TENANCY.md) ----------------------
+//
+// The single-workspace simulation above is blind to the highest-risk part of the
+// multi-workspace change: GC marks reachability across a store's workspaces, so a
+// bug there would silently sweep another workspace's live content. These drive
+// seeded churn spread over several workspaces sharing one store and check GC
+// safety/completeness, cross-workspace non-interference, and determinism.
+
+/// Build `n` workspaces sharing one store (`default` at index 0, then `ws1..`),
+/// each its own engine handle over a `with_workspace`-scoped metadata view.
+async fn build_workspaces(
+    base: &Arc<dyn MetadataStore>,
+    store: &Arc<FaultyContentStore>,
+    clock: &Arc<dyn Clock>,
+    n: usize,
+) -> Vec<SimFs> {
+    let root_fs = Fs::with_clock(base.clone(), store.clone(), clock.clone());
+    root_fs.init().await.unwrap();
+    let mut wss = vec![root_fs.clone()];
+    for i in 1..n {
+        let (id, root) = base.create_workspace(&format!("ws{i}")).await.unwrap();
+        let fs = root_fs.rebind(base.with_workspace(id), root);
+        fs.init().await.unwrap();
+        wss.push(fs);
+    }
+    wss
+}
+
+/// Compare a workspace's live tree against its ground truth: a missing live file
+/// means GC dropped it; an unexpected present file means an op leaked across the
+/// workspace boundary.
+async fn check_tree(
+    fs: &SimFs,
+    truth: &BTreeMap<String, Vec<u8>>,
+    seed: u64,
+    w: usize,
+    when: &str,
+) {
+    for &p in PATHS {
+        match (fs.read(p).await, truth.get(p)) {
+            (Ok(got), Some(want)) => assert_eq!(
+                &got[..],
+                &want[..],
+                "seed {seed} ws{w} {when}: {p} content mismatch"
+            ),
+            (Err(OrigoFSError::NotFound(_)), None) => {}
+            (Ok(_), None) => {
+                panic!("seed {seed} ws{w} {when}: {p} present but not in ground truth (leak?)")
+            }
+            (Err(OrigoFSError::NotFound(_)), Some(_)) => {
+                panic!("seed {seed} ws{w} {when}: {p} missing (gc dropped a live file?)")
+            }
+            (Err(e), _) => panic!("seed {seed} ws{w} {when}: {p} unexpected error {e}"),
+        }
+    }
+}
+
+/// Drive seeded churn across 2–4 workspaces sharing one store, tracking each
+/// workspace's live content as ground truth. Returns (store, handles, truth).
+async fn run_multi_ws_sim(
+    seed: u64,
+) -> (
+    Arc<FaultyContentStore>,
+    Vec<SimFs>,
+    Vec<BTreeMap<String, Vec<u8>>>,
+) {
+    let mut rng = Rng::new(seed);
+    let store = Arc::new(FaultyContentStore::new(true, HashSet::new()));
+    let clock: Arc<dyn Clock> = Arc::new(SimClock::new(1_000_000 + seed as i64));
+    let base: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
+    let n_ws = 2 + rng.below(3) as usize; // 2..=4 workspaces
+    let wss = build_workspaces(&base, &store, &clock, n_ws).await;
+    let mut truth: Vec<BTreeMap<String, Vec<u8>>> = vec![BTreeMap::new(); n_ws];
+
+    for _ in 0..(12 + rng.below(30)) {
+        let w = rng.below(n_ws as u64) as usize;
+        let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+        match rng.below(10) {
+            0..=6 => {
+                let len = 1 + rng.below(4096) as usize;
+                let data = rng.bytes(len);
+                wss[w].write(path, &data).await.unwrap();
+                truth[w].insert(path.to_string(), data);
+            }
+            7..=8 => {
+                let _ = wss[w].remove(path).await;
+                truth[w].remove(path);
+            }
+            _ => {
+                let _ = wss[w].commit("sim", "snap").await;
+            }
+        }
+    }
+    (store, wss, truth)
+}
+
+/// GC over the shared content store must be **safe** and **complete** across
+/// workspaces: churn spread over several workspaces, then one `gc()` that may not
+/// drop any workspace's live content (the data-loss path), plus **non-interference**
+/// — no op in one workspace ever altered another's tree.
+#[tokio::test]
+async fn gc_and_isolation_hold_across_workspaces() {
+    for seed in 0..32u64 {
+        let (store, wss, truth) = run_multi_ws_sim(seed).await;
+
+        // Non-interference: before collecting, every workspace equals its truth.
+        for (w, fs) in wss.iter().enumerate() {
+            check_tree(fs, &truth[w], seed, w, "pre-gc").await;
+        }
+
+        // Safe: GC keeps every workspace's live content.
+        let stats = wss[0].gc().await.unwrap();
+        for (w, fs) in wss.iter().enumerate() {
+            check_tree(fs, &truth[w], seed, w, "post-gc").await;
+        }
+        // Complete + idempotent over the shared store.
+        assert_eq!(
+            store.list().await.unwrap().len(),
+            stats.reachable,
+            "seed {seed}: post-gc object count != reachable set"
+        );
+        assert_eq!(
+            wss[0].gc().await.unwrap().deleted,
+            0,
+            "seed {seed}: a second gc pass was not idempotent"
+        );
+    }
+}
+
+/// Determinism holds with multiple workspaces: the same seed reproduces every
+/// workspace's tree, including commit hashes (the clock seam).
+#[tokio::test]
+async fn multi_workspace_runs_are_reproducible() {
+    for seed in [3u64, 11, 29, 77, 500] {
+        let (_s1, w1, _t1) = run_multi_ws_sim(seed).await;
+        let (_s2, w2, _t2) = run_multi_ws_sim(seed).await;
+        assert_eq!(w1.len(), w2.len(), "seed {seed}: workspace count diverged");
+        for (i, (a, b)) in w1.iter().zip(w2.iter()).enumerate() {
+            assert_eq!(
+                snapshot(a).await,
+                snapshot(b).await,
+                "seed {seed} ws{i}: state diverged between identical-seed runs"
+            );
+        }
     }
 }

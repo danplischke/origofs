@@ -88,6 +88,18 @@ impl PostgresMetadataStore {
             .map_err(|e| OrigoFSError::Metadata(e.to_string()))
     }
 
+    /// A concrete handle to this store bound to `workspace_id`, sharing the same
+    /// pool + DSN. The typed counterpart to [`MetadataStore::with_workspace`], for
+    /// the SDK to re-scope the Postgres-only push feed (`subscribe`) to the
+    /// workspace it is serving (`docs/MULTI_TENANCY.md`).
+    pub fn for_workspace(&self, workspace_id: i64) -> Arc<PostgresMetadataStore> {
+        Arc::new(PostgresMetadataStore {
+            pool: self.pool.clone(),
+            dsn: self.dsn.clone(),
+            workspace_id,
+        })
+    }
+
     // A session-level `pg_advisory_lock` helper used to live here (H11). It was
     // structurally broken — it took the lock on a pooled connection and returned
     // that connection (lock still held) to the pool, so the unlock could land on
@@ -162,6 +174,7 @@ impl PostgresMetadataStore {
             wakeups: rx,
             cursor: after_seq,
             branch,
+            workspace_id: self.workspace_id,
             driver,
         })
     }
@@ -174,6 +187,9 @@ pub struct EventSubscription {
     wakeups: tokio::sync::mpsc::Receiver<()>,
     cursor: i64,
     branch: Option<String>,
+    /// The workspace this feed is scoped to — the change feed is per-workspace
+    /// (`docs/MULTI_TENANCY.md`), so every drain filters by it.
+    workspace_id: i64,
     /// The task draining the dedicated connection and forwarding NOTIFYs. Held
     /// so it is aborted when the subscription drops, rather than leaked (L5).
     driver: tokio::task::JoinHandle<()>,
@@ -211,8 +227,9 @@ impl EventSubscription {
                 self.client
                     .query(
                         "SELECT seq, actor_id, session_id, kind, path, detail, ts, branch
-                         FROM fs_event WHERE seq > $1 AND branch = $2 ORDER BY seq LIMIT $3",
-                        &[&self.cursor, b, &DRAIN_BATCH],
+                         FROM fs_event WHERE workspace_id = $1 AND seq > $2 AND branch = $3
+                         ORDER BY seq LIMIT $4",
+                        &[&self.workspace_id, &self.cursor, b, &DRAIN_BATCH],
                     )
                     .await
             }
@@ -220,8 +237,8 @@ impl EventSubscription {
                 self.client
                     .query(
                         "SELECT seq, actor_id, session_id, kind, path, detail, ts, branch
-                         FROM fs_event WHERE seq > $1 ORDER BY seq LIMIT $2",
-                        &[&self.cursor, &DRAIN_BATCH],
+                         FROM fs_event WHERE workspace_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+                        &[&self.workspace_id, &self.cursor, &DRAIN_BATCH],
                     )
                     .await
             }
@@ -238,7 +255,10 @@ impl EventSubscription {
             // so we don't rescan the same non-matching rows every wakeup.
             let max: Option<i64> = self
                 .client
-                .query_opt("SELECT max(seq) FROM fs_event", &[])
+                .query_opt(
+                    "SELECT max(seq) FROM fs_event WHERE workspace_id = $1",
+                    &[&self.workspace_id],
+                )
                 .await
                 .map_err(|e| OrigoFSError::Metadata(e.to_string()))?
                 .and_then(|row| row.get(0));
@@ -1159,10 +1179,10 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let row = c
             .query_one(
-                "INSERT INTO edit_op(session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
+                "INSERT INTO edit_op(workspace_id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
                 &[
-                    &op.session_id, &op.actor_id, &op.tool_call_id, &op.ino, &op.path, &op.op,
+                    &self.workspace_id, &op.session_id, &op.actor_id, &op.tool_call_id, &op.ino, &op.path, &op.op,
                     &op.byte_start, &op.byte_len, &op.pre_hash, &op.post_hash, &op.ts,
                 ],
             )
@@ -1175,8 +1195,8 @@ impl MetadataStore for PostgresMetadataStore {
         let rows = c
             .query(
                 "SELECT id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts
-                 FROM edit_op WHERE actor_id = $1 AND ($2::bigint IS NULL OR session_id = $2::bigint) ORDER BY id",
-                &[&actor_id, &session_id],
+                 FROM edit_op WHERE workspace_id = $1 AND actor_id = $2 AND ($3::bigint IS NULL OR session_id = $3::bigint) ORDER BY id",
+                &[&self.workspace_id, &actor_id, &session_id],
             )
             .await?;
         Ok(rows
@@ -1241,9 +1261,10 @@ impl MetadataStore for PostgresMetadataStore {
             .await?;
         let row = tx
             .query_one(
-                "INSERT INTO fs_event(actor_id, session_id, kind, path, detail, ts, branch)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING seq",
+                "INSERT INTO fs_event(workspace_id, actor_id, session_id, kind, path, detail, ts, branch)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING seq",
                 &[
+                    &self.workspace_id,
                     &ev.actor_id,
                     &ev.session_id,
                     &ev.kind,
@@ -1271,8 +1292,8 @@ impl MetadataStore for PostgresMetadataStore {
         let rows = c
             .query(
                 "SELECT seq, actor_id, session_id, kind, path, detail, ts, branch FROM fs_event
-                 WHERE seq > $1 ORDER BY seq LIMIT $2",
-                &[&after_seq, &limit],
+                 WHERE workspace_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+                &[&self.workspace_id, &after_seq, &limit],
             )
             .await?;
         Ok(rows.iter().map(row_to_event).collect())
@@ -1287,10 +1308,11 @@ impl MetadataStore for PostgresMetadataStore {
     ) -> Result<()> {
         let c = self.client().await?;
         c.execute(
-            "INSERT INTO presence(session_id, actor_id, path, last_seen) VALUES ($1, $2, $3, $4)
+            "INSERT INTO presence(session_id, workspace_id, actor_id, path, last_seen) VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (session_id) DO UPDATE SET
-                 actor_id = EXCLUDED.actor_id, path = EXCLUDED.path, last_seen = EXCLUDED.last_seen",
-            &[&session_id, &actor_id, &path, &at],
+                 workspace_id = EXCLUDED.workspace_id, actor_id = EXCLUDED.actor_id,
+                 path = EXCLUDED.path, last_seen = EXCLUDED.last_seen",
+            &[&session_id, &self.workspace_id, &actor_id, &path, &at],
         )
         .await?;
         Ok(())
@@ -1302,8 +1324,8 @@ impl MetadataStore for PostgresMetadataStore {
             .query(
                 "SELECT p.session_id, p.actor_id, a.display_name, a.kind, p.path, p.last_seen
                  FROM presence p JOIN actor a ON a.id = p.actor_id
-                 WHERE p.last_seen >= $1 ORDER BY p.last_seen DESC",
-                &[&since_ts],
+                 WHERE p.workspace_id = $1 AND p.last_seen >= $2 ORDER BY p.last_seen DESC",
+                &[&self.workspace_id, &since_ts],
             )
             .await?;
         Ok(rows
@@ -1334,10 +1356,11 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let row = c
             .query_one(
-                "INSERT INTO suggestion(actor_id, session_id, branch, path, base_hash,
+                "INSERT INTO suggestion(workspace_id, actor_id, session_id, branch, path, base_hash,
                      proposed_hash, summary, status, created_ts)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
                 &[
+                    &self.workspace_id,
                     &init.actor_id,
                     &init.session_id,
                     &init.branch,
@@ -1359,8 +1382,8 @@ impl MetadataStore for PostgresMetadataStore {
             .query_opt(
                 "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
                      summary, status, created_ts, resolved_ts, resolved_by
-                 FROM suggestion WHERE id = $1",
-                &[&id],
+                 FROM suggestion WHERE id = $1 AND workspace_id = $2",
+                &[&id, &self.workspace_id],
             )
             .await?;
         Ok(row.as_ref().map(row_to_suggestion))
@@ -1378,9 +1401,9 @@ impl MetadataStore for PostgresMetadataStore {
                 "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
                      summary, status, created_ts, resolved_ts, resolved_by
                  FROM suggestion
-                 WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR path = $2)
+                 WHERE workspace_id = $1 AND ($2::text IS NULL OR status = $2) AND ($3::text IS NULL OR path = $3)
                  ORDER BY id DESC",
-                &[&st, &path],
+                &[&self.workspace_id, &st, &path],
             )
             .await?;
         Ok(rows.iter().map(row_to_suggestion).collect())
@@ -1397,8 +1420,8 @@ impl MetadataStore for PostgresMetadataStore {
         let n = c
             .execute(
                 "UPDATE suggestion SET status = $1, resolved_by = $2, resolved_ts = $3
-                 WHERE id = $4 AND status = 'pending'",
-                &[&status.as_str(), &resolved_by, &ts, &id],
+                 WHERE id = $4 AND workspace_id = $5 AND status = 'pending'",
+                &[&status.as_str(), &resolved_by, &ts, &id, &self.workspace_id],
             )
             .await?;
         Ok(n == 1)
@@ -1547,13 +1570,14 @@ impl MetaTxn for PostgresTxn {
     }
 
     async fn append_edit_op(&mut self, op: EditOpInit) -> Result<i64> {
+        let ws = self.workspace_id;
         let row = self
             .conn()
             .query_one(
-                "INSERT INTO edit_op(session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
+                "INSERT INTO edit_op(workspace_id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
                 &[
-                    &op.session_id, &op.actor_id, &op.tool_call_id, &op.ino, &op.path, &op.op,
+                    &ws, &op.session_id, &op.actor_id, &op.tool_call_id, &op.ino, &op.path, &op.op,
                     &op.byte_start, &op.byte_len, &op.pre_hash, &op.post_hash, &op.ts,
                 ],
             )

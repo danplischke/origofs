@@ -780,10 +780,10 @@ impl MetadataStore for SqliteMetadataStore {
     async fn append_edit_op(&self, op: EditOpInit) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO edit_op(session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO edit_op(workspace_id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                op.session_id, op.actor_id, op.tool_call_id, op.ino, op.path, op.op,
+                self.workspace_id, op.session_id, op.actor_id, op.tool_call_id, op.ino, op.path, op.op,
                 op.byte_start, op.byte_len, op.pre_hash, op.post_hash, op.ts
             ],
         )?;
@@ -794,9 +794,9 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts
-             FROM edit_op WHERE actor_id = ?1 AND (?2 IS NULL OR session_id = ?2) ORDER BY id",
+             FROM edit_op WHERE workspace_id = ?1 AND actor_id = ?2 AND (?3 IS NULL OR session_id = ?3) ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![actor_id, session_id], |r| {
+        let rows = stmt.query_map(params![self.workspace_id, actor_id, session_id], |r| {
             Ok(EditOp {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
@@ -843,9 +843,10 @@ impl MetadataStore for SqliteMetadataStore {
     async fn append_event(&self, ev: EventInit, ts: i64) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO fs_event(actor_id, session_id, kind, path, detail, ts, branch)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO fs_event(workspace_id, actor_id, session_id, kind, path, detail, ts, branch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
+                self.workspace_id,
                 ev.actor_id,
                 ev.session_id,
                 ev.kind,
@@ -862,9 +863,9 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT seq, actor_id, session_id, kind, path, detail, ts, branch FROM fs_event
-             WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+             WHERE workspace_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![after_seq, limit], |r| {
+        let rows = stmt.query_map(params![self.workspace_id, after_seq, limit], |r| {
             Ok(Event {
                 seq: r.get(0)?,
                 actor_id: r.get(1)?,
@@ -892,10 +893,11 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO presence(session_id, actor_id, path, last_seen) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO presence(session_id, workspace_id, actor_id, path, last_seen) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(session_id) DO UPDATE SET
-                 actor_id = excluded.actor_id, path = excluded.path, last_seen = excluded.last_seen",
-            params![session_id, actor_id, path, at],
+                 workspace_id = excluded.workspace_id, actor_id = excluded.actor_id,
+                 path = excluded.path, last_seen = excluded.last_seen",
+            params![session_id, self.workspace_id, actor_id, path, at],
         )?;
         Ok(())
     }
@@ -905,9 +907,9 @@ impl MetadataStore for SqliteMetadataStore {
         let mut stmt = conn.prepare(
             "SELECT p.session_id, p.actor_id, a.display_name, a.kind, p.path, p.last_seen
              FROM presence p JOIN actor a ON a.id = p.actor_id
-             WHERE p.last_seen >= ?1 ORDER BY p.last_seen DESC",
+             WHERE p.workspace_id = ?1 AND p.last_seen >= ?2 ORDER BY p.last_seen DESC",
         )?;
-        let rows = stmt.query_map(params![since_ts], |r| {
+        let rows = stmt.query_map(params![self.workspace_id, since_ts], |r| {
             let kind: String = r.get(3)?;
             Ok(Presence {
                 session_id: r.get(0)?,
@@ -937,10 +939,11 @@ impl MetadataStore for SqliteMetadataStore {
     async fn create_suggestion(&self, init: SuggestionInit, ts: i64) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO suggestion(actor_id, session_id, branch, path, base_hash,
+            "INSERT INTO suggestion(workspace_id, actor_id, session_id, branch, path, base_hash,
                  proposed_hash, summary, status, created_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
+                self.workspace_id,
                 init.actor_id,
                 init.session_id,
                 init.branch,
@@ -960,8 +963,8 @@ impl MetadataStore for SqliteMetadataStore {
         conn.query_row(
             "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
                  summary, status, created_ts, resolved_ts, resolved_by
-             FROM suggestion WHERE id = ?1",
-            params![id],
+             FROM suggestion WHERE id = ?1 AND workspace_id = ?2",
+            params![id, self.workspace_id],
             row_to_suggestion,
         )
         .optional()
@@ -978,10 +981,13 @@ impl MetadataStore for SqliteMetadataStore {
             "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
                  summary, status, created_ts, resolved_ts, resolved_by
              FROM suggestion
-             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR path = ?2)
+             WHERE workspace_id = ?1 AND (?2 IS NULL OR status = ?2) AND (?3 IS NULL OR path = ?3)
              ORDER BY id DESC",
         )?;
-        let rows = stmt.query_map(params![status.map(|s| s.as_str()), path], row_to_suggestion)?;
+        let rows = stmt.query_map(
+            params![self.workspace_id, status.map(|s| s.as_str()), path],
+            row_to_suggestion,
+        )?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -999,8 +1005,8 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.lock();
         let n = conn.execute(
             "UPDATE suggestion SET status = ?1, resolved_by = ?2, resolved_ts = ?3
-             WHERE id = ?4 AND status = 'pending'",
-            params![status.as_str(), resolved_by, ts, id],
+             WHERE id = ?4 AND workspace_id = ?5 AND status = 'pending'",
+            params![status.as_str(), resolved_by, ts, id, self.workspace_id],
         )?;
         Ok(n == 1)
     }
@@ -1128,12 +1134,13 @@ impl MetaTxn for SqliteTxn {
     }
 
     async fn append_edit_op(&mut self, op: EditOpInit) -> Result<i64> {
+        let ws = self.workspace_id;
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO edit_op(session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO edit_op(workspace_id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                op.session_id, op.actor_id, op.tool_call_id, op.ino, op.path, op.op,
+                ws, op.session_id, op.actor_id, op.tool_call_id, op.ino, op.path, op.op,
                 op.byte_start, op.byte_len, op.pre_hash, op.post_hash, op.ts
             ],
         )?;

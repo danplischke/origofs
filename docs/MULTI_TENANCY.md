@@ -14,12 +14,22 @@
 > *traits* stay unchanged (the `workspace_id` is ambient on the concrete store handle,
 > §6); the schema gains the discriminator column and a per-workspace root inode.
 >
-> **Implementation status.** The **workspace layer (MT1) is implemented** — migration
-> V11 adds the `workspace` registry + `workspace_id`; the SQLite and Postgres backends
-> scope by it (via an ambient `for_workspace` handle); `Fs` roots at a per-workspace
-> inode; `Workspace::workspace(name)` / `workspaces()` open and list workspaces in one
-> store; and GC marks across all of them. See `crates/origofs-sdk/tests/multi_workspace.rs`.
-> The **tenant layer (MT2+) remains a concept** described below.
+> **Implementation status.** The **workspace layer (MT1) is implemented.** Migration
+> V11 adds the `workspace` registry + `workspace_id` on the working-tree/namespace
+> tables (`inode`, `ref`, `config`, `conflict`, `file_lock`); V12 extends it to the
+> per-location activity/attribution tables (`suggestion`, `fs_event`, `edit_op`,
+> `presence`) so the suggestion queue, change feed, op-log, and presence isolate too
+> — a proposal made in one workspace can't be seen or accepted from another. The
+> SQLite and Postgres backends scope by an ambient `for_workspace` handle; `Fs` roots
+> at a per-workspace inode; `Workspace::workspace(name)` / `workspaces()` open and list
+> workspaces; GC marks across all of them; and **disaster recovery (`rebuild`) restores
+> every workspace** from the content store (each workspace's ref mirror is tagged with
+> its name). `actor`/`session`/`tool_calls` stay store-wide (identity is tenant-wide),
+> and `blob_blame` stays keyed by content hash (shared by content). `dentry`/`symlink`
+> need no column — inodes share one id sequence, so a subtree is reachable only from
+> its own root. See `crates/origofs-sdk/tests/multi_workspace.rs` and the multi-workspace
+> invariants in `crates/origofs-core/tests/simulation.rs`. The **tenant layer (MT2+)
+> remains a concept** described below.
 
 ---
 
@@ -495,23 +505,26 @@ the schema and the two backend impls but keeps the `MetadataStore` *trait* uncha
 The **tenant** layer is purely additive.
 
 **Workspace layer — many workspaces in one store (`workspace_id`):**
-- **Migration** (V11+): a `workspace(id PK, name UNIQUE, root_ino, created_at, …)`
+- **Migration** (V11 + V12): a `workspace(id PK, name UNIQUE, root_ino, created_at)`
   registry table; `workspace_id` folded into the primary keys of the namespace-keyed
-  tables (`ref`, `config`, `conflict`, `file_lock`) and added as a filter/tag column
-  on `inode`, `dentry`, `fs_event`, `suggestion`, `edit_op`. `symlink` (keyed by the
-  global `ino`) and `blob_blame` (keyed by content hash — deliberately shared, §12)
-  are untouched. Backfill maps every existing row to a `default` workspace (id 1,
-  root = `INO_ROOT`), so the migration is **non-breaking** — an existing single-
-  workspace store just becomes a store with one workspace. The PK changes are a
-  table-rebuild on SQLite (create/copy/drop/rename in the migration), a
-  `DROP/ADD CONSTRAINT` on Postgres.
+  tables (`ref`, `config`, `conflict`, `file_lock`) and added as a tag column on
+  `inode` (**V11**), then on the per-location activity/attribution tables
+  `suggestion`, `fs_event`, `edit_op`, `presence` (**V12**) so the suggestion queue,
+  change feed, op-log, and presence isolate too. `dentry`/`symlink` (keyed by the
+  global `ino`), `blob_blame` (keyed by content hash — deliberately shared, §12), and
+  the store-wide identity tables `actor`/`session`/`tool_calls` are untouched. Backfill
+  maps every existing row to a `default` workspace (id 1, root = `INO_ROOT`), so the
+  migration is **non-breaking** — an existing single-workspace store just becomes a
+  store with one workspace. The V11 PK changes are a table-rebuild on SQLite
+  (create/copy/drop/rename), a `DROP/ADD CONSTRAINT` on Postgres; V12 is plain
+  `ADD COLUMN` (surrogate-id/seq PKs don't collide, so no rebuild).
 - **Ambient `workspace_id` on the concrete stores — trait unchanged.** Rather than add
   a parameter to ~40 trait methods, `SqliteMetadataStore`/`PostgresMetadataStore` gain
   a `workspace_id` field and a `for_workspace(id)` that clones the handle sharing the
   same connection/pool but scopes every statement (`… WHERE workspace_id = self.id`,
   stamped on inserts). Trait object-safety and the content-store decorator stack are
-  untouched. Defense-in-depth: the scoped handle also filters `get_inode` by
-  `workspace_id`, so a stray/hostile `ino` can't read another workspace's row.
+  untouched. Inode/dentry reads stay keyed by `ino` (globally unique, reachable only
+  from a workspace's own root), so they need no predicate.
 - **Per-workspace root inode — the one engine change.** `Fs` holds a `root_ino`
   instead of assuming the `INO_ROOT` constant; path resolution starts there.
   `Workspace::open` resolves/creates the named workspace and binds `Fs` to
@@ -519,6 +532,12 @@ The **tenant** layer is purely additive.
   `workspace` registry and GC only.
 - **GC becomes per-store (per-tenant):** mark from *every* workspace's refs before
   sweeping the shared content (§8). Deleting one workspace is metadata-only.
+- **Disaster recovery restores every workspace.** The `workspace` registry lives only
+  in the DB, so each workspace's ref mirror (`mirror_refs`) tags its snapshot with its
+  workspace name (reusing the ref-list — no object-format change); `rebuild` groups
+  the scanned mirrors by workspace and recovers the `default` into the target plus
+  each other workspace into a freshly created registry entry, materializing every
+  committed tree.
 
 **Tenant layer — additive, no core trait change:**
 - New module `origofs-tenant`: `TenantId`, `TenantRecord`, `TenantState`, `Quota`, a

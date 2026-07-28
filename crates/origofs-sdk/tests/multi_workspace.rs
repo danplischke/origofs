@@ -4,7 +4,7 @@
 //! are shared. These tests pin the isolation, independent versioning, and
 //! persistence guarantees.
 
-use origofs_sdk::{MemStore, OrigoFSError, Workspace};
+use origofs_sdk::{MemStore, OrigoFSError, Workspace, WriteCtx};
 
 /// Files, directory listings, and reads are isolated per workspace, and each
 /// workspace roots at its own inode (only the `default` workspace is `INO_ROOT`).
@@ -161,6 +161,153 @@ async fn workspaces_isolate_on_postgres() {
     a.commit("tester", "add only-a").await.unwrap();
     assert_eq!(a.log().await.unwrap().len(), 1);
     assert_eq!(b.log().await.unwrap().len(), 0);
+}
+
+/// The suggestion queue is workspace-isolated (migration V12): a proposal made in
+/// one workspace is invisible in another and cannot be accepted into the wrong
+/// tree — the cross-workspace-accept hole the fix closed.
+#[tokio::test]
+async fn suggestions_are_workspace_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let beta = ws.workspace("beta").await.unwrap();
+
+    // Actors are store-wide; an author and a distinct reviewer (review needs a
+    // different actor than the author).
+    let author = ws.create_human("author", None).await.unwrap();
+    let reviewer = ws.create_human("reviewer", None).await.unwrap();
+
+    // A proposal made in alpha for a new file.
+    let sid = alpha
+        .suggest(
+            WriteCtx::actor(author),
+            "/x.txt",
+            b"proposed",
+            Some("add x"),
+        )
+        .await
+        .unwrap();
+
+    // Visible in alpha, invisible in beta.
+    assert_eq!(alpha.list_suggestions(None, None).await.unwrap().len(), 1);
+    assert!(beta.list_suggestions(None, None).await.unwrap().is_empty());
+    assert!(beta.get_suggestion(sid).await.unwrap().is_none());
+
+    // beta cannot accept alpha's suggestion (it can't even resolve it), and the
+    // proposed file never leaks into beta's tree.
+    assert!(
+        beta.accept_suggestion(sid, WriteCtx::actor(reviewer))
+            .await
+            .is_err(),
+        "beta must not accept another workspace's suggestion"
+    );
+    assert!(matches!(
+        beta.read("/x.txt").await,
+        Err(OrigoFSError::NotFound(_))
+    ));
+
+    // alpha accepts it → lands in alpha's tree only.
+    alpha
+        .accept_suggestion(sid, WriteCtx::actor(reviewer))
+        .await
+        .unwrap();
+    assert_eq!(&alpha.read("/x.txt").await.unwrap()[..], b"proposed");
+    assert!(matches!(
+        beta.read("/x.txt").await,
+        Err(OrigoFSError::NotFound(_))
+    ));
+}
+
+/// The change feed and the op-log are workspace-isolated (migration V12): activity
+/// in one workspace never surfaces on another's feed or attribution history.
+#[tokio::test]
+async fn change_feed_and_op_log_are_workspace_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alpha = ws.workspace("alpha").await.unwrap();
+    let beta = ws.workspace("beta").await.unwrap();
+    let actor = ws.create_human("writer", None).await.unwrap();
+
+    // An attributed write in alpha.
+    alpha
+        .write_as(WriteCtx::actor(actor), "/only-alpha.txt", b"hi")
+        .await
+        .unwrap();
+
+    // Change feed: alpha sees its write; beta's feed does not.
+    let alpha_feed: Vec<String> = alpha
+        .watch(0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    let beta_feed: Vec<String> = beta
+        .watch(0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    assert!(alpha_feed.iter().any(|p| p == "/only-alpha.txt"));
+    assert!(!beta_feed.iter().any(|p| p == "/only-alpha.txt"));
+
+    // Op-log: the edit-op is on alpha's history, not beta's.
+    assert!(!alpha.edit_ops(actor, None).await.unwrap().is_empty());
+    assert!(beta.edit_ops(actor, None).await.unwrap().is_empty());
+}
+
+/// Disaster recovery restores **every** workspace of a multi-workspace store from
+/// the content store alone: a fresh metadata DB over the surviving content
+/// rebuilds the `default` workspace and each other one, with its committed tree.
+#[tokio::test]
+async fn rebuild_recovers_all_workspaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = dir.path().join("cas");
+
+    // Author committed history across three workspaces sharing one content store.
+    {
+        let ws = Workspace::open_local(dir.path().join("db1.sqlite"), &cas)
+            .await
+            .unwrap();
+        ws.write("/root.txt", b"in-default").await.unwrap();
+        ws.commit("t", "default").await.unwrap();
+
+        let alpha = ws.workspace("alpha").await.unwrap();
+        alpha.write("/a.txt", b"in-alpha").await.unwrap();
+        alpha.commit("t", "alpha").await.unwrap();
+
+        let beta = ws.workspace("beta").await.unwrap();
+        beta.mkdir_p("/d").await.unwrap();
+        beta.write("/d/b.txt", b"in-beta").await.unwrap();
+        beta.commit("t", "beta").await.unwrap();
+    }
+
+    // Catastrophe: the metadata DB is gone. A FRESH DB over the same content store
+    // rebuilds every workspace from the object graph + tagged ref mirrors.
+    let ws = Workspace::open_local(dir.path().join("db2.sqlite"), &cas)
+        .await
+        .unwrap();
+    let report = ws.rebuild().await.unwrap();
+    assert_eq!(
+        report.extra_workspaces, 2,
+        "alpha + beta should be recovered beyond the default"
+    );
+
+    // Every workspace and its committed tree came back.
+    let mut ws_names = ws.workspaces().await.unwrap();
+    ws_names.sort();
+    assert_eq!(ws_names, vec!["alpha", "beta", "default"]);
+    assert_eq!(&ws.read("/root.txt").await.unwrap()[..], b"in-default");
+    let alpha = ws.workspace("alpha").await.unwrap();
+    assert_eq!(&alpha.read("/a.txt").await.unwrap()[..], b"in-alpha");
+    let beta = ws.workspace("beta").await.unwrap();
+    assert_eq!(&beta.read("/d/b.txt").await.unwrap()[..], b"in-beta");
 }
 
 /// The sorted-by-insertion entry names directly under a workspace's root.
