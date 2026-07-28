@@ -2,8 +2,9 @@
 //! its delta (create / modify / delete) back into origofs with attribution.
 //!
 //! Self-skips where unprivileged overlayfs isn't available.
+#![cfg(feature = "sandbox")]
 
-use origofs_sandbox::{overlay_supported, run, LiveSync, RunOpts};
+use origofs_sdk::sandbox::{LiveSync, RunOpts, overlay_supported, run};
 use origofs_sdk::{ActorKind, Workspace};
 
 async fn workspace(dir: &std::path::Path) -> Workspace {
@@ -163,9 +164,9 @@ async fn run_live_streams_changes_to_origofs() {
         "-c".to_string(),
         "echo created > new.txt; sleep 0.5; echo more >> keep.txt; rm gone.txt".to_string(),
     ];
-    let out = origofs_sandbox::run_live(
+    let out = origofs_sdk::sandbox::run_live(
         &ws,
-        origofs_sandbox::LiveOpts {
+        origofs_sdk::sandbox::LiveOpts {
             actor: Some(agent),
             work_root: dir.path().join("ovl"),
             sync_interval: std::time::Duration::from_millis(150),

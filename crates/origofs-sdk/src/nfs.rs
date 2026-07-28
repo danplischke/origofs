@@ -1,4 +1,4 @@
-//! origofs-nfs — serve a workspace over NFSv3 (`docs/DESIGN.md` §6, M7 surfaces).
+//! NFSv3 surface (`nfs` feature) — serve a workspace over NFSv3 (`docs/DESIGN.md` §6, M7 surfaces).
 //!
 //! A [`nfsserve`] adapter that maps NFSv3 operations onto origofs's inode-oriented
 //! `vfs_*` methods — the very same ones the FUSE mount uses, so the filesystem
@@ -7,7 +7,7 @@
 //!
 //! ```no_run
 //! # async fn run(ws: origofs_sdk::Workspace) -> std::io::Result<()> {
-//! origofs_nfs::serve(ws, "127.0.0.1:11111").await
+//! origofs_sdk::nfs::serve(ws, "127.0.0.1:11111").await
 //! # }
 //! ```
 //!
@@ -15,6 +15,7 @@
 //! `mount -t nfs -o vers=3,tcp,port=11111,mountport=11111,nolock host:/ /mnt`
 //! (needs the OS NFS client / `nfs-utils`).
 
+use crate::{DirEntry, FileKind, Inode, OrigoFSError, Workspace};
 use async_trait::async_trait;
 use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_mode3,
@@ -22,7 +23,6 @@ use nfsserve::nfs::{
 };
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
-use origofs_sdk::{DirEntry, FileKind, Inode, OrigoFSError, Workspace};
 
 /// The origofs root inode, which is also the NFS root fileid.
 const ROOT: fileid3 = 1;

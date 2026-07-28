@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/origofs-core", "crates/origofs-sdk", "crates/origofs-cli", "crates/origofs-sandbox", "crates/origofs-fuse", "crates/origofs-mcp", "crates/origofs-git", "crates/origofs-api", "crates/origofs-nfs", "crates/origofs-py"]
+members = ["crates/origofs-core", "crates/origofs-sdk", "crates/origofs-cli", "crates/origofs-py"]
 
 [workspace.package]
 version = "0.0.0"

@@ -1,13 +1,13 @@
-//! origofs-mcp — expose an origofs workspace to agents over the Model Context Protocol
-//! (`docs/DESIGN.md` §4e).
+//! MCP surface (`mcp` feature) — expose an origofs workspace to agents over the
+//! Model Context Protocol (`docs/DESIGN.md` §4e).
 //!
 //! A minimal JSON-RPC 2.0 server over newline-delimited stdio (the MCP stdio
 //! transport). Every mutating tool call is attributed to the server's agent
 //! actor, so blame + the edit-op audit come "for free" from how the agent works
 //! — reading and writing files *is* the tool call.
 
-use origofs_sdk::{OrigoFSError, SuggestionStatus, Workspace, WriteCtx, WriteOutcome};
-use serde_json::{json, Value};
+use crate::{OrigoFSError, SuggestionStatus, Workspace, WriteCtx, WriteOutcome};
+use serde_json::{Value, json};
 
 type Result<T> = std::result::Result<T, OrigoFSError>;
 
@@ -82,10 +82,10 @@ impl McpServer {
             "origofs_write" => {
                 let p = path();
                 let data = args.get("content").and_then(Value::as_str).unwrap_or("");
-                if let Some((parent, _)) = p.rsplit_once('/') {
-                    if !parent.is_empty() {
-                        self.ws.mkdir_p(parent).await?;
-                    }
+                if let Some((parent, _)) = p.rsplit_once('/')
+                    && !parent.is_empty()
+                {
+                    self.ws.mkdir_p(parent).await?;
                 }
                 // Governed by this agent's write policy: a direct agent writes
                 // straight to the tree; a propose-only agent's edit is queued for
@@ -171,10 +171,10 @@ impl McpServer {
                 let p = path();
                 let data = args.get("content").and_then(Value::as_str).unwrap_or("");
                 let summary = args.get("summary").and_then(Value::as_str);
-                if let Some((parent, _)) = p.rsplit_once('/') {
-                    if !parent.is_empty() {
-                        self.ws.mkdir_p(parent).await?;
-                    }
+                if let Some((parent, _)) = p.rsplit_once('/')
+                    && !parent.is_empty()
+                {
+                    self.ws.mkdir_p(parent).await?;
                 }
                 let id = self
                     .ws

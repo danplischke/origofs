@@ -4,14 +4,15 @@
 //! Mutations are authenticated: the fixture maps bearer tokens to actors the
 //! server pre-provisioned, so attribution is derived from the verified identity —
 //! never from the request. Reads are open.
+#![cfg(feature = "api")]
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use http_body_util::BodyExt;
-use origofs_api::{router, router_with, ApiOptions, BearerAuth};
 use origofs_sdk::Workspace;
-use serde_json::{json, Value};
+use origofs_sdk::api::{ApiOptions, BearerAuth, router, router_with};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -187,10 +188,12 @@ async fn missing_file_is_404_and_dir_read_is_400() {
     let app = &fx.app;
     let (st, body) = send(app, get("/files/nope.txt")).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
-    assert!(as_json(&body)["error"]
-        .as_str()
-        .unwrap()
-        .contains("not found"));
+    assert!(
+        as_json(&body)["error"]
+            .as_str()
+            .unwrap()
+            .contains("not found")
+    );
 
     send(app, post_json_as("/dirs/adir", T_HUMAN, json!({}))).await;
     let (st, _) = send(app, get("/files/adir")).await; // reading a directory
@@ -246,11 +249,13 @@ async fn versioning_over_http() {
     // a branch shows up as current
     let (_st, body) = send(app, get("/branches")).await;
     let branches = as_json(&body);
-    assert!(branches
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|b| b["name"] == "main" && b["current"] == true));
+    assert!(
+        branches
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["name"] == "main" && b["current"] == true)
+    );
 }
 
 #[tokio::test]
@@ -340,12 +345,14 @@ async fn diff_between_branches_over_http() {
         2,
         "edit.txt modified + new.txt added; keep.txt unchanged"
     );
-    assert!(arr
-        .iter()
-        .any(|d| d["path"] == "/edit.txt" && d["status"] == "modified"));
-    assert!(arr
-        .iter()
-        .any(|d| d["path"] == "/new.txt" && d["status"] == "added"));
+    assert!(
+        arr.iter()
+            .any(|d| d["path"] == "/edit.txt" && d["status"] == "modified")
+    );
+    assert!(
+        arr.iter()
+            .any(|d| d["path"] == "/new.txt" && d["status"] == "added")
+    );
 
     // per-file unified diff
     let (st, body) = send(app, get("/diff/file?from=main&to=feature&path=/edit.txt")).await;

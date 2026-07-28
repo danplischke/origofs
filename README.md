@@ -359,8 +359,8 @@ origofs --workspace "$WS" gc     # run when idle — not safe alongside active w
 | **`origofs` CLI** | Scripting and day-to-day workspace operations |
 | **Rust SDK** (`origofs-sdk`) | Embedding origofs in a Rust service |
 | **Python** (`origofs-py`) | Async-native PyO3 bindings — FastAPI-ready, resolve identity yourself |
-| **HTTP API** (`origofs-api`) | Any language / any client over JSON |
-| **MCP** (`origofs-mcp`) | Agents calling filesystem tools directly, attributed |
+| **HTTP API** (`origofs-sdk` `api` feature) | Any language / any client over JSON |
+| **MCP** (`origofs-sdk` `mcp` feature) | Agents calling filesystem tools directly, attributed |
 | **Overlay mount** | Running an agent live in a fast native mount |
 | **FUSE / NFS** | Mounting the workspace as a POSIX filesystem |
 

@@ -607,12 +607,12 @@ async fn main() -> Result<()> {
             cmd,
         } => {
             if isolate {
-                if !origofs_sandbox::bwrap_available() {
+                if !origofs_sdk::sandbox::bwrap_available() {
                     anyhow::bail!(
                         "--isolate needs bubblewrap (`bwrap`) on PATH (>= 0.8.0, for overlay support)"
                     );
                 }
-            } else if !origofs_sandbox::overlay_supported() {
+            } else if !origofs_sdk::sandbox::overlay_supported() {
                 anyhow::bail!(
                     "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
                 );
@@ -620,13 +620,13 @@ async fn main() -> Result<()> {
             let tmp = cli
                 .workspace
                 .join(format!("sandbox-{}", std::process::id()));
-            let opts = origofs_sandbox::RunOpts {
+            let opts = origofs_sdk::sandbox::RunOpts {
                 actor,
                 discard,
                 work_root: tmp.clone(),
                 isolate,
             };
-            let outcome = origofs_sandbox::run(&ws, opts, &cmd).await?;
+            let outcome = origofs_sdk::sandbox::run(&ws, opts, &cmd).await?;
             let _ = std::fs::remove_dir_all(&tmp);
             if outcome.imported {
                 println!(
@@ -645,12 +645,12 @@ async fn main() -> Result<()> {
             cmd,
         } => {
             if isolate {
-                if !origofs_sandbox::bwrap_available() {
+                if !origofs_sdk::sandbox::bwrap_available() {
                     anyhow::bail!(
                         "--isolate needs bubblewrap (`bwrap`) on PATH (>= 0.8.0, for overlay support)"
                     );
                 }
-            } else if !origofs_sandbox::overlay_supported() {
+            } else if !origofs_sdk::sandbox::overlay_supported() {
                 anyhow::bail!(
                     "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
                 );
@@ -658,13 +658,13 @@ async fn main() -> Result<()> {
             let tmp = cli
                 .workspace
                 .join(format!("overlay-{}", std::process::id()));
-            let opts = origofs_sandbox::LiveOpts {
+            let opts = origofs_sdk::sandbox::LiveOpts {
                 actor,
                 work_root: tmp.clone(),
                 sync_interval: std::time::Duration::from_millis(sync_ms),
                 isolate,
             };
-            let outcome = origofs_sandbox::run_live(&ws, opts, &cmd).await?;
+            let outcome = origofs_sdk::sandbox::run_live(&ws, opts, &cmd).await?;
             let _ = std::fs::remove_dir_all(&tmp);
             println!(
                 "agent exited {}; streamed {} change(s) into origofs",
@@ -673,7 +673,7 @@ async fn main() -> Result<()> {
             std::process::exit(outcome.exit_code);
         }
         Cmd::Mount { mountpoint } => {
-            if !origofs_fuse::mountable() {
+            if !origofs_sdk::fuse::mountable() {
                 anyhow::bail!("FUSE mount unavailable here (needs root + /dev/fuse)");
             }
             std::fs::create_dir_all(&mountpoint)?;
@@ -682,13 +682,13 @@ async fn main() -> Result<()> {
                 mountpoint.display()
             );
             // The mount drives its own runtime, so run it off the async main thread.
-            let handle = std::thread::spawn(move || origofs_fuse::mount(ws, &mountpoint));
+            let handle = std::thread::spawn(move || origofs_sdk::fuse::mount(ws, &mountpoint));
             handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("mount thread panicked"))??;
         }
         Cmd::Mcp { agent_name, model } => {
-            let server = origofs_mcp::McpServer::create(ws, &agent_name, &model).await?;
+            let server = origofs_sdk::mcp::McpServer::create(ws, &agent_name, &model).await?;
             server.serve_stdio().await?;
         }
         Cmd::Git { cmd } => match cmd {
@@ -698,14 +698,14 @@ async fn main() -> Result<()> {
                 format,
                 lfs_threshold,
             } => {
-                let format = origofs_git::ObjectFormat::parse(&format)
+                let format = origofs_sdk::git::ObjectFormat::parse(&format)
                     .ok_or_else(|| anyhow::anyhow!("format must be `sha1` or `sha256`"))?;
-                let opts = origofs_git::ExportOptions {
+                let opts = origofs_sdk::git::ExportOptions {
                     format,
                     branch,
                     lfs_threshold,
                 };
-                let out = origofs_git::export_git(&ws, &dir, &opts).await?;
+                let out = origofs_sdk::git::export_git(&ws, &dir, &opts).await?;
                 println!(
                     "exported branch {} ({} commit(s), {} lfs object(s)) to {}",
                     out.branch,
@@ -716,7 +716,7 @@ async fn main() -> Result<()> {
                 println!("head {} {}", format.as_str(), out.head);
             }
             GitCmd::Import { dir, branch } => {
-                let head = origofs_git::import_git(&ws, &dir, &branch).await?;
+                let head = origofs_sdk::git::import_git(&ws, &dir, &branch).await?;
                 println!(
                     "imported branch {branch} at {} from {}",
                     &head.to_hex()[..12],
@@ -809,7 +809,7 @@ async fn main() -> Result<()> {
         Cmd::Serve { addr, auth_tokens } => {
             let auth = build_api_auth(&ws, &addr, &auth_tokens).await?;
             println!("serving origofs at http://{addr} (Ctrl-C to stop)");
-            origofs_api::serve(std::sync::Arc::new(ws), addr, auth).await?;
+            origofs_sdk::api::serve(std::sync::Arc::new(ws), addr, auth).await?;
         }
         Cmd::Nfs { addr } => {
             // NFSv3 is unauthenticated; warn loudly if this isn't a loopback bind.
@@ -825,7 +825,7 @@ async fn main() -> Result<()> {
             println!(
                 "serving origofs over NFSv3 at {addr}\n  mount with: mount -t nfs -o vers=3,tcp,port=<port>,mountport=<port>,nolock <host>:/ /mnt"
             );
-            origofs_nfs::serve(ws, &addr).await?;
+            origofs_sdk::nfs::serve(ws, &addr).await?;
         }
     }
     Ok(())
@@ -839,7 +839,7 @@ async fn build_api_auth(
     ws: &Workspace,
     addr: &std::net::SocketAddr,
     specs: &[String],
-) -> Result<std::sync::Arc<dyn origofs_api::Authenticator>> {
+) -> Result<std::sync::Arc<dyn origofs_sdk::api::Authenticator>> {
     if specs.is_empty() {
         if !addr.ip().is_loopback() {
             anyhow::bail!(
@@ -850,14 +850,14 @@ async fn build_api_auth(
         eprintln!(
             "warning: no --auth-token given; attributing all writes to local actor {actor} (dev only, loopback bind)"
         );
-        return Ok(std::sync::Arc::new(origofs_api::LocalDevAuth(
-            origofs_api::Principal {
+        return Ok(std::sync::Arc::new(origofs_sdk::api::LocalDevAuth(
+            origofs_sdk::api::Principal {
                 actor,
                 session: None,
             },
         )));
     }
-    let mut bearer = origofs_api::BearerAuth::new();
+    let mut bearer = origofs_sdk::api::BearerAuth::new();
     for spec in specs {
         let (token, who) = spec.split_once('=').ok_or_else(|| {
             anyhow::anyhow!("bad --auth-token {spec:?}; expected TOKEN=ACTOR_ID[:SESSION_ID]")

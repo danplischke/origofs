@@ -24,6 +24,24 @@ pub use origofs_core::{
 #[cfg(feature = "coedit")]
 pub use origofs_core::{CoeditDoc, CoeditRelayNote, CoeditRelaySub};
 
+// ── Access surfaces ─────────────────────────────────────────────────────────
+// Each surface that was formerly its own crate is now an opt-in, feature-gated
+// module over this same `Workspace`. A default build pulls none of their
+// dependencies (axum, fuser, nfsserve, …); enable the ones you need, or `full`.
+// FUSE/NFS are Unix-only. See `Cargo.toml` `[features]`.
+#[cfg(feature = "api")]
+pub mod api;
+#[cfg(all(unix, feature = "fuse"))]
+pub mod fuse;
+#[cfg(feature = "git")]
+pub mod git;
+#[cfg(feature = "mcp")]
+pub mod mcp;
+#[cfg(all(unix, feature = "nfs"))]
+pub mod nfs;
+#[cfg(feature = "sandbox")]
+pub mod sandbox;
+
 type Meta = Arc<dyn MetadataStore>;
 type Content = Arc<dyn ContentStore>;
 

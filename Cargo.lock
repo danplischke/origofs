@@ -1732,38 +1732,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
-name = "origofs-api"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "axum",
- "futures",
- "getrandom 0.2.17",
- "http-body-util",
- "origofs-sdk",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-postgres",
- "tokio-tungstenite 0.24.0",
- "tower",
- "yrs",
-]
-
-[[package]]
 name = "origofs-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "origofs-api",
- "origofs-fuse",
- "origofs-git",
- "origofs-mcp",
- "origofs-nfs",
- "origofs-sandbox",
+ "libc",
  "origofs-sdk",
+ "tempfile",
  "tokio",
 ]
 
@@ -1795,63 +1771,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "origofs-fuse"
-version = "0.0.0"
-dependencies = [
- "fuser",
- "libc",
- "origofs-sdk",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "origofs-git"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-recursion",
- "flate2",
- "hex",
- "libc",
- "origofs-core",
- "origofs-sdk",
- "sha1",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "origofs-mcp"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "origofs-sdk",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "origofs-nfs"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "nfsserve",
- "origofs-sdk",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "origofs-py"
 version = "0.0.0"
 dependencies = [
  "fuser",
  "origofs-core",
- "origofs-fuse",
- "origofs-nfs",
  "origofs-sdk",
  "pyo3",
  "pyo3-async-runtimes",
@@ -1859,26 +1783,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "origofs-sandbox"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "origofs-sdk",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "origofs-sdk"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-recursion",
+ "async-trait",
+ "axum",
  "bytes",
+ "flate2",
+ "fuser",
  "futures",
  "getrandom 0.2.17",
+ "hex",
+ "http-body-util",
+ "libc",
+ "nfsserve",
  "origofs-core",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-postgres",
+ "tokio-tungstenite 0.24.0",
+ "tower",
+ "yrs",
 ]
 
 [[package]]

@@ -7,10 +7,10 @@
 //! capability: for each operation git asks us to `connect git-upload-pack`
 //! (fetch/clone) or `connect git-receive-pack` (push). We materialize the origofs
 //! history into a throwaway real git repository with the M5 object codec
-//! ([`origofs_git::export_git`]), hand our stdin/stdout to a genuine
+//! ([`origofs_sdk::git::export_git`]), hand our stdin/stdout to a genuine
 //! `git upload-pack` / `git receive-pack` pointed at that repo — so real git
 //! does all the pack-protocol work — and, on push, import whatever it wrote back
-//! into origofs ([`origofs_git::import_git`]).
+//! into origofs ([`origofs_sdk::git::import_git`]).
 //!
 //! A URL is `origofs://<workspace-path>`, where the workspace is an origofs directory
 //! (holding `meta.db` + `cas/`), the same one the `origofs` CLI's `--workspace`
@@ -21,9 +21,9 @@
 //!
 //! [remote-helper protocol]: https://git-scm.com/docs/gitremote-helpers
 
-use anyhow::{bail, Context, Result};
-use origofs_git::{export_git, import_git, ExportOptions, ObjectFormat};
+use anyhow::{Context, Result, bail};
 use origofs_sdk::Workspace;
+use origofs_sdk::git::{ExportOptions, ObjectFormat, export_git, import_git};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -189,11 +189,11 @@ fn read_heads(dir: &Path) -> HashMap<String, String> {
             if line.starts_with('#') || line.starts_with('^') {
                 continue;
             }
-            if let Some((oid, name)) = line.split_once(' ') {
-                if let Some(b) = name.trim().strip_prefix("refs/heads/") {
-                    out.entry(b.to_string())
-                        .or_insert_with(|| oid.trim().to_string());
-                }
+            if let Some((oid, name)) = line.split_once(' ')
+                && let Some(b) = name.trim().strip_prefix("refs/heads/")
+            {
+                out.entry(b.to_string())
+                    .or_insert_with(|| oid.trim().to_string());
             }
         }
     }
