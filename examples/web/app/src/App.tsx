@@ -2,13 +2,14 @@ import { useCallback, useState } from "react";
 import { useSession } from "./session";
 import { useDocument } from "./doc/useDocument";
 import { EditPane } from "./editor/EditPane";
+import { CoeditPane } from "./editor/CoeditPane";
 import { BlameView } from "./editor/BlameView";
 import { HistoryPanel } from "./panels/HistoryPanel";
 import { SuggestionsPanel } from "./panels/SuggestionsPanel";
 import { ActivityFeed } from "./panels/ActivityFeed";
 import { kindGlyph } from "./lib/colors";
 
-type Tab = "edit" | "blame" | "history" | "suggestions";
+type Tab = "edit" | "live" | "blame" | "history" | "suggestions";
 
 function SignIn() {
   const { config, me, token, signIn, signOut } = useSession();
@@ -100,7 +101,7 @@ export function App() {
       <div className="body">
         <main className="main">
           <nav className="tabs">
-            {(["edit", "blame", "history", "suggestions"] as Tab[]).map((t) => (
+            {(["edit", "live", "blame", "history", "suggestions"] as Tab[]).map((t) => (
               <button key={t} className={tab === t ? "active" : ""} onClick={() => setTab(t)}>
                 {t}
               </button>
@@ -123,6 +124,8 @@ export function App() {
                 blame={doc.blame}
                 onChanged={afterWrite}
               />
+            ) : tab === "live" ? (
+              <CoeditPane key={path} path={path} />
             ) : tab === "blame" ? (
               <BlameView text={doc.text} blame={doc.blame} />
             ) : tab === "history" ? (

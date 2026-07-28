@@ -17,6 +17,7 @@ import type {
   Suggestion,
   SuggestionDetail,
   SuggestionStatus,
+  WriteResult,
 } from "./types";
 
 /** Encode an origofs path ("/dir/a.md") into a `{path:path}` URL suffix. */
@@ -97,13 +98,18 @@ export class OrigoFSClient {
   // --- files + attribution (/fs) --------------------------------------------
 
   /** Attributed write of the whole document (UTF-8). Creates parent dirs. */
-  async writeDoc(path: string, text: string): Promise<{ path: string; written: number }> {
+  /**
+   * Write a file. The result depends on the actor's *write policy*: a `direct`
+   * actor's write lands (`written`); a `propose`-only actor's write is queued for
+   * review instead (`proposed`, the new suggestion id) and the file is unchanged.
+   */
+  async writeDoc(path: string, text: string): Promise<WriteResult> {
     const res = await fetch(`${this.base}/fs/files/${pathSuffix(path)}`, {
       method: "PUT",
       headers: this.authHeaders({ "Content-Type": "application/octet-stream" }),
       body: new Blob([text], { type: "application/octet-stream" }),
     });
-    return this.json(res);
+    return this.json<WriteResult>(res);
   }
 
   blame(path: string): Promise<BlameRange[]> {

@@ -226,13 +226,26 @@ impl CoeditDoc {
                     has_reply = true;
                 }
                 // The client is handing us content (initial sync or a live edit):
-                // apply + attribute, then fan the attributed delta out to peers.
+                // apply + attribute, then fan the attributed delta out to peers —
+                // and back to the sender.
                 Message::Sync(SyncMessage::SyncStep2(update))
                 | Message::Sync(SyncMessage::Update(update)) => {
                     let delta = self.apply_update_as(ctx, &update)?;
                     if !delta.is_empty() {
-                        Message::Sync(SyncMessage::Update(delta)).encode(&mut broadcast);
+                        Message::Sync(SyncMessage::Update(delta.clone())).encode(&mut broadcast);
                         has_broadcast = true;
+                        // Echo it to the sender too. Attributing the edit adds CRDT
+                        // items (the author marks) to our doc that the sender's doc
+                        // lacks — it never saw them, since the sender doesn't get the
+                        // broadcast. Without them the sender diverges structurally,
+                        // and a *later* peer edit positioned against those items can't
+                        // integrate (it waits, pending, on origins the sender is
+                        // missing). Sending the delta back keeps every replica — server
+                        // and all clients, author included — structurally identical.
+                        // Re-applying the sender's own items is a no-op (updates are
+                        // idempotent); only the attribution items are new.
+                        Message::Sync(SyncMessage::Update(delta)).encode(&mut reply);
+                        has_reply = true;
                     }
                 }
                 // Cursor presence: relay to the room, keep no server-side state.

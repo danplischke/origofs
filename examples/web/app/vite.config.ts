@@ -9,7 +9,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/fs": { target: "http://127.0.0.1:8000", changeOrigin: true },
+      // `ws: true` so the live co-editing WebSocket (/fs/coedit/…) upgrades through.
+      "/fs": { target: "http://127.0.0.1:8000", changeOrigin: true, ws: true },
       "/api": { target: "http://127.0.0.1:8000", changeOrigin: true },
     },
   },
