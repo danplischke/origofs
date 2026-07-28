@@ -8,12 +8,12 @@
 //! lossless. Packed objects are out of scope for this milestone — freshly
 //! committed and freshly exported repos keep their objects loose.
 
-use crate::object::{parse_commit, parse_tree, read_loose, ObjectFormat};
+use super::object::{ObjectFormat, parse_commit, parse_tree, read_loose};
+use crate::Workspace;
 use async_recursion::async_recursion;
 use origofs_core::error::{OrigoFSError, Result};
 use origofs_core::objectgraph::{Commit, Tree, TreeEntry, TreeKind};
 use origofs_core::types::Hash;
-use origofs_sdk::Workspace;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -55,10 +55,10 @@ fn resolve_head(git_dir: &Path, branch: &str) -> Result<String> {
             if line.starts_with('#') || line.starts_with('^') {
                 continue;
             }
-            if let Some((oid, name)) = line.split_once(' ') {
-                if name.trim() == want {
-                    return Ok(oid.trim().to_string());
-                }
+            if let Some((oid, name)) = line.split_once(' ')
+                && name.trim() == want
+            {
+                return Ok(oid.trim().to_string());
             }
         }
     }

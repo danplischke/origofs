@@ -1,8 +1,9 @@
 //! MCP server: protocol handshake, tool listing, and attributed tool calls.
+#![cfg(feature = "mcp")]
 
-use origofs_mcp::McpServer;
+use origofs_sdk::mcp::McpServer;
 use origofs_sdk::{SuggestionStatus, Workspace, WriteCtx, WritePolicy};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 async fn server() -> McpServer {
     let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
@@ -40,10 +41,11 @@ async fn initialize_and_list_tools() {
     assert!(init["result"]["capabilities"]["tools"].is_object());
 
     // initialized is a notification -> no response
-    assert!(s
-        .handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
-        .await
-        .is_none());
+    assert!(
+        s.handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await
+            .is_none()
+    );
 
     let list = s
         .handle(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
@@ -118,10 +120,12 @@ async fn serves_over_a_stream() {
         .collect();
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["result"]["serverInfo"]["name"], "origofs");
-    assert!(responses[1]["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("created /d"));
+    assert!(
+        responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("created /d")
+    );
 }
 
 // A propose-only agent (the untrusted-agent posture from §6) can't land a direct

@@ -8,15 +8,15 @@
 //! above `lfs_threshold` are written as git-LFS pointer blobs, with their bytes
 //! stashed as LFS objects, so real git clients clone quickly.
 
-use crate::object::{
-    git_ident, make_object, sha256_hex, tree_payload, write_loose, GitObject, GitTreeEntry,
-    ObjectFormat,
+use super::object::{
+    GitObject, GitTreeEntry, ObjectFormat, git_ident, make_object, sha256_hex, tree_payload,
+    write_loose,
 };
+use crate::Workspace;
 use async_recursion::async_recursion;
 use origofs_core::error::{OrigoFSError, Result};
 use origofs_core::objectgraph::TreeKind;
 use origofs_core::types::Hash;
-use origofs_sdk::Workspace;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -193,10 +193,10 @@ impl Exporter<'_> {
     /// Encode a file body as a git blob, or as a git-LFS pointer (stashing the
     /// real bytes as an LFS object) when it exceeds the threshold.
     fn export_file_blob(&mut self, bytes: &[u8]) -> Result<String> {
-        if let Some(threshold) = self.lfs_threshold {
-            if bytes.len() as u64 >= threshold {
-                return self.export_lfs_pointer(bytes);
-            }
+        if let Some(threshold) = self.lfs_threshold
+            && bytes.len() as u64 >= threshold
+        {
+            return self.export_lfs_pointer(bytes);
         }
         let obj = make_object(self.fmt, "blob", bytes);
         write_loose(&self.git_dir, &obj)?;

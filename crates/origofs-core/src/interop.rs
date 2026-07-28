@@ -1,10 +1,10 @@
 //! Low-level accessors that interop layers build on (`docs/DESIGN.md` §4c).
 //!
-//! The git bridge in `origofs-git` needs to reach *below* the path-oriented engine:
+//! The git bridge (the `origofs-sdk` `git` module) needs to reach *below* the path-oriented engine:
 //! read and write raw objects in the content store, reassemble or store whole
 //! file bodies, decode object-graph nodes by hash, and read/point branch refs.
 //! These are the stable seams it uses; everything git-specific (object encoding,
-//! packfiles, LFS) lives in `origofs-git` so origofs-core stays free of git deps.
+//! packfiles, LFS) lives in the `origofs-sdk` `git` module so origofs-core stays free of git deps.
 
 use crate::chunk::Manifest;
 use crate::content::ContentStore;

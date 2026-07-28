@@ -6,10 +6,10 @@
 //!
 //! Self-skips unless `ORIGOFS_PG_TEST_URL` points at a reachable database.
 //! Requires the `coedit` feature.
-#![cfg(feature = "coedit")]
+#![cfg(all(feature = "api", feature = "coedit"))]
 
 use futures::{SinkExt, StreamExt};
-use origofs_api::{router, BearerAuth};
+use origofs_sdk::api::{BearerAuth, router};
 use origofs_sdk::{MemStore, Workspace};
 use std::sync::Arc;
 use std::time::Duration;
@@ -157,11 +157,11 @@ async fn edit_on_one_worker_reaches_a_client_on_another() {
     b.send(Ws::Close(None)).await.ok();
     let mut blame = vec![];
     for _ in 0..40 {
-        if let Ok(bl) = ws_a.blame("/doc.md").await {
-            if !bl.is_empty() {
-                blame = bl;
-                break;
-            }
+        if let Ok(bl) = ws_a.blame("/doc.md").await
+            && !bl.is_empty()
+        {
+            blame = bl;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

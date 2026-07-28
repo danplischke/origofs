@@ -1,6 +1,7 @@
-//! origofs-sandbox — run an unmodified process against an **isolated copy-on-write
-//! view** of an origofs workspace, then import what it changed back as an attributed
-//! commit (`docs/DESIGN.md` §4e; the agentfs `run` use case for overlay).
+//! Sandbox surface (`sandbox` feature) — run an unmodified process against an
+//! **isolated copy-on-write view** of an origofs workspace, then import what it
+//! changed back as an attributed commit (`docs/DESIGN.md` §4e; the agentfs `run`
+//! use case for overlay).
 //!
 //! Flow:
 //! 1. **Materialize** the workspace's working tree to a real `lower/` directory.
@@ -35,8 +36,8 @@
 //! left shared on purpose because agents typically need egress, so it does not by
 //! itself contain network-reachable resources.
 
-use anyhow::{bail, Context, Result};
-use origofs_sdk::{FileKind, Workspace, WriteCtx};
+use crate::{FileKind, Workspace, WriteCtx};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -588,18 +589,20 @@ mod tests {
             "writable overlay: {args:?}"
         );
         // Host toolchain is bind-mounted read-only (never read-write).
-        assert!(args
-            .windows(3)
-            .any(|w| w[0] == "--ro-bind" && w[1] == "/usr" && w[2] == "/usr"));
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == "/usr" && w[2] == "/usr")
+        );
         assert!(
             !args.iter().any(|a| a == "--bind"),
             "nothing host is writable: {args:?}"
         );
         // Real namespaces + working dir inside the overlay.
         assert!(args.contains(&"--unshare-pid".to_string()));
-        assert!(args
-            .windows(2)
-            .any(|w| w[0] == "--chdir" && w[1] == BWRAP_WORKDIR));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--chdir" && w[1] == BWRAP_WORKDIR)
+        );
         // The user command comes last, after the `--` separator, unmodified.
         let sep = args.iter().position(|a| a == "--").expect("`--` separator");
         assert_eq!(&args[sep + 1..], &["echo".to_string(), "hi".to_string()]);

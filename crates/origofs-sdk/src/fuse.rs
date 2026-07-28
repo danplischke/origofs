@@ -1,5 +1,5 @@
-//! origofs-fuse — mount an origofs workspace as a POSIX filesystem via FUSE
-//! (`docs/DESIGN.md` §4e).
+//! FUSE surface (`fuse` feature) — mount an origofs workspace as a POSIX
+//! filesystem via FUSE (`docs/DESIGN.md` §4e).
 //!
 //! A [`fuser::Filesystem`] adapter over the inode-oriented [`Fs::vfs_*`] methods.
 //! origofs is async and FUSE callbacks are synchronous, so each callback drives the
@@ -9,12 +9,12 @@
 //! Mounting uses the `mount()` syscall directly (no `fusermount` needed) and so
 //! requires root/`CAP_SYS_ADMIN`; [`mountable`] probes for that.
 
+use crate::{FileKind, Inode, OrigoFSError, Workspace};
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
-use origofs_sdk::{FileKind, Inode, OrigoFSError, Workspace};
 use std::ffi::OsStr;
 use std::future::Future;
 use std::path::Path;
@@ -154,11 +154,11 @@ impl Filesystem for OrigoFSFuse {
         reply: ReplyAttr,
     ) {
         let ino = ino.0 as i64;
-        if let Some(sz) = size {
-            if let Err(e) = self.blk(self.ws.fs().vfs_truncate(ino, sz)) {
-                reply.error(errno(&e));
-                return;
-            }
+        if let Some(sz) = size
+            && let Err(e) = self.blk(self.ws.fs().vfs_truncate(ino, sz))
+        {
+            reply.error(errno(&e));
+            return;
         }
         match self.blk(self.ws.fs().vfs_getattr(ino)) {
             Ok(i) => reply.attr(&TTL, &to_attr(&i)),

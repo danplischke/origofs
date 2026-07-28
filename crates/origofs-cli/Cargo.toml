@@ -7,14 +7,25 @@ edition = "2024"
 name = "origofs"
 path = "src/main.rs"
 
+# git invokes a helper named exactly `git-remote-origofs` off PATH. Shipping it
+# from the CLI crate means a single `cargo install --path crates/origofs-cli`
+# provides both binaries; it drives the git-interop surface (sdk `git` feature).
+[[bin]]
+name = "git-remote-origofs"
+path = "src/bin/git-remote-origofs.rs"
+
 [dependencies]
-origofs-api = { version = "0.0.0", path = "../origofs-api" }
-origofs-fuse = { version = "0.0.0", path = "../origofs-fuse" }
-origofs-git = { version = "0.0.0", path = "../origofs-git" }
-origofs-mcp = { version = "0.0.0", path = "../origofs-mcp" }
-origofs-nfs = { version = "0.0.0", path = "../origofs-nfs" }
-origofs-sandbox = { version = "0.0.0", path = "../origofs-sandbox" }
-origofs-sdk = { version = "0.1.0", path = "../origofs-sdk" }
+# Every access surface is now a feature-gated module of the sdk; `full` enables
+# them all (api, mcp, sandbox, git, fuse, nfs). Deliberately NOT `coedit`, so
+# `origofs serve` ships without the live co-editing WebSocket, exactly as before.
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk", features = ["full"] }
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
+# git-remote-origofs reads a byte at a time from stdin via libc::read.
+libc = "0.2.189"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+# tests/remote.rs drives a real `git clone origofs://…` through the git-remote-origofs
+# helper binary (CARGO_BIN_EXE_git-remote-origofs) against a temp workspace.
+tempfile = "3.27.0"

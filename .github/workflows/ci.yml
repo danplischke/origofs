@@ -39,28 +39,39 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          # The access surfaces (api/mcp/sandbox/git/fuse/nfs) are default-off
+          # features of origofs-sdk. `--workspace` builds their code via the CLI's
+          # `full`, but lint the surface modules + their gated tests explicitly too.
+          cargo clippy -p origofs-sdk --features full --all-targets -- -D warnings
 
       # Postgres tests self-skip without ORIGOFS_PG_TEST_URL; the S3/GCS integration
       # tests are #[ignore]d; and the FUSE / NFS / overlayfs tests self-skip when
       # the needed privileges aren't present — so the suite is green on a stock
       # runner with no extra services.
       - name: Test
-        run: cargo test --workspace --no-fail-fast
+        run: |
+          cargo test --workspace --no-fail-fast
+          # Run the surface-gated tests (api/mcp/sandbox/git/fuse/nfs) explicitly,
+          # rather than relying on workspace feature-unification to enable them.
+          cargo test -p origofs-sdk --features full --no-fail-fast
 
       # The opt-in `coedit` feature (yrs-backed CRDT co-editing, roadmap M8) is
-      # off by default for the core/sdk/api crates, so exercise it — clippy +
-      # tests — explicitly across each. (origofs-py enables it unconditionally, so
-      # the default workspace build already covers its compilation; its live
-      # co-editing is tested in the Python job.)
+      # off by default for origofs-core and origofs-sdk, so exercise it — clippy +
+      # tests — explicitly. `-p origofs-sdk --features coedit` covers coedit without
+      # the API (proving the `axum?/ws` weak-dep stays axum-free); `full,coedit`
+      # covers the API's y-sync WebSocket + every surface. (origofs-py enables coedit
+      # unconditionally, so the default workspace build already covers its
+      # compilation; its live co-editing is tested in the Python job.)
       - name: Test coedit feature
         run: |
           cargo clippy -p origofs-core --features coedit --all-targets -- -D warnings
           cargo clippy -p origofs-sdk --features coedit --all-targets -- -D warnings
-          cargo clippy -p origofs-api --features coedit --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features full,coedit --all-targets -- -D warnings
           cargo test -p origofs-core --features coedit --no-fail-fast
           cargo test -p origofs-sdk --features coedit --no-fail-fast
-          cargo test -p origofs-api --features coedit --no-fail-fast
+          cargo test -p origofs-sdk --features full,coedit --no-fail-fast
 
   python:
     name: Python bindings (maturin + pytest)

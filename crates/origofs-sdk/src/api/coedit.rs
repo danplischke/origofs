@@ -13,7 +13,7 @@
 //! Identity is resolved exactly as everywhere else — server-side, never trusted
 //! from the client. Because browsers can't set headers on a WebSocket, the token
 //! may ride in a `?token=` query param; it is authenticated through the same
-//! [`Authenticator`](crate::Authenticator) as every other route. Content a socket
+//! [`Authenticator`](super::Authenticator) as every other route. Content a socket
 //! contributes is attributed to *its* principal by the engine, no matter what the
 //! bytes claim.
 //!
@@ -25,23 +25,23 @@
 //! out to its sockets, so all replicas converge. A joining room replays recent ops
 //! to catch up. On SQLite (single-writer) the relay is simply off.
 
-use crate::{abspath, AppState};
+use super::{AppState, abspath};
+use crate::{CoeditDoc, OrigoFSError, Workspace, WriteCtx};
 use axum::{
     body::Bytes,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{header::AUTHORIZATION, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
 };
 use futures::{SinkExt, StreamExt};
-use origofs_sdk::{CoeditDoc, OrigoFSError, Workspace, WriteCtx};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::sync::{Mutex, broadcast};
 
 /// How many y-sync frames a slow socket can fall behind before it's dropped from
 /// the fan-out. A dropped frame only costs a resync on the next edit (the CRDT
@@ -281,12 +281,12 @@ pub(crate) async fn coedit_ws(
 /// Authenticate a WebSocket upgrade: the real upgrade headers first (programmatic
 /// clients, cookies), then — for browsers that can't set headers — a `?token=`
 /// query param synthesized as a `Bearer` credential and run through the same
-/// [`Authenticator`](crate::Authenticator).
+/// [`Authenticator`](super::Authenticator).
 async fn authenticate_ws(
     state: &AppState,
     headers: &HeaderMap,
     token: Option<&str>,
-) -> Option<crate::Principal> {
+) -> Option<super::Principal> {
     if let Some(p) = state.auth.authenticate(headers).await {
         return Some(p);
     }

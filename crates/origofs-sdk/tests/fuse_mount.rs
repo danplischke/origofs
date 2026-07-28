@@ -1,8 +1,9 @@
 //! Mount an origofs workspace via FUSE and exercise it with ordinary `std::fs`
 //! syscalls. Self-skips where a FUSE mount isn't possible (needs root + /dev/fuse).
+#![cfg(all(unix, feature = "fuse"))]
 
-use origofs_fuse::{mountable, spawn};
 use origofs_sdk::Workspace;
+use origofs_sdk::fuse::{mountable, spawn};
 use std::time::Duration;
 
 #[test]

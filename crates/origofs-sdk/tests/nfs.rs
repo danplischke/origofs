@@ -1,6 +1,7 @@
 //! The NFSv3 adapter: exercise every operation against a real workspace by
 //! calling the `NFSFileSystem` methods directly (a live kernel mount needs
 //! `nfs-utils`, absent in CI), plus a server-bind smoke test.
+#![cfg(all(unix, feature = "nfs"))]
 
 use nfsserve::nfs::{
     fattr3, ftype3, nfsstat3, nfsstring, sattr3, set_atime, set_gid3, set_mode3, set_mtime,
@@ -8,8 +9,8 @@ use nfsserve::nfs::{
 };
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{NFSFileSystem, VFSCapabilities};
-use origofs_nfs::{serve, OrigoFSNfs};
 use origofs_sdk::Workspace;
+use origofs_sdk::nfs::{OrigoFSNfs, serve};
 
 fn fname(s: &str) -> nfsstring {
     nfsstring::from(s.as_bytes())

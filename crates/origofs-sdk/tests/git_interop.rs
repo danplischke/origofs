@@ -1,8 +1,9 @@
 //! Git interop: origofs history <-> real git objects, verified against the actual
 //! `git` binary in both object formats, plus a git-LFS pointer round-trip.
+#![cfg(feature = "git")]
 
-use origofs_git::{export_git, import_git, ExportOptions, ObjectFormat};
 use origofs_sdk::Workspace;
+use origofs_sdk::git::{ExportOptions, ObjectFormat, export_git, import_git};
 use std::path::Path;
 use std::process::Command;
 

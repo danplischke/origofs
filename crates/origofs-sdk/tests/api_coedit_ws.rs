@@ -3,11 +3,11 @@
 //! PlateJS and `y-websocket` run — connects to `/coedit/{path}`, and its edits
 //! merge, fan out to a second client, and land attributed in blame. Requires the
 //! `coedit` feature.
-#![cfg(feature = "coedit")]
+#![cfg(all(feature = "api", feature = "coedit"))]
 
 use futures::{SinkExt, StreamExt};
-use origofs_api::{router, BearerAuth};
 use origofs_sdk::Workspace;
+use origofs_sdk::api::{BearerAuth, router};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -134,10 +134,10 @@ async fn vanilla_yjs_clients_collaborate_over_websocket() {
 /// Poll blame until the checkpoint (async, on last disconnect) has landed.
 async fn loop_until_blamed(ws: &Workspace) -> Vec<origofs_sdk::BlameRange> {
     for _ in 0..40 {
-        if let Ok(b) = ws.blame("/doc.md").await {
-            if !b.is_empty() {
-                return b;
-            }
+        if let Ok(b) = ws.blame("/doc.md").await
+            && !b.is_empty()
+        {
+            return b;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

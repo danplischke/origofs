@@ -1,9 +1,9 @@
-//! origofs-api — an HTTP/JSON surface over a workspace (`docs/DESIGN.md` §6, M7).
+//! HTTP/JSON API surface (`api` feature) — over a workspace (`docs/DESIGN.md` §6, M7).
 //!
 //! A thin [`axum`] layer that exposes the same operations as the `origofs` CLI to any
 //! HTTP client: read/write/list files, versioning (commit/log/branches/checkout),
 //! attribution (blame), and the live-collaboration feed + presence. Everything
-//! goes through [`origofs_sdk::Workspace`], so writes are recorded on the change feed
+//! goes through [`crate::Workspace`], so writes are recorded on the change feed
 //! and attributed exactly as they are everywhere else.
 //!
 //! **Authentication.** Every mutating route requires an authenticated
@@ -20,16 +20,16 @@
 //! else is JSON. Paths are the URL tail after the resource segment, e.g.
 //! `GET /files/notes/todo.txt` reads `/notes/todo.txt`.
 
+use crate::{Workspace, WriteCtx, WriteOutcome};
 use axum::{
+    Json, Router,
     body::{Body, Bytes},
     extract::{FromRef, FromRequestParts, Path, Query, Request, State},
-    http::{request::Parts, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
-use origofs_sdk::{Workspace, WriteCtx, WriteOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -269,10 +269,10 @@ fn abspath(p: &str) -> String {
 
 // --- error mapping ----------------------------------------------------------
 
-/// An HTTP error: either a mapped [`origofs_sdk::OrigoFSError`] or an explicit status
+/// An HTTP error: either a mapped [`crate::OrigoFSError`] or an explicit status
 /// (e.g. `401` from the [`Auth`] extractor).
 enum ApiError {
-    OrigoFS(origofs_sdk::OrigoFSError),
+    OrigoFS(crate::OrigoFSError),
     Status(StatusCode, String),
 }
 
@@ -282,15 +282,15 @@ impl ApiError {
     }
 }
 
-impl From<origofs_sdk::OrigoFSError> for ApiError {
-    fn from(e: origofs_sdk::OrigoFSError) -> Self {
+impl From<crate::OrigoFSError> for ApiError {
+    fn from(e: crate::OrigoFSError) -> Self {
         ApiError::OrigoFS(e)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        use origofs_sdk::OrigoFSError::*;
+        use crate::OrigoFSError::*;
         let (status, message) = match self {
             ApiError::Status(code, msg) => (code, msg),
             ApiError::OrigoFS(e) => {
@@ -335,10 +335,10 @@ async fn write_file(
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     let p = abspath(&path);
-    if let Some((parent, _)) = p.rsplit_once('/') {
-        if !parent.is_empty() {
-            ws.mkdir_p(parent).await?;
-        }
+    if let Some((parent, _)) = p.rsplit_once('/')
+        && !parent.is_empty()
+    {
+        ws.mkdir_p(parent).await?;
     }
     // Attribution comes only from the authenticated principal — never the request.
     // Governed by the principal's write policy: a propose-only actor's edit is
@@ -520,9 +520,9 @@ async fn diff(
         .map(|d| DiffEntryDto {
             path: d.path,
             status: match d.status {
-                origofs_sdk::DiffStatus::Added => "added",
-                origofs_sdk::DiffStatus::Modified => "modified",
-                origofs_sdk::DiffStatus::Deleted => "deleted",
+                crate::DiffStatus::Added => "added",
+                crate::DiffStatus::Modified => "modified",
+                crate::DiffStatus::Deleted => "deleted",
             },
         })
         .collect();
@@ -570,8 +570,8 @@ struct SuggestionDto {
     resolved_by: Option<i64>,
 }
 
-impl From<origofs_sdk::Suggestion> for SuggestionDto {
-    fn from(s: origofs_sdk::Suggestion) -> Self {
+impl From<crate::Suggestion> for SuggestionDto {
+    fn from(s: crate::Suggestion) -> Self {
         Self {
             id: s.id,
             actor_id: s.actor_id,
@@ -628,9 +628,10 @@ async fn list_suggestions(
     Query(q): Query<ListSuggestQuery>,
 ) -> ApiResult<Json<Vec<SuggestionDto>>> {
     let status = match q.status.as_deref() {
-        Some(s) => Some(origofs_sdk::SuggestionStatus::parse(s).ok_or_else(|| {
-            origofs_sdk::OrigoFSError::InvalidArgument(format!("bad status {s}"))
-        })?),
+        Some(s) => Some(
+            crate::SuggestionStatus::parse(s)
+                .ok_or_else(|| crate::OrigoFSError::InvalidArgument(format!("bad status {s}")))?,
+        ),
         None => None,
     };
     let out = ws
@@ -649,7 +650,7 @@ async fn get_suggestion(
     let s = ws
         .get_suggestion(id)
         .await?
-        .ok_or_else(|| origofs_sdk::OrigoFSError::NotFound(format!("suggestion #{id}")))?;
+        .ok_or_else(|| crate::OrigoFSError::NotFound(format!("suggestion #{id}")))?;
     Ok(Json(s.into()))
 }
 
