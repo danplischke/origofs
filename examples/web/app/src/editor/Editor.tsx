@@ -85,8 +85,16 @@ export function EditorTab({
     setStatus(null);
     try {
       const md = serializeMd(editor);
-      const { written } = await client.writeDoc(path, md);
-      setStatus({ kind: "ok", text: `saved ${written} bytes — attributed to you` });
+      const res = await client.writeDoc(path, md);
+      if (res.proposed !== undefined) {
+        // This actor is propose-only: the write was routed into the review queue.
+        setStatus({
+          kind: "ok",
+          text: `you're propose-only — queued as suggestion #${res.proposed} for review, not applied`,
+        });
+      } else {
+        setStatus({ kind: "ok", text: `saved ${res.written} bytes — attributed to you` });
+      }
       onSaved();
     } catch (e) {
       setStatus({ kind: "err", text: e instanceof Error ? e.message : String(e) });

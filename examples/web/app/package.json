@@ -14,13 +14,16 @@
     "@platejs/basic-nodes": "^49.0.0",
     "@platejs/markdown": "^49.0.0",
     "diff": "^7.0.0",
+    "lib0": "^0.2.99",
     "platejs": "^49.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "slate": "^0.117.0",
     "slate-dom": "^0.117.0",
     "slate-history": "^0.113.0",
-    "slate-react": "^0.117.0"
+    "slate-react": "^0.117.0",
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.20"
   },
   "devDependencies": {
     "@types/diff": "^7.0.2",
