@@ -257,9 +257,12 @@ change — a real push, not a poll.
 
 Opt-in (the `coedit` feature): humans, agents, and browser editors type into the
 same document **concurrently** and converge — a CRDT (`yrs`) under the hood, with
-authorship tracked per character. It speaks the Yjs **y-sync** protocol, so an
-*unmodified* Yjs editor — PlateJS, `y-websocket` — connects to the co-editing
-WebSocket and collaborates directly, no custom client.
+authorship tracked per character. It speaks the standard Yjs **y-sync** protocol,
+so an unmodified Yjs client connects to the co-editing WebSocket with no custom
+server code — a plain-text or Markdown editor bound to the shared text (over
+`y-websocket`) collaborates out of the box. The shared document is a flat-text
+CRDT, so a *structural* rich-text editor such as PlateJS shapes its Yjs document
+to match rather than binding the flat text directly.
 
 The server stays the sole authority on **who wrote what**: whatever a client's
 bytes claim, each inserted run is attributed to the *authenticated* actor. When a
