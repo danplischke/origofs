@@ -585,6 +585,25 @@ impl Workspace {
         Ok(())
     }
 
+    /// Attributed write with **explicit** byte-range authorship — the CRDT/editor
+    /// checkpoint path (roadmap M8). `spans` holds `(actor_id, session_id,
+    /// byte_len)` runs summing to `data.len()`, so co-edited content lands with
+    /// each collaborator's character-level spans attributed exactly (sub-line,
+    /// interleaved), bypassing the line-diff heuristic. `ctx` is the actor
+    /// performing the checkpoint (recorded on the op-log and the feed).
+    pub async fn write_as_blamed(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        data: &[u8],
+        spans: &[(i64, i64, u64)],
+    ) -> Result<()> {
+        self.fs.write_as_blamed(ctx, path, data, spans).await?;
+        self.emit("write", path, None, Some(ctx.actor), ctx.session)
+            .await;
+        Ok(())
+    }
+
     /// Propose an edit to `path` for human review instead of applying it. The
     /// bytes are stored now; the working tree changes only on accept. Returns
     /// the suggestion id. (Records a `suggest` event on the feed.)

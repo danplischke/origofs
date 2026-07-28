@@ -1,7 +1,9 @@
 //! Attribution & blame: per-line human-vs-agent authorship, provenance, the
 //! edit-op log, and reverting an agent's session.
 
-use origofs_core::{ActorInit, ActorKind, Fs, MemStore, SqliteMetadataStore, WriteCtx};
+use origofs_core::{
+    ActorInit, ActorKind, Fs, MemStore, OrigoFSError, SqliteMetadataStore, WriteCtx,
+};
 use std::sync::Arc;
 
 async fn fixture() -> Fs<SqliteMetadataStore, Arc<MemStore>> {
@@ -432,4 +434,145 @@ async fn suggestion_content_reads_base_and_proposed() {
     let cd = fs.suggestion_content(del).await.unwrap();
     assert_eq!(cd.base, "one\ntwo\n");
     assert!(cd.proposed.is_none());
+}
+
+// write_as_blamed lets an authoritative caller (a CRDT/editor checkpoint) set
+// authorship directly, so co-edited spans are credited to their true authors —
+// not to whoever drove the write, which is all the diff heuristic could infer on
+// a fresh file. This is the M8 CRDT -> blame bridge.
+#[tokio::test]
+async fn write_as_blamed_honors_explicit_authors() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let claude = fs
+        .create_agent("claude", "claude-opus-4-8", Some(alice))
+        .await
+        .unwrap();
+    let s_alice = fs.create_session(alice, Some("editor")).await.unwrap();
+    let s_claude = fs.create_session(claude, Some("mcp")).await.unwrap();
+
+    // One checkpoint driven by the agent's session, but with lines authored by
+    // alice / claude / alice — exactly what a co-edited CRDT snapshot produces. A
+    // plain write_as here would credit all three lines to claude. Spans are byte
+    // lengths: "alice-1\n"=8, "claude-1\n"=9, "alice-2\n"=8.
+    fs.write_as_blamed(
+        WriteCtx::session(claude, s_claude),
+        "/doc",
+        b"alice-1\nclaude-1\nalice-2\n",
+        &[
+            (alice, s_alice, 8),
+            (claude, s_claude, 9),
+            (alice, s_alice, 8),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let b = fs.blame("/doc").await.unwrap();
+    assert_eq!(b.len(), 3);
+    assert_eq!(
+        (b[0].actor.id, b[0].line_start, b[0].line_end),
+        (alice, 1, 1)
+    );
+    assert_eq!(
+        (b[1].actor.id, b[1].line_start, b[1].line_end),
+        (claude, 2, 2)
+    );
+    assert_eq!(
+        (b[2].actor.id, b[2].line_start, b[2].line_end),
+        (alice, 3, 3)
+    );
+    assert_eq!(b[0].actor.kind, ActorKind::Human);
+    assert_eq!(b[1].actor.kind, ActorKind::Agent);
+    assert_eq!(b[1].session, Some(s_claude)); // session carried per span
+
+    // The explicit map replaces prior authorship wholesale: re-checkpoint the same
+    // bytes crediting everything to alice, and blame collapses to a single range.
+    fs.write_as_blamed(
+        WriteCtx::session(claude, s_claude),
+        "/doc",
+        b"alice-1\nclaude-1\nalice-2\n",
+        &[(alice, s_alice, 25)],
+    )
+    .await
+    .unwrap();
+    let b = fs.blame("/doc").await.unwrap();
+    assert_eq!(b.len(), 1);
+    assert_eq!(
+        (b[0].actor.id, b[0].line_start, b[0].line_end),
+        (alice, 1, 3)
+    );
+}
+
+// The byte-range model's payoff: two authors on ONE line survive as two ranges,
+// which the old per-line map could not represent. This is what a co-edited CRDT
+// checkpoint of a single line produces.
+#[tokio::test]
+async fn write_as_blamed_preserves_sub_line_authorship() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let claude = fs.create_agent("claude", "m", Some(alice)).await.unwrap();
+    let s_a = fs.create_session(alice, None).await.unwrap();
+    let s_c = fs.create_session(claude, None).await.unwrap();
+
+    // "hello world\n": alice authored "hello " (6 bytes), claude "world\n" (6).
+    fs.write_as_blamed(
+        WriteCtx::session(claude, s_c),
+        "/doc",
+        b"hello world\n",
+        &[(alice, s_a, 6), (claude, s_c, 6)],
+    )
+    .await
+    .unwrap();
+
+    let b = fs.blame("/doc").await.unwrap();
+    assert_eq!(b.len(), 2);
+    // Both on line 1, distinct byte ranges — sub-line authorship survives.
+    assert_eq!(
+        (
+            b[0].actor.id,
+            b[0].line_start,
+            b[0].line_end,
+            b[0].byte_start,
+            b[0].byte_end
+        ),
+        (alice, 1, 1, 0, 6)
+    );
+    assert_eq!(
+        (
+            b[1].actor.id,
+            b[1].line_start,
+            b[1].line_end,
+            b[1].byte_start,
+            b[1].byte_end
+        ),
+        (claude, 1, 1, 6, 12)
+    );
+}
+
+// The spans must cover exactly the content's bytes, or the blame index would
+// desync from it — reject rather than write a corrupt mapping.
+#[tokio::test]
+async fn write_as_blamed_rejects_spans_that_dont_cover_the_content() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let s = fs.create_session(alice, None).await.unwrap();
+
+    // 8-byte content, spans cover only 4 -> rejected before anything is written.
+    let err = fs
+        .write_as_blamed(
+            WriteCtx::session(alice, s),
+            "/f",
+            b"one\ntwo\n",
+            &[(alice, s, 4)],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, OrigoFSError::InvalidArgument(_)),
+        "got {err:?}"
+    );
+
+    // The file was never created (validation precedes the write).
+    assert!(fs.blame("/f").await.is_err());
 }
