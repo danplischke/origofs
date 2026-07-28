@@ -221,3 +221,110 @@ async fn direct_agent_still_writes_directly() {
         .unwrap();
     assert_eq!(text(&r), "landed");
 }
+
+// origofs_edit is exact string search-and-replace (the canonical str_replace
+// contract): it replaces a unique `old` with `new`, refuses an ambiguous or
+// missing match with a helpful error, and does every occurrence only when asked.
+#[tokio::test]
+async fn edit_replaces_exact_string_and_enforces_uniqueness() {
+    let s = server().await;
+    s.handle(call(
+        "origofs_write",
+        json!({"path":"/f.txt","content":"hello world\n"}),
+    ))
+    .await
+    .unwrap();
+
+    // a unique replacement lands
+    let e = s
+        .handle(call(
+            "origofs_edit",
+            json!({"path":"/f.txt","old":"world","new":"origofs"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(e["result"]["isError"], false, "{}", text(&e));
+    let r = s
+        .handle(call("origofs_read", json!({"path":"/f.txt"})))
+        .await
+        .unwrap();
+    assert_eq!(text(&r), "hello origofs\n");
+
+    // a string that isn't there is a (recoverable) error, not a silent no-op
+    let miss = s
+        .handle(call(
+            "origofs_edit",
+            json!({"path":"/f.txt","old":"NOPE","new":"x"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(miss["result"]["isError"], true);
+    assert!(text(&miss).contains("not found"), "{}", text(&miss));
+
+    // an ambiguous match is refused unless replace_all is set
+    s.handle(call(
+        "origofs_write",
+        json!({"path":"/g.txt","content":"a a a"}),
+    ))
+    .await
+    .unwrap();
+    let amb = s
+        .handle(call(
+            "origofs_edit",
+            json!({"path":"/g.txt","old":"a","new":"b"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(amb["result"]["isError"], true);
+    assert!(text(&amb).contains("matches 3 times"), "{}", text(&amb));
+
+    let all = s
+        .handle(call(
+            "origofs_edit",
+            json!({"path":"/g.txt","old":"a","new":"b","replace_all":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(all["result"]["isError"], false, "{}", text(&all));
+    let rg = s
+        .handle(call("origofs_read", json!({"path":"/g.txt"})))
+        .await
+        .unwrap();
+    assert_eq!(text(&rg), "b b b");
+}
+
+// An edit is governed by the write policy exactly like a write: a propose-only
+// agent's edit becomes a suggestion, leaving the file untouched until review.
+#[tokio::test]
+async fn edit_is_governed_by_write_policy() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    // seed a file directly (a trusted human)
+    let human = ws.create_human("dan", None).await.unwrap();
+    let hs = ws.create_session(human, None).await.unwrap();
+    ws.write_as(WriteCtx::session(human, hs), "/f.txt", b"hello world\n")
+        .await
+        .unwrap();
+
+    // a propose-only agent edits it
+    let agent = ws.create_agent("claude", "opus", None).await.unwrap();
+    let asess = ws.create_session(agent, Some("mcp")).await.unwrap();
+    ws.set_write_policy(agent, WritePolicy::Propose)
+        .await
+        .unwrap();
+    let s = McpServer::new(ws.clone(), agent, asess);
+
+    let e = s
+        .handle(call(
+            "origofs_edit",
+            json!({"path":"/f.txt","old":"world","new":"origofs"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(e["result"]["isError"], false, "{}", text(&e));
+    assert!(text(&e).contains("proposed suggestion"), "{}", text(&e));
+    // unchanged until a different actor accepts
+    assert_eq!(&ws.read("/f.txt").await.unwrap()[..], b"hello world\n");
+}

@@ -104,6 +104,69 @@ impl McpServer {
                     )),
                 }
             }
+            "origofs_edit" => {
+                // Exact string search-and-replace — the canonical edit contract
+                // (Anthropic's text_editor `str_replace`, Aider/Cursor SEARCH-REPLACE):
+                // content-based, never line numbers, and `old` must be unique so an
+                // edit can't land in the wrong place. Governed by the write policy,
+                // like `origofs_write`.
+                let p = path();
+                let old = args.get("old").and_then(Value::as_str).unwrap_or("");
+                let new = args.get("new").and_then(Value::as_str).unwrap_or("");
+                let replace_all = args
+                    .get("replace_all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if old.is_empty() {
+                    return Err(OrigoFSError::InvalidArgument(
+                        "edit: `old` must be non-empty (use origofs_write to create/replace a file)"
+                            .into(),
+                    ));
+                }
+                if old == new {
+                    return Err(OrigoFSError::InvalidArgument(
+                        "edit: `old` and `new` are identical — nothing to change".into(),
+                    ));
+                }
+                let bytes = self.ws.read(p).await?;
+                let text = std::str::from_utf8(&bytes).map_err(|_| {
+                    OrigoFSError::InvalidArgument(format!(
+                        "{p}: not a UTF-8 text file; edit works on text"
+                    ))
+                })?;
+                let count = text.matches(old).count();
+                if count == 0 {
+                    return Err(OrigoFSError::InvalidArgument(format!(
+                        "edit: `old` not found in {p}"
+                    )));
+                }
+                if count > 1 && !replace_all {
+                    return Err(OrigoFSError::InvalidArgument(format!(
+                        "edit: `old` matches {count} times in {p}; include more surrounding \
+                         context to make it unique, or set replace_all=true"
+                    )));
+                }
+                let updated = if replace_all {
+                    text.replace(old, new)
+                } else {
+                    text.replacen(old, new, 1)
+                };
+                let summary = format!("edit {p} via mcp agent");
+                match self
+                    .ws
+                    .write_or_propose(self.ctx(), p, updated.as_bytes(), Some(&summary))
+                    .await?
+                {
+                    WriteOutcome::Wrote => Ok(format!(
+                        "edited {p} ({count} replacement{})",
+                        if count == 1 { "" } else { "s" }
+                    )),
+                    WriteOutcome::Proposed(id) => Ok(format!(
+                        "proposed suggestion #{id} for {p} (edit) — pending review; \
+                         this agent is propose-only"
+                    )),
+                }
+            }
             "origofs_suggest" => {
                 let p = path();
                 let data = args.get("content").and_then(Value::as_str).unwrap_or("");
@@ -285,6 +348,21 @@ fn tool_defs() -> Vec<Value> {
                 "content": { "type": "string" },
             }),
             &["path", "content"],
+        ),
+        tool(
+            "origofs_edit",
+            "Edit a text file by exact string replacement: replace `old` with `new`. \
+             `old` must appear exactly once — include enough surrounding context to be \
+             unique — unless replace_all is set. Prefer this over origofs_write for a \
+             small change: it sends only the changed text and credits only the changed \
+             lines. Governed by this agent's write policy, like origofs_write.",
+            json!({
+                "path": { "type": "string" },
+                "old": { "type": "string", "description": "exact text to replace; must be unique unless replace_all" },
+                "new": { "type": "string", "description": "replacement text" },
+                "replace_all": { "type": "boolean", "description": "replace every occurrence (default false)" },
+            }),
+            &["path", "old", "new"],
         ),
         tool(
             "origofs_suggest",
