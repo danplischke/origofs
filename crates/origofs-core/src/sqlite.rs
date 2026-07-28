@@ -6,7 +6,9 @@
 //! `Send`. A production build would move DB work onto `spawn_blocking` (or use an
 //! async driver like sqlx, which M2 introduces alongside Postgres).
 
-use crate::attribution::{Actor, ActorInit, ActorKind, EditOp, EditOpInit, ToolCallInit};
+use crate::attribution::{
+    Actor, ActorInit, ActorKind, EditOp, EditOpInit, ToolCallInit, WritePolicy,
+};
 use crate::collab::{Event, EventInit, Presence};
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::{MetaTxn, MetadataStore};
@@ -513,7 +515,7 @@ impl MetadataStore for SqliteMetadataStore {
         let conn = self.lock();
         let row = conn
             .query_row(
-                "SELECT id, kind, display_name, auth_subject, agent_model, agent_vendor, controller_actor_id, created_at
+                "SELECT id, kind, display_name, auth_subject, agent_model, agent_vendor, controller_actor_id, created_at, write_policy
                  FROM actor WHERE id = ?1",
                 params![id],
                 |r| {
@@ -526,6 +528,7 @@ impl MetadataStore for SqliteMetadataStore {
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<i64>>(6)?,
                         r.get::<_, i64>(7)?,
+                        r.get::<_, i64>(8)?,
                     ))
                 },
             )
@@ -540,6 +543,7 @@ impl MetadataStore for SqliteMetadataStore {
                 agent_vendor,
                 controller,
                 created_at,
+                write_policy,
             )) => {
                 let kind = ActorKind::parse(&kind)
                     .ok_or_else(|| OrigoFSError::Metadata(format!("bad actor kind {kind:?}")))?;
@@ -552,10 +556,23 @@ impl MetadataStore for SqliteMetadataStore {
                     agent_vendor,
                     controller_actor_id: controller,
                     created_at,
+                    write_policy: WritePolicy::from_i64(write_policy),
                 }))
             }
             None => Ok(None),
         }
+    }
+
+    async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE actor SET write_policy = ?1 WHERE id = ?2",
+            params![policy.as_i64(), actor_id],
+        )?;
+        if n == 0 {
+            return Err(OrigoFSError::NotFound(format!("actor #{actor_id}")));
+        }
+        Ok(())
     }
 
     async fn actor_by_subject(&self, subject: &str) -> Result<Option<Actor>> {
@@ -578,7 +595,7 @@ impl MetadataStore for SqliteMetadataStore {
     async fn list_actors(&self) -> Result<Vec<Actor>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, kind, display_name, auth_subject, agent_model, agent_vendor, controller_actor_id, created_at
+            "SELECT id, kind, display_name, auth_subject, agent_model, agent_vendor, controller_actor_id, created_at, write_policy
              FROM actor ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -591,6 +608,7 @@ impl MetadataStore for SqliteMetadataStore {
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, Option<i64>>(6)?,
                 r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
             ))
         })?;
         let mut actors = Vec::new();
@@ -604,6 +622,7 @@ impl MetadataStore for SqliteMetadataStore {
                 agent_vendor,
                 controller,
                 created_at,
+                write_policy,
             ) = row?;
             let kind = ActorKind::parse(&kind)
                 .ok_or_else(|| OrigoFSError::Metadata(format!("bad actor kind {kind:?}")))?;
@@ -616,6 +635,7 @@ impl MetadataStore for SqliteMetadataStore {
                 agent_vendor,
                 controller_actor_id: controller,
                 created_at,
+                write_policy: WritePolicy::from_i64(write_policy),
             });
         }
         Ok(actors)

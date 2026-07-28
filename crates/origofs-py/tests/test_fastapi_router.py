@@ -14,6 +14,7 @@ Build + run (from crates/origofs-py, in a venv):
 import asyncio
 import os
 import tempfile
+from types import SimpleNamespace
 
 import origofs
 from origofs.fastapi import build_router
@@ -58,6 +59,13 @@ class FakeWs:
     async def write_as(self, ctx, path, data):
         self.writes.append((ctx, path, data))
         self.files[path] = data
+
+    async def write_or_propose(self, ctx, path, data, summary=None):
+        # The fake actor is direct, so this records a write like write_as and
+        # reports it landed.
+        self.writes.append((ctx, path, data))
+        self.files[path] = data
+        return SimpleNamespace(wrote=True, suggestion_id=None)
 
     async def remove(self, path):
         self.files.pop(path, None)
@@ -180,6 +188,48 @@ def test_integration_attribution_end_to_end():
     bl = c.get("/blame/src/app.py").json()
     assert bl and bl[0]["actor"]["id"] == dan, bl
     assert bl[0]["actor"]["kind"] == "human"
+
+
+# A propose-only actor's write through the router is queued for review, not
+# applied — and only a different actor can accept it. This is the bounded,
+# actor-agnostic write policy reaching the FastAPI surface.
+def test_propose_only_actor_write_is_queued_via_router():
+    d = tempfile.mkdtemp()
+
+    async def _setup():
+        ws = await origofs.Workspace.open_local(
+            os.path.join(d, "meta.db"), os.path.join(d, "cas")
+        )
+        author = await ws.create_human("ext", None)  # an untrusted contributor
+        author_s = await ws.create_session(author, "web")
+        reviewer = await ws.create_human("dan", None)
+        reviewer_s = await ws.create_session(reviewer, "web")
+        await ws.set_write_policy(author, "propose")
+        return ws, author, author_s, reviewer, reviewer_s
+
+    ws, author, author_s, reviewer, reviewer_s = asyncio.run(_setup())
+    c = _client(ws)
+
+    # The propose-only actor's PUT is queued, not applied.
+    r = c.put(
+        "/files/notes.txt",
+        content=b"proposed",
+        headers={"X-Actor-Id": str(author), "X-Session-Id": str(author_s)},
+    )
+    assert r.status_code == 200, r.text
+    sid = r.json()["proposed"]
+    assert sid is not None
+    assert c.get("/files/notes.txt").status_code == 404  # nothing landed
+
+    # A different actor reviews and accepts — now it lands, credited to its author.
+    ra = c.post(
+        f"/suggestions/{sid}/accept",
+        headers={"X-Actor-Id": str(reviewer), "X-Session-Id": str(reviewer_s)},
+    )
+    assert ra.status_code == 200, ra.text
+    assert c.get("/files/notes.txt").content == b"proposed"
+    bl = c.get("/blame/notes.txt").json()
+    assert bl and bl[0]["actor"]["id"] == author
 
 
 def _run_all():

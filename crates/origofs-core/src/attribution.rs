@@ -49,6 +49,51 @@ impl ActorKind {
     }
 }
 
+/// How an actor's direct writes are governed — a bounded, actor-agnostic trust
+/// gate (§6). It is a property of the *actor*, not their [`ActorKind`], so a
+/// trusted agent can be [`Direct`](WritePolicy::Direct) while an untrusted human
+/// contributor is [`Propose`](WritePolicy::Propose).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WritePolicy {
+    /// May write straight to the working tree (the default).
+    #[default]
+    Direct,
+    /// Direct writes are refused; edits must go through the suggestion queue for
+    /// review by a *different* actor before they land.
+    Propose,
+}
+
+impl WritePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WritePolicy::Direct => "direct",
+            WritePolicy::Propose => "propose",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "direct" => Some(WritePolicy::Direct),
+            "propose" => Some(WritePolicy::Propose),
+            _ => None,
+        }
+    }
+    /// The stored integer form (the `actor.write_policy` column).
+    pub fn as_i64(self) -> i64 {
+        match self {
+            WritePolicy::Direct => 0,
+            WritePolicy::Propose => 1,
+        }
+    }
+    /// Decode the stored integer; anything unrecognized is the safe default
+    /// (`Direct`) so an unknown value never silently blocks writes.
+    pub fn from_i64(v: i64) -> Self {
+        match v {
+            1 => WritePolicy::Propose,
+            _ => WritePolicy::Direct,
+        }
+    }
+}
+
 /// Fields to register a new actor.
 #[derive(Clone, Debug, Default)]
 pub struct ActorInit {
@@ -96,6 +141,8 @@ pub struct Actor {
     pub agent_vendor: Option<String>,
     pub controller_actor_id: Option<i64>,
     pub created_at: i64,
+    /// How this actor's direct writes are governed (§6).
+    pub write_policy: WritePolicy,
 }
 
 /// A recorded tool-call audit entry (agentfs-style), optionally linked from edits.
@@ -293,6 +340,13 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     pub async fn get_actor(&self, id: i64) -> Result<Option<Actor>> {
         self.meta.get_actor(id).await
+    }
+
+    /// Set an actor's write policy — `direct` (may write straight to the tree) or
+    /// `propose` (writes are routed through the suggestion queue for review by a
+    /// different actor). A bounded, actor-agnostic trust gate (§6).
+    pub async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()> {
+        self.meta.set_write_policy(actor_id, policy).await
     }
 
     /// Look up an actor by external identity (`auth_subject`), if registered.

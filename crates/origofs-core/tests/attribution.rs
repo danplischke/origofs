@@ -2,7 +2,8 @@
 //! edit-op log, and reverting an agent's session.
 
 use origofs_core::{
-    ActorInit, ActorKind, Fs, MemStore, OrigoFSError, SqliteMetadataStore, WriteCtx,
+    ActorInit, ActorKind, Fs, MemStore, OrigoFSError, SqliteMetadataStore, WriteCtx, WriteOutcome,
+    WritePolicy,
 };
 use std::sync::Arc;
 
@@ -575,4 +576,67 @@ async fn write_as_blamed_rejects_spans_that_dont_cover_the_content() {
 
     // The file was never created (validation precedes the write).
     assert!(fs.blame("/f").await.is_err());
+}
+
+// The write policy is a bounded, actor-agnostic trust gate (§6): a `Direct` actor
+// writes straight to the tree; a `Propose` actor's write is routed into the
+// suggestion queue instead of landing, and only appears after a *different* actor
+// accepts it. Nothing here keys on the actor's kind — a human or an agent is
+// gated identically by its own policy.
+#[tokio::test]
+async fn write_policy_gates_direct_writes_into_suggestions() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap(); // reviewer, stays direct
+    let ext = fs.create_human("ext", None).await.unwrap(); // an untrusted human contributor
+    let s_a = fs.create_session(alice, None).await.unwrap();
+    let s_e = fs.create_session(ext, None).await.unwrap();
+
+    // Default is direct — both actors write straight through until reconfigured.
+    assert_eq!(
+        fs.get_actor(ext).await.unwrap().unwrap().write_policy,
+        WritePolicy::Direct
+    );
+
+    // Bound `ext` to propose-only. (A human — the gate is the policy, not the kind.)
+    fs.set_write_policy(ext, WritePolicy::Propose)
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.get_actor(ext).await.unwrap().unwrap().write_policy,
+        WritePolicy::Propose
+    );
+
+    // Alice (direct) lands her write immediately.
+    let out = fs
+        .write_or_propose(WriteCtx::session(alice, s_a), "/doc", b"from alice", None)
+        .await
+        .unwrap();
+    assert_eq!(out, WriteOutcome::Wrote);
+    assert_eq!(&fs.read("/doc").await.unwrap()[..], b"from alice");
+
+    // `ext` cannot land a direct write — it becomes a pending suggestion, and the
+    // file is untouched.
+    let out = fs
+        .write_or_propose(
+            WriteCtx::session(ext, s_e),
+            "/doc",
+            b"from ext",
+            Some("my edit"),
+        )
+        .await
+        .unwrap();
+    let sid = match out {
+        WriteOutcome::Proposed(id) => id,
+        WriteOutcome::Wrote => panic!("a propose-only actor must not write directly"),
+    };
+    assert_eq!(&fs.read("/doc").await.unwrap()[..], b"from alice"); // unchanged
+
+    // A different actor (alice) reviews and accepts; only now does it land, credited
+    // to its proposer (ext).
+    fs.accept_suggestion(sid, WriteCtx::session(alice, s_a))
+        .await
+        .unwrap();
+    assert_eq!(&fs.read("/doc").await.unwrap()[..], b"from ext");
+    let blame = fs.blame("/doc").await.unwrap();
+    assert!(blame.iter().all(|r| r.actor.id == ext));
 }

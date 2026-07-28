@@ -2,7 +2,7 @@
 //! and attribution. Content bytes never live here — only content addresses do
 //! (`docs/DESIGN.md` §4b).
 
-use crate::attribution::{Actor, ActorInit, EditOp, EditOpInit, ToolCallInit};
+use crate::attribution::{Actor, ActorInit, EditOp, EditOpInit, ToolCallInit, WritePolicy};
 use crate::collab::{Event, EventInit, Presence};
 use crate::error::Result;
 use crate::suggest::{Suggestion, SuggestionInit, SuggestionStatus};
@@ -130,6 +130,9 @@ pub trait MetadataStore: Send + Sync {
 
     async fn create_actor(&self, init: ActorInit) -> Result<i64>;
     async fn get_actor(&self, id: i64) -> Result<Option<Actor>>;
+    /// Set an actor's write policy (direct vs. propose-only). Actor-agnostic — the
+    /// gate is a property of the actor, not their kind.
+    async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()>;
     /// Look up an actor by external identity (`auth_subject`). At most one exists
     /// (a partial UNIQUE index enforces it); returns `None` if unregistered.
     async fn actor_by_subject(&self, subject: &str) -> Result<Option<Actor>>;
@@ -348,6 +351,9 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn get_actor(&self, id: i64) -> Result<Option<Actor>> {
         (**self).get_actor(id).await
+    }
+    async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()> {
+        (**self).set_write_policy(actor_id, policy).await
     }
     async fn actor_by_subject(&self, subject: &str) -> Result<Option<Actor>> {
         (**self).actor_by_subject(subject).await

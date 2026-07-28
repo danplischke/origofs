@@ -6,7 +6,7 @@
 //! actor, so blame + the edit-op audit come "for free" from how the agent works
 //! — reading and writing files *is* the tool call.
 
-use origofs_sdk::{OrigoFSError, Workspace, WriteCtx};
+use origofs_sdk::{OrigoFSError, SuggestionStatus, Workspace, WriteCtx, WriteOutcome};
 use serde_json::{json, Value};
 
 type Result<T> = std::result::Result<T, OrigoFSError>;
@@ -87,8 +87,139 @@ impl McpServer {
                         self.ws.mkdir_p(parent).await?;
                     }
                 }
-                self.ws.write_as(self.ctx(), p, data.as_bytes()).await?;
-                Ok(format!("wrote {} bytes to {p}", data.len()))
+                // Governed by this agent's write policy: a direct agent writes
+                // straight to the tree; a propose-only agent's edit is queued for
+                // review instead of landing.
+                let summary = format!("write {p} via mcp agent");
+                match self
+                    .ws
+                    .write_or_propose(self.ctx(), p, data.as_bytes(), Some(&summary))
+                    .await?
+                {
+                    WriteOutcome::Wrote => Ok(format!("wrote {} bytes to {p}", data.len())),
+                    WriteOutcome::Proposed(id) => Ok(format!(
+                        "proposed suggestion #{id} for {p} ({} bytes) — pending review; \
+                         this agent is propose-only",
+                        data.len()
+                    )),
+                }
+            }
+            "origofs_edit" => {
+                // Exact string search-and-replace — the canonical edit contract
+                // (Anthropic's text_editor `str_replace`, Aider/Cursor SEARCH-REPLACE):
+                // content-based, never line numbers, and `old` must be unique so an
+                // edit can't land in the wrong place. Governed by the write policy,
+                // like `origofs_write`.
+                let p = path();
+                let old = args.get("old").and_then(Value::as_str).unwrap_or("");
+                let new = args.get("new").and_then(Value::as_str).unwrap_or("");
+                let replace_all = args
+                    .get("replace_all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if old.is_empty() {
+                    return Err(OrigoFSError::InvalidArgument(
+                        "edit: `old` must be non-empty (use origofs_write to create/replace a file)"
+                            .into(),
+                    ));
+                }
+                if old == new {
+                    return Err(OrigoFSError::InvalidArgument(
+                        "edit: `old` and `new` are identical — nothing to change".into(),
+                    ));
+                }
+                let bytes = self.ws.read(p).await?;
+                let text = std::str::from_utf8(&bytes).map_err(|_| {
+                    OrigoFSError::InvalidArgument(format!(
+                        "{p}: not a UTF-8 text file; edit works on text"
+                    ))
+                })?;
+                let count = text.matches(old).count();
+                if count == 0 {
+                    return Err(OrigoFSError::InvalidArgument(format!(
+                        "edit: `old` not found in {p}"
+                    )));
+                }
+                if count > 1 && !replace_all {
+                    return Err(OrigoFSError::InvalidArgument(format!(
+                        "edit: `old` matches {count} times in {p}; include more surrounding \
+                         context to make it unique, or set replace_all=true"
+                    )));
+                }
+                let updated = if replace_all {
+                    text.replace(old, new)
+                } else {
+                    text.replacen(old, new, 1)
+                };
+                let summary = format!("edit {p} via mcp agent");
+                match self
+                    .ws
+                    .write_or_propose(self.ctx(), p, updated.as_bytes(), Some(&summary))
+                    .await?
+                {
+                    WriteOutcome::Wrote => Ok(format!(
+                        "edited {p} ({count} replacement{})",
+                        if count == 1 { "" } else { "s" }
+                    )),
+                    WriteOutcome::Proposed(id) => Ok(format!(
+                        "proposed suggestion #{id} for {p} (edit) — pending review; \
+                         this agent is propose-only"
+                    )),
+                }
+            }
+            "origofs_suggest" => {
+                let p = path();
+                let data = args.get("content").and_then(Value::as_str).unwrap_or("");
+                let summary = args.get("summary").and_then(Value::as_str);
+                if let Some((parent, _)) = p.rsplit_once('/') {
+                    if !parent.is_empty() {
+                        self.ws.mkdir_p(parent).await?;
+                    }
+                }
+                let id = self
+                    .ws
+                    .suggest(self.ctx(), p, data.as_bytes(), summary)
+                    .await?;
+                Ok(format!(
+                    "proposed suggestion #{id} for {p} (pending review)"
+                ))
+            }
+            "origofs_suggestions" => {
+                let path_filter = args.get("path").and_then(Value::as_str);
+                let list = self
+                    .ws
+                    .list_suggestions(Some(SuggestionStatus::Pending), path_filter)
+                    .await?;
+                if list.is_empty() {
+                    return Ok("no pending suggestions".to_string());
+                }
+                Ok(list
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "#{}\t{}\tby actor {}\t{}",
+                            s.id,
+                            s.path,
+                            s.actor_id,
+                            s.summary.as_deref().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            "origofs_suggestion_diff" => {
+                let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
+                self.ws.suggestion_diff(id).await
+            }
+            "origofs_accept" => {
+                let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
+                self.ws.accept_suggestion(id, self.ctx()).await?;
+                Ok(format!("accepted suggestion #{id}"))
+            }
+            "origofs_reject" => {
+                let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
+                self.ws.reject_suggestion(id, self.ctx()).await?;
+                Ok(format!("rejected suggestion #{id}"))
             }
             "origofs_ls" => {
                 let entries = self.ws.ls(path()).await?;
@@ -209,12 +340,65 @@ fn tool_defs() -> Vec<Value> {
         ),
         tool(
             "origofs_write",
-            "Write a file (attributed to this agent; records blame).",
+            "Write a file, attributed to this agent (records blame). If this agent is \
+             propose-only, the edit is queued as a suggestion for review instead of \
+             landing — the result says which happened.",
             json!({
                 "path": { "type": "string" },
                 "content": { "type": "string" },
             }),
             &["path", "content"],
+        ),
+        tool(
+            "origofs_edit",
+            "Edit a text file by exact string replacement: replace `old` with `new`. \
+             `old` must appear exactly once — include enough surrounding context to be \
+             unique — unless replace_all is set. Prefer this over origofs_write for a \
+             small change: it sends only the changed text and credits only the changed \
+             lines. Governed by this agent's write policy, like origofs_write.",
+            json!({
+                "path": { "type": "string" },
+                "old": { "type": "string", "description": "exact text to replace; must be unique unless replace_all" },
+                "new": { "type": "string", "description": "replacement text" },
+                "replace_all": { "type": "boolean", "description": "replace every occurrence (default false)" },
+            }),
+            &["path", "old", "new"],
+        ),
+        tool(
+            "origofs_suggest",
+            "Propose an edit to a file for review instead of writing it directly. The \
+             bytes are stored now; the file changes only when a different actor accepts.",
+            json!({
+                "path": { "type": "string" },
+                "content": { "type": "string" },
+                "summary": { "type": "string", "description": "optional note for the reviewer" },
+            }),
+            &["path", "content"],
+        ),
+        tool(
+            "origofs_suggestions",
+            "List pending suggestions awaiting review (optionally filtered to a path).",
+            json!({ "path": { "type": "string", "description": "optional path filter" } }),
+            &[],
+        ),
+        tool(
+            "origofs_suggestion_diff",
+            "Show a suggestion's unified diff (base to proposed).",
+            json!({ "id": { "type": "integer" } }),
+            &["id"],
+        ),
+        tool(
+            "origofs_accept",
+            "Accept a pending suggestion, landing it attributed to its author. Refused \
+             if this agent is the suggestion's own author (review requires a different actor).",
+            json!({ "id": { "type": "integer" } }),
+            &["id"],
+        ),
+        tool(
+            "origofs_reject",
+            "Reject a pending suggestion without applying it.",
+            json!({ "id": { "type": "integer" } }),
+            &["id"],
         ),
         tool(
             "origofs_ls",

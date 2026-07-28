@@ -35,7 +35,9 @@ mod util;
 pub mod version;
 pub mod vfs;
 
-pub use attribution::{Actor, ActorInit, ActorKind, BlameRange, EditOp, ToolCallInit, WriteCtx};
+pub use attribution::{
+    Actor, ActorInit, ActorKind, BlameRange, EditOp, ToolCallInit, WriteCtx, WritePolicy,
+};
 pub use chunk::{AVG_CHUNK, ChunkRef, MAX_CHUNK, MIN_CHUNK, Manifest};
 pub use clock::{Clock, SystemClock};
 #[cfg(feature = "coedit")]
@@ -60,5 +62,5 @@ pub use postgres::{CoeditRelayNote, CoeditRelaySub};
 pub use postgres::{EventSubscription, PostgresMetadataStore};
 pub use recover::RebuildReport;
 pub use sqlite::SqliteMetadataStore;
-pub use suggest::{Suggestion, SuggestionContent, SuggestionInit, SuggestionStatus};
+pub use suggest::{Suggestion, SuggestionContent, SuggestionInit, SuggestionStatus, WriteOutcome};
 pub use types::{DirEntry, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit};

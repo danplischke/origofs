@@ -29,7 +29,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use origofs_sdk::{Workspace, WriteCtx};
+use origofs_sdk::{Workspace, WriteCtx, WriteOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -341,8 +341,15 @@ async fn write_file(
         }
     }
     // Attribution comes only from the authenticated principal — never the request.
-    ws.write_as(principal.write_ctx(), &p, &body).await?;
-    Ok(Json(json!({ "path": p, "written": body.len() })))
+    // Governed by the principal's write policy: a propose-only actor's edit is
+    // queued for review rather than landing directly.
+    match ws
+        .write_or_propose(principal.write_ctx(), &p, &body, None)
+        .await?
+    {
+        WriteOutcome::Wrote => Ok(Json(json!({ "path": p, "written": body.len() }))),
+        WriteOutcome::Proposed(id) => Ok(Json(json!({ "path": p, "proposed": id }))),
+    }
 }
 
 async fn delete_file(
