@@ -37,6 +37,11 @@ coedit = ["dep:yrs"]
 criterion = "0.5.1"
 tempfile = "3.27.0"
 tokio-postgres = "0.7"
+# The coedit tests drive a *vanilla* Yjs client (a raw `yrs::Doc` + the stock
+# y-sync `DefaultProtocol`, no origofs authorship) against our server handler, to
+# prove an unmodified editor connects and is attributed server-side. Dev-only;
+# the library still pulls `yrs` in solely through the `coedit` feature.
+yrs = "0.23"
 
 [[bench]]
 name = "engine"
