@@ -79,6 +79,15 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V9,
         postgres: V9,
     },
+    // V10 — per-actor write policy: `0` = direct (may write straight to the tree),
+    // `1` = propose (writes must go through the suggestion queue for review). An
+    // actor property, not a kind — a bounded, actor-agnostic trust gate. Defaults
+    // to direct, so existing actors keep writing directly. Plain `ADD COLUMN`.
+    Migration {
+        version: 10,
+        sqlite: V10_SQLITE,
+        postgres: V10_POSTGRES,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -105,6 +114,13 @@ const V9: &str = "
 CREATE UNIQUE INDEX IF NOT EXISTS idx_actor_auth_subject
     ON actor(auth_subject) WHERE auth_subject IS NOT NULL;
 ";
+
+// V10 — the per-actor write policy column (0 = direct, 1 = propose). NOT NULL with
+// a default so it applies to existing rows; the runner tolerates a re-applied
+// SQLite ADD COLUMN, Postgres expresses idempotency directly.
+const V10_SQLITE: &str = "ALTER TABLE actor ADD COLUMN write_policy INTEGER NOT NULL DEFAULT 0;";
+const V10_POSTGRES: &str =
+    "ALTER TABLE actor ADD COLUMN IF NOT EXISTS write_policy BIGINT NOT NULL DEFAULT 0;";
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS`; the migration runner tolerates a
 // re-applied ADD COLUMN (duplicate-column) so a re-run is idempotent. Postgres

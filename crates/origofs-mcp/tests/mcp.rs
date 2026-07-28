@@ -1,7 +1,7 @@
 //! MCP server: protocol handshake, tool listing, and attributed tool calls.
 
 use origofs_mcp::McpServer;
-use origofs_sdk::Workspace;
+use origofs_sdk::{SuggestionStatus, Workspace, WriteCtx, WritePolicy};
 use serde_json::{json, Value};
 
 async fn server() -> McpServer {
@@ -122,4 +122,102 @@ async fn serves_over_a_stream() {
         .as_str()
         .unwrap()
         .contains("created /d"));
+}
+
+// A propose-only agent (the untrusted-agent posture from §6) can't land a direct
+// write over MCP: `origofs_write` routes it into the suggestion queue, the file
+// stays absent, and it takes a *different* actor to accept — the agent can't
+// rubber-stamp its own proposal.
+#[tokio::test]
+async fn propose_only_agent_writes_become_suggestions() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let agent = ws
+        .create_agent("claude", "claude-opus-4-8", None)
+        .await
+        .unwrap();
+    let session = ws.create_session(agent, Some("mcp")).await.unwrap();
+    // Bound this agent to propose-only.
+    ws.set_write_policy(agent, WritePolicy::Propose)
+        .await
+        .unwrap();
+    let s = McpServer::new(ws.clone(), agent, session);
+
+    // The write is queued, not applied.
+    let w = s
+        .handle(call(
+            "origofs_write",
+            json!({"path":"/notes.txt","content":"proposed edit"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(w["result"]["isError"], false);
+    assert!(
+        text(&w).contains("proposed suggestion"),
+        "expected a proposal, got: {}",
+        text(&w)
+    );
+    // The file doesn't exist yet.
+    let r = s
+        .handle(call("origofs_read", json!({"path":"/notes.txt"})))
+        .await
+        .unwrap();
+    assert_eq!(r["result"]["isError"], true);
+
+    // The suggestion is visible via the MCP review tools.
+    let list = s
+        .handle(call("origofs_suggestions", json!({})))
+        .await
+        .unwrap();
+    assert!(
+        text(&list).contains("/notes.txt"),
+        "list was: {}",
+        text(&list)
+    );
+
+    let sid = ws
+        .list_suggestions(Some(SuggestionStatus::Pending), None)
+        .await
+        .unwrap()[0]
+        .id;
+
+    // The agent cannot accept its own proposal — review needs a different actor.
+    let self_accept = s
+        .handle(call("origofs_accept", json!({ "id": sid })))
+        .await
+        .unwrap();
+    assert_eq!(self_accept["result"]["isError"], true);
+    assert!(ws.read("/notes.txt").await.is_err()); // still not applied
+
+    // A human reviewer accepts it — now it lands, credited to the agent.
+    let reviewer = ws.create_human("dan", None).await.unwrap();
+    let rs = ws.create_session(reviewer, None).await.unwrap();
+    ws.accept_suggestion(sid, WriteCtx::session(reviewer, rs))
+        .await
+        .unwrap();
+    assert_eq!(&ws.read("/notes.txt").await.unwrap()[..], b"proposed edit");
+    let blame = ws.blame("/notes.txt").await.unwrap();
+    assert!(blame.iter().all(|r| r.actor.id == agent));
+}
+
+// A direct agent (the default) still writes straight through — the policy is
+// opt-in and nothing changes for a trusted agent.
+#[tokio::test]
+async fn direct_agent_still_writes_directly() {
+    let s = server().await;
+    let w = s
+        .handle(call(
+            "origofs_write",
+            json!({"path":"/d.txt","content":"landed"}),
+        ))
+        .await
+        .unwrap();
+    assert!(text(&w).contains("wrote"), "got: {}", text(&w));
+    let r = s
+        .handle(call("origofs_read", json!({"path":"/d.txt"})))
+        .await
+        .unwrap();
+    assert_eq!(text(&r), "landed");
 }

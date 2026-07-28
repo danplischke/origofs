@@ -1,23 +1,38 @@
-//! Agent-suggestion review queue (`docs/DESIGN.md` §6).
+//! Suggestion / review queue (`docs/DESIGN.md` §6).
 //!
-//! An agent can *propose* an edit instead of writing it directly: the proposed
+//! Any actor can *propose* an edit instead of writing it directly: the proposed
 //! bytes are stored in the content-addressed store (dedup'd, and diffable like
 //! anything else) and a review record is written to the `suggestion` table.
-//! A human then reviews it — [`Fs::suggestion_diff`] renders it as a unified
-//! diff of `base` → `proposed` — and [`Fs::accept_suggestion`] applies it (an
-//! attributed write, so blame still credits the agent that authored the
+//! A *different* actor then reviews it — [`Fs::suggestion_diff`] renders it as a
+//! unified diff of `base` → `proposed` — and [`Fs::accept_suggestion`] applies it
+//! (an attributed write, so blame still credits the actor that authored the
 //! content) or [`Fs::reject_suggestion`] discards it.
+//!
+//! The mechanism is **actor-agnostic**: it serves an untrusted agent proposing for
+//! human review *and* a change-request workflow between people. Whether an actor
+//! *must* propose (vs. write directly) is its [`WritePolicy`](crate::WritePolicy),
+//! enforced by [`Fs::write_or_propose`] — a bounded trust gate that is a property
+//! of the actor, never its kind.
 //!
 //! Nothing here is a new storage path: suggestions reuse the CAS, the diff
 //! machinery, the change feed, and attribution. Rejected/superseded proposals
 //! leave orphaned chunks that ordinary GC reclaims.
 
-use crate::attribution::WriteCtx;
+use crate::attribution::{WriteCtx, WritePolicy};
 use crate::collab::EventInit;
 use crate::content::ContentStore;
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
 use crate::types::Hash;
+
+/// The outcome of a policy-governed write (see [`Fs::write_or_propose`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The actor writes directly; the edit landed in the working tree.
+    Wrote,
+    /// The actor is propose-only; the edit was queued as this suggestion for review.
+    Proposed(i64),
+}
 
 /// The lifecycle state of a suggestion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +111,43 @@ pub struct SuggestionContent {
 }
 
 impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
+    /// Submit an edit to `path` **governed by the actor's write policy** (§6): a
+    /// [`Direct`](WritePolicy::Direct) actor writes straight to the working tree; a
+    /// [`Propose`](WritePolicy::Propose) actor's edit is instead queued as a
+    /// suggestion for review by a *different* actor. This is the entry point
+    /// untrusted surfaces (the MCP agent, the HTTP API) route writes through, so a
+    /// propose-only actor can never land an unreviewed edit through the front door.
+    /// Internal machinery (checkpoints, accepting a suggestion) uses the raw
+    /// [`write_as`](Self::write_as) and is exempt by construction. Actor-agnostic —
+    /// the gate is the actor's policy, never their kind.
+    pub async fn write_or_propose(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        data: &[u8],
+        summary: Option<&str>,
+    ) -> Result<WriteOutcome> {
+        // An unknown actor has no policy on record: default to direct (matching the
+        // column default). Identity is resolved server-side before we get here, so
+        // in practice the actor always exists.
+        let policy = self
+            .meta
+            .get_actor(ctx.actor)
+            .await?
+            .map(|a| a.write_policy)
+            .unwrap_or(WritePolicy::Direct);
+        match policy {
+            WritePolicy::Direct => {
+                self.write_as(ctx, path, data).await?;
+                Ok(WriteOutcome::Wrote)
+            }
+            WritePolicy::Propose => {
+                let id = self.suggest(ctx, path, data, summary).await?;
+                Ok(WriteOutcome::Proposed(id))
+            }
+        }
+    }
+
     /// Propose an edit to `path` without applying it. The bytes are stored in
     /// the CAS now; the working tree is untouched until the suggestion is
     /// accepted. Returns the new suggestion id. `data` empty with the intent to

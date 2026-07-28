@@ -19,7 +19,7 @@ pub use origofs_core::{
     EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind, GcStats, GcsConfig,
     Hash, Inode, MemStore, MergeOutcome, ObjectContentStore, OrigoFSError, PackStore, Presence,
     RebuildReport, S3Config, Suggestion, SuggestionContent, SuggestionInit, SuggestionStatus,
-    TieredStore, ToolCallInit, VerifyingStore, VersioningMode, WriteCtx,
+    TieredStore, ToolCallInit, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
 #[cfg(feature = "coedit")]
 pub use origofs_core::{CoeditDoc, CoeditRelayNote, CoeditRelaySub};
@@ -627,6 +627,36 @@ impl Workspace {
         summary: Option<&str>,
     ) -> Result<i64> {
         self.fs.suggest_delete(ctx, path, summary).await
+    }
+
+    /// Set an actor's write policy — `Direct` (may write straight to the tree) or
+    /// `Propose` (writes are routed through the suggestion queue). A bounded,
+    /// actor-agnostic trust gate; the default is `Direct`.
+    pub async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()> {
+        self.fs.set_write_policy(actor_id, policy).await
+    }
+
+    /// Submit an edit to `path` governed by the actor's write policy: a `Direct`
+    /// actor writes straight to the working tree ([`WriteOutcome::Wrote`]); a
+    /// `Propose` actor's edit is queued as a suggestion for review
+    /// ([`WriteOutcome::Proposed`]). The entry point an untrusted surface routes
+    /// writes through so a propose-only actor can't land an unreviewed edit.
+    pub async fn write_or_propose(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        data: &[u8],
+        summary: Option<&str>,
+    ) -> Result<WriteOutcome> {
+        let outcome = self.fs.write_or_propose(ctx, path, data, summary).await?;
+        // Emit the change-feed event for a direct write, exactly as `write_as`
+        // does. The propose path emits its own `suggest` event in the engine, so
+        // don't double-emit here.
+        if matches!(outcome, WriteOutcome::Wrote) {
+            self.emit("write", path, None, Some(ctx.actor), ctx.session)
+                .await;
+        }
+        Ok(outcome)
     }
 
     /// Suggestions, optionally filtered by status and/or path, newest first.

@@ -158,6 +158,14 @@ enum Cmd {
         #[arg(long)]
         controller: Option<i64>,
     },
+    /// Set an actor's write policy: `direct` (writes land immediately) or `propose`
+    /// (writes are routed through the suggestion queue for review). Actor-agnostic.
+    WritePolicy {
+        /// The actor id to configure.
+        actor: i64,
+        /// `direct` or `propose`.
+        policy: String,
+    },
     /// Show per-line authorship (blame) for a file.
     Blame { path: String },
     /// Run a command over a copy-on-write view of the workspace, then import what
@@ -572,6 +580,15 @@ async fn main() -> Result<()> {
                 ws.create_human(&name, None).await?
             };
             println!("{id}");
+        }
+        Cmd::WritePolicy { actor, policy } => {
+            let p = origofs_sdk::WritePolicy::parse(&policy).ok_or_else(|| {
+                origofs_sdk::OrigoFSError::InvalidArgument(format!(
+                    "unknown write policy {policy:?} (expected `direct` or `propose`)"
+                ))
+            })?;
+            ws.set_write_policy(actor, p).await?;
+            println!("actor #{actor} write policy set to {}", p.as_str());
         }
         Cmd::Blame { path } => {
             for r in ws.blame(&path).await? {

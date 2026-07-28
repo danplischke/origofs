@@ -8,7 +8,9 @@
 //! critical sections on the unique dentry index), and `LISTEN/NOTIFY` change
 //! feeds (consumed by the watch API in M8).
 
-use crate::attribution::{Actor, ActorInit, ActorKind, EditOp, EditOpInit, ToolCallInit};
+use crate::attribution::{
+    Actor, ActorInit, ActorKind, EditOp, EditOpInit, ToolCallInit, WritePolicy,
+};
 use crate::collab::{EVENT_CHANNEL, Event, EventInit, Presence};
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::{MetaTxn, MetadataStore};
@@ -923,7 +925,7 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let row = c
             .query_opt(
-                "SELECT id, kind, display_name, auth_subject, agent_model, agent_vendor, controller_actor_id, created_at
+                "SELECT id, kind, display_name, auth_subject, agent_model, agent_vendor, controller_actor_id, created_at, write_policy
                  FROM actor WHERE id = $1",
                 &[&id],
             )
@@ -942,10 +944,25 @@ impl MetadataStore for PostgresMetadataStore {
                     agent_vendor: r.get(5),
                     controller_actor_id: r.get(6),
                     created_at: r.get(7),
+                    write_policy: WritePolicy::from_i64(r.get(8)),
                 }))
             }
             None => Ok(None),
         }
+    }
+
+    async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "UPDATE actor SET write_policy = $1 WHERE id = $2",
+                &[&policy.as_i64(), &actor_id],
+            )
+            .await?;
+        if n == 0 {
+            return Err(OrigoFSError::NotFound(format!("actor #{actor_id}")));
+        }
+        Ok(())
     }
 
     async fn actor_by_subject(&self, subject: &str) -> Result<Option<Actor>> {
@@ -966,7 +983,7 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let rows = c
             .query(
-                "SELECT id, kind, display_name, auth_subject, agent_model, agent_vendor, controller_actor_id, created_at
+                "SELECT id, kind, display_name, auth_subject, agent_model, agent_vendor, controller_actor_id, created_at, write_policy
                  FROM actor ORDER BY id",
                 &[],
             )
@@ -985,6 +1002,7 @@ impl MetadataStore for PostgresMetadataStore {
                 agent_vendor: r.get(5),
                 controller_actor_id: r.get(6),
                 created_at: r.get(7),
+                write_policy: WritePolicy::from_i64(r.get(8)),
             });
         }
         Ok(actors)
