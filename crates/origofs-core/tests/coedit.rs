@@ -320,6 +320,70 @@ async fn coedit_reopen_after_accepted_suggestion_rebuilds_from_file() {
     assert_eq!((b[0].byte_start, b[0].byte_end), (0, 11));
 }
 
+// Regression: the convergence-ordering bug. An author edits *alone* — before any
+// peer has joined the room — so the server's attribution (formatting the inserted
+// range with the author mark) adds CRDT items to the server's replica that the
+// author's own replica has never seen. If the server does not echo that attributed
+// delta back to the sender, the author diverges structurally, and a *later* peer's
+// edit — positioned in the CRDT against those unseen author-mark items — can never
+// integrate on the author (it waits, pending, on origins the author is missing).
+// The earlier Rust tests missed this because they always had both peers exchange
+// state before the single edit; this pins the solo-author-first ordering that the
+// live browser E2E exposed.
+#[test]
+fn coedit_solo_author_converges_with_a_later_peer_edit() {
+    let server = CoeditDoc::new();
+    let a = CoeditDoc::new(); // the author — connects and edits first, alone
+    let b = CoeditDoc::new(); // a peer — joins only afterwards
+    let ctx_a = WriteCtx::session(1, 10);
+    let ctx_b = WriteCtx::session(2, 20);
+
+    // A connects to an empty room and types "hello" as a vanilla client would:
+    // unattributed locally, the server is the authority. A hands its content to the
+    // server (framed as the SyncStep2 answering the server's greeting); the server
+    // attributes it to actor 1.
+    a.insert(WriteCtx::session(0, 0), 0, "hello");
+    let a_push = a
+        .handle_sync(WriteCtx::session(0, 0), &server.sync_start())
+        .unwrap();
+    let after_a = server.handle_sync(ctx_a, &a_push.reply).unwrap();
+    assert_eq!(server.text(), "hello");
+    // The fix: the server echoes the attributed delta back to the *sender*, so A's
+    // replica gains the server's author-mark items. Without the echo, this is empty.
+    assert!(
+        !after_a.reply.is_empty(),
+        "server must echo the attributed delta back to the author"
+    );
+    a.apply_relayed(&after_a.reply).unwrap();
+    assert_eq!(a.text(), "hello");
+
+    // B joins later and syncs up from the server: it sends SyncStep1, the server
+    // answers with the state B lacks (A's "hello" *and* the author-mark items).
+    let srv_state = server.handle_sync(ctx_b, &b.sync_start()).unwrap();
+    b.apply_relayed(&srv_state.reply).unwrap();
+    assert_eq!(b.text(), "hello");
+
+    // B appends " world" — its CRDT position references the server's author-mark
+    // items, the very items A must also hold for this edit to integrate on A.
+    b.insert(WriteCtx::session(0, 0), 5, " world");
+    let b_push = b
+        .handle_sync(WriteCtx::session(0, 0), &server.sync_start())
+        .unwrap();
+    let after_b = server.handle_sync(ctx_b, &b_push.reply).unwrap();
+    assert_eq!(server.text(), "hello world");
+    assert!(!after_b.broadcast.is_empty()); // fans out to the room's other peer, A
+
+    // The payoff: A converges. Before the fix, A could not integrate B's insert
+    // (it referenced author-mark origins A never received) and stayed at "hello".
+    a.apply_relayed(&after_b.broadcast).unwrap();
+    assert_eq!(a.text(), "hello world");
+
+    // And authorship is exact on the server: "hello" → actor 1, " world" → actor 2.
+    let (_t, spans) = server.snapshot();
+    let actors_lens: Vec<(i64, u64)> = spans.iter().map(|&(x, _, l)| (x, l)).collect();
+    assert_eq!(actors_lens, vec![(1, 5), (2, 6)]);
+}
+
 // With no prior sidecar, opening an existing file promotes its text — preserving
 // whatever authorship the file already carries (a prior attributed write), not
 // re-crediting it to whoever opens it.
