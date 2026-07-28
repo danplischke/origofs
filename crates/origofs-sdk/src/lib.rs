@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 pub use bytes::Bytes;
 pub use futures::stream::BoxStream;
+#[cfg(feature = "coedit")]
+pub use origofs_core::CoeditDoc;
 pub use origofs_core::{
     Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DiffEntry, DiffStatus, DirEntry,
     EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind, GcStats, GcsConfig,
@@ -703,6 +705,30 @@ impl Workspace {
                 "subscribe requires the Postgres backend; use watch() to poll".into(),
             )),
         }
+    }
+
+    /// Open a live co-editing document for `path` (roadmap M8): resume the CRDT
+    /// from its persisted sidecar if one exists, else promote the file's current
+    /// text into a fresh document attributed to `ctx`. Drive it over the Yjs wire
+    /// protocol with [`CoeditDoc::handle_sync`], then land it with
+    /// [`checkpoint_coedit`](Self::checkpoint_coedit). Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn open_coedit(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
+        self.fs.open_coedit(ctx, path).await
+    }
+
+    /// Checkpoint a live co-editing document into `path`, landing each
+    /// collaborator's exact character spans in the byte-range blame index and
+    /// persisting the CRDT sidecar so the session is durable and resumable. `ctx`
+    /// is the actor performing the checkpoint. Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn checkpoint_coedit(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditDoc,
+    ) -> Result<()> {
+        self.fs.checkpoint_coedit(ctx, path, doc).await
     }
 
     /// Record an arbitrary event on the change feed.
