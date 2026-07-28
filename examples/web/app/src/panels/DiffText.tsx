@@ -1,4 +1,4 @@
-// Render a unified diff (origo returns plain `diff -u` text) with +/- coloring.
+// Render a unified diff (origofs returns plain `diff -u` text) with +/- coloring.
 
 export function DiffText({ text }: { text: string }) {
   if (!text) return <div className="empty">No diff.</div>;

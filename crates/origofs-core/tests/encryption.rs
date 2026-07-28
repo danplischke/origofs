@@ -1,0 +1,148 @@
+//! Encryption at rest: content is transparent to the engine, ciphertext on the
+//! backend never contains the plaintext, dedup survives, GC still works, and the
+//! wrong key fails loudly.
+
+use origofs_core::{
+    ContentStore, EncryptedStore, Fs, Hash, LocalCasStore, MemStore, SqliteMetadataStore,
+};
+use std::sync::Arc;
+
+fn key(seed: u8) -> [u8; 32] {
+    [seed; 32]
+}
+
+#[tokio::test]
+async fn roundtrips_through_the_engine() {
+    let backend = Arc::new(MemStore::new());
+    let enc: Arc<dyn ContentStore> = Arc::new(EncryptedStore::new(backend.clone(), key(1)));
+    let fs = Fs::new(SqliteMetadataStore::open_in_memory().unwrap(), enc);
+    fs.init().await.unwrap();
+
+    fs.mkdir_p("/dir").await.unwrap();
+    fs.write("/dir/a.txt", b"secret contents").await.unwrap();
+    let big = vec![7u8; 300 * 1024]; // multi-chunk
+    fs.write("/big.bin", &big).await.unwrap();
+
+    assert_eq!(
+        &fs.read("/dir/a.txt").await.unwrap()[..],
+        b"secret contents"
+    );
+    assert_eq!(&fs.read("/big.bin").await.unwrap()[..], &big[..]);
+    // Ranged reads decrypt correctly too.
+    assert_eq!(
+        &fs.read_range("/big.bin", 10, 5).await.unwrap()[..],
+        &big[10..15]
+    );
+}
+
+#[tokio::test]
+async fn backend_holds_ciphertext_not_plaintext() {
+    let backend = Arc::new(MemStore::new());
+    let enc = EncryptedStore::new(backend.clone(), key(2));
+
+    let plaintext = b"the quick brown fox jumps over the lazy dog";
+    let hash = enc.put(plaintext).await.unwrap();
+    // The address is the plaintext hash (transparent to the engine)...
+    assert_eq!(hash, Hash::of(plaintext));
+
+    // ...but the bytes actually stored are ciphertext: different, longer (AEAD
+    // tag), and not containing the plaintext.
+    let stored = backend.get(&hash).await.unwrap();
+    assert_ne!(&stored[..], &plaintext[..]);
+    assert!(stored.len() > plaintext.len());
+    assert!(
+        !stored.windows(plaintext.len()).any(|w| w == plaintext),
+        "plaintext must not appear in the stored bytes"
+    );
+
+    // And it decrypts back.
+    assert_eq!(&enc.get(&hash).await.unwrap()[..], &plaintext[..]);
+}
+
+#[tokio::test]
+async fn dedup_is_preserved() {
+    let backend = Arc::new(MemStore::new());
+    let enc = EncryptedStore::new(backend.clone(), key(3));
+
+    let h1 = enc.put(b"same bytes").await.unwrap();
+    let h2 = enc.put(b"same bytes").await.unwrap();
+    assert_eq!(h1, h2);
+    assert_eq!(backend.len(), 1, "identical plaintext stored once");
+
+    // Convergent: identical plaintext produces identical ciphertext.
+    enc.put(b"other bytes").await.unwrap();
+    assert_eq!(backend.len(), 2);
+}
+
+#[tokio::test]
+async fn wrong_key_fails_loudly() {
+    let backend = Arc::new(MemStore::new());
+    let writer = EncryptedStore::new(backend.clone(), key(4));
+    let hash = writer.put(b"classified").await.unwrap();
+
+    // A reader with a different key must error, not return garbage.
+    let reader = EncryptedStore::new(backend.clone(), key(5));
+    let err = reader.get(&hash).await.unwrap_err();
+    assert!(err.to_string().contains("decryption failed"), "got: {err}");
+
+    // The correct key still works.
+    let ok = EncryptedStore::new(backend, key(4));
+    assert_eq!(&ok.get(&hash).await.unwrap()[..], b"classified");
+}
+
+#[tokio::test]
+async fn gc_works_through_encryption() {
+    let backend = Arc::new(MemStore::new());
+    let enc: Arc<dyn ContentStore> = Arc::new(EncryptedStore::new(backend.clone(), key(6)));
+    let fs = Fs::new(SqliteMetadataStore::open_in_memory().unwrap(), enc);
+    fs.init().await.unwrap();
+
+    fs.write("/a.bin", &vec![1u8; 200 * 1024]).await.unwrap();
+    let before = backend.len();
+    fs.write("/a.bin", &vec![2u8; 200 * 1024]).await.unwrap(); // orphan v1
+    assert!(backend.len() > before);
+
+    let stats = fs.gc().await.unwrap();
+    assert!(stats.deleted > 0);
+    // Live body still decrypts after collection.
+    assert_eq!(
+        &fs.read("/a.bin").await.unwrap()[..],
+        &vec![2u8; 200 * 1024][..]
+    );
+}
+
+#[tokio::test]
+async fn on_disk_local_store_is_encrypted() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(LocalCasStore::open(dir.path().join("cas")).await.unwrap());
+    let enc = EncryptedStore::new(backend.clone(), key(7));
+
+    let plaintext = b"on-disk secrets that must not leak to the filesystem";
+    let hash = enc.put(plaintext).await.unwrap();
+
+    // The raw file on disk is ciphertext.
+    let raw = backend.get(&hash).await.unwrap();
+    assert!(!raw.windows(plaintext.len()).any(|w| w == plaintext));
+    assert_eq!(&enc.get(&hash).await.unwrap()[..], &plaintext[..]);
+}
+
+// SEC (security audit #19): EncryptedStore::put_keyed must refuse a
+// non-content-addressed key. The nonce is derived from the key, so storing two
+// distinct plaintexts under one key would reuse an AEAD (key, nonce) pair — this
+// guard makes it impossible to wrap a mutable-value keyed store (e.g. a pack
+// index, whose entry for a chunk changes on repack) in encryption unsafely.
+#[tokio::test]
+async fn put_keyed_rejects_a_non_content_addressed_key() {
+    let backend = Arc::new(MemStore::new());
+    let enc = EncryptedStore::new(backend, key(9));
+
+    let bytes = b"index-entry-v1";
+    // The content-addressed key (the hash of the bytes) is accepted...
+    enc.put_keyed(&Hash::of(bytes), bytes).await.unwrap();
+    // ...but a key that isn't the hash of the bytes is refused.
+    let wrong = Hash::of(b"a-different-key");
+    assert!(
+        enc.put_keyed(&wrong, bytes).await.is_err(),
+        "a non-content-addressed key must be rejected (nonce reuse)"
+    );
+}

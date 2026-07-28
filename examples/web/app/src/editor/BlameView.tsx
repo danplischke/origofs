@@ -1,7 +1,7 @@
-// The exact, line-precise attribution view — origo blames by source line, and this
+// The exact, line-precise attribution view — origofs blames by source line, and this
 // renders exactly that: every line with its author, like `git blame`. Unlike the
 // editor gutter (which maps blame onto rendered blocks), this is 1:1 with what
-// origo stored, so it's the ground truth.
+// origofs stored, so it's the ground truth.
 
 import { useMemo } from "react";
 import { blameLines } from "../lib/blame";

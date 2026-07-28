@@ -28,7 +28,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # origo-py is a pyo3 extension, so building the workspace needs a Python
+      # origofs-py is a pyo3 extension, so building the workspace needs a Python
       # interpreter available for it to link against.
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -41,7 +41,7 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Postgres tests self-skip without ORIGO_PG_TEST_URL; the S3/GCS integration
+      # Postgres tests self-skip without ORIGOFS_PG_TEST_URL; the S3/GCS integration
       # tests are #[ignore]d; and the FUSE / NFS / overlayfs tests self-skip when
       # the needed privileges aren't present — so the suite is green on a stock
       # runner with no extra services.
@@ -68,14 +68,14 @@ jobs:
       # exercises the object-store content path (S3/GCS config + in-memory
       # roundtrip) from Python.
       - name: Build extension and run tests
-        working-directory: crates/origo-py
+        working-directory: crates/origofs-py
         run: |
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
           # fastapi + httpx are needed by tests/test_fastapi_router.py — it
-          # imports origo.fastapi (the router integration) and fastapi's TestClient,
-          # which rides on httpx. They are test-only deps, not runtime deps of origo.
+          # imports origofs.fastapi (the router integration) and fastapi's TestClient,
+          # which rides on httpx. They are test-only deps, not runtime deps of origofs.
           pip install maturin pytest fastapi httpx
           maturin develop
           pytest -q tests

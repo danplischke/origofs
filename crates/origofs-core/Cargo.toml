@@ -1,0 +1,36 @@
+[package]
+name = "origofs-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argon2 = "0.5.3"
+async-recursion = "1.1.1"
+async-trait = "0.1.91"
+blake3 = "1.8.5"
+bytes = "1.12.1"
+chacha20poly1305 = "0.10.1"
+deadpool-postgres = "0.14"
+diffy = "0.5.1"
+fastcdc = "3"
+futures = "0.3.33"
+hex = "0.4.3"
+object_store = { version = "0.12", features = ["aws", "gcp"] }
+# `arc_lock` gives an owned (`'static`) connection guard a transaction can hold
+# across `.await`s; `send_guard` makes that guard `Send` so the transaction
+# future stays `Send`. Both are needed for the SQLite `MetaTxn` (C1).
+parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+similar = "3.1.1"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
+tokio-postgres = "0.7"
+
+[dev-dependencies]
+criterion = "0.5.1"
+tempfile = "3.27.0"
+tokio-postgres = "0.7"
+
+[[bench]]
+name = "engine"
+harness = false

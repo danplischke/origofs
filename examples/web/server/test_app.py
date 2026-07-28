@@ -1,15 +1,15 @@
-"""Tests for the origo document server (examples/web/server/app.py).
+"""Tests for the origofs document server (examples/web/server/app.py).
 
 Run (after building the bindings — see requirements.txt):
     pip install fastapi httpx pytest
     pytest test_app.py            # or: python test_app.py
 
-The end-to-end tests use a real origo.Workspace (a temp dir opened by the app's
-lifespan), so they need the compiled `origo` extension. They prove the thing that
+The end-to-end tests use a real origofs.Workspace (a temp dir opened by the app's
+lifespan), so they need the compiled `origofs` extension. They prove the thing that
 matters: a write made through the server is attributed, server-side, to the
 actor the bearer token resolves to — and a client can't forge that.
 """
-import origo  # noqa: F401  (import guard: the app needs the compiled extension)
+import origofs  # noqa: F401  (import guard: the app needs the compiled extension)
 from fastapi.testclient import TestClient
 
 from app import app
@@ -45,7 +45,7 @@ def test_unauthenticated_write_is_refused():
 
 def test_write_is_attributed_and_doc_load_carries_blame():
     with TestClient(app) as c:
-        # /api/me resolves the token to an origo actor server-side.
+        # /api/me resolves the token to an origofs actor server-side.
         me = c.get("/api/me", headers=_auth("tok-ada")).json()
         assert me["display_name"] == "Ada Lovelace" and me["kind"] == "human"
 

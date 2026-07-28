@@ -1,4 +1,4 @@
-// Lineage: the commit history (origo's versioning DAG) plus, for the current
+// Lineage: the commit history (origofs's versioning DAG) plus, for the current
 // document, the unified diff a selected commit introduced against its parent.
 
 import { useCallback, useEffect, useState } from "react";

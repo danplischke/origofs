@@ -1,6 +1,6 @@
-// Bridge origo's per-line blame to the editor.
+// Bridge origofs's per-line blame to the editor.
 //
-// origo attributes documents by **source line** (1-based, inclusive). PlateJS
+// origofs attributes documents by **source line** (1-based, inclusive). PlateJS
 // edits **blocks**. These helpers map between the two:
 //   * `blameLines`       — the exact, line-by-line view (for the Blame tab).
 //   * `blockLineSpans`   — which source lines each top-level block round-trips to
@@ -25,13 +25,13 @@ export interface BlameLine {
 }
 
 /**
- * Split a document into lines paired with their author. Matches origo's line
+ * Split a document into lines paired with their author. Matches origofs's line
  * counting (it splits on '\n' keeping the trailing newline), so line N here is
  * the same line N that blame refers to.
  */
 export function blameLines(text: string, blame: BlameRange[]): BlameLine[] {
   const parts = text.split("\n");
-  // origo's split_inclusive('\n') on "a\nb\n" yields 2 lines; JS split yields a
+  // origofs's split_inclusive('\n') on "a\nb\n" yields 2 lines; JS split yields a
   // trailing "" — drop it so our line count matches blame's.
   if (parts.length > 0 && parts[parts.length - 1] === "") parts.pop();
   return parts.map((t, i) => ({ line: i + 1, text: t, actor: authorForLine(blame, i + 1) }));
@@ -43,7 +43,7 @@ export function blameLines(text: string, blame: BlameRange[]): BlameLine[] {
  * We serialize each block on its own (`serializeMd(editor, { value: [node] })`)
  * to learn how many lines it contributes, then advance past the blank line
  * remark puts between blocks. This mirrors how the whole document serializes, so
- * the spans line up with what origo stored and blamed.
+ * the spans line up with what origofs stored and blamed.
  */
 export function blockLineSpans(editor: unknown, nodes: unknown[]): Array<[number, number]> {
   const spans: Array<[number, number]> = [];

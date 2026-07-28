@@ -1,35 +1,35 @@
-"""origo document server — the backend for the React + PlateJS attribution demo.
+"""origofs document server — the backend for the React + PlateJS attribution demo.
 
 This is the companion to ``examples/web/app`` (a Vite + React + PlateJS editor).
-It shows the *proper* shape of an origo integration:
+It shows the *proper* shape of an origofs integration:
 
-  * **origo owns attribution, the app owns identity.** origo never trusts a
-    client-named actor — every mutating route resolves the caller to an origo actor
+  * **origofs owns attribution, the app owns identity.** origofs never trusts a
+    client-named actor — every mutating route resolves the caller to an origofs actor
     server-side, via the ``authn`` dependency, and attributes the write to it.
     The React app only ever sends a bearer token; it cannot forge who wrote what.
-  * **The whole workspace API in one line.** ``origo.fastapi.build_router`` mounts
+  * **The whole workspace API in one line.** ``origofs.fastapi.build_router`` mounts
     files, blame, versioning, diff, the agent-suggestion review queue, the change
     feed, and presence under ``/fs``.
-  * **A thin app layer on top** (``/api/*``) for the things a UI wants that origo
+  * **A thin app layer on top** (``/api/*``) for the things a UI wants that origofs
     deliberately leaves to you: *who am I* (``/api/me``), an *actor directory*
     that resolves the ``actor_id`` in events/suggestions to a name+kind
     (``/api/actors``), a *combined document load* (text + line blame in one round
     trip, ``/api/doc/{path}``), and a *live SSE feed* of attributed edits
     (``/api/feed``).
 
-Why the app owns the actor directory: origo embeds the full actor in every *blame*
+Why the app owns the actor directory: origofs embeds the full actor in every *blame*
 range, but events, suggestions, and ``resolved_by`` carry only an ``actor_id``.
 The app is the component that *created* those actors (it maps your users/agents
-onto origo actors), so it is the natural place to resolve an id back to a name —
-origo stays a storage-and-attribution engine, not a user directory.
+onto origofs actors), so it is the natural place to resolve an id back to a name —
+origofs stays a storage-and-attribution engine, not a user directory.
 
 Run it
 ------
-    pip install -r requirements.txt          # origo[fastapi] + uvicorn
+    pip install -r requirements.txt          # origofs[fastapi] + uvicorn
     uvicorn app:app --reload                 # http://127.0.0.1:8000
 
-Point it at a real store with env vars: ``ORIGO_DSN=postgres://…`` (multi-writer),
-or ``ORIGO_WORKSPACE=/srv/ws`` (local dir). Default is a throwaway temp workspace.
+Point it at a real store with env vars: ``ORIGOFS_DSN=postgres://…`` (multi-writer),
+or ``ORIGOFS_WORKSPACE=/srv/ws`` (local dir). Default is a throwaway temp workspace.
 
     !!! DEMO AUTH ONLY. The bearer tokens below are hardcoded so you can try the
     demo with `curl`/the React token picker. Do NOT ship them — replace
@@ -51,14 +51,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-import origo
-from origo.fastapi import build_router
+import origofs
+from origofs.fastapi import build_router
 
 
 # --- your identity backend (DEMO) -------------------------------------------
 # A bearer token -> the principal it authenticates. In a real app you would
 # decode a JWT / look up a session / verify an agent token here. Each principal
-# carries a stable ``external_id``; origo maps that onto an actor the first time we
+# carries a stable ``external_id``; origofs maps that onto an actor the first time we
 # see it and reuses it forever after (idempotent, no side table).
 
 PRINCIPALS: dict[str, dict[str, Any]] = {
@@ -69,14 +69,14 @@ PRINCIPALS: dict[str, dict[str, Any]] = {
 
 
 class Identity:
-    """Resolves bearer tokens to origo actors (idempotently) and creates a session
-    on first use. origo owns the actor *records* — the UI resolves the id-only feeds
+    """Resolves bearer tokens to origofs actors (idempotently) and creates a session
+    on first use. origofs owns the actor *records* — the UI resolves the id-only feeds
     with ``ws.list_actors()`` / ``ws.actor(id)``, so this keeps no directory of its
     own. A real deployment would resolve tokens against your user store here."""
 
-    def __init__(self, ws: "origo.Workspace") -> None:
+    def __init__(self, ws: "origofs.Workspace") -> None:
         self._ws = ws
-        self._ctx: dict[str, origo.WriteCtx] = {}  # token -> WriteCtx (cached)
+        self._ctx: dict[str, origofs.WriteCtx] = {}  # token -> WriteCtx (cached)
 
     async def onboard_all(self) -> None:
         """Pre-create every demo principal's actor so ``ws.list_actors()`` is
@@ -96,15 +96,15 @@ class Identity:
             principal["external_id"], principal["name"]
         )
 
-    async def ctx_for_token(self, token: str) -> "origo.WriteCtx":
-        """Resolve a token to the :class:`origo.WriteCtx` its writes attribute to,
+    async def ctx_for_token(self, token: str) -> "origofs.WriteCtx":
+        """Resolve a token to the :class:`origofs.WriteCtx` its writes attribute to,
         creating the actor (idempotent) and a session on first use."""
         cached = self._ctx.get(token)
         if cached is not None:
             return cached
         actor_id = await self._actor_id_for(token)
         session_id = await self._ws.create_session(actor_id, client="web")
-        ctx = origo.WriteCtx.session(actor_id, session_id)
+        ctx = origofs.WriteCtx.session(actor_id, session_id)
         self._ctx[token] = ctx
         return ctx
 
@@ -119,18 +119,18 @@ def bearer_token(authorization: Optional[str] = Header(default=None)) -> str:
 # --- app wiring -------------------------------------------------------------
 
 
-async def _open_workspace() -> "origo.Workspace":
-    dsn = os.environ.get("ORIGO_DSN")
+async def _open_workspace() -> "origofs.Workspace":
+    dsn = os.environ.get("ORIGOFS_DSN")
     if dsn:
-        return await origo.Workspace.open_pg(dsn, os.environ.get("ORIGO_CAS", "cas"))
-    ws_dir = os.environ.get("ORIGO_WORKSPACE")
+        return await origofs.Workspace.open_pg(dsn, os.environ.get("ORIGOFS_CAS", "cas"))
+    ws_dir = os.environ.get("ORIGOFS_WORKSPACE")
     if ws_dir is None:
         # Throwaway temp workspace; kept alive on app.state so it isn't GC'd.
-        tmp = tempfile.TemporaryDirectory(prefix="origo-web-")
+        tmp = tempfile.TemporaryDirectory(prefix="origofs-web-")
         _TMP.append(tmp)
         ws_dir = tmp.name
     os.makedirs(ws_dir, exist_ok=True)
-    return await origo.Workspace.open_local(f"{ws_dir}/meta.db", f"{ws_dir}/cas")
+    return await origofs.Workspace.open_local(f"{ws_dir}/meta.db", f"{ws_dir}/cas")
 
 
 _TMP: list[tempfile.TemporaryDirectory] = []
@@ -154,7 +154,7 @@ async def lifespan(app: FastAPI):
         _TMP.clear()
 
 
-app = FastAPI(title="origo web — attribution & lineage", lifespan=lifespan)
+app = FastAPI(title="origofs web — attribution & lineage", lifespan=lifespan)
 
 # The React dev server runs on a different origin (Vite: 5173). For a *dev*
 # example we allow it broadly; tighten `allow_origins` for anything real.
@@ -171,15 +171,15 @@ app.add_middleware(
 
 
 # --- app-level convenience endpoints (/api/*) -------------------------------
-# Everything origo-native lives under /fs (the router). These add the few things a
+# Everything origofs-native lives under /fs (the router). These add the few things a
 # UI wants on top: identity, an actor directory, a combined doc load, and a feed.
 
 
-def _ws(request: Request) -> "origo.Workspace":
+def _ws(request: Request) -> "origofs.Workspace":
     return request.app.state.ws
 
 
-async def _authn(request: Request, token: str = Depends(bearer_token)) -> "origo.WriteCtx":
+async def _authn(request: Request, token: str = Depends(bearer_token)) -> "origofs.WriteCtx":
     """The single auth dependency, used by both the /fs router and /api routes:
     resolve the bearer token to the actor the write is attributed to. Reads the
     workspace/identity from app.state, so a client can't forge attribution and a
@@ -203,7 +203,7 @@ class _WsProxy:
         return getattr(ws, name)
 
 
-# The full origo workspace API under /fs, attribution driven by `_authn`. Mounted
+# The full origofs workspace API under /fs, attribution driven by `_authn`. Mounted
 # once, at import time, against the proxy — never inside the lifespan.
 app.include_router(build_router(_WsProxy(), authn=_authn), prefix="/fs")
 
@@ -222,7 +222,7 @@ async def config() -> dict[str, Any]:
 
 
 def _actor_view(a: Optional[dict[str, Any]]) -> dict[str, Any]:
-    """The compact actor shape the UI wants, from an origo actor dict."""
+    """The compact actor shape the UI wants, from an origofs actor dict."""
     if a is None:
         return {}
     return {
@@ -234,8 +234,8 @@ def _actor_view(a: Optional[dict[str, Any]]) -> dict[str, Any]:
 
 
 @app.get("/api/me")
-async def me(request: Request, ctx: "origo.WriteCtx" = Depends(_authn)) -> dict[str, Any]:
-    """Who the presented token authenticates as — the actor resolved from origo by
+async def me(request: Request, ctx: "origofs.WriteCtx" = Depends(_authn)) -> dict[str, Any]:
+    """Who the presented token authenticates as — the actor resolved from origofs by
     id (``ws.actor``), no app-side directory."""
     info = _actor_view(await _ws(request).actor(ctx.actor_id))
     return {
@@ -250,7 +250,7 @@ async def me(request: Request, ctx: "origo.WriteCtx" = Depends(_authn)) -> dict[
 @app.get("/api/actors")
 async def actors(request: Request) -> list[dict[str, Any]]:
     """Resolve the ``actor_id`` carried by events, suggestions, and ``resolved_by``
-    to a name + kind — straight from origo (``ws.list_actors``), no app-side table.
+    to a name + kind — straight from origofs (``ws.list_actors``), no app-side table.
     (Blame already embeds the full actor; this is for the id-only feeds.)"""
     return [_actor_view(a) for a in await _ws(request).list_actors()]
 
@@ -304,11 +304,11 @@ async def feed(request: Request, since: int = 0):
 
 
 # --- inline suggestion review (VSCode-style agent edits) --------------------
-# origo's suggestion queue is propose-then-accept. These endpoints let the UI show
+# origofs's suggestion queue is propose-then-accept. These endpoints let the UI show
 # a pending suggestion *inline* as a line diff and Keep/Discard it per hunk.
 #
-# Attribution is preserved: "keep all" uses origo's native accept (atomic, credits
-# the agent). A *partial* keep can't go through origo accept (that applies the whole
+# Attribution is preserved: "keep all" uses origofs's native accept (atomic, credits
+# the agent). A *partial* keep can't go through origofs accept (that applies the whole
 # proposal), so the server reconstructs the kept hunks and writes them **as the
 # agent** — the server is the trusted identity boundary, so the agent stays
 # credited for its lines and the reviewer never is.
@@ -352,7 +352,7 @@ class _ApplyReq(BaseModel):
 @app.get("/api/suggestion/{sid}")
 async def suggestion_detail(request: Request, sid: int) -> dict[str, Any]:
     """A pending suggestion as an inline line diff. Base + proposed content come
-    straight from origo (``ws.suggestion_content``) — no app-side stash — so this
+    straight from origofs (``ws.suggestion_content``) — no app-side stash — so this
     works for *any* suggestion, including ones proposed via the raw /fs route."""
     ws = _ws(request)
     sug = await ws.get_suggestion(sid)
@@ -377,9 +377,9 @@ async def apply_suggestion(
     request: Request,
     sid: int,
     req: _ApplyReq,
-    ctx: "origo.WriteCtx" = Depends(_authn),
+    ctx: "origofs.WriteCtx" = Depends(_authn),
 ) -> dict[str, Any]:
-    """Keep the chosen hunks. Keep-all → origo accept (credits the agent, refuses a
+    """Keep the chosen hunks. Keep-all → origofs accept (credits the agent, refuses a
     stale base). Partial → the server writes the kept hunks as the agent, then
     resolves the original proposal. Discard-all → reject."""
     ws = _ws(request)
@@ -401,7 +401,7 @@ async def apply_suggestion(
         # Write the kept hunks AS THE AGENT so its lines stay credited to it.
         agent_id = sug["actor_id"]
         agent_session = await ws.create_session(agent_id, client="review-apply")
-        agent_ctx = origo.WriteCtx.session(agent_id, agent_session)
+        agent_ctx = origofs.WriteCtx.session(agent_id, agent_session)
         await ws.write_as(agent_ctx, sug["path"], merged.encode("utf-8"))
     await ws.reject_suggestion(sid, ctx)  # original proposal resolved (superseded)
     return {"applied": True, "mode": "partial", "kept": len(keep), "total": total}
@@ -410,8 +410,8 @@ async def apply_suggestion(
 @app.get("/")
 async def index() -> dict[str, Any]:
     return {
-        "service": "origo web — attribution & lineage",
-        "origo_api": "/fs (files, blame, commit, log, diff, suggestions, events, presence)",
+        "service": "origofs web — attribution & lineage",
+        "origofs_api": "/fs (files, blame, commit, log, diff, suggestions, events, presence)",
         "app_api": [
             "/api/config", "/api/me", "/api/actors", "/api/doc/{path}", "/api/feed",
             "/api/suggestion/{id}", "/api/suggestion/{id}/apply",

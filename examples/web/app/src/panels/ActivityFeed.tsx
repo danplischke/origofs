@@ -1,5 +1,5 @@
 // Live collaboration: presence (who's here now) + an SSE stream of every
-// attributed change, straight off origo's change feed. The signed-in principal
+// attributed change, straight off origofs's change feed. The signed-in principal
 // heartbeats presence so they show up for everyone else.
 
 import { useEffect, useMemo, useRef, useState } from "react";

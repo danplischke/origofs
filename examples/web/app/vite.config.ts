@@ -1,7 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// The origo document server (examples/web/server) runs on :8000. We proxy /fs and
+// The origofs document server (examples/web/server) runs on :8000. We proxy /fs and
 // /api to it so the app can use same-origin relative URLs in dev (no CORS, and
 // the SSE feed streams through cleanly).
 export default defineConfig({

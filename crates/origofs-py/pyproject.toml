@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "origofs"
+description = "Python bindings for origofs (agent filesystem): async workspace ops, attribution, suggestions, and mount/NFS orchestration"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+# The `origofs.fastapi` router integration (and the examples under examples/).
+fastapi = ["fastapi", "uvicorn"]
+
+[tool.maturin]
+# Build the importable extension module (pyo3 resolves libpython at import).
+features = ["extension-module"]
+# Mixed layout: the pure-Python `origofs` package lives under python/, and the
+# compiled core is imported as its `origofs._origofs` submodule. Type stubs and
+# py.typed ship inside python/origofs/ automatically.
+python-source = "python"
+module-name = "origofs._origofs"

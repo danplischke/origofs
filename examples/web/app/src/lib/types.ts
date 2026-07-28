@@ -1,10 +1,10 @@
-// TypeScript mirrors of the exact JSON shapes the origo Python bindings emit
-// (via origo.fastapi.build_router at /fs) and the app server (/api/*). Keys and
-// nullability match the bindings 1:1 — see crates/origo-py/src/lib.rs.
+// TypeScript mirrors of the exact JSON shapes the origofs Python bindings emit
+// (via origofs.fastapi.build_router at /fs) and the app server (/api/*). Keys and
+// nullability match the bindings 1:1 — see crates/origofs-py/src/lib.rs.
 
 export type ActorKind = "human" | "agent" | "system";
 
-/** The actor embedded in every blame range (crates/origo-py/src/lib.rs `actor_dict`). */
+/** The actor embedded in every blame range (crates/origofs-py/src/lib.rs `actor_dict`). */
 export interface Actor {
   id: number;
   kind: ActorKind;
