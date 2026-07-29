@@ -92,6 +92,81 @@ jobs:
           cargo test -p origofs-sdk --features coedit --no-fail-fast
           cargo test -p origofs-sdk --features full,coedit --no-fail-fast
 
+  # B1 (#70): code-coverage signal. Instrument the same test invocations the
+  # `rust` job runs — the default workspace suite plus the origofs-sdk `full`
+  # surfaces (api/mcp/sandbox/git/fuse/nfs are default-off features, otherwise
+  # invisible to coverage) — merge them into one lcov report, and upload to
+  # Codecov. Uses the Postgres service so the PG-gated paths count too.
+  coverage:
+    name: Coverage (llvm-cov + Codecov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: origofs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      # origofs-py is a pyo3 extension, so building the workspace needs a Python
+      # interpreter available for it to link against.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Collect coverage
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --no-report --workspace
+          cargo llvm-cov --no-report -p origofs-sdk --features full
+          cargo llvm-cov report --lcov --output-path lcov.info
+
+      # Tokenless upload works for public repos; set the CODECOV_TOKEN secret to
+      # make it reliable. A Codecov hiccup must not fail the build, so the upload
+      # is best-effort — the gate lives in codecov.yml (status checks).
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # B4 (#70): supply-chain gate. RUSTSEC advisories, the license allow-list, and
+  # source pinning from deny.toml. Reads Cargo metadata only — no workspace
+  # build — so it's fast and independent of the test jobs.
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   python:
     name: Python bindings (maturin + pytest)
     runs-on: ubuntu-latest

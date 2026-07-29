@@ -2,6 +2,7 @@
 name = "origofs-sdk"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 origofs-core = { version = "0.1.0", path = "../origofs-core" }
