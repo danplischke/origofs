@@ -60,9 +60,13 @@ pytest tests/          # some tests also gate on ORIGOFS_PG_TEST_URL
 ### Toolchain note
 
 There is no `rust-toolchain` file. **`origofs-core`, `origofs-sdk`, and `origofs-cli`
-use `edition = "2024"`** (needs Rust ≥ 1.85); `origofs-py` inherits `edition = "2021"`
-from the workspace. CI lives at `.github/workflows/ci.yml` (fmt + clippy + tests, and
-an explicit `coedit` pass) and runs on stable. Use a recent stable toolchain.
+use `edition = "2024"`** (edition 2024 itself sets a Rust ≥ 1.85 *language* floor);
+`origofs-py` inherits `edition = "2021"` from the workspace. The **effective MSRV is
+1.88**, though — the code uses `let`-chains (stabilized in 1.88) and the dependency
+graph (`icu`, via `url`/`object_store`) needs ≥ 1.86 — and the `msrv` CI job pins it
+so an accidental newer-stdlib use or a dependency MSRV bump is caught. CI lives at
+`.github/workflows/ci.yml` (fmt + clippy + tests, an explicit `coedit` pass, and the
+`msrv` floor) and otherwise runs on stable. Use a recent stable toolchain.
 
 ## The one architectural idea everything hangs on
 

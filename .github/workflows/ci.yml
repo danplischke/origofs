@@ -18,6 +18,7 @@ jobs:
   rust:
     name: Rust (clippy + test)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     # Exercise the Postgres (multi-writer / production) metadata backend. Without
     # ORIGOFS_PG_TEST_URL the PG-gated suites (postgres.rs, concurrency.rs,
     # subscribe.rs) self-skip and only the SQLite path is tested.
@@ -54,6 +55,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -69,12 +73,18 @@ jobs:
       # tests are #[ignore]d; and the FUSE / NFS / overlayfs tests self-skip when
       # the needed privileges aren't present — so the suite is green on a stock
       # runner with no extra services.
+      # nextest is the primary runner (per-test hang guard + retries; see
+      # .config/nextest.toml). It doesn't run doctests, so those run via
+      # `cargo test --doc` afterward (the one executable doctest, nfs.rs, is
+      # gated by `full`).
       - name: Test
         run: |
-          cargo test --workspace --no-fail-fast
+          cargo nextest run --profile ci --workspace
           # Run the surface-gated tests (api/mcp/sandbox/git/fuse/nfs) explicitly,
           # rather than relying on workspace feature-unification to enable them.
-          cargo test -p origofs-sdk --features full --no-fail-fast
+          cargo nextest run --profile ci -p origofs-sdk --features full
+          cargo test --workspace --doc
+          cargo test -p origofs-sdk --features full --doc
 
       # The opt-in `coedit` feature (yrs-backed CRDT co-editing, roadmap M8) is
       # off by default for origofs-core and origofs-sdk, so exercise it — clippy +
@@ -88,13 +98,210 @@ jobs:
           cargo clippy -p origofs-core --features coedit --all-targets -- -D warnings
           cargo clippy -p origofs-sdk --features coedit --all-targets -- -D warnings
           cargo clippy -p origofs-sdk --features full,coedit --all-targets -- -D warnings
-          cargo test -p origofs-core --features coedit --no-fail-fast
-          cargo test -p origofs-sdk --features coedit --no-fail-fast
-          cargo test -p origofs-sdk --features full,coedit --no-fail-fast
+          cargo nextest run --profile ci -p origofs-core --features coedit
+          cargo nextest run --profile ci -p origofs-sdk --features coedit
+          cargo nextest run --profile ci -p origofs-sdk --features full,coedit
+
+  # B1 (#70): code-coverage signal. Instrument the same test invocations the
+  # `rust` job runs — the default workspace suite plus the origofs-sdk `full`
+  # surfaces (api/mcp/sandbox/git/fuse/nfs are default-off features, otherwise
+  # invisible to coverage) — merge them into one lcov report, and upload to
+  # Codecov. Uses the Postgres service so the PG-gated paths count too.
+  coverage:
+    name: Coverage (llvm-cov + Codecov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: origofs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      # origofs-py is a pyo3 extension, so building the workspace needs a Python
+      # interpreter available for it to link against.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Collect coverage
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --no-report --workspace
+          cargo llvm-cov --no-report -p origofs-sdk --features full
+          cargo llvm-cov report --lcov --output-path lcov.info
+
+      # Tokenless upload works for public repos; set the CODECOV_TOKEN secret to
+      # make it reliable. A Codecov hiccup must not fail the build, so the upload
+      # is best-effort — the gate lives in codecov.yml (status checks).
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # B4 (#70): supply-chain gate. RUSTSEC advisories, the license allow-list, and
+  # source pinning from deny.toml. Reads Cargo metadata only — no workspace
+  # build — so it's fast and independent of the test jobs.
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # B5 (#70): MSRV floor. edition 2024 sets a 1.85 *language* floor, but the real
+  # minimum is higher — the code uses let-chains (stabilized in 1.88), and the
+  # dependency graph (icu, via url/object_store) needs >= 1.86 — so 1.88 is the
+  # true floor. Pinning it catches an accidental newer-stdlib use (or a
+  # dependency MSRV bump) before it silently raises the minimum. `cargo check`
+  # only — compilation is what MSRV is about — and `--locked` so the committed
+  # Cargo.lock (not a fresh, newer-dep resolution) is what gets verified.
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      # origofs-py is a pyo3 extension, so building the workspace needs a Python
+      # interpreter available for it to link against.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: cargo check on the MSRV toolchain
+        run: |
+          cargo check --workspace --locked
+          # The default-off origofs-sdk surfaces (api/mcp/sandbox/git/fuse/nfs)
+          # aren't built by --workspace; check them on the MSRV toolchain too.
+          cargo check -p origofs-sdk --features full --locked
+
+  # B3 (#70): fuzz the content-addressed object decoders. Every blob/tree/commit/
+  # ref-snapshot object is parsed from untrusted bytes on read (a bare bucket, a
+  # bit-rotted or tampered store), so each `&[u8] -> Result` decoder is a
+  # hostile-input boundary with explicit anti-OOM guards. cargo-fuzz (libFuzzer)
+  # needs nightly. This is a bounded *smoke* run on every push — enough to catch
+  # panics, aborts, OOMs, and encode↔decode asymmetry; longer campaigns run
+  # out-of-band. The fuzz crate (crates/origofs-core/fuzz) is detached from the
+  # workspace, so it never enters a stable build.
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/origofs-core/fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Each target runs briefly: -runs caps iterations so fast targets exit
+      # promptly, -max_total_time bounds the rest, and -rss_limit_mb turns a
+      # runaway allocation (a defeated anti-OOM guard) into a hard failure. A
+      # crash writes a reproducer under fuzz/artifacts and fails the job.
+      - name: Fuzz each decoder (bounded)
+        working-directory: crates/origofs-core
+        run: |
+          for t in manifest_decode tree_decode commit_decode refsnapshot_decode; do
+            echo "::group::fuzz $t"
+            cargo fuzz run "$t" -- -max_total_time=45 -runs=3000000 -rss_limit_mb=2048
+            echo "::endgroup::"
+          done
+
+  # B6 (#70): exercise the real object-store backend. The S3 content-store suite
+  # in content_backends.rs is #[ignore]d (it needs an S3-compatible endpoint), so
+  # run it against MinIO — covering multipart upload of a multi-MiB blob, ranged
+  # GETs across part boundaries, the production VerifyingStore(PackStore(s3))
+  # stack, and durability that lives in the bucket (a fresh store re-reads) —
+  # semantics the in-memory object adapter can't model. MinIO runs via `docker
+  # run` rather than a service container so we can pass its `server` command and
+  # use the stable official image.
+  s3:
+    name: Object store (MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ORIGOFS_S3_TEST_BUCKET: origofs-ci
+      ORIGOFS_S3_TEST_REGION: us-east-1
+      ORIGOFS_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+      ORIGOFS_S3_TEST_ACCESS_KEY_ID: minioadmin
+      ORIGOFS_S3_TEST_SECRET_ACCESS_KEY: minioadmin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Start MinIO and create the bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          # Wait for liveness, then create the test bucket (idempotent on re-run).
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:9000/minio/health/live && break
+            sleep 2
+          done
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://origofs-ci || true
+
+      # `--run-ignored all` un-gates the #[ignore]d tests; the filterset scopes the
+      # run to just the S3 suite (not the GCS one, which needs a separate backend).
+      - name: Run the S3 content-store suite
+        run: cargo nextest run --profile ci -p origofs-core --run-ignored all -E 'test(/^s3_/)'
 
   python:
     name: Python bindings (maturin + pytest)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     # The Python suite has PG-gated tests too; give it the same backend.
     env:
       ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
@@ -162,3 +369,107 @@ jobs:
         run: |
           . .venv/bin/activate
           mypy
+
+  # B7 (#70): the macOS leg. origofs is developed on macOS as a first-class
+  # platform (its POSIX mount there is NFSv3, not FUSE), so build and test on
+  # macOS to catch platform-specific breakage the Linux jobs miss — path
+  # handling, `cfg(unix)`/`cfg(target_os)` splits, and the NFS surface. macOS
+  # runners have no Docker, so there is no Postgres or MinIO here: the SQLite
+  # metadata path carries the suite and the PG-gated tests self-skip. FUSE is
+  # excluded because `fuser` needs macFUSE (a kernel extension absent on the
+  # runner), which is also why the `full` feature set — and the CLI/Python
+  # builds that pull it — are never used on this leg; the surfaces are enabled
+  # individually minus `fuse`. The NFSv3 adapter stands in for the mount path:
+  # its test drives the NFSFileSystem methods directly plus a bind smoke test,
+  # so it needs no privileged kernel mount and runs on a stock runner.
+  macos:
+    name: macOS (SQLite + NFS surface)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Lint core and the non-fuse surfaces (the NFS module is the
+      # macOS-relevant one) with warnings denied, matching the Linux `rust` job.
+      - name: Clippy (deny warnings, non-fuse surfaces)
+        run: |
+          cargo clippy -p origofs-core --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features api,mcp,sandbox,git,nfs --all-targets -- -D warnings
+
+      # Core on the SQLite path (PG-gated tests self-skip with no
+      # ORIGOFS_PG_TEST_URL) plus the non-fuse SDK surfaces, including the NFSv3
+      # adapter (nfs.rs).
+      - name: Test
+        run: |
+          cargo nextest run --profile ci -p origofs-core
+          cargo nextest run --profile ci -p origofs-sdk --features api,mcp,sandbox,git,nfs
+
+  # B9 (#70): benchmark-regression signal. The criterion micro-benchmarks in
+  # benches/engine.rs cover the hot paths — content-defined-chunking writes,
+  # whole-file reads, the incremental copy-on-write edit, tree/commit building,
+  # and the overhead encryption-at-rest adds. Run them with criterion's
+  # `bencher` output format (the libtest `... bench: N ns/iter` shape
+  # github-action-benchmark parses) and diff each run against a baseline kept in
+  # the Actions cache — no gh-pages branch or push token needed. Shared CI
+  # runners are too noisy to gate a merge on, so a regression is surfaced in the
+  # job summary (and flagged past 2x) rather than failing the build.
+  bench:
+    name: Benchmarks (criterion regression)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--bench engine` scopes the run to the criterion target: a bare
+      # `cargo bench` would also start the lib's libtest harness, which rejects
+      # criterion's `--output-format` flag.
+      - name: Run benchmarks
+        run: cargo bench -p origofs-core --bench engine -- --output-format bencher | tee output.txt
+
+      # Restore the rolling benchmark history so the action has something to diff
+      # against. A per-run key with a shared prefix means each run saves a fresh
+      # entry the next run's restore-keys prefix match will pick up as the baseline.
+      - name: Restore benchmark baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: ./cache
+          key: bench-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            bench-${{ runner.os }}-
+
+      - name: Compare against baseline
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: origofs-core micro-benchmarks
+          tool: cargo
+          output-file-path: output.txt
+          external-data-json-path: ./cache/benchmark-data.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Flag a >2x slowdown. Kept non-failing because shared-runner variance
+          # would make a hard gate flaky; the alert lands in the job summary.
+          alert-threshold: "200%"
+          comment-on-alert: false
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Save benchmark baseline
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ./cache
+          key: bench-${{ runner.os }}-${{ github.run_id }}

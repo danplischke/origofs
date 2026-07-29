@@ -117,3 +117,52 @@ async fn reclaims_on_the_local_on_disk_store() {
     assert_eq!(&fs.read("/big.bin").await.unwrap()[..], &v2[..]);
     assert_eq!(fs.gc().await.unwrap().deleted, 0);
 }
+
+// A3 (issue #70): GC is documented as unsafe alongside active writers — a freshly
+// `put` chunk is briefly unreferenced, so an in-flight *new* write can lose a race
+// with the sweep. That known hazard aside, the guarantee users actually depend on
+// must hold even under concurrent churn: content reachable from a **ref that
+// exists throughout the pass** is never reclaimed. This runs a real GC
+// concurrently with a writer hammering a *different, uncommitted* path (maximal
+// orphan + working-tree pressure) and asserts the committed body — pinned by the
+// `main` ref and never touched by the writer — always survives. The assertion is
+// on content committed *before* GC starts, so it is deterministic despite the race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_never_reclaims_committed_refs_under_concurrent_writers() {
+    for round in 0..40u64 {
+        let (fs, _store) = mem_fixture().await;
+        let fs = Arc::new(fs);
+
+        // Commit a body; it is now reachable via the `main` branch ref.
+        let keep = blob(200 * 1024, round * 2 + 1);
+        fs.write("/a.bin", &keep).await.unwrap();
+        fs.commit("gc-race", "keep a.bin").await.unwrap();
+
+        // A writer churning a DIFFERENT, uncommitted path — it never touches
+        // /a.bin and never moves `main`, so it can't legitimately affect `keep`.
+        let writer = {
+            let fs = Arc::clone(&fs);
+            tokio::spawn(async move {
+                for i in 0..25u64 {
+                    let scratch = blob(48 * 1024, 9000 + round * 100 + i);
+                    let _ = fs.write("/scratch.bin", &scratch).await;
+                }
+            })
+        };
+        // GC runs concurrently with that churn.
+        let sweeper = {
+            let fs = Arc::clone(&fs);
+            tokio::spawn(async move { fs.gc().await })
+        };
+
+        writer.await.unwrap();
+        sweeper.await.unwrap().unwrap();
+
+        // The committed, still-referenced body survived the concurrent sweep.
+        assert_eq!(
+            &fs.read("/a.bin").await.unwrap()[..],
+            &keep[..],
+            "round {round}: GC reclaimed content still reachable from the `main` ref"
+        );
+    }
+}

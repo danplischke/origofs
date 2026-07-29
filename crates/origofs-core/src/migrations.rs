@@ -561,3 +561,61 @@ CREATE TABLE IF NOT EXISTS symlink(
     target TEXT NOT NULL
 );
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A4 (issue #70): the migration list is the single source of truth for the
+    // schema version, and `latest_schema_version()` trusts it to be sorted — it
+    // reads `MIGRATIONS.last()`. Pin the forward-only, append-only invariants so an
+    // authoring slip (a duplicate version, a gap, an out-of-order append, or an
+    // empty step) fails loudly here instead of silently reporting the wrong schema
+    // version or bricking an upgrade. The end-to-end "every populated store
+    // upgrades to latest" path is covered by the V10→latest data-preservation tests
+    // (`sqlite::tests::upgrade_preserves_data_and_backfills_default_workspace` and
+    // `tests/postgres.rs`); this guards the list those runners iterate.
+    #[test]
+    fn migration_list_is_contiguous_sorted_and_nonempty() {
+        assert!(
+            !MIGRATIONS.is_empty(),
+            "there must be at least one migration"
+        );
+
+        for (i, m) in MIGRATIONS.iter().enumerate() {
+            // Versions are exactly 1, 2, 3, … with no gaps, duplicates, or reordering.
+            assert_eq!(
+                m.version,
+                (i + 1) as i64,
+                "migration at index {i} has version {} — versions must be contiguous from 1",
+                m.version
+            );
+            // Every step carries real SQL for both dialects (no accidental empty step).
+            assert!(
+                !m.sqlite.trim().is_empty(),
+                "migration v{} has empty SQLite SQL",
+                m.version
+            );
+            assert!(
+                !m.postgres.trim().is_empty(),
+                "migration v{} has empty Postgres SQL",
+                m.version
+            );
+        }
+
+        // `latest_schema_version()` reads `.last()`, so the list MUST be sorted for
+        // it to be correct: assert it equals the true maximum, and — given the
+        // contiguous-from-1 invariant above — the element count.
+        let max = MIGRATIONS.iter().map(|m| m.version).max().unwrap();
+        assert_eq!(
+            latest_schema_version(),
+            max,
+            "latest_schema_version() must equal the highest migration version"
+        );
+        assert_eq!(
+            latest_schema_version(),
+            MIGRATIONS.len() as i64,
+            "with contiguous 1..=N versions, latest must equal the migration count"
+        );
+    }
+}

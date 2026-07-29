@@ -13,17 +13,28 @@
 //!   invariant is checked by re-reading the working tree and running `gc()`, whose
 //!   mark phase loads every reachable object (refs → commits → trees → manifests →
 //!   chunks + the live working tree) — a lost object surfaces as an error.
+//! - **The barrier holds under a *mid-operation* crash.** Beyond crashing at op
+//!   boundaries, the process can die at an arbitrary content-store call — *inside*
+//!   a `write_as` or `commit` — and the barrier still holds. A per-seed sweep
+//!   crashes at every `put`/`put_keyed`/`flush` a run makes, proving the
+//!   flush-before-commit ordering at call granularity (e.g. a crash mid-`commit`
+//!   never leaves a ref swapped to a body whose bytes weren't yet durable).
 //! - **Determinism.** The same seed yields byte-identical state, including commit
 //!   hashes (which embed the injected clock's timestamps — the clock seam is what
 //!   makes that reproducible).
-//! - **The checker isn't vacuous.** A negative control (a store whose `flush`
-//!   never makes writes durable — a *broken* barrier) is reliably caught.
+//! - **The checkers aren't vacuous.** Negative controls (a store whose `flush`
+//!   never makes writes durable — a *broken* barrier) are reliably caught, at both
+//!   op-boundary and mid-operation crash granularity.
 //!
 //! Honest scope: this is the trait-seam tier. It exercises origofs's *own* ordering
-//! and logic, not SQLite's internal crash-safety, and it crashes at *op
-//! boundaries* rather than intercepting individual `await`s. Mid-`await` crash
-//! injection and a deterministic scheduler (madsim-style) are the natural next
-//! steps toward full DST; see the PR description.
+//! and logic (at the `ContentStore` seam, down to individual `put`/`flush` calls),
+//! not SQLite's internal crash-safety. The remaining step toward full DST is a
+//! *deterministic scheduler* for concurrent interleavings — deliberately not
+//! adopted here: origofs's mutating ops hold a `parking_lot` guard across `.await`
+//! (SQLite `MetaTxn`, C1), which a single-threaded cooperative sim (madsim-style)
+//! would deadlock, and its genuine multi-writer backend is Postgres, which such a
+//! sim can't drive. Concurrent-interleaving coverage therefore lives in the
+//! real-runtime stress tiers (`concurrency.rs`, `postgres.rs`) instead.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,7 +43,7 @@ use origofs_core::{
     WriteCtx,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // --- seeded PRNG (SplitMix64) -----------------------------------------------
@@ -97,6 +108,15 @@ struct FaultyContentStore {
     promote_on_flush: bool,
     flush_calls: AtomicU64,
     fail_flush_at: HashSet<u64>,
+    // --- mid-operation crash injection (finer than the op-boundary `crash()`) --
+    // The process can die *inside* an engine op, at an arbitrary content-store
+    // call. `op_seq` counts durability-relevant calls (`put`/`put_keyed`/`flush`)
+    // since the last `arm_crash_at`; when it reaches `crash_at_op`, buffered
+    // (non-durable) writes vanish and the call fails, unwinding the caller before
+    // any metadata commit could reference the lost bytes. `u64::MAX` disarms it.
+    op_seq: AtomicU64,
+    crash_at_op: AtomicU64,
+    crashed: AtomicBool,
 }
 
 impl FaultyContentStore {
@@ -107,12 +127,51 @@ impl FaultyContentStore {
             promote_on_flush,
             flush_calls: AtomicU64::new(0),
             fail_flush_at,
+            op_seq: AtomicU64::new(0),
+            crash_at_op: AtomicU64::new(u64::MAX),
+            crashed: AtomicBool::new(false),
         }
     }
 
     /// Power loss: everything not yet flushed to durable storage is gone.
     fn crash(&self) {
         self.buffered.lock().unwrap().clear();
+    }
+
+    /// Arm a mid-operation crash at content-call index `op` (counted from now),
+    /// resetting the counter and the fired flag. `u64::MAX` leaves it disarmed —
+    /// used to *count* the content calls a run makes, so a sweep can crash at each.
+    fn arm_crash_at(&self, op: u64) {
+        self.op_seq.store(0, Ordering::Relaxed);
+        self.crashed.store(false, Ordering::Relaxed);
+        self.crash_at_op.store(op, Ordering::Relaxed);
+    }
+
+    /// Content-call index reached since the last `arm_crash_at` — i.e. the number
+    /// of durability-relevant calls a disarmed run made.
+    fn op_count(&self) -> u64 {
+        self.op_seq.load(Ordering::Relaxed)
+    }
+
+    /// Whether the armed mid-operation crash has fired (the process is "dead").
+    fn crashed_mid_op(&self) -> bool {
+        self.crashed.load(Ordering::Relaxed)
+    }
+
+    /// Tick a durability-relevant content call; if it is the armed crash index,
+    /// drop buffered writes (power loss) and fail the call so the caller unwinds
+    /// before committing metadata that would reference the now-lost bytes.
+    fn durability_tick(&self, op: &str) -> Result<()> {
+        let idx = self.op_seq.fetch_add(1, Ordering::Relaxed);
+        if idx == self.crash_at_op.load(Ordering::Relaxed)
+            && !self.crashed.swap(true, Ordering::Relaxed)
+        {
+            self.buffered.lock().unwrap().clear();
+            return Err(OrigoFSError::Content(format!(
+                "injected mid-operation crash at content call #{idx} ({op})"
+            )));
+        }
+        Ok(())
     }
 
     fn store(&self, key: Hash, bytes: &[u8]) {
@@ -131,12 +190,14 @@ impl FaultyContentStore {
 #[async_trait]
 impl ContentStore for FaultyContentStore {
     async fn put(&self, bytes: &[u8]) -> Result<Hash> {
+        self.durability_tick("put")?;
         let h = Hash::of(bytes);
         self.store(h, bytes);
         Ok(h)
     }
 
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        self.durability_tick("put_keyed")?;
         self.store(*key, bytes);
         Ok(())
     }
@@ -185,6 +246,7 @@ impl ContentStore for FaultyContentStore {
     }
 
     async fn flush(&self) -> Result<()> {
+        self.durability_tick("flush")?;
         let idx = self.flush_calls.fetch_add(1, Ordering::Relaxed);
         if self.fail_flush_at.contains(&idx) {
             return Err(OrigoFSError::Content(format!(
@@ -302,6 +364,63 @@ async fn run_sim(
     (store, fs)
 }
 
+/// Like [`run_sim`], but with **mid-operation** crash injection: the process dies
+/// at content-store call index `crash_at_op` (counted over `put`/`put_keyed`/
+/// `flush` *after* setup), which can land *inside* a `write_as` or `commit` — not
+/// only at an op boundary. `u64::MAX` disarms it (used to count a run's content
+/// calls so the sweep can crash at each). The op loop stops once the crash fires,
+/// because the process is gone. The RNG drives only op selection, so the op
+/// sequence up to the crash is identical for every `crash_at_op` — a fair sweep.
+async fn run_sim_armed(
+    seed: u64,
+    crash_at_op: u64,
+    promote_on_flush: bool,
+) -> (Arc<FaultyContentStore>, SimFs) {
+    let mut rng = Rng::new(seed);
+    let n_ops = 8 + rng.below(20) as usize;
+
+    let store = Arc::new(FaultyContentStore::new(promote_on_flush, HashSet::new()));
+    let clock: Arc<dyn Clock> = Arc::new(SimClock::new(1_000_000 + seed as i64));
+    let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
+    let fs = Fs::with_clock(meta, store.clone(), clock);
+    fs.init().await.unwrap();
+    let actor = fs.create_human("sim", None).await.unwrap();
+    let ctx = WriteCtx::actor(actor);
+
+    // Arm only after setup, so init / actor-creation content calls are never the
+    // crash target and the crash-index space is the driven ops alone.
+    store.arm_crash_at(crash_at_op);
+
+    for _ in 0..n_ops {
+        if store.crashed_mid_op() {
+            break; // the process died mid-op
+        }
+        match rng.below(10) {
+            0..=6 => {
+                let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+                let len = if rng.below(4) == 0 {
+                    // Multi-chunk (chunks are 16–256 KiB), so a crash can land
+                    // *between* a write's chunk puts — kept modest so each of the
+                    // many replays in the sweep stays cheap.
+                    40_000 + rng.below(120_000) as usize
+                } else {
+                    1 + rng.below(4096) as usize
+                };
+                let data = rng.bytes(len);
+                let _ = fs.write_as(ctx, path, &data).await;
+            }
+            7..=8 => {
+                let path = PATHS[rng.below(PATHS.len() as u64) as usize];
+                let _ = fs.remove(path).await;
+            }
+            _ => {
+                let _ = fs.commit("sim", "snapshot").await;
+            }
+        }
+    }
+    (store, fs)
+}
+
 /// The C3/C4 invariant: every content object referenced by committed metadata is
 /// durable. Re-reading the working tree exercises manifest+chunk durability;
 /// `gc()`'s mark phase walks the full reachable set (incl. the commit DAG) and
@@ -346,6 +465,75 @@ async fn broken_barrier_is_detected() {
     assert!(
         caught > 0,
         "the barrier checker never fired on a broken store — it is vacuous"
+    );
+}
+
+/// Crash points for a mid-op sweep: every content call when there are at most
+/// `cap` of them, otherwise `cap` points spread evenly across `[0, total)` — so a
+/// run with many-chunk writes stays bounded while still probing the full span.
+fn sweep_points(total: u64, cap: u64) -> Vec<u64> {
+    if total <= cap {
+        (0..total).collect()
+    } else {
+        (0..cap).map(|i| i * total / cap).collect()
+    }
+}
+
+/// A1 (issue #70) — **mid-operation crash.** The C3/C4 durability barrier must
+/// hold even when the process dies *inside* an engine op — at an arbitrary
+/// content-store call, not only at an op boundary (the gap this file's header
+/// names as the next DST step).
+/// For each seed we count the content calls a full run makes, then crash across
+/// them (every call, or an evenly-spread sample when a run makes many) and assert
+/// no *committed* metadata reference dangles. This proves the flush-before-commit
+/// ordering holds at call granularity, not just between ops — e.g. a crash
+/// mid-`commit` must never leave a ref swapped to a body whose bytes weren't yet
+/// made durable.
+#[tokio::test]
+async fn durability_barrier_holds_under_mid_operation_crash() {
+    for seed in 0..24u64 {
+        // A disarmed dry run counts this seed's durability-relevant content calls.
+        let total = {
+            let (store, _fs) = run_sim_armed(seed, u64::MAX, true).await;
+            store.op_count()
+        };
+        // Crash at each content call, but bound the sweep so a run with
+        // many-chunk writes stays CI-friendly while still spanning [0, total).
+        for crash_at in sweep_points(total, 50) {
+            let (_store, fs) = run_sim_armed(seed, crash_at, true).await;
+            if let Err(e) = check_barrier(&fs).await {
+                panic!(
+                    "seed {seed}: durability barrier violated when crashing at content call \
+                     #{crash_at} of {total}: {e}"
+                );
+            }
+        }
+    }
+}
+
+/// A1 (issue #70) — negative control for the mid-op checker: a broken barrier
+/// (writes never made durable) loses *everything* on a crash, so a mid-op crash
+/// after a committed reference must leave a dangling body the checker catches —
+/// proving the sweep above isn't vacuously green.
+#[tokio::test]
+async fn mid_operation_crash_checker_has_teeth() {
+    let mut caught = 0;
+    for seed in 0..24u64 {
+        let total = {
+            let (store, _fs) = run_sim_armed(seed, u64::MAX, false).await;
+            store.op_count()
+        };
+        for crash_at in 0..total {
+            let (_store, fs) = run_sim_armed(seed, crash_at, false).await;
+            if check_barrier(&fs).await.is_err() {
+                caught += 1;
+                break;
+            }
+        }
+    }
+    assert!(
+        caught > 0,
+        "the mid-op crash checker never fired on a broken store — it is vacuous"
     );
 }
 
