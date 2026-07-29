@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::Runtime;
 
 /// How long the kernel may trust a cached entry/attr reply before asking again.
 ///
@@ -50,12 +50,13 @@ use tokio::runtime::{Handle, Runtime};
 /// freshness one.
 ///
 /// The fix is the other direction of the FUSE protocol: the server tells the
-/// kernel to drop what it cached ([`Notifier::inval_inode`] /
-/// [`Notifier::inval_entry`]). [`Watcher`] does that from the workspace's change
-/// feed, so this TTL only ever governs how long a change *we did not hear about*
-/// can linger — not how long a change we did hear about stays hidden. Shrinking
-/// the TTL instead would cost a round-trip per `stat` and still not touch the
-/// page cache.
+/// kernel to drop what it cached ([`Notifier::inval_inode`]). [`Watcher`] does
+/// that from the workspace's change feed, so page-cache staleness is repaired on
+/// the spot and this TTL is left governing only what it can safely govern —
+/// cached *names*, where one second of staleness is the pre-existing, bounded
+/// behaviour (see [`invalidate`] for why dentries are deliberately left to it).
+/// Shrinking the TTL instead would cost a round-trip per `stat` and still not
+/// touch the page cache.
 const TTL: Duration = Duration::from_secs(1);
 
 /// How often the invalidation [`Watcher`] re-reads the change feed when the
@@ -69,6 +70,15 @@ const TTL: Duration = Duration::from_secs(1);
 /// per interval per mount against a local SQLite file — the backend the docs
 /// already scope to solo/offline use.
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long the push feed may block in `recv` before the watcher re-checks its
+/// stop flag. Purely a shutdown-responsiveness bound: no query is issued when it
+/// lapses, so it costs a wakeup and nothing else.
+const SUBSCRIBE_WAKE: Duration = Duration::from_millis(250);
+
+/// How long an unmount waits for the change-feed watcher to confirm it is gone
+/// before giving up on it. See [`Watcher::shutdown`] for why this is bounded.
+const WATCHER_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Entries pulled from the store per round-trip while filling one `readdir`
 /// reply. A FUSE reply buffer is a few KiB — on the order of a hundred short
@@ -91,7 +101,7 @@ pub struct OrigoFSFuse {
     /// mount ends, so tying the watcher's lifetime here makes teardown
     /// automatic — an unmount (however it happens: dropping the
     /// [`BackgroundSession`], `umount(8)`, the session loop failing) drops this,
-    /// and [`Watcher::drop`] stops the task. Nothing outlives the mount.
+    /// and [`Watcher::drop`] stops the watcher. Nothing outlives the mount.
     ///
     /// It is behind an `Arc` only so [`spawn`] can hand it the session's
     /// [`Notifier`], which does not exist until after the filesystem has been
@@ -185,44 +195,90 @@ impl OrigoFSFuse {
 /// together with the levers that stop it.
 ///
 /// See [`TTL`] for *why* this exists. Lifetime: owned by [`OrigoFSFuse`], so it
-/// is dropped exactly when the mount ends; [`Drop`] both flags and aborts the
-/// task, so no watcher (and no Postgres `LISTEN` connection behind it) survives
-/// an unmount.
+/// is stopped exactly when the mount ends — no watcher, and no Postgres `LISTEN`
+/// connection behind it, survives an unmount.
+///
+/// # Why its own thread instead of a task on the mount's runtime
+///
+/// A kernel notification is a **blocking** write to `/dev/fuse` that the kernel
+/// services synchronously, so it can park for as long as the kernel needs — and
+/// it parks in uninterruptible `D` state, where nothing can cancel or kill it.
+/// Running that on the mount's own Tokio runtime makes it part of the mount's
+/// teardown path, because dropping a `Runtime` joins its workers: a watcher task
+/// caught mid-notification would block the session thread that is dropping the
+/// filesystem, which is the very thread that has to answer outstanding requests.
+/// That is a cycle, and a `D`-state thread makes it survive `SIGKILL`.
+///
+/// Its own thread and its own single-threaded runtime break that by
+/// construction: nothing the session does on the way down is ever queued behind
+/// an in-flight notification. (This is necessary, not sufficient — see
+/// [`invalidate`] for the notification this mount still refuses to send.)
 struct Watcher {
-    /// Cooperative stop, checked between feed batches so a watcher parked in a
-    /// `sleep`/`recv` still exits promptly once aborted.
+    /// Cooperative stop. The loop checks it between feed batches, and the waits
+    /// in between are bounded ([`WATCH_POLL_INTERVAL`], [`SUBSCRIBE_WAKE`]) so it
+    /// is seen promptly.
     stop: Arc<AtomicBool>,
-    /// `None` until [`Watcher::start`]; the mount's own runtime hosts the task.
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Signalled by the watcher thread just before it returns, so [`Drop`] can
+    /// wait for a real exit rather than assume one.
+    done: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl Watcher {
     fn new() -> Self {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
-            task: Mutex::new(None),
+            done: Mutex::new(None),
         }
     }
 
-    /// Begin consuming `ws`'s change feed on `rt`, invalidating through `notifier`.
-    fn start(&self, rt: &Handle, ws: Workspace, notifier: Notifier) {
+    /// Begin consuming `ws`'s change feed, invalidating through `notifier`.
+    fn start(&self, ws: Workspace, notifier: Notifier) {
         let stop = Arc::clone(&self.stop);
-        let task = rt.spawn(watch_loop(ws, notifier, stop));
-        *self.task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let spawned = std::thread::Builder::new()
+            .name("origofs-fuse-notify".to_string())
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(watch_loop(ws, notifier, stop)),
+                    Err(e) => tracing::warn!(error = %e, "fuse: no runtime for the change feed"),
+                }
+                let _ = tx.send(());
+            });
+        match spawned {
+            Ok(_) => *self.done.lock().unwrap_or_else(PoisonError::into_inner) = Some(rx),
+            // A mount that cannot spawn its watcher still serves; it just can't
+            // hear about other writers.
+            Err(e) => tracing::warn!(error = %e, "fuse: could not start the change-feed watcher"),
+        }
+    }
+
+    /// Ask the watcher to stop and wait — briefly — for it to actually be gone.
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let done = self
+            .done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(done) = done {
+            // Bounded on purpose. The watcher normally exits within one
+            // [`WATCH_POLL_INTERVAL`], but it may be parked in an uninterruptible
+            // kernel notification (see the type docs) that only completes once
+            // this thread has finished tearing the session down — so waiting for
+            // it unconditionally would be the deadlock we just designed away.
+            if done.recv_timeout(WATCHER_JOIN_TIMEOUT).is_err() {
+                tracing::debug!("fuse: change-feed watcher still winding down at unmount");
+            }
+        }
     }
 }
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(task) = self
-            .task
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            task.abort();
-        }
+        self.shutdown();
     }
 }
 
@@ -248,15 +304,22 @@ async fn watch_loop(ws: Workspace, notifier: Notifier, stop: Arc<AtomicBool>) {
         match ws.subscribe(cursor, None).await {
             Ok(mut sub) => {
                 while !stop.load(Ordering::Relaxed) {
-                    match sub.recv().await {
+                    // Bounded so an unmount is noticed even on a silent feed.
+                    match tokio::time::timeout(SUBSCRIBE_WAKE, sub.recv()).await {
+                        Err(_elapsed) => continue,
                         // `recv` only yields empty once the connection has closed.
-                        Ok(batch) if batch.is_empty() => break,
-                        Ok(batch) => apply_batch(&ws, &notifier, batch, &mut cursor).await,
-                        Err(e) => {
+                        Ok(Ok(batch)) if batch.is_empty() => break,
+                        Ok(Ok(batch)) => {
+                            apply_batch(&ws, &notifier, batch, &mut cursor, &stop).await;
+                        }
+                        Ok(Err(e)) => {
                             tracing::warn!(error = %e, "fuse: change-feed subscription failed");
                             break;
                         }
                     }
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
                 }
             }
             Err(e) => tracing::debug!(error = %e, "fuse: no push feed, polling instead"),
@@ -269,7 +332,7 @@ async fn watch_loop(ws: Workspace, notifier: Notifier, stop: Arc<AtomicBool>) {
             return;
         }
         match ws.watch(cursor).await {
-            Ok(batch) => apply_batch(&ws, &notifier, batch, &mut cursor).await,
+            Ok(batch) => apply_batch(&ws, &notifier, batch, &mut cursor, &stop).await,
             Err(e) => tracing::debug!(error = %e, "fuse: change-feed poll failed"),
         }
     }
@@ -292,9 +355,20 @@ async fn tail_cursor(ws: &Workspace) -> i64 {
     }
 }
 
-async fn apply_batch(ws: &Workspace, notifier: &Notifier, batch: Vec<Event>, cursor: &mut i64) {
+async fn apply_batch(
+    ws: &Workspace,
+    notifier: &Notifier,
+    batch: Vec<Event>,
+    cursor: &mut i64,
+    stop: &AtomicBool,
+) {
     for ev in batch {
         *cursor = (*cursor).max(ev.seq);
+        // Re-checked per event, not just per batch: a long batch must not keep
+        // pushing notifications at a mount that is already coming down.
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         invalidate(ws, notifier, &ev).await;
     }
 }
@@ -312,32 +386,54 @@ async fn apply_batch(ws: &Workspace, notifier: &Notifier, batch: Vec<Event>, cur
 /// it writes through the same session), so filtering on it would risk dropping a
 /// genuinely-remote invalidation to save a redundant one. Correctness over the
 /// round-trip.
+///
+/// # Why only `inval_inode`, never `inval_entry`
+///
+/// `FUSE_NOTIFY_INVAL_INODE` is handled by the kernel without taking any inode
+/// lock, so it can never wait on a request this mount has not answered yet.
+/// `FUSE_NOTIFY_INVAL_ENTRY` — the one that would forget a cached *dentry* — is
+/// the opposite: it takes the parent directory's `i_rwsem` exclusively, so it
+/// parks in uninterruptible `D` state behind any syscall on the mount that holds
+/// that lock while waiting for us.
+///
+/// That is not theoretical. An earlier revision of this file did issue
+/// `inval_entry`, and under concurrent mount traffic it wedged the whole process
+/// roughly one run in eight: a watcher thread stuck in `fuse_reverse_inval_entry`,
+/// a caller stuck in `request_wait_answer` holding the lock it wanted, and a
+/// session thread that never got to answer — a cycle that survives `SIGKILL`,
+/// because a `D`-state thread cannot be killed, and leaves the mount behind.
+/// Moving the watcher onto its own thread (see [`Watcher`]) removed one arm of
+/// it but not the hang; dropping `inval_entry` did, over 20 consecutive runs of
+/// the same stress loop.
+///
+/// So namespace events invalidate the parent directory's *attributes* instead.
+/// The consequence is honest and bounded: a name the kernel has already resolved
+/// keeps resolving for up to [`TTL`] after a remote create/delete/rename — which
+/// is exactly the freshness the mount had before this change, and one second,
+/// not forever. The unbounded failure the change feed exists to fix — a mounted
+/// reader served *stale file bytes* indefinitely out of the page cache — is
+/// fixed, by the safe notification.
+///
+/// Doing better needs `inval_entry` to be impossible to have in flight while the
+/// session is torn down, i.e. a mount guard that stops the watcher *before* the
+/// unmount rather than after. That is an API change to `spawn`'s return type and
+/// so to `origofs-py`'s `Mount`; it is deliberately left as follow-up.
 async fn invalidate(ws: &Workspace, notifier: &Notifier, ev: &Event) {
     match ev.kind.as_str() {
-        // Content changed. Drop the cached data *and* re-check the name: a
-        // `write` also creates files, so the parent's dentry cache may be
-        // holding a stale view of the directory.
+        // Content changed: the page cache for this inode is the stale thing, and
+        // it is the only staleness here that no timeout ever repairs.
         "write" => {
             invalidate_data(ws, notifier, &ev.path).await;
-            invalidate_entry(ws, notifier, &ev.path).await;
+            invalidate_dir(ws, notifier, &ev.path).await;
         }
-        // Namespace changes: the cached dentry in the parent is the stale thing.
-        // A deleted path no longer resolves, which is exactly why this is keyed
-        // off the *parent* and the basename rather than the target's inode.
-        "remove" | "symlink" => invalidate_entry(ws, notifier, &ev.path).await,
-        // `mkdir` is `mkdir -p`, so every missing ancestor was created too.
-        "mkdir" => {
-            let mut at = ev.path.as_str();
-            while let Some((parent, _)) = split_parent(at) {
-                invalidate_entry(ws, notifier, at).await;
-                at = parent;
-            }
-        }
+        // Namespace changes: refresh the directory's own attributes so a reader
+        // sees the new mtime/size (see the note above about dentries).
+        "remove" | "symlink" | "mkdir" => invalidate_dir(ws, notifier, &ev.path).await,
         "rename" => {
-            invalidate_entry(ws, notifier, &ev.path).await;
+            invalidate_dir(ws, notifier, &ev.path).await;
             // `detail` carries the destination (see `Workspace::rename`).
             if let Some(to) = &ev.detail {
-                invalidate_entry(ws, notifier, to).await;
+                invalidate_dir(ws, notifier, to).await;
                 invalidate_data(ws, notifier, to).await;
             }
         }
@@ -351,7 +447,8 @@ async fn invalidate(ws: &Workspace, notifier: &Notifier, ev: &Event) {
 async fn invalidate_data(ws: &Workspace, notifier: &Notifier, path: &str) {
     let ino = match ws.fs().stat(path).await {
         Ok(inode) => inode.ino,
-        // Raced with a delete — the dentry invalidation is what matters then.
+        // Raced with a delete; there is no longer an inode to invalidate, and
+        // the path stops resolving on its own once the entry TTL lapses.
         Err(e) => {
             tracing::debug!(path, error = %e, "fuse: no inode to invalidate");
             return;
@@ -366,10 +463,11 @@ async fn invalidate_data(ws: &Workspace, notifier: &Notifier, path: &str) {
     }
 }
 
-/// Drop the kernel's cached dentry for `path` within its parent directory.
-async fn invalidate_entry(ws: &Workspace, notifier: &Notifier, path: &str) {
-    let Some((parent_path, name)) = split_parent(path) else {
-        return; // the root has no parent dentry to forget
+/// Refresh the attributes of the directory `path` lives in, so its mtime/size
+/// reflect the change instead of being served from a cache for up to [`TTL`].
+async fn invalidate_dir(ws: &Workspace, notifier: &Notifier, path: &str) {
+    let Some((parent_path, _name)) = split_parent(path) else {
+        return; // the root's own attributes are not interesting on their own
     };
     let parent = match ws.fs().stat(parent_path).await {
         Ok(inode) => INodeNo(inode.ino as u64),
@@ -378,11 +476,8 @@ async fn invalidate_entry(ws: &Workspace, notifier: &Notifier, path: &str) {
             return;
         }
     };
-    if let Err(e) = notifier.inval_entry(parent, OsStr::new(name)) {
-        tracing::debug!(path, error = %e, "fuse: inval_entry rejected");
-    }
-    // The directory's own attributes (mtime, size) moved with its contents. A
-    // negative offset means "attributes only" — don't disturb the dir's pages.
+    // A *negative* offset means "attributes only" — leave the directory's own
+    // pages alone, and take no inode lock.
     if let Err(e) = notifier.inval_inode(parent, -1, 0) {
         tracing::debug!(path, error = %e, "fuse: parent inval_inode rejected");
     }
@@ -445,13 +540,11 @@ pub fn mount(ws: Workspace, mountpoint: &Path) -> std::io::Result<()> {
 /// by dropping the returned handle or otherwise — stops it.
 pub fn spawn(ws: Workspace, mountpoint: &Path) -> std::io::Result<BackgroundSession> {
     let fs = OrigoFSFuse::new(ws.clone())?;
-    // Both grabbed before `fs` is handed to the session: the runtime handle
-    // outlives its `Runtime` field only as long as the filesystem does, which is
-    // exactly the watcher's lifetime.
+    // Grabbed before `fs` is handed to the session, which is what gives us the
+    // notifier to hand back to it.
     let watcher = Arc::clone(&fs.watcher);
-    let rt = fs.rt.handle().clone();
     let session = fuser::spawn_mount2(fs, mountpoint, &config())?;
-    watcher.start(&rt, ws, session.notifier());
+    watcher.start(ws, session.notifier());
     Ok(session)
 }
 
@@ -497,6 +590,14 @@ fn to_attr(i: &Inode) -> FileAttr {
 }
 
 impl Filesystem for OrigoFSFuse {
+    /// The session calls this once its event loop has stopped. Stopping the
+    /// watcher here rather than waiting for [`Drop`] shortens the window in which
+    /// a notification can be issued at a mount that can no longer answer the
+    /// syscall that notification has to wait behind (see [`Watcher`]).
+    fn destroy(&mut self) {
+        self.watcher.shutdown();
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy().to_string();
         match self.blk(self.ws.fs().vfs_lookup(parent.0 as i64, &name)) {

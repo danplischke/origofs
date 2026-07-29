@@ -7,16 +7,15 @@ use origofs_sdk::fuse::{mountable, spawn};
 use std::io::{Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 
-/// The entry/attr TTL the mount hands the kernel (`fuse::TTL`). Anything the
-/// kernel cached becomes fresh again on its own after this, so the
-/// invalidation tests below assert they see the change *sooner* than this —
-/// otherwise they'd pass on the TTL lapsing rather than on a notification.
+/// The entry/attr TTL the mount hands the kernel (`fuse::TTL`).
+///
+/// Cached *names* become fresh again on their own after this, so a test that
+/// only checked "the change eventually shows up" would pass with or without any
+/// notification. The genuine regression guard here is the page cache, which no
+/// TTL ever repairs — see [`fuse_mount_sees_remote_write`].
 const MOUNT_TTL: Duration = Duration::from_secs(1);
 
-/// Slack for a loaded CI box: still comfortably inside [`MOUNT_TTL`].
-const INVALIDATION_BUDGET: Duration = Duration::from_millis(800);
-
-/// How long to wait before giving up on an invalidation entirely.
+/// How long to wait before giving up on a change becoming visible.
 const GIVE_UP: Duration = Duration::from_secs(10);
 
 #[test]
@@ -141,16 +140,38 @@ fn fuse_mount_sees_remote_write() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    // Attributes too, and this one is timed: the kernel would refresh a cached
+    // `stat` by itself once [`MOUNT_TTL`] lapsed, so seeing the new size well
+    // inside that window can only be the notification's doing.
+    assert_eq!(f.metadata().unwrap().len(), 4); // caches the attrs
+    let grew_at = Instant::now();
+    rt.block_on(ws.write("/live.txt", b"CCCCCCCC")).unwrap();
+    while f.metadata().unwrap().len() != 8 {
+        assert!(
+            grew_at.elapsed() < GIVE_UP,
+            "mount kept serving a stale size after a remote write"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let took = grew_at.elapsed();
+    assert!(
+        took < MOUNT_TTL * 3 / 4,
+        "the new size only showed up after {took:?}, i.e. plausibly by the \
+         {MOUNT_TTL:?} attribute TTL lapsing rather than by an invalidation"
+    );
+
+    drop(f); // an fd still open on the mount would make the unmount EBUSY
     drop(session);
 }
 
-/// A remote *delete* must not keep resolving on the mount, and a remote *create*
-/// must show up — via both `stat` and `readdir`.
+/// A remote *create* and a remote *delete* must both become visible on the
+/// mount, through `stat` and `readdir`.
 ///
-/// The delete half is the regression guard: the positive dentry and its
-/// attributes were just cached by the `exists()` probe, so within [`MOUNT_TTL`]
-/// the kernel answers `stat` entirely by itself. Only an `inval_entry` can make
-/// the path stop resolving before the TTL lapses — hence the deadline assert.
+/// Names, unlike bytes, are covered by [`MOUNT_TTL`] on their own — the mount
+/// deliberately does not send the dentry-forgetting notification that would beat
+/// it (`fuse::invalidate` documents the deadlock that ruled it out). So this
+/// pins the *bounded* guarantee: the change lands within a small multiple of the
+/// TTL, not eventually-or-never.
 #[test]
 fn fuse_mount_sees_remote_create_and_delete() {
     if !mountable() {
@@ -187,9 +208,9 @@ fn fuse_mount_sees_remote_create_and_delete() {
     }
     let took = removed_at.elapsed();
     assert!(
-        took < INVALIDATION_BUDGET,
-        "the deletion only became visible after {took:?}, i.e. plausibly by the \
-         {MOUNT_TTL:?} entry TTL lapsing rather than by an invalidation"
+        took < MOUNT_TTL * 3,
+        "the deletion took {took:?} to become visible; the mount's entry TTL is \
+         {MOUNT_TTL:?}, so this is unbounded staleness, not cache expiry"
     );
 
     // And a remote create becomes visible through both stat and readdir.
@@ -320,6 +341,7 @@ fn fuse_mount_sees_remote_write_over_postgres() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    drop(f); // an fd still open on the mount would make the unmount EBUSY
     drop(session);
     let _ = rt.block_on(ws.remove(&path));
 }
