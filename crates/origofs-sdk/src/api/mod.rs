@@ -24,7 +24,7 @@ use crate::{Workspace, WriteCtx, WriteOutcome};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{FromRef, FromRequestParts, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, FromRef, FromRequestParts, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -35,6 +35,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tower::ServiceBuilder;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::trace::TraceLayer;
 
 #[cfg(feature = "coedit")]
 mod coedit;
@@ -168,12 +172,30 @@ impl FromRequestParts<AppState> for Auth {
 }
 
 /// Options for [`router_with`].
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ApiOptions {
     /// Require an authenticated principal for reads too, not only mutations. Off
     /// by default: reads are open (parity with the Python `build_router`). When
-    /// on, every route except `/health` demands a valid credential.
+    /// on, every data route demands a valid credential (`/health`/`/readyz` stay
+    /// open).
     pub gate_reads: bool,
+    /// Origins allowed by CORS (e.g. `https://app.example.com`). Empty means no
+    /// cross-origin access — same-origin only — which is the safe default; a
+    /// browser client on another origin needs its origin listed here.
+    pub cors_origins: Vec<String>,
+    /// Maximum request-body size in bytes for uploads (`PUT /v1/files/…`).
+    /// Defaults to 1 GiB.
+    pub max_body_bytes: usize,
+}
+
+impl Default for ApiOptions {
+    fn default() -> Self {
+        Self {
+            gate_reads: false,
+            cors_origins: Vec::new(),
+            max_body_bytes: 1 << 30,
+        }
+    }
 }
 
 /// Build the router for a workspace. Every mutating route requires an
@@ -191,7 +213,7 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
         ws,
         auth,
     };
-    let mut app = Router::new()
+    let mut data = Router::new()
         .route(
             "/files/{*path}",
             get(read_file).put(write_file).delete(delete_file),
@@ -222,18 +244,55 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
     if options.gate_reads {
         // Require a valid credential for every data route, reads included.
         // Mutations already enforce it in-handler; this closes reads too.
-        app = app.route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+        data = data.route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     }
     // The co-editing WebSocket authenticates itself (it accepts a `?token=` query
-    // param a browser can't send as a header), so it sits outside the read gate,
-    // alongside `/health`, which stays open regardless.
+    // param a browser can't send as a header), so it sits outside the read gate.
     #[cfg(feature = "coedit")]
     {
-        app = app.route("/coedit/{*path}", get(coedit::coedit_ws));
+        data = data.route("/coedit/{*path}", get(coedit::coedit_ws));
     }
-    app.route("/health", get(health))
+    // Versioned data surface. Liveness/readiness stay unversioned at the root so an
+    // orchestrator probes them independent of the API version.
+    let app = Router::new()
+        .nest("/v1", data)
+        .route("/health", get(health))
         .route("/readyz", get(readyz))
-        .with_state(state)
+        .with_state(state);
+    // Cross-cutting middleware (outermost first): an `x-request-id` set on the
+    // request and echoed on the response, a tracing span per request, a
+    // request-body size cap, and CORS for browser clients. CORS sits innermost so
+    // it wraps the router's plain body (it requires a `Default` response body,
+    // which the trace layer's wrapped body is not).
+    app.layer(
+        ServiceBuilder::new()
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            .layer(PropagateRequestIdLayer::x_request_id())
+            .layer(TraceLayer::new_for_http())
+            .layer(DefaultBodyLimit::max(options.max_body_bytes))
+            .layer(cors_layer(&options)),
+    )
+}
+
+/// Build the CORS layer from the configured origins. Empty means no cross-origin
+/// access is granted (same-origin only) — the safe default.
+fn cors_layer(options: &ApiOptions) -> CorsLayer {
+    use axum::http::{Method, header};
+    let origins: Vec<axum::http::HeaderValue> = options
+        .cors_origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_origin(AllowOrigin::list(origins))
 }
 
 /// Middleware that rejects with `401` unless the request carries a credential the
@@ -293,20 +352,45 @@ impl From<crate::OrigoFSError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         use crate::OrigoFSError::*;
-        let (status, message) = match self {
-            ApiError::Status(code, msg) => (code, msg),
+        // (status, machine-readable code, human message, retryable)
+        let (status, code, message, retryable) = match self {
+            ApiError::Status(status, msg) => {
+                let code = match status {
+                    StatusCode::UNAUTHORIZED => "unauthenticated",
+                    StatusCode::FORBIDDEN => "forbidden",
+                    _ => "error",
+                };
+                (status, code, msg, false)
+            }
             ApiError::OrigoFS(e) => {
-                let status = match e {
+                let status = match &e {
                     NotFound(_) | ContentMissing(_) => StatusCode::NOT_FOUND,
                     AlreadyExists(_) | Conflict(_) => StatusCode::CONFLICT,
                     IsADirectory(_) | NotADirectory(_) | DirectoryNotEmpty(_) | InvalidPath(_)
                     | InvalidArgument(_) => StatusCode::BAD_REQUEST,
+                    // A transient backend failure: tell the client it may retry.
+                    e if e.retryable() => StatusCode::SERVICE_UNAVAILABLE,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
-                (status, e.to_string())
+                (status, e.code(), e.to_string(), e.retryable())
             }
         };
-        (status, Json(json!({ "error": message }))).into_response()
+        // Machine-readable envelope: a stable `code` a client can branch on, the
+        // human `message`, and whether the operation is safe to retry.
+        let mut resp = (
+            status,
+            Json(json!({
+                "error": { "code": code, "message": message, "retryable": retryable }
+            })),
+        )
+            .into_response();
+        if retryable {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        resp
     }
 }
 
@@ -506,11 +590,34 @@ struct CommitDto {
     parents: Vec<String>,
 }
 
-async fn log(State(ws): State<Shared>) -> ApiResult<Json<Vec<CommitDto>>> {
-    let out = ws
-        .log()
-        .await?
+#[derive(Deserialize)]
+struct LogQuery {
+    /// Maximum commits to return (default 100, capped at 1000).
+    limit: Option<usize>,
+    /// Continue after this commit hash — pass the last hash of the previous page
+    /// to walk history in bounded pages.
+    before: Option<String>,
+}
+
+async fn log(
+    State(ws): State<Shared>,
+    Query(q): Query<LogQuery>,
+) -> ApiResult<Json<Vec<CommitDto>>> {
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let all = ws.log().await?;
+    // Skip past the cursor commit (exclusive), if one was given.
+    let start = match &q.before {
+        Some(h) => all
+            .iter()
+            .position(|ci| ci.hash.to_hex() == *h)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let out = all
         .into_iter()
+        .skip(start)
+        .take(limit)
         .map(|ci| CommitDto {
             hash: ci.hash.to_hex(),
             author: ci.commit.author,
@@ -810,12 +917,15 @@ struct EventsQuery {
     since: Option<i64>,
     /// Restrict the feed to changes on this branch (the per-branch UI view).
     branch: Option<String>,
+    /// Maximum events to return (default and cap 1000).
+    limit: Option<usize>,
 }
 
 async fn events(
     State(ws): State<Shared>,
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<Vec<EventDto>>> {
+    let limit = q.limit.unwrap_or(1000).min(1000);
     let out = ws
         .watch(q.since.unwrap_or(0))
         .await?
@@ -824,6 +934,7 @@ async fn events(
             Some(b) => e.branch.as_deref() == Some(b.as_str()),
             None => true,
         })
+        .take(limit)
         .map(|e| EventDto {
             seq: e.seq,
             actor_id: e.actor_id,
