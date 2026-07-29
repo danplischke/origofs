@@ -193,6 +193,33 @@ report = await ws.rebuild()                             # restores refs + workin
 Reading every object also integrity-checks it (`report["corrupt"]` counts any that
 failed). The DB stays the thing to back up — so also run Postgres PITR / a replica.
 
+## Alembic migrations for the metadata schema
+
+A workspace already migrates its own metadata schema forward automatically on
+open (`ws.schema_version()` / `ws.migrate()`) — `origofs.db` is for the times
+you want that schema managed by **Alembic** instead: a CI-driven migration
+step, a schema-diffing tool, or provisioning a fresh database before the
+engine ever touches it. `origofs.db.models` declares every table from
+`crates/origofs-core/src/migrations.rs` as SQLAlchemy models (the single
+source of truth `origofs.db`'s packaged migrations autogenerate against), so
+a database Alembic creates is fully interoperable with one the engine creates:
+
+```python
+import origofs.db
+
+origofs.db.upgrade("sqlite:///meta.db")                        # or set ORIGOFS_DATABASE_URL
+origofs.db.upgrade("postgresql+psycopg://user@host/db")
+```
+
+`origofs.db.downgrade(url, revision="-1")` steps back; `get_alembic_config(url)`
+hands you the `alembic.config.Config` directly for anything else (`alembic.command.current`,
+`.history`, …). Needs the `db` extra (`pip install "origofs[db]"`) plus a driver
+for your backend (Postgres: `psycopg[binary]`; SQLite's `sqlite3` is stdlib).
+
+Developing origofs itself — after editing `python/origofs/db/models.py` — draft
+the next migration from the `origofs-py` crate root: `alembic revision --autogenerate
+-m "…"` (uses the `alembic.ini` there, not `origofs.db`'s programmatic config).
+
 ## Examples
 
 - **`examples/collab_app.py`** — the one to start from. A complete little
@@ -227,4 +254,5 @@ failed). The DB stays the thing to back up — so also run Postgres PITR / a rep
 
 Integrations (own extras): `origofs.fastapi` (HTTP router) · `origofs.fsspec`
 (`OrigoFileSystem`, the fsspec filesystem — also a `UPath("origofs://…")` via
-universal-pathlib) · `origofs.overlay` (agent overlay).
+universal-pathlib) · `origofs.overlay` (agent overlay) · `origofs.db`
+(SQLAlchemy models + Alembic migrations for the metadata schema).
