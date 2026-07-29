@@ -113,11 +113,11 @@ async fn edit_on_one_worker_reaches_a_client_on_another() {
 
     // Alice on worker A, Bob on worker B — same document.
     let (mut a, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr_a}/coedit/doc.md?token=alice"))
+        tokio_tungstenite::connect_async(format!("ws://{addr_a}/v1/coedit/doc.md?token=alice"))
             .await
             .unwrap();
     let (mut b, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr_b}/coedit/doc.md?token=bob"))
+        tokio_tungstenite::connect_async(format!("ws://{addr_b}/v1/coedit/doc.md?token=bob"))
             .await
             .unwrap();
     let a_aware = Awareness::new(Doc::new());
