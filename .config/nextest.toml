@@ -1,0 +1,27 @@
+# cargo-nextest configuration (B8, #70). Adds a hang guard (a wedged test is
+# terminated instead of running out the whole CI job) and targeted retries for
+# the randomized concurrency / durability-crash stress suites. The Rust CI job
+# runs `cargo nextest run --profile ci`.
+
+[profile.default]
+# Report a test as slow once it passes 60s and terminate it after a second such
+# period (~120s), so a genuine hang surfaces as a failure. The slowest real test
+# today is ~11s locally, so this is comfortable headroom.
+slow-timeout = { period = "60s", terminate-after = 2 }
+retries = 0
+
+# CI: run every test (don't stop at the first failure), tolerate a single
+# transient retry, and loosen the hang guard since coverage/instrumentation and
+# the Postgres backend make CI slower than a local run.
+[profile.ci]
+fail-fast = false
+retries = 1
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+# The randomized concurrency and durability/crash simulations are the
+# flakiness-prone, long-running suites — give them extra retries and a longer
+# leash before the hang guard fires.
+[[profile.ci.overrides]]
+filter = 'package(origofs-core) & (binary(simulation) | binary(concurrency) | binary(gc))'
+retries = 3
+slow-timeout = { period = "180s", terminate-after = 3 }

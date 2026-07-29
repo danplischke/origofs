@@ -18,6 +18,7 @@ jobs:
   rust:
     name: Rust (clippy + test)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     # Exercise the Postgres (multi-writer / production) metadata backend. Without
     # ORIGOFS_PG_TEST_URL the PG-gated suites (postgres.rs, concurrency.rs,
     # subscribe.rs) self-skip and only the SQLite path is tested.
@@ -54,6 +55,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -69,12 +73,18 @@ jobs:
       # tests are #[ignore]d; and the FUSE / NFS / overlayfs tests self-skip when
       # the needed privileges aren't present — so the suite is green on a stock
       # runner with no extra services.
+      # nextest is the primary runner (per-test hang guard + retries; see
+      # .config/nextest.toml). It doesn't run doctests, so those run via
+      # `cargo test --doc` afterward (the one executable doctest, nfs.rs, is
+      # gated by `full`).
       - name: Test
         run: |
-          cargo test --workspace --no-fail-fast
+          cargo nextest run --profile ci --workspace
           # Run the surface-gated tests (api/mcp/sandbox/git/fuse/nfs) explicitly,
           # rather than relying on workspace feature-unification to enable them.
-          cargo test -p origofs-sdk --features full --no-fail-fast
+          cargo nextest run --profile ci -p origofs-sdk --features full
+          cargo test --workspace --doc
+          cargo test -p origofs-sdk --features full --doc
 
       # The opt-in `coedit` feature (yrs-backed CRDT co-editing, roadmap M8) is
       # off by default for origofs-core and origofs-sdk, so exercise it — clippy +
@@ -88,9 +98,9 @@ jobs:
           cargo clippy -p origofs-core --features coedit --all-targets -- -D warnings
           cargo clippy -p origofs-sdk --features coedit --all-targets -- -D warnings
           cargo clippy -p origofs-sdk --features full,coedit --all-targets -- -D warnings
-          cargo test -p origofs-core --features coedit --no-fail-fast
-          cargo test -p origofs-sdk --features coedit --no-fail-fast
-          cargo test -p origofs-sdk --features full,coedit --no-fail-fast
+          cargo nextest run --profile ci -p origofs-core --features coedit
+          cargo nextest run --profile ci -p origofs-sdk --features coedit
+          cargo nextest run --profile ci -p origofs-sdk --features full,coedit
 
   # B1 (#70): code-coverage signal. Instrument the same test invocations the
   # `rust` job runs — the default workspace suite plus the origofs-sdk `full`
@@ -170,6 +180,7 @@ jobs:
   python:
     name: Python bindings (maturin + pytest)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     # The Python suite has PG-gated tests too; give it the same backend.
     env:
       ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
