@@ -108,3 +108,35 @@ pub struct DirEntry {
     pub ino: Ino,
     pub kind: FileKind,
 }
+
+/// A directory entry with its inode attributes already resolved.
+///
+/// A `readdir` that also needs attributes (NFSv3 `READDIRPLUS`-style replies)
+/// would otherwise issue one `getattr` per entry; the attrs here come from a
+/// single batched inode fetch instead (M16).
+#[derive(Clone, Debug)]
+pub struct DirEntryAttr {
+    pub entry: DirEntry,
+    pub inode: Inode,
+}
+
+/// One keyset page of a directory read (M16).
+///
+/// Pages are ordered by name and resumed by name — [`next_after`](Self::next_after)
+/// is the cursor to hand back as `after_name` for the following page. It is the
+/// name of the last *dentry* on the page, which is deliberately not the same as
+/// the last element of `entries`: an inode that vanished between the dentry query
+/// and the attribute fetch is dropped from `entries`, and the cursor must still
+/// advance past it or the read would loop forever.
+#[derive(Clone, Debug, Default)]
+pub struct DirPage {
+    /// The page's entries, in name order, each with its attributes.
+    pub entries: Vec<DirEntryAttr>,
+    /// Keyset cursor for the next page, or `None` when the page was empty.
+    pub next_after: Option<String>,
+    /// The store returned fewer rows than the requested limit, so this is the
+    /// last page. A page that exactly fills the limit reports `false` even when
+    /// the directory happens to end there — the caller confirms with one more
+    /// (empty) page, exactly as a keyset scan must.
+    pub end: bool,
+}

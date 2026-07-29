@@ -90,6 +90,11 @@ class _Name(BaseModel):
 
 
 class _Touch(BaseModel):
+    """The body of a presence heartbeat. It carries **no** actor and **no**
+    session on purpose: like every other mutating route, identity is resolved
+    server-side from ``authn``, so a client can only ever heartbeat *itself* —
+    naming someone else is not expressible, let alone honoured."""
+
     path: Optional[str] = None
 
 
@@ -343,8 +348,21 @@ class _Rooms:
             room.conns.discard(conn)
             if not room.conns:
                 # Final checkpoint under the registry lock so a concurrent join
-                # can't fork a fresh room off a half-written sidecar.
+                # can't fork a fresh room off a half-written sidecar -- or clear
+                # the live marker out from under a room still taking edits.
                 await self._ws.checkpoint_coedit(ctx, path, room.doc)
+                # Only after that checkpoint lands: until it does, the durable
+                # blob really does lag the document, and the marker is what says
+                # so. (`open_coedit` set it; this is the matching clear, exactly
+                # as the Rust api::Coordinator does on last leave.)
+                try:
+                    await self._ws.end_coedit(path)
+                except Exception:
+                    # An older extension without `end_coedit`, or a transient
+                    # metadata error: a marker left behind is the *safe* failure
+                    # direction (a reader is told the bytes may lag when they
+                    # don't), so it must not fail the disconnect path.
+                    pass
                 del self._rooms[path]
 
 
@@ -578,11 +596,37 @@ def build_router(
     async def presence(window: int = Query(default=60)):
         return await _run(ws.presence(window))
 
+    async def _heartbeat(req: Optional[_Touch], ctx: Any) -> dict:
+        """Heartbeat the authenticated caller's presence. Mirrors the Rust HTTP
+        API's ``POST /v1/presence``: the body is optional and only ever carries a
+        `path`; the actor and session come from the credential.
+
+        Presence is keyed by **session**, so the credential must be bound to one —
+        a bare actor context gets a ``400`` telling it to create a session first.
+        Minting one here instead would let a heartbeat loop create unbounded
+        session rows and make the presence list a directory of connections rather
+        than of working sessions.
+        """
+        if ctx.session_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="this credential is not bound to a session; create one (POST /sessions) "
+                       "and present a session-bound credential to heartbeat presence",
+            )
+        raw = (req.path or "").strip() if req is not None else ""
+        path = _abs(raw) if raw else None
+        await _run(ws.touch(ctx.actor_id, ctx.session_id, path))
+        return {"session_id": ctx.session_id, "actor_id": ctx.actor_id, "path": path}
+
+    @router.post("/presence")
+    async def heartbeat_presence(req: Optional[_Touch] = None, ctx: Any = Depends(authn)):
+        return await _heartbeat(req, ctx)
+
+    # The original spelling of the same heartbeat, kept so existing clients keep
+    # working; `POST /presence` is the one that matches the Rust HTTP API.
     @router.post("/presence/touch")
     async def touch(req: _Touch, ctx: Any = Depends(authn)):
-        if ctx.session_id is None:
-            raise HTTPException(status_code=400, detail="presence requires a session (WriteCtx.session)")
-        await _run(ws.touch(ctx.actor_id, ctx.session_id, _abs(req.path) if req.path else None))
+        await _heartbeat(req, ctx)
         return {"ok": True}
 
     # --- actors + sessions ---------------------------------------------------

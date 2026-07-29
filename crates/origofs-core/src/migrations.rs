@@ -128,6 +128,34 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V13_SQLITE,
         postgres: V13_POSTGRES,
     },
+    // V14 — a `kind` discriminator on `suggestion` (issue #75 §3.2). A `bytes`
+    // suggestion proposes a whole file body, so its `base_hash` is the file's
+    // content hash and accepting it is a conditional whole-file write. A `crdt`
+    // suggestion proposes a *merge* into a co-edited document: `base_hash`
+    // addresses the document's Yjs **state vector** and `proposed_hash` an opaque
+    // `encodeStateAsUpdate` blob, so accepting it is `applyUpdate` and can never
+    // be stale (a CRDT merge is defined for any pair of states). Both blobs still
+    // live in the CAS — only their addresses are here. Defaults to `bytes`, so
+    // every existing row keeps its current meaning. Plain `ADD COLUMN`.
+    Migration {
+        version: 14,
+        sqlite: V14_SQLITE,
+        postgres: V14_POSTGRES,
+    },
+    // V15 — the per-path **live document** marker (issue #75 §3.4): while a path is
+    // open in a CRDT co-editing session, its durable CAS blob may lag the live
+    // `Y.Doc`. A byte reader (`read`, three-way merge, git export) consults this to
+    // tell "these bytes may be behind an open editor" from "these bytes are the
+    // whole truth". `content_hash` is the file's content address as of the last
+    // checkpoint, which is what makes an *out-of-band* write to a live path
+    // detectable (and therefore reconcilable) instead of a silent race.
+    // Workspace-scoped like `conflict`/`file_lock` (V11): a path names a different
+    // file in every workspace.
+    Migration {
+        version: 15,
+        sqlite: V15,
+        postgres: V15,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -301,6 +329,27 @@ const V13_POSTGRES: &str = "
 ALTER TABLE blob_blame ADD COLUMN IF NOT EXISTS workspace_id BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE blob_blame DROP CONSTRAINT IF EXISTS blob_blame_pkey;
 ALTER TABLE blob_blame ADD PRIMARY KEY(workspace_id, content_hash);
+";
+
+// V14 — the suggestion `kind` discriminator (see the migration entry above). NOT
+// NULL with a constant default, so it applies to existing rows; the SQLite
+// `ADD COLUMN` rides the runner's duplicate-column tolerance on re-apply.
+const V14_SQLITE: &str = "ALTER TABLE suggestion ADD COLUMN kind TEXT NOT NULL DEFAULT 'bytes';";
+const V14_POSTGRES: &str =
+    "ALTER TABLE suggestion ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'bytes';";
+
+// V15 — the per-path live-document marker (see the migration entry above). Plain
+// TEXT/INTEGER columns, so one statement serves both dialects.
+const V15: &str = "
+CREATE TABLE IF NOT EXISTS live_doc(
+    workspace_id BIGINT NOT NULL DEFAULT 1,
+    path         TEXT NOT NULL,
+    session_id   BIGINT,
+    actor_id     BIGINT NOT NULL,
+    content_hash TEXT,
+    since        BIGINT NOT NULL,
+    PRIMARY KEY(workspace_id, path)
+);
 ";
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS`; the migration runner tolerates a

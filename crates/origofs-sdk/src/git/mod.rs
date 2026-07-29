@@ -7,7 +7,10 @@
 //! - [`export_git`] re-encodes an origofs branch as real git objects under a `.git`
 //!   directory the actual `git` binary reads (`log`, `diff`, `blame`,
 //!   `checkout`, `fsck`) — in SHA-1 (GitHub-compatible) or SHA-256 (origofs's native
-//!   256-bit ids), with large files optionally written as git-LFS pointers.
+//!   256-bit ids), with large files optionally written as git-LFS pointers. A path
+//!   still open in a live co-editing session exports its last *checkpoint*, which
+//!   may lag the open document; the export warns and reports those paths
+//!   ([`GitExport::live_paths`]) rather than exporting them silently.
 //! - [`import_git`] reads a real git repository's history back into origofs commits,
 //!   trees, and blobs, then checks the branch out.
 //!

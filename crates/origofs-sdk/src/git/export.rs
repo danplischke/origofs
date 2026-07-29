@@ -47,9 +47,30 @@ pub struct GitExport {
     pub head: String,
     pub commits: usize,
     pub lfs_objects: usize,
+    /// Paths that had a **live co-editing document open** when the export ran, so
+    /// their exported bytes may lag what people are typing (see [`export_git`]).
+    /// Empty in the ordinary case. Sorted by path, as `live_paths` returns them.
+    pub live_paths: Vec<String>,
 }
 
 /// Export a workspace branch into a git repository rooted at `dir`.
+///
+/// # Live documents
+///
+/// A path with an open live co-editing document has durable bytes that are a
+/// *checkpoint* — real and fully attributed, but possibly behind the `Y.Doc`
+/// people are typing into. Exporting one silently would hand `git` stale content
+/// with nothing to say so, which is the actual bug: the export is a snapshot
+/// somebody will treat as the truth.
+///
+/// So the export **surfaces** it and does not act on it: any live path is
+/// `warn!`ed and returned in [`GitExport::live_paths`]. It deliberately does not
+/// block, fail, or force a checkpoint — the same rule
+/// `origofs_core::Fs::read_live` documents for every byte reader. A checkpoint
+/// needs an actor to attribute, and the live document is in-process room state
+/// this function cannot reach anyway. A caller that wants the freshest bytes
+/// checkpoints the co-editing coordinator first (`api::Coordinator::checkpoint_all`)
+/// and then exports.
 pub async fn export_git(ws: &Workspace, dir: &Path, opts: &ExportOptions) -> Result<GitExport> {
     let branch = match &opts.branch {
         Some(b) => b.clone(),
@@ -60,6 +81,22 @@ pub async fn export_git(ws: &Workspace, dir: &Path, opts: &ExportOptions) -> Res
     let head = ws.fs().branch_head(&branch).await?.ok_or_else(|| {
         OrigoFSError::InvalidArgument(format!("branch {branch} has no commits to export"))
     })?;
+
+    // Before writing anything: is any path still being co-edited? Checked up front
+    // so the warning reaches the operator's log alongside the export they started,
+    // not after it has already finished.
+    let live_paths: Vec<String> = ws.live_paths().await?.into_iter().map(|l| l.path).collect();
+    if !live_paths.is_empty() {
+        tracing::warn!(
+            branch = %branch,
+            live = %live_paths.join(", "),
+            count = live_paths.len(),
+            "git export: {} path(s) have a live co-editing document open; their exported \
+             bytes are the last checkpoint and may lag the open document. Checkpoint the \
+             co-editing coordinator first if you need the freshest content.",
+            live_paths.len(),
+        );
+    }
 
     let git_dir = dir.join(".git");
     init_git_dir(&git_dir, opts.format, &branch)?;
@@ -88,6 +125,7 @@ pub async fn export_git(ws: &Workspace, dir: &Path, opts: &ExportOptions) -> Res
         head: head_oid,
         commits,
         lfs_objects,
+        live_paths,
     })
 }
 

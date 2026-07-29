@@ -252,7 +252,7 @@ class Session(Base):
 
 
 class ToolCall(Base):
-    """The agent tool-call audit log (retained from agentfs)."""
+    """The agent tool-call audit log."""
 
     __tablename__ = "tool_calls"
     __table_args__ = {"sqlite_autoincrement": True}

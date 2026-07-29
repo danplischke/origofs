@@ -102,6 +102,20 @@ jobs:
           cargo nextest run --profile ci -p origofs-sdk --features coedit
           cargo nextest run --profile ci -p origofs-sdk --features full,coedit
 
+      # The opt-in `metrics` feature (roadmap M9) is likewise off by default and
+      # out of `full`, so the feature-on build is otherwise only covered
+      # incidentally via `origofs-cli`. Exercise both states explicitly: the
+      # recording facade compiles to nothing with the feature off (so a default
+      # build must stay clean and dependency-free), and with it on the `/metrics`
+      # exposition endpoint and the per-request instrumentation must work.
+      - name: Test metrics feature
+        run: |
+          cargo clippy -p origofs-core --features metrics --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features metrics --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features full,metrics --all-targets -- -D warnings
+          cargo nextest run --profile ci -p origofs-core --features metrics
+          cargo nextest run --profile ci -p origofs-sdk --features full,metrics
+
   # B1 (#70): code-coverage signal. Instrument the same test invocations the
   # `rust` job runs — the default workspace suite plus the origofs-sdk `full`
   # surfaces (api/mcp/sandbox/git/fuse/nfs are default-off features, otherwise

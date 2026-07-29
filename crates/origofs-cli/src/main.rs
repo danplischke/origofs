@@ -154,6 +154,28 @@ enum Cmd {
         #[arg(short, long)]
         message: Option<String>,
     },
+    /// Reconcile this (offline/solo) workspace with a remote one over a branch,
+    /// merging any divergence with the ordinary three-way merge engine. Objects
+    /// move both ways as needed and per-line blame travels with them; the remote
+    /// branch only advances by compare-and-swap. Both working trees must be clean.
+    /// E.g. `origofs resync --remote-config team.toml` or `origofs resync --remote ../shared`.
+    Resync {
+        /// The remote workspace directory (holds `meta.db` and `cas/`, like
+        /// `--workspace`). Also roots any path defaulted by `--remote-config`.
+        #[arg(long, value_name = "DIR")]
+        remote: Option<PathBuf>,
+        /// Backend configuration file (TOML) for the remote workspace — the same
+        /// format as `--config`, for a Postgres/S3/GCS remote.
+        #[arg(long, value_name = "FILE")]
+        remote_config: Option<PathBuf>,
+        /// Branch to reconcile (defaults to the local current branch).
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, default_value = "origofs")]
+        author: String,
+        #[arg(short, long)]
+        message: Option<String>,
+    },
     /// List unresolved merge conflicts.
     Conflicts,
     /// Acquire an exclusive lock on a path.
@@ -287,6 +309,12 @@ enum Cmd {
         /// all writes are attributed to an auto-created local actor (dev only).
         #[arg(long = "auth-token", value_name = "TOKEN=ACTOR[:SESSION]")]
         auth_tokens: Vec<String>,
+        /// Install the Prometheus recorder and expose `GET /metrics` (also
+        /// `ORIGOFS_METRICS=1`). Off by default: without it nothing is exported and
+        /// that route answers `503 metrics not enabled`. Like `/readyz`, the
+        /// endpoint is unauthenticated.
+        #[arg(long)]
+        metrics: bool,
     },
     /// Serve the workspace over NFSv3 (blocks; mount with `-o vers=3,tcp,port=…`).
     Nfs {
@@ -344,6 +372,51 @@ fn init_tracing(format: LogFormat) {
         LogFormat::Json => builder.json().init(),
         LogFormat::Text => builder.init(),
     }
+}
+
+/// Latency buckets for the `_seconds` histograms, in seconds: sub-millisecond
+/// metadata operations through multi-second object-store round trips. Picking
+/// buckets is the *binary's* call — the library only records raw observations.
+const METRICS_BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// Install the Prometheus recorder — the metrics counterpart to [`init_tracing`],
+/// and for the same reason: origofs-core/-sdk only *record* measurements, they
+/// install no exporter and start no server, so a Rust embedder pays nothing and
+/// wires up their own. This is the one place the `origofs` binary opts in.
+///
+/// It installs a recorder, registers the `# HELP`/`# TYPE` metadata, and hands the
+/// exposition renderer to the HTTP surface, which serves it at **`GET /metrics`**
+/// on the same address as the API (no second listener, so the endpoint inherits
+/// the API's bind address and middleware). Until this runs, `/metrics` answers
+/// `503 metrics not enabled`.
+///
+/// Off unless `origofs serve --metrics` (or `ORIGOFS_METRICS=1`) asks for it, so a
+/// plain `origofs read`/`write` allocates no metrics registry.
+fn init_metrics() -> Result<()> {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    let handle = PrometheusBuilder::new()
+        .set_buckets(METRICS_BUCKETS)
+        .map_err(|e| anyhow::anyhow!("configuring metrics histogram buckets: {e}"))?
+        .install_recorder()
+        .map_err(|e| anyhow::anyhow!("installing the Prometheus recorder: {e}"))?;
+    origofs_sdk::api::describe_metrics();
+    if !origofs_sdk::api::set_metrics_renderer(move || handle.render()) {
+        anyhow::bail!("a metrics renderer is already installed in this process");
+    }
+    Ok(())
+}
+
+/// Whether an environment variable is set to a truthy value. Used for
+/// `ORIGOFS_METRICS`, the env-var twin of `serve --metrics`.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// Open the workspace the CLI operates on. With `--config` this selects the
@@ -520,10 +593,14 @@ async fn main() -> Result<()> {
                 println!("no suggestions");
             }
             for s in list {
+                // The kind matters to a reviewer: a `crdt` proposal merges into a
+                // live document (and is never stale), a `bytes` one replaces the
+                // file and can be superseded when the base moves.
                 println!(
-                    "#{:<4} {:<9} actor={} {}{}",
+                    "#{:<4} {:<10} {:<5} actor={} {}{}",
                     s.id,
                     s.status.as_str(),
+                    s.kind.as_str(),
                     s.actor_id,
                     s.path,
                     s.summary.map(|m| format!("  — {m}")).unwrap_or_default(),
@@ -596,6 +673,95 @@ async fn main() -> Result<()> {
                         println!("  {} {}", c.kind, c.path);
                     }
                 }
+            }
+        }
+        Cmd::Resync {
+            remote,
+            remote_config,
+            branch,
+            author,
+            message,
+        } => {
+            if remote.is_none() && remote_config.is_none() {
+                anyhow::bail!(
+                    "resync needs a remote: pass --remote <DIR> and/or --remote-config <FILE>"
+                );
+            }
+            // `--remote` alone means a plain local SQLite + local-CAS workspace at
+            // that directory; `--remote-config` selects the backends, rooting any
+            // defaulted path at `--remote` (or the config file's own directory).
+            let remote_root = remote.clone().unwrap_or_else(|| {
+                remote_config
+                    .as_ref()
+                    .and_then(|p| p.parent().map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+            let remote_cfg = match &remote_config {
+                Some(path) => config::Config::load(path)?,
+                None => config::Config::default(),
+            };
+            std::fs::create_dir_all(&remote_root)?;
+            let remote_ws = remote_cfg.open(&remote_root).await?;
+
+            let branch = match branch {
+                Some(b) => b,
+                None => ws.current_branch().await?.ok_or_else(|| {
+                    anyhow::anyhow!("HEAD is detached; pass --branch to name the branch to resync")
+                })?,
+            };
+            let msg = message.unwrap_or_else(|| format!("resync {branch}"));
+            let report = ws.resync(&remote_ws, &branch, &author, &msg).await?;
+
+            match &report.outcome {
+                origofs_sdk::ResyncOutcome::UpToDate => {
+                    println!("{}: already up to date", report.branch)
+                }
+                origofs_sdk::ResyncOutcome::Pushed(h) => println!(
+                    "{}: pushed {} to the remote",
+                    report.branch,
+                    &h.to_hex()[..12]
+                ),
+                origofs_sdk::ResyncOutcome::FastForwarded(h) => {
+                    println!("{}: fast-forwarded to {}", report.branch, &h.to_hex()[..12])
+                }
+                origofs_sdk::ResyncOutcome::Merged(h) => println!(
+                    "{}: merged as {} and pushed",
+                    report.branch,
+                    &h.to_hex()[..12]
+                ),
+                origofs_sdk::ResyncOutcome::Conflicted => println!(
+                    "{}: merge stopped with {} conflict(s); the remote was not advanced — \
+                     resolve, commit, then resync again:",
+                    report.branch,
+                    report.conflicts.len()
+                ),
+            }
+            for c in &report.conflicts {
+                println!("  {} {}", c.kind, c.path);
+            }
+            println!(
+                "  fetched {} object(s), {} B ({} already present)",
+                report.fetched.objects, report.fetched.bytes, report.fetched.skipped
+            );
+            println!(
+                "  pushed  {} object(s), {} B ({} already present)",
+                report.pushed.objects, report.pushed.bytes, report.pushed.skipped
+            );
+            println!(
+                "  blame carried: {} in, {} out",
+                report.blame_fetched, report.blame_pushed
+            );
+            if report.cas_retries > 0 {
+                println!(
+                    "  retried {} time(s) after a concurrent remote push",
+                    report.cas_retries
+                );
+            }
+            if report.remote_tree_updated {
+                println!("  the remote working tree was rematerialized at the new head");
+            }
+            for p in &report.stale_live_paths {
+                println!("  warning: {p} has an open live document; its merged bytes may lag it");
             }
         }
         Cmd::Conflicts => {
@@ -860,8 +1026,25 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Serve { addr, auth_tokens } => {
+        Cmd::Serve {
+            addr,
+            auth_tokens,
+            metrics,
+        } => {
             let auth = build_api_auth(&ws, &addr, &auth_tokens).await?;
+            if metrics || env_flag("ORIGOFS_METRICS") {
+                init_metrics()?;
+                // `/metrics` gets the same auth treatment as `/readyz`: open. Its
+                // labels are closed sets (error code/class, matched route
+                // template), so it exposes no path, actor, or content — but say so
+                // rather than letting a public bind surprise anyone.
+                if !addr.ip().is_loopback() {
+                    eprintln!(
+                        "warning: exposing unauthenticated Prometheus metrics at http://{addr}/metrics (non-loopback bind, same posture as /readyz); restrict it at your proxy if scrapes shouldn't be public"
+                    );
+                }
+                println!("exposing Prometheus metrics at http://{addr}/metrics");
+            }
             tracing::info!(%addr, "starting origofs HTTP API");
             println!("serving origofs at http://{addr} (Ctrl-C to stop)");
             origofs_sdk::api::serve(std::sync::Arc::new(ws), addr, auth).await?;

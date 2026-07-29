@@ -68,4 +68,25 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub async fn set_branch(&self, branch: &str, hash: Hash) -> Result<()> {
         self.meta.set_ref(branch, &hash.to_hex()).await
     }
+
+    /// Compare-and-swap a branch onto `new`, expecting it to currently be at
+    /// `expect` (`None` meaning "must not exist"), and refresh the content-store
+    /// ref mirror on success. Returns whether the swap happened.
+    ///
+    /// The checked counterpart of [`set_branch`](Self::set_branch), for anything
+    /// that advances someone *else's* branch — notably [`crate::resync`] pushing a
+    /// reconciled head to a shared workspace. A `false` return means a concurrent
+    /// writer got there first; re-read [`branch_head`](Self::branch_head) and
+    /// retry rather than forcing the write.
+    pub async fn cas_branch(&self, branch: &str, expect: Option<Hash>, new: Hash) -> Result<bool> {
+        let expect = expect.map(|h| h.to_hex());
+        let swapped = self
+            .meta
+            .cas_ref(branch, expect.as_deref(), &new.to_hex())
+            .await?;
+        if swapped {
+            self.mirror_refs().await?;
+        }
+        Ok(swapped)
+    }
 }

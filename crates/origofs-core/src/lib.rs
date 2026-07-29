@@ -23,12 +23,14 @@ pub mod gc;
 pub mod interop;
 pub mod merge;
 pub mod metadata;
+pub mod metrics;
 pub mod migrations;
 pub mod objectgraph;
 pub mod objectstore;
 pub mod pack;
 pub mod postgres;
 pub mod recover;
+pub mod resync;
 pub mod sqlite;
 pub mod suggest;
 pub mod types;
@@ -42,8 +44,8 @@ pub use attribution::{
 pub use chunk::{AVG_CHUNK, ChunkRef, MAX_CHUNK, MIN_CHUNK, Manifest};
 pub use clock::{Clock, SystemClock};
 #[cfg(feature = "coedit")]
-pub use coedit::CoeditDoc;
-pub use collab::{EVENT_CHANNEL, Event, EventInit, PRESENCE_WINDOW_SECS, Presence};
+pub use coedit::{COEDIT_SIDECAR_DIR, CoeditDoc, coedit_sidecar_path};
+pub use collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, PRESENCE_WINDOW_SECS, Presence};
 pub use content::{ContentStore, LocalCasStore, MemStore, TieredStore, VerifyingStore};
 pub use corpus::{Passage, PassageOptions, Segmentation};
 pub use encrypt::EncryptedStore;
@@ -52,6 +54,7 @@ pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
 pub use gc::GcStats;
 pub use merge::{Conflict, MergeOutcome};
 pub use metadata::{MetaTxn, MetadataStore};
+pub use metrics::OpTimer;
 pub use migrations::latest_schema_version;
 pub use objectgraph::{
     Commit, CommitInfo, DiffEntry, DiffStatus, RefSnapshot, Tree, TreeEntry, TreeKind,
@@ -63,6 +66,11 @@ pub use pack::{DEFAULT_PACK_SIZE, PackStore};
 pub use postgres::{CoeditRelayNote, CoeditRelaySub};
 pub use postgres::{EventSubscription, PostgresMetadataStore};
 pub use recover::RebuildReport;
+pub use resync::{
+    IdentityMap, ResyncOutcome, ResyncReport, TransferStats, carry_blame, resync, transfer,
+};
 pub use sqlite::SqliteMetadataStore;
-pub use suggest::{Suggestion, SuggestionContent, SuggestionInit, SuggestionStatus, WriteOutcome};
-pub use types::{DirEntry, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit};
+pub use suggest::{
+    Suggestion, SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, WriteOutcome,
+};
+pub use types::{DirEntry, DirEntryAttr, DirPage, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit};

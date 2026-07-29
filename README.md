@@ -144,7 +144,29 @@ origofs --workspace "$WS" accept 1 --actor "$HUMAN"      # applies it, credited 
 
 `accept` lands the edit **attributed to the authoring agent** (so blame stays
 honest) and records the approver; it refuses if the file moved since the proposal
-(a stale base). `reject` discards it.
+(a stale base) — and retires that proposal as `superseded` rather than leaving it
+pending forever. A *successful* accept does the same to the other pending
+proposals on that path whose base it just moved. `reject` discards it.
+
+A proposal comes in two **kinds**, because "stale" means different things:
+
+| kind | base | proposal | accepting it |
+|---|---|---|---|
+| `bytes` (default) | the file's content hash | a whole file body | a conditional whole-file write — refused, and superseded, if the file moved |
+| `crdt` | the document's Yjs **state vector** | an opaque `encodeStateAsUpdate` blob | an `applyUpdate` **merge** |
+
+A CRDT merge is defined for *any* pair of states, so a `crdt` proposal against a
+[live co-edited](#live-co-editing-crdt) document is never stale: a colleague's
+concurrent edit elsewhere in the file neither invalidates it nor gets clobbered by
+it. `crdt` proposals are therefore never swept as superseded. Either way the
+review gate is the same — the merged text is credited to its original author, the
+approver is recorded, and nobody accepts their own proposal.
+
+```rust
+let doc = ws.open_coedit(ctx, "/notes.md").await?;
+doc.insert(ctx, 0, "a suggestion");
+let id = ws.suggest_coedit(ctx, "/notes.md", &doc, Some("reword the intro")).await?;
+```
 
 The queue is **actor-agnostic** — it's a change-request workflow between people
 just as much as an agent-proposal one. Whether an actor *must* propose (rather
@@ -161,7 +183,10 @@ Over **MCP**, an agent gets the whole loop as tools — `origofs_read`,
 `origofs_write`, `origofs_edit` (exact string search-and-replace), `origofs_suggest`,
 `origofs_suggestion_diff`, `origofs_accept`, `origofs_reject` — under the same
 server-side attribution and policy enforcement (and it can't accept its own
-proposals).
+proposals). `origofs_live` tells it whether a path has a live editing session open
+(so it knows its read may lag), and — on a server built with the `coedit` feature —
+`origofs_suggest_coedit` proposes into such a document as a CRDT merge instead of a
+file body, which is the right shape when a human has the file open.
 
 ## Know who did what
 
@@ -268,6 +293,36 @@ branch. From Rust, `PostgresMetadataStore::subscribe(after_seq, branch)` returns
 a blocking `LISTEN`-backed subscription whose `recv()` wakes on every committed
 change — a real push, not a poll.
 
+### Working offline, then rejoining
+
+SQLite mode is the offline mode: one portable file, full speed, no server. When
+you reconnect, `resync` reconciles what you did with what everyone else did —
+through the same three-way merge that powers `origofs merge`, not a separate
+code path:
+
+```bash
+origofs --workspace ./offline resync --remote ./shared --branch main -m "back online"
+```
+
+```text
+main: merged as 3a9f21c8b4d0 and pushed
+  fetched 41 object(s), 2203648 B (6 already present)
+  pushed  17 object(s), 856064 B (3 already present)
+  blame carried: 12 in, 5 out
+```
+
+It works between **different backends** — your offline SQLite + local content
+store against the team's Postgres + object storage — because that is the whole
+point. A conflicting merge records conflicts exactly as an ordinary merge does
+and leaves the shared branch untouched until you resolve them, and the shared
+branch only ever moves under a compare-and-swap, so a teammate who pushed while
+you were merging is never clobbered.
+
+Crucially, **your attribution comes with you**: the lines an agent wrote offline
+are still credited to that agent on the server afterwards, with its identity
+mapped into the shared workspace rather than blindly copied onto whichever actor
+happens to hold that id there.
+
 ### Live co-editing (CRDT)
 
 Opt-in (the `coedit` feature): humans, agents, and browser editors type into the
@@ -296,6 +351,26 @@ once (behind a load balancer), a Postgres `LISTEN/NOTIFY` relay fans each update
 out so every worker's replica converges. The co-editing endpoint is served as a
 WebSocket at `GET /coedit/{path}` by both the HTTP API and the FastAPI router.
 
+While a document is open, its stored bytes are the last **checkpoint** — real,
+fully attributed, but possibly behind what people are typing. origofs records that
+as a per-path **live marker**, and the rule is to *surface* the staleness, never to
+block on it:
+
+```rust
+let (bytes, live) = ws.read_live("/notes.md").await?;   // never blocks, never fails
+if live.is_some() { /* these bytes may lag an open editor */ }
+for doc in ws.live_paths().await? { … }                 // everything open right now
+```
+
+`read` keeps its contract unchanged and always answers; a reader is simply told
+whether the answer may be behind. Nothing forces a checkpoint on a reader's
+behalf — a read must not write, a checkpoint needs an actor to attribute it to,
+and the live document is in-process room state the engine cannot reach anyway. A
+caller that needs the freshest bytes (a release build, a `git` export) checkpoints
+the co-editing coordinator first, then reads; `origofs`'s own git export warns and
+lists any live path rather than exporting stale bytes silently. `end_coedit` clears
+the marker once the final checkpoint has landed.
+
 ### HTTP API
 
 Every operation is available over HTTP/JSON — files as raw bytes, everything else
@@ -311,14 +386,24 @@ curl "${AUTH[@]}" -X PUT --data-binary 'hello' http://127.0.0.1:8080/v1/files/no
 curl 'http://127.0.0.1:8080/v1/files/notes/a.txt'                    # → hello
 curl "${AUTH[@]}" -X POST -d '{"message":"first"}' http://127.0.0.1:8080/v1/commit
 curl 'http://127.0.0.1:8080/v1/events?since=0'                       # the change feed
+curl "${AUTH[@]}" -X POST -d '{"path":"/notes/a.txt"}' \
+     http://127.0.0.1:8080/v1/presence                               # heartbeat: I'm here
+curl 'http://127.0.0.1:8080/v1/presence'                             # who's active
 curl 'http://127.0.0.1:8080/readyz'                                  # backends reachable?
 ```
 
 The data surface is versioned under **`/v1`**; liveness (`/health`) and readiness
 (`/readyz`) stay at the root so an orchestrator probes them independent of the API
 version. Full routes cover files, dirs, stat, blame, rename, commit/log,
-branches/checkout, events, presence, actors, sessions, diff, suggestions, and the
-live co-editing WebSocket.
+branches/checkout, events, presence (`GET` to list, `POST` to heartbeat), actors,
+sessions, diff, suggestions, and the live co-editing WebSocket.
+
+`POST /v1/presence` takes an optional `{"path": …}` and nothing else: the actor
+and session come from the credential, so a browser client can keep itself visible
+in `GET /v1/presence` without an in-process SDK bridge, and cannot heartbeat
+anyone but itself. Presence is keyed by session, so a credential not bound to one
+gets a `400` telling it to create a session rather than having one minted per
+heartbeat.
 
 **Attribution never comes from the request.** A write is attributed to the actor
 the *credential* resolves to — the request never names an actor, so a client can't
@@ -327,6 +412,35 @@ instead of landing. `--auth-token TOKEN=ACTOR[:SESSION]` is the built-in bearer
 mapping; `serve` refuses to bind a non-loopback address without one. Errors come
 back as a machine-readable envelope (`{"error":{"code","message","retryable"}}`)
 and every response carries an `x-request-id`.
+
+### Metrics
+
+origofs is **emit-only** for observability: the library records `tracing` spans and
+numeric measurements but installs no subscriber and no exporter, so embedding it
+costs nothing and you wire up your own. The binary opts in — `--log-format json`
+for logs, `--metrics` for numbers:
+
+```bash
+origofs --workspace "$WS" serve --addr 127.0.0.1:8080 --metrics   # or ORIGOFS_METRICS=1
+curl 'http://127.0.0.1:8080/metrics'      # Prometheus text exposition
+```
+
+`/metrics` sits at the root next to `/health` and `/readyz`, and gets the same
+treatment as `/readyz`: no credential required. Nothing sensitive is exposed —
+every label is a closed set (an error `code`/`class`, a fixed operation name, a
+*matched route template* like `/v1/files/{*path}`), so no path, actor, hash, or
+file content ever reaches a scrape. Without `--metrics` nothing is installed and
+the route answers `503 metrics not enabled`.
+
+Series: `origofs_writes_total` / `origofs_write_bytes_total`, `origofs_reads_total` /
+`origofs_read_bytes_total`, `origofs_chunks_put_total` / `origofs_chunks_deduped_total`
+(dedup hit rate), `origofs_commits_total`, `origofs_gc_objects_deleted_total` /
+`origofs_gc_bytes_freed_total`, `origofs_errors_total{code,class}` (keyed off the
+same machine-readable code the API error envelope returns), and the
+`origofs_op_duration_seconds{op}` / `origofs_http_request_duration_seconds{method,path}`
+histograms. Rust embedders record into the same facade — enable
+`origofs-core`'s `metrics` feature and install any [`metrics`](https://docs.rs/metrics)
+recorder.
 
 ## Built to not lose or corrupt data
 
@@ -434,8 +548,7 @@ at ~1.3 GiB/s and reads reassemble at ~10 GiB/s; encryption at rest costs roughl
 
 The full design and rationale — the metadata/content split, the versioning model,
 attribution, and the failure-surface work — live in
-[`docs/DESIGN.md`](docs/DESIGN.md). origofs was inspired by
-[`tursodatabase/agentfs`](https://github.com/tursodatabase/agentfs).
+[`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## License
 

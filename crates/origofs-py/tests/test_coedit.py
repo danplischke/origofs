@@ -136,3 +136,123 @@ if __name__ == "__main__":
     test_coedit_websocket_closes_cleanly_on_malformed_frame()
     print("ok   closes_cleanly_on_malformed_frame")
     print("ALL OK")
+
+
+# --- the live/dirty marker + CRDT suggestions (issue #75 §3.2, §3.4) ---------
+
+
+def test_live_marker_is_set_on_open_and_cleared_on_last_leave():
+    # `open_coedit` marks the path live so a byte reader can tell "these bytes
+    # are the whole truth" from "these bytes may lag an open Y.Doc"; the router
+    # clears it after the last socket's final checkpoint. Reading a live path
+    # never blocks or fails -- `read_live` just reports the marker alongside the
+    # (genuinely checkpointed) bytes.
+    app, ws, alice, alice_s = _app_with_alice()
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+    _run(lambda: ws.write_as(ctx, "/doc.md", b"seed"))
+
+    assert _run(lambda: ws.live_doc("/doc.md")) is None
+    assert _run(lambda: ws.live_paths()) == []
+    assert _run(lambda: ws.read_live("/doc.md"))[1] is None
+
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            sock.receive_bytes()  # SyncStep1 greeting: the room is open
+
+            live = _run(lambda: ws.live_doc("/doc.md"))
+            assert live is not None, "open_coedit did not mark the path live"
+            assert live["path"] == "/doc.md"
+            assert live["actor_id"] == alice
+            assert live["session_id"] == alice_s
+            assert [d["path"] for d in _run(lambda: ws.live_paths())] == ["/doc.md"]
+
+            # A read of a live path is answered, not refused, not blocked -- the
+            # durable bytes come back *with* the marker saying they may lag.
+            data, mark = _run(lambda: ws.read_live("/doc.md"))
+            assert bytes(data) == b"seed"
+            assert mark is not None and mark["path"] == "/doc.md"
+
+        # After the last leave: the final checkpoint lands, then the marker goes.
+        for _ in range(60):
+            if _run(lambda: ws.live_doc("/doc.md")) is None:
+                break
+            time.sleep(0.05)
+
+    assert _run(lambda: ws.live_doc("/doc.md")) is None, "live marker outlived the room"
+    assert _run(lambda: ws.live_paths()) == []
+    # Clearing the flag is only about the flag: the bytes are still there.
+    data, mark = _run(lambda: ws.read_live("/doc.md"))
+    assert bytes(data) == b"seed" and mark is None
+
+
+def test_suggest_coedit_records_a_crdt_suggestion():
+    # A co-edited path is proposed against as a CRDT merge, not a file body: the
+    # review row's kind is `crdt`, and accepting it merges rather than clobbering.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(
+        os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    bob = _run(lambda: ws.create_human("bob", None))
+    bob_s = _run(lambda: ws.create_session(bob, "web"))
+    a_ctx = origofs.WriteCtx.session(alice, alice_s)
+    b_ctx = origofs.WriteCtx.session(bob, bob_s)
+
+    # Alice co-edits and checkpoints, so the document has a durable sidecar.
+    doc = _run(lambda: ws.open_coedit(a_ctx, "/doc.md"))
+    _run(lambda: doc.insert(a_ctx, 0, "base"))
+    _run(lambda: ws.checkpoint_coedit(a_ctx, "/doc.md", doc))
+    _run(lambda: ws.end_coedit("/doc.md"))
+
+    # Bob forks that document, types, and proposes the result as a CRDT merge.
+    fork = _run(lambda: ws.open_coedit(b_ctx, "/doc.md"))
+    _run(lambda: fork.insert(b_ctx, 4, " + bob"))
+    sid = _run(lambda: ws.suggest_coedit(b_ctx, "/doc.md", fork, "bob's take"))
+    _run(lambda: ws.end_coedit("/doc.md"))
+
+    s = _run(lambda: ws.get_suggestion(sid))
+    assert s["kind"] == "crdt", s
+    assert s["status"] == "pending" and s["actor_id"] == bob
+    # Both blobs live in the content store; the row holds only their addresses.
+    assert s["base_hash"] and s["proposed_hash"]
+
+    # A plain byte proposal still reports kind == "bytes", so a reviewer UI can
+    # tell the two apart (and knows which one a stale base can retire).
+    bsid = _run(lambda: ws.suggest(b_ctx, "/other.md", b"hi", None))
+    assert _run(lambda: ws.get_suggestion(bsid))["kind"] == "bytes"
+
+    # Accepting merges the update in, credited to its author (bob), not the
+    # approver (alice).
+    _run(lambda: ws.accept_suggestion(sid, a_ctx))
+    assert bytes(_run(lambda: ws.read("/doc.md"))) == b"base + bob"
+    assert _run(lambda: ws.get_suggestion(sid))["status"] == "accepted"
+    assert any(b["actor"]["id"] == bob for b in _run(lambda: ws.blame("/doc.md")))
+
+
+def test_suggest_coedit_update_takes_raw_yjs_blobs():
+    # The primitive a browser editor uses: it already holds encodeStateVector /
+    # encodeStateAsUpdate, so it proposes without the server materializing a doc.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(
+        os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    dan = _run(lambda: ws.create_human("dan", None))
+    dan_s = _run(lambda: ws.create_session(dan, "web"))
+    ctx = origofs.WriteCtx.session(dan, dan_s)
+
+    doc = _run(lambda: ws.open_coedit(ctx, "/doc.md"))
+    _run(lambda: doc.insert(ctx, 0, "hello"))
+    _run(lambda: ws.checkpoint_coedit(ctx, "/doc.md", doc))
+    _run(lambda: ws.end_coedit("/doc.md"))
+
+    fork = _run(lambda: ws.open_coedit(ctx, "/doc.md"))
+    base_sv = bytes(_run(lambda: fork.state_vector()))
+    _run(lambda: fork.insert(ctx, 5, " world"))
+    update = bytes(_run(lambda: fork.state_update()))
+    sid = _run(lambda: ws.suggest_coedit_update(ctx, "/doc.md", base_sv, update, None))
+    _run(lambda: ws.end_coedit("/doc.md"))
+    assert _run(lambda: ws.get_suggestion(sid))["kind"] == "crdt"
+
+    # An empty update proposes nothing and is refused at propose time, rather
+    # than becoming a review row nobody can apply.
+    with pytest.raises(ValueError):
+        _run(lambda: ws.suggest_coedit_update(ctx, "/doc.md", base_sv, b"", None))

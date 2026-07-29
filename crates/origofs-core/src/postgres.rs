@@ -11,11 +11,11 @@
 use crate::attribution::{
     Actor, ActorInit, ActorKind, EditOp, EditOpInit, ToolCallInit, WritePolicy,
 };
-use crate::collab::{EVENT_CHANNEL, Event, EventInit, Presence};
+use crate::collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, Presence};
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::{MetaTxn, MetadataStore};
 use crate::migrations::MIGRATIONS;
-use crate::suggest::{Suggestion, SuggestionInit, SuggestionStatus};
+use crate::suggest::{Suggestion, SuggestionInit, SuggestionKind, SuggestionStatus};
 use crate::types::{DirEntry, FileKind, Hash, Ino, Inode, InodeInit};
 use crate::util::now_secs;
 use async_trait::async_trait;
@@ -664,6 +664,28 @@ impl MetadataStore for PostgresMetadataStore {
         }
     }
 
+    async fn get_inodes(&self, inos: &[Ino]) -> Result<Vec<Inode>> {
+        if inos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let c = self.client().await?;
+        // `= ANY($1)` passes the whole list as one array parameter, so there is no
+        // per-statement parameter ceiling to chunk around (unlike SQLite) and the
+        // plan stays a single index probe per key.
+        let rows = c
+            .query(
+                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                 FROM inode WHERE ino = ANY($1)",
+                &[&inos],
+            )
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(row_to_inode(&r)?);
+        }
+        Ok(out)
+    }
+
     async fn create_inode(&self, init: InodeInit) -> Result<Ino> {
         let c = self.client().await?;
         let now = now_secs();
@@ -771,6 +793,65 @@ impl MetadataStore for PostgresMetadataStore {
             });
         }
         Ok(out)
+    }
+
+    async fn list_dir_page(
+        &self,
+        parent: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>> {
+        let c = self.client().await?;
+        let limit = limit as i64;
+        // Two statements rather than one with `($2::text IS NULL OR d.name > $2)`:
+        // the OR would stop the planner using the `(parent_ino, name)` primary-key
+        // index as a range scan and re-read the whole directory per page.
+        let rows = match after_name {
+            Some(after) => {
+                c.query(
+                    "SELECT d.name, d.ino, i.kind
+                     FROM dentry d JOIN inode i ON i.ino = d.ino
+                     WHERE d.parent_ino = $1 AND d.name > $2
+                     ORDER BY d.name LIMIT $3",
+                    &[&parent, &after, &limit],
+                )
+                .await?
+            }
+            None => {
+                c.query(
+                    "SELECT d.name, d.ino, i.kind
+                     FROM dentry d JOIN inode i ON i.ino = d.ino
+                     WHERE d.parent_ino = $1
+                     ORDER BY d.name LIMIT $2",
+                    &[&parent, &limit],
+                )
+                .await?
+            }
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let kind_s: String = r.get(2);
+            let kind = FileKind::parse(&kind_s)
+                .ok_or_else(|| OrigoFSError::Metadata(format!("unknown inode kind {kind_s:?}")))?;
+            out.push(DirEntry {
+                name: r.get(0),
+                ino: r.get(1),
+                kind,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT name FROM dentry WHERE parent_ino = $1 AND ino = $2
+                 ORDER BY name LIMIT 1",
+                &[&parent, &ino],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
     }
 
     async fn child_count(&self, parent: Ino) -> Result<usize> {
@@ -1368,13 +1449,79 @@ impl MetadataStore for PostgresMetadataStore {
         Ok(n)
     }
 
+    async fn set_live_doc(
+        &self,
+        path: &str,
+        session_id: Option<i64>,
+        actor_id: i64,
+        content_hash: Option<&str>,
+        at: i64,
+    ) -> Result<()> {
+        let c = self.client().await?;
+        // `since` is deliberately not in the DO UPDATE list: re-marking an
+        // already-live path (a second joiner, a checkpoint) keeps when it first
+        // went live.
+        c.execute(
+            "INSERT INTO live_doc(workspace_id, path, session_id, actor_id, content_hash, since)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (workspace_id, path) DO UPDATE SET
+                 session_id = EXCLUDED.session_id,
+                 actor_id = EXCLUDED.actor_id,
+                 content_hash = EXCLUDED.content_hash",
+            &[
+                &self.workspace_id,
+                &path,
+                &session_id,
+                &actor_id,
+                &content_hash,
+                &at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn get_live_doc(&self, path: &str) -> Result<Option<LiveDoc>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT path, session_id, actor_id, content_hash, since
+                 FROM live_doc WHERE workspace_id = $1 AND path = $2",
+                &[&self.workspace_id, &path],
+            )
+            .await?;
+        Ok(row.as_ref().map(row_to_live_doc))
+    }
+
+    async fn list_live_docs(&self) -> Result<Vec<LiveDoc>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT path, session_id, actor_id, content_hash, since
+                 FROM live_doc WHERE workspace_id = $1 ORDER BY path",
+                &[&self.workspace_id],
+            )
+            .await?;
+        Ok(rows.iter().map(row_to_live_doc).collect())
+    }
+
+    async fn clear_live_doc(&self, path: &str) -> Result<()> {
+        let c = self.client().await?;
+        c.execute(
+            "DELETE FROM live_doc WHERE workspace_id = $1 AND path = $2",
+            &[&self.workspace_id, &path],
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn create_suggestion(&self, init: SuggestionInit, ts: i64) -> Result<i64> {
         let c = self.client().await?;
         let row = c
             .query_one(
                 "INSERT INTO suggestion(workspace_id, actor_id, session_id, branch, path, base_hash,
-                     proposed_hash, summary, status, created_ts)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+                     proposed_hash, summary, status, created_ts, kind)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
                 &[
                     &self.workspace_id,
                     &init.actor_id,
@@ -1386,6 +1533,7 @@ impl MetadataStore for PostgresMetadataStore {
                     &init.summary,
                     &SuggestionStatus::Pending.as_str(),
                     &ts,
+                    &init.kind.as_str(),
                 ],
             )
             .await?;
@@ -1397,7 +1545,7 @@ impl MetadataStore for PostgresMetadataStore {
         let row = c
             .query_opt(
                 "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
-                     summary, status, created_ts, resolved_ts, resolved_by
+                     summary, status, created_ts, resolved_ts, resolved_by, kind
                  FROM suggestion WHERE id = $1 AND workspace_id = $2",
                 &[&id, &self.workspace_id],
             )
@@ -1415,7 +1563,7 @@ impl MetadataStore for PostgresMetadataStore {
         let rows = c
             .query(
                 "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
-                     summary, status, created_ts, resolved_ts, resolved_by
+                     summary, status, created_ts, resolved_ts, resolved_by, kind
                  FROM suggestion
                  WHERE workspace_id = $1 AND ($2::text IS NULL OR status = $2) AND ($3::text IS NULL OR path = $3)
                  ORDER BY id DESC",
@@ -1635,8 +1783,19 @@ impl Drop for PostgresTxn {
     }
 }
 
+fn row_to_live_doc(r: &Row) -> LiveDoc {
+    LiveDoc {
+        path: r.get(0),
+        session_id: r.get(1),
+        actor_id: r.get(2),
+        content_hash: r.get(3),
+        since: r.get(4),
+    }
+}
+
 fn row_to_suggestion(r: &Row) -> Suggestion {
     let status: String = r.get(8);
+    let kind: String = r.get(12);
     Suggestion {
         id: r.get(0),
         actor_id: r.get(1),
@@ -1646,6 +1805,7 @@ fn row_to_suggestion(r: &Row) -> Suggestion {
         base_hash: r.get(5),
         proposed_hash: r.get(6),
         summary: r.get(7),
+        kind: SuggestionKind::parse(&kind).unwrap_or_default(),
         status: SuggestionStatus::parse(&status).unwrap_or(SuggestionStatus::Pending),
         created_ts: r.get(9),
         resolved_ts: r.get(10),

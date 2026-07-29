@@ -121,11 +121,20 @@ async fn accept_refuses_a_stale_base() {
         matches!(err, origofs_sdk::OrigoFSError::Conflict(_)),
         "got {err:?}"
     );
-    // the file keeps the newer content; the suggestion stays pending
+    // The file keeps the newer content — a stale proposal is never applied.
     assert_eq!(&ws.read("/x.txt").await.unwrap()[..], b"moved on\n");
+    // And the proposal is *retired*, not left Pending forever (issue #75 §3.2):
+    // it is about a version of the file that no longer exists, and `Superseded`
+    // is the state that says so. Re-diff and re-suggest to propose again.
     assert_eq!(
         ws.get_suggestion(id).await.unwrap().unwrap().status,
-        SuggestionStatus::Pending
+        SuggestionStatus::Superseded
+    );
+    assert!(
+        ws.list_suggestions(Some(SuggestionStatus::Pending), None)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 

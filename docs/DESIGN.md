@@ -1,30 +1,30 @@
 # origofs — an agent-and-human filesystem with object storage, Postgres, Gitflow versioning, and edit attribution
 
-> Design & implementation plan. This document specifies a custom, ground-up build inspired by
-> [`tursodatabase/agentfs`](https://github.com/tursodatabase/agentfs), extended with the four capabilities
-> we need: (1) object storage / remote content, (2) a pluggable metadata database (Postgres), (3) first-class
-> Git-style versioning and merging, and (4) per-actor edit attribution in a shared human+agent workspace.
+> Design & implementation plan. This document specifies a custom, ground-up build around the four
+> capabilities we need: (1) object storage / remote content, (2) a pluggable metadata database (Postgres),
+> (3) first-class Git-style versioning and merging, and (4) per-actor edit attribution in a shared
+> human+agent workspace.
 
 ---
 
-## 1. Vision — and what we change vs. agentfs
+## 1. Vision — and the four ceilings we design past
 
-agentfs is a filesystem for AI agents that records every file edit and every tool call into **one SQLite/libSQL
-file**, giving auditability, reproducibility (snapshot = copy the `.db`), and portability (one file). Its data
-model is a POSIX inode/dentry table set (`fs_inode`, `fs_dentry`), file bytes stored as fixed **4 KB BLOB chunks
-inside the DB** (`fs_data`, *not* content-addressed, no dedup), plus an **overlayfs-style copy-on-write** (a
-read-only base + a writable delta with `fs_whiteout`/`fs_origin`), a `tool_calls` audit log, and a `kv_store`.
+The obvious way to build a filesystem for AI agents is to record every file edit and every tool call into
+**one SQLite file**: a POSIX inode/dentry table set, file bytes stored as fixed-size BLOB chunks in the DB,
+an overlayfs-style copy-on-write layer, and a tool-call audit log. That buys auditability, reproducibility
+(snapshot = copy the `.db`), and portability (one file), and it is the right shape for a single agent on one
+machine.
 
-That design has four ceilings we hit:
+It has four ceilings, and a shared human+agent workspace hits all of them:
 
-| agentfs limit | Why it blocks us | What we build instead |
+| Ceiling | Why it blocks us | What we build instead |
 |---|---|---|
 | Content is BLOBs locked in one SQLite file | Can't hold large files; can't share content across machines; the DB *is* the data | **Content-addressed object store** with pluggable backends incl. **S3 / remote FS**; DB holds only metadata + hashes |
-| Storage engine hardwired to SQLite/libSQL | No real multi-writer; "remote" = copy the whole DB | **Pluggable metadata store**, **Postgres-first** for true concurrency; SQLite kept as a solo/offline mode |
+| Storage engine hardwired to SQLite | No real multi-writer; "remote" = copy the whole DB | **Pluggable metadata store**, **Postgres-first** for true concurrency; SQLite kept as a solo/offline mode |
 | "Versioning" = overlay layers + `cp agent.db` | No named branches, no history DAG, no merge | **Opt-in Git-style commit DAG**, branches/refs, **three-way merge** — plus a **git-interop mode you can drive with the real `git` CLI / GitHub** |
-| `tool_calls` records *tool calls*, not *who edited which bytes* | Can't tell agent-vs-human authorship inside a file | **Per-actor, per-range attribution** with blame + provenance, in a shared workspace |
+| An audit log records *tool calls*, not *who edited which bytes* | Can't tell agent-vs-human authorship inside a file | **Per-actor, per-range attribution** with blame + provenance, in a shared workspace |
 
-The organizing insight: agentfs's copy-on-write overlay is *already* a branch. We make that literal by adopting
+The organizing insight: a copy-on-write overlay is *already* a branch. We make that literal by adopting
 git's object model as the source of truth, and we split "the bytes" (immutable, content-addressed, in object
 storage) from "the names and versions" (mutable metadata, in Postgres).
 
@@ -105,10 +105,10 @@ This resolves the POSIX-mutability-vs-immutability tension exactly the way git d
   - `tree` = a directory: entries of `(name, mode, kind, object_hash)`.
   - `commit` = `(root tree hash, parent hashes[], author actor, committer actor, message, timestamp)`.
 - **Working tree + index (mutable):** per `(workspace, branch, session-or-shared)`, the metadata DB holds live
-  `inode`/`dentry` rows — essentially agentfs's tables — but they are an **overlay whose base is a commit
+  `inode`/`dentry` rows — an ordinary POSIX table set — but they are an **overlay whose base is a commit
   tree**. Reads fall through to the base tree (then to content chunks); writes copy-up into the working tree.
-  This is precisely agentfs's overlay CoW, except the "read-only base" is now an immutable commit and the
-  "delta" is the git index.
+  This is exactly overlayfs-style CoW, except the "read-only base" is an immutable commit and the "delta" is
+  the git index.
 
 How mutable POSIX semantics coexist with immutable objects:
 
@@ -135,8 +135,8 @@ extension). Object key (blob/tree/commit) = BLAKE3 of the canonical-serialized o
 us dedup, integrity verification (re-hash on read), and immutability — which is exactly what makes remote
 object storage and cheap snapshots work.
 
-**Chunking — content-defined, not fixed.** agentfs's fixed 4 KB chunks re-chunk the entire tail of a file on any
-insertion. We use **FastCDC** content-defined chunking so an edit only rewrites the chunks it touches:
+**Chunking — content-defined, not fixed.** Fixed-size chunking (say 4 KB blocks) re-chunks the entire tail of a
+file on any insertion. We use **FastCDC** content-defined chunking so an edit only rewrites the chunks it touches:
 
 - target/avg chunk **~64 KB**, min **16 KB**, max **256 KB** (rolling Gear hash boundaries).
 - files `≤` one min-chunk (say `≤ 16 KB`) are stored **inline** as a single chunk (optionally in-DB) to avoid
@@ -208,8 +208,26 @@ trait MetadataStore {
 **advisory locks** (`pg_advisory_xact_lock(hash(inode))`) serialize hot-inode writes without blocking the rest;
 **`LISTEN/NOTIFY`** is a native change feed for `watch`/FUSE cache-invalidation; **logical replication** and
 read replicas scale reads and give geo-distribution. SQLite gives none of this (single writer), so it is our
-**solo/offline** mode — and it preserves agentfs's "one portable file" property for local dev and disconnected
+**solo/offline** mode — and it preserves the "one portable file" property for local dev and disconnected
 work; solo edits reconcile on reconnect via the same merge machinery (§4c).
+
+**Reconnect reconciliation is a real operation, not a hope** (`resync`). It works between two workspaces with
+*independent* metadata and content backends — the whole point being the heterogeneous pair (offline
+SQLite + local CAS ↔ shared Postgres + object storage). It fetches the remote head first so every ancestry
+question resolves locally, then fast-forwards, pushes, or runs the ordinary three-way merge, and pushes a
+clean result back under a **compare-and-swap** on the branch ref; a lost CAS re-runs the attempt against the
+new remote head rather than forcing. Object transfer walks the same edges GC marks, cuts at anything the
+destination already has, and writes children before parents — so an object's presence implies its whole
+closure and an interrupted transfer leaves a prefix, never a hole.
+
+The subtle part is **attribution**, which lives only in the metadata DB (§4d) and would otherwise be lost
+exactly when it matters. Because blame is keyed by *content hash*, it can travel with the content — but the
+actor and session ids cannot be copied verbatim, since ids are local to a store and a raw copy lands the
+offline agent's work on whoever happens to hold that id remotely. They are **remapped** through the
+destination's identity space (resolved by `auth_subject`, with a stable synthetic subject as the fallback so
+repeated resyncs converge on one actor instead of cloning it), and a blob naming an actor that cannot be
+resolved is skipped whole rather than partially mis-credited. What is deliberately *not* carried: the op-log,
+audit log, change feed, presence, suggestions, and locks.
 
 **Dialect differences handled behind the trait** (not leaked to callers):
 
@@ -330,7 +348,7 @@ edit_op(id PK, session_id, actor_id, tool_call_id NULL,   -- links to tool_calls
         byte_start, byte_len,          -- the range touched (byte granularity, natural for pwrite)
         pre_hash NULL, post_hash NULL, -- manifest before/after (for exact reconstruction)
         ts)
-tool_calls(...)   -- agentfs's audit log, retained; edit_op.tool_call_id references it
+tool_calls(...)   -- the agent tool-call audit log; edit_op.tool_call_id references it
 ```
 
 Every `pwrite`/`truncate` records the actor + byte range. This is the durable, event-sourced truth of *who
@@ -393,6 +411,33 @@ metadata round-trips are cut by caching dentries with `LISTEN/NOTIFY`-driven inv
 The boundary: **live co-editing is for open, editor-attached files; commit-time merge is for everything else.**
 Both funnel into one attribution store, so blame is uniform regardless of path.
 
+**The live/dirty marker (ruling).** While a path is promoted to a CRDT document, its durable bytes are the last
+**checkpoint** — a real, fully attributed state, but possibly behind the `Y.Doc` people are typing into. A
+workspace-scoped `live_doc` row records that a path is open (plus the file's content address as of the last
+checkpoint, which is how an *out-of-band* write to a live path is detected and reconciled rather than clobbered).
+The rule for every byte reader — `read`, the three-way merge, the git export, a UI — is: **surface the staleness;
+never block, fail, or force a checkpoint.** Three reasons, in order of finality: a read must not write; forcing a
+checkpoint needs an actor to attribute it to, and a reader has none; and the engine could not force one anyway,
+because the live document is in-process room state owned by a co-editing room, quite possibly on another worker —
+the metadata store knows a document is open, it does not *have* the document. The durable bytes are never
+garbage, so `read_live(path) -> (bytes, Option<LiveDoc>)` returning them with a "may lag" flag is the honest
+answer; erroring out because a colleague has an editor open is not. A caller that needs the freshest bytes asks
+the co-editing coordinator to checkpoint first (`Coordinator::checkpoint_all`), then reads. The marker is set on
+`open_coedit` and cleared by the coordinator only *after* the final checkpoint lands; a marker left behind by a
+crashed worker is the safe failure direction (a reader is told the bytes may lag when they do not), whereas a
+live document with no marker would mislead — which is why the marker is written before the document is handed
+out.
+
+**Presence.** Every surface heartbeats `(session, actor, current path)`; `POST /v1/presence` is the HTTP form, so
+a browser client appears in the presence list without an in-process SDK bridge. Like every mutating route the
+body names no actor — identity is the credential's. Presence is keyed by *session*, and a credential not bound to
+one is refused rather than having a session minted for it: minting per heartbeat would let a polling loop create
+unbounded session rows and turn presence into a directory of connections rather than of working sessions.
+
+**Agents propose into live documents too.** The MCP surface exposes the live flag (`origofs_live`) and, with the
+`coedit` feature, a CRDT-shaped proposal (`origofs_suggest_coedit`) — so an agent editing a file a human has open
+proposes a *merge* rather than a whole body. Identity stays server-side, as for every other tool call.
+
 **Change notifications.** `watch(path|branch)` subscribes via Postgres `LISTEN/NOTIFY` (or the in-proc bus in
 SQLite mode); FUSE uses these to invalidate its attr/dentry cache and to push inotify-style events.
 
@@ -433,6 +478,14 @@ reflog(id BIGINT PK, workspace_id, ref_name TEXT, old_hash BYTEA, new_hash BYTEA
 lock(workspace_id, path TEXT, actor_id BIGINT, acquired_at BIGINT, expires_at BIGINT,
      PRIMARY KEY(workspace_id, path));   -- LFS-style binary locks
 conflict(id BIGINT PK, workspace_id, merge_ref TEXT, path TEXT, state TEXT, detail JSONB);
+live_doc(workspace_id, path TEXT, session_id BIGINT, actor_id BIGINT, content_hash TEXT,
+         since BIGINT, PRIMARY KEY(workspace_id, path));  -- an open CRDT doc; bytes may lag (§4e)
+
+-- propose-and-review (bytes live in the content store; only addresses here)
+suggestion(id BIGINT PK, workspace_id, actor_id BIGINT, session_id BIGINT, branch TEXT, path TEXT,
+           base_hash TEXT, proposed_hash TEXT, summary TEXT, kind TEXT,   -- 'bytes' | 'crdt'
+           status TEXT,                                                   -- pending|accepted|rejected|superseded
+           created_ts BIGINT, resolved_ts BIGINT, resolved_by BIGINT);
 
 -- attribution + audit ----------------------------------------------------
 edit_op(id BIGINT PK, session_id BIGINT, actor_id BIGINT, tool_call_id BIGINT NULL,
@@ -495,7 +548,27 @@ human-or-agent + which session + which tool call + which commit introduced it.
 **Human + agent co-edit the same file, live:** file promoted to a CRDT doc; Alice types in her editor, the agent
 inserts via the editor API; the CRDT merges character ops with per-span authorship; every ~N ops it checkpoints
 → new manifest + `edit_op`s split by author span → blame index shows interleaved `human:alice` / `agent:claude`
-ranges with zero manual bookkeeping.
+ranges with zero manual bookkeeping. The path carries a `live_doc` marker for the duration, so a byte reader
+elsewhere can tell "these bytes are the whole truth" from "these bytes are the last checkpoint" (§4e).
+
+**Propose and review an edit (the two kinds):** a proposal stores its bytes in the content store immediately and
+leaves the working tree alone; the review row (`suggestion`) holds only addresses. Its `kind` decides what the
+addresses *mean* and what accepting does:
+
+- `bytes` — `base_hash` is the file's content address when the proposal was computed and `proposed_hash` a whole
+  file body. Accept is a **conditional write**: a null-safe compare-and-set on the current content
+  (`set_content_if`). If the file moved on, applying it would silently discard the intervening change, so it is
+  refused (`Conflict`) *and* the row is retired as `Superseded` — a proposal that can never be applied does not
+  belong in the pending queue. A successful accept likewise sweeps the other pending `bytes` proposals on that
+  path whose base it just moved.
+- `crdt` — `base_hash` addresses the document's Yjs **state vector** and `proposed_hash` an opaque
+  `encodeStateAsUpdate` blob. Accept is `applyUpdate` + checkpoint, not a whole-file write. A CRDT merge is
+  defined for *any* pair of states, so a disjoint concurrent edit is not a conflict; the byte staleness guard
+  does not apply and `crdt` rows are never swept as superseded. The update is applied through `apply_update_as`,
+  so text it introduces is re-stamped server-side with the suggestion's real author, whatever the blob claims.
+
+Either kind lands **attributed to the original author** with the approver recorded, and the review gate
+(author ≠ approver) is the same for both.
 
 ---
 
@@ -544,8 +617,10 @@ each write is, and a storage engine that agents point at untrusted code and untr
 - **Torn multi-step mutations:** operations that touch several rows run inside a single `MetaTxn` that rolls back
   on drop, so a crash or mid-way error can't leave a half-applied state. Working-tree replacement
   (checkout/merge/recover) swaps the tree atomically (`truncate_tree` + `replace_working_tree`); `accept` lands a
-  suggestion only if the author's base still matches (null-safe compare-and-set, `set_content_if`, so a stale
-  proposal is rejected rather than silently clobbering a concurrent edit); ref-mirror generations advance with an
+  **byte** suggestion only if the author's base still matches (null-safe compare-and-set, `set_content_if`, so a
+  stale proposal is rejected rather than silently clobbering a concurrent edit — and is then retired as
+  `Superseded` instead of lingering pending forever, as are the other pending byte proposals a successful accept
+  strands; a `crdt` suggestion merges and so is never stale, §6); ref-mirror generations advance with an
   atomic `bump_counter` instead of a read-modify-write.
 - **Encryption key & nonce discipline:** convergent encryption keeps dedup (identical plaintext → identical
   ciphertext, which the shared content address already revealed — a documented, accepted trade-off), but the AEAD
@@ -559,12 +634,24 @@ each write is, and a storage engine that agents point at untrusted code and untr
   **bubblewrap** in a fresh tmpfs root that hides the host filesystem (`meta.db`/`cas`, home, credentials) — a
   real *filesystem* boundary for untrusted code. Network egress is left shared on purpose (agents need it), so it
   is deliberately not a network boundary; the delta is captured and imported the same either way.
+- **Observability without hijacking the host process (M9):** both halves of observability are **emit-only** in
+  the library. `origofs-core`/`origofs-sdk` emit `tracing` spans/events and record metrics through the
+  [`metrics`](https://docs.rs/metrics) facade (`origofs-core::metrics`, behind an opt-in `metrics` feature that
+  compiles to nothing when off), but install **no subscriber, no exporter, and no listener** — a library that
+  only emits is a no-op until a binary opts in, so an embedder pays nothing and keeps their own telemetry stack.
+  The `origofs` binary is what opts in: `init_tracing` for logs (`--log-format json`, stderr) and `init_metrics`
+  for numbers (`serve --metrics` / `ORIGOFS_METRICS=1`), which installs a Prometheus recorder and hands its
+  renderer to the HTTP surface. Metrics are then scraped from `GET /metrics` on the API's own listener — root
+  level beside `/health` and `/readyz`, and unauthenticated like them, which is safe here because every label is
+  a closed set (error `code`/`class` from `OrigoFSError`, a fixed operation name, a *matched route template*)
+  and never a path, actor, hash, or content. Names follow Prometheus conventions (`origofs_` namespace, `_total`
+  counters, base units `_bytes`/`_seconds`).
 
 ---
 
 ## 8. Recommended tech stack
 
-- **Language: Rust** for the core (matches agentfs, best-in-class FUSE via `fuser`, zero-cost async, strong
+- **Language: Rust** for the core (best-in-class FUSE via `fuser`, zero-cost async, strong
   S3/Postgres crates, and it compiles to the native mount + the SDK). SDKs for **TypeScript/Python** via
   `napi-rs`/`pyo3` bindings over the same core. *Alternative:* Go (simpler concurrency, good FUSE via
   `bazil.org/fuse`) if team familiarity dominates — but we lose the single-core-shared-with-bindings advantage.
@@ -609,18 +696,3 @@ Each milestone is independently demoable; M1+M2+M3 in either order after M0.
 - **git-mode fidelity** — SHA-256 git objects + LFS pointers vs. what GitHub/hosts currently accept; confirm host
   support and the remote-helper/LFS bridge performance on very large histories, and whether a workspace should be
   able to switch `native`↔`git` in place or only export/import.
-
-## 11. Mapping: agentfs → origofs
-
-| agentfs | origofs |
-|---|---|
-| `fs_inode` / `fs_dentry` | `inode` / `dentry` — but a **mutable working-tree overlay over a base commit** |
-| `fs_data` (4 KB BLOB chunks in DB) | **content store**: FastCDC chunks, BLAKE3-addressed, in S3/local/inline; DB holds only `manifest_hash` |
-| `fs_whiteout` / `fs_origin` (overlay CoW) | same overlay idea, but base = an **immutable commit tree** |
-| snapshot = `cp agent.db` | **opt-in versioning**: `off` / `native` (chunked commit DAG) / `git`; branches = `ref` |
-| git not involved | **opt-in `git` mode**: SHA-256 git-compatible objects, `git-remote-origofs`, git-LFS bridge — usable with the real `git` CLI / GitHub |
-| `agentfs sync` (libSQL whole-DB) | content is content-addressed & remote by default; metadata via Postgres/replicas; branches merge |
-| `tool_calls` (audit) | retained `tool_calls` **+** `edit_op` op-log **+** `blame` index tying edits to **actors** |
-| SQLite/libSQL only | `MetadataStore` trait: **Postgres** (multi-writer) or SQLite (solo/offline) |
-| FUSE/NFS/MCP | same surfaces, each resolving an **actor+session** for attribution |
-| single-user | **shared human+agent workspace** with per-range human-vs-agent differentiation |

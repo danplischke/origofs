@@ -145,7 +145,7 @@ pub struct Actor {
     pub write_policy: WritePolicy,
 }
 
-/// A recorded tool-call audit entry (agentfs-style), optionally linked from edits.
+/// A recorded tool-call audit entry, optionally linked from edits.
 #[derive(Clone, Debug, Default)]
 pub struct ToolCallInit {
     pub session_id: Option<i64>,
