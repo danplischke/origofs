@@ -202,23 +202,74 @@ step, a schema-diffing tool, or provisioning a fresh database before the
 engine ever touches it. `origofs.db.models` declares every table from
 `crates/origofs-core/src/migrations.rs` as SQLAlchemy models (the single
 source of truth `origofs.db`'s packaged migrations autogenerate against), so
-a database Alembic creates is fully interoperable with one the engine creates:
+a database Alembic creates is fully interoperable with one the engine creates.
+Needs the `db` extra (`pip install "origofs[db]"`) plus a driver for your
+backend (Postgres: `psycopg[binary]`; SQLite's `sqlite3` is stdlib).
+
+**Provision or upgrade a database** — run this once (a deploy step, an init
+container, or before the first `origofs.Workspace.open_*`) and the workspace
+API opens straight into an already-migrated store:
 
 ```python
 import origofs.db
 
-origofs.db.upgrade("sqlite:///meta.db")                        # or set ORIGOFS_DATABASE_URL
-origofs.db.upgrade("postgresql+psycopg://user@host/db")
+origofs.db.upgrade("sqlite:///meta.db")                          # dev/solo
+origofs.db.upgrade("postgresql+psycopg://user:pass@host/dbname")  # multi-writer/production
+
+# ...or skip passing a URL at all and set it once in the environment:
+#   os.environ["ORIGOFS_DATABASE_URL"] = "postgresql+psycopg://…"
+#   origofs.db.upgrade()
 ```
 
-`origofs.db.downgrade(url, revision="-1")` steps back; `get_alembic_config(url)`
-hands you the `alembic.config.Config` directly for anything else (`alembic.command.current`,
-`.history`, …). Needs the `db` extra (`pip install "origofs[db]"`) plus a driver
-for your backend (Postgres: `psycopg[binary]`; SQLite's `sqlite3` is stdlib).
+**Roll back or inspect history** — `get_alembic_config` hands you a real
+`alembic.config.Config` for anything beyond upgrade/downgrade:
 
-Developing origofs itself — after editing `python/origofs/db/models.py` — draft
-the next migration from the `origofs-py` crate root: `alembic revision --autogenerate
--m "…"` (uses the `alembic.ini` there, not `origofs.db`'s programmatic config).
+```python
+origofs.db.downgrade("sqlite:///meta.db")           # one revision back
+origofs.db.downgrade("sqlite:///meta.db", "base")   # drop every origofs table
+
+from alembic import command
+cfg = origofs.db.get_alembic_config("sqlite:///meta.db")
+command.current(cfg)   # the revision(s) currently applied
+command.history(cfg)   # the full revision list
+```
+
+**Two migration ledgers, one schema.** Alembic tracks its own progress in
+`alembic_version`; the engine tracks its own in `schema_meta`
+(`crates/origofs-core/src/migrations.rs`). The packaged initial revision
+creates every table *and* stamps `schema_meta` through the latest version the
+engine knows about, so both ledgers agree from the moment Alembic creates the
+database — the engine never re-runs (or, for the destructive V11/V13 table
+rebuilds, re-applies) a migration Alembic already handled. Whichever tool
+creates the database, `ws.schema_version()` reports `up_to_date: True`.
+
+**Query the schema directly** — every table is a plain SQLAlchemy model
+(`origofs.db.Actor`, `.EditOp`, `.BlobBlame`, `.Suggestion`, `.FsEvent`, …),
+handy for read-only reporting/analytics queries that sit alongside the async
+workspace API:
+
+```python
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session as DbSession   # origofs.db.Session is the *table* model
+from origofs.db import Actor, EditOp
+
+engine = create_engine("sqlite:///meta.db")
+with DbSession(engine) as db:
+    edits_by_actor = db.execute(
+        select(Actor.display_name, EditOp.path)
+        .join(EditOp, EditOp.actor_id == Actor.id)
+    ).all()
+```
+
+**Developing origofs itself** — after editing `python/origofs/db/models.py`,
+draft the next migration from the `origofs-py` crate root (uses the
+`alembic.ini` there, not `origofs.db`'s programmatic config):
+
+```bash
+cd crates/origofs-py
+alembic -x db_url=sqlite:///./dev.db revision --autogenerate -m "…"
+alembic -x db_url=sqlite:///./dev.db upgrade head
+```
 
 ## Examples
 
