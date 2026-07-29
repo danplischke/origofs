@@ -1,54 +1,69 @@
+<div align="center">
+
 # origofs
 
-**A filesystem where humans and AI agents share the same files — and you always
-know who changed what.**
+**A filesystem where humans and AI agents share the same files —
+and every byte knows who wrote it.**
 
-origofs is content-addressed storage with a real metadata database (Postgres or
-SQLite), opt-in Git-style versioning, and per-actor attribution built in. Point
-your agents at it and let them work: every edit is recorded against the actor
-that made it, an agent's whole session can be reverted in one call, and the bytes
-you read back are cryptographically guaranteed to be the bytes that were written.
+[![CI](https://github.com/danplischke/origofs/actions/workflows/ci.yml/badge.svg)](https://github.com/danplischke/origofs/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![rust](https://img.shields.io/badge/rust-1.88%2B-dea584)](#install)
+[![design](https://img.shields.io/badge/docs-DESIGN.md-informational)](docs/DESIGN.md)
 
-```bash
-# an agent works in a fast native mount; its edits stream into origofs, attributed
-origofs --workspace ./ws overlay --actor "$AGENT" -- claude -p "refactor the parser"
+[**Quickstart**](#quickstart) · [**Agents**](#working-with-agents) ·
+[**Attribution**](#know-who-did-what) · [**Versioning**](#versioning) ·
+[**Teams**](#running-for-a-team) · [**Backends**](#storage-backends) ·
+[**Design**](docs/DESIGN.md)
 
-# afterwards, see exactly which lines the agent wrote
-origofs --workspace ./ws blame /src/parser.rs
-```
-
-Don't like the result? One SDK call undoes everything that agent did in a
-session — across every file it touched — and leaves human edits untouched.
+</div>
 
 ---
 
+Point an agent at your files and let it work. Then ask what it did — not the
+chat log, not a diff you hope is complete. Ask the **filesystem**:
+
+```bash
+origofs --workspace ./ws init
+AGENT=$(origofs --workspace ./ws actor claude --agent --model claude-opus-4-8)
+
+# the agent edits in a fast native mount; every change streams into origofs, attributed, live
+origofs --workspace ./ws overlay --actor "$AGENT" -- claude -p "refactor the parser"
+
+# who wrote which lines?
+origofs --workspace ./ws blame /src/parser.rs
+```
+
+```text
+   1-40    human:dan
+  41-58    agent:claude      ← the agent's work, down to the line
+  59-72    human:dan
+```
+
+Don't like the result? `ws.revert_session(agent, session)` undoes **everything
+that agent did in that session** — across every file it touched — and leaves the
+human edits standing.
+
+origofs is content-addressed storage with a real metadata database (Postgres or
+SQLite), opt-in Git-style versioning, and per-actor attribution recorded in the
+write path itself. It isn't a wrapper over `git` or a VFS shim — it's a storage
+engine, exposed through a CLI, a Rust SDK, Python bindings, an HTTP API, MCP, and
+real filesystem mounts (FUSE/NFS).
+
+> **Pre-1.0 and moving fast.** Build from source ([Install](#install)); the
+> `overlay` and `sandbox` commands need Linux (unprivileged overlayfs).
+
 ## Why origofs
 
-When people and AI agents edit the same workspace, a plain filesystem stops being
-enough. You need to answer questions a directory of files can't:
+Six questions a directory of files can't answer:
 
-- **Who wrote this line — a person or an agent?** Every attributed write records
-  the actor, session, and tool-call behind it. `origofs blame` reports it per line;
-  the record survives commits, branch switches, and reformatting.
-- **Can I undo just the agent's work?** Revert an agent's entire session across
-  every file it touched, keeping everyone else's edits intact.
-- **Can I review before it lands?** Agents can *propose* edits into a review
-  queue instead of applying them; a human accepts (credited to the agent) or
-  rejects. An actor can even be made *propose-only*, so its writes are gated into
-  that queue automatically.
-- **Can people and agents edit together, live?** Opt-in CRDT co-editing lets
-  humans, agents, and browser editors type into the same document at once and
-  converge — with every character still attributed to whoever wrote it.
-- **Will it hold up for a team?** The Postgres backend is built for many
-  concurrent writers — humans and agents — sharing one workspace, with a live
-  change feed and presence so every client sees edits as they happen.
-- **Can I trust what I read back?** Content is BLAKE3-addressed and verified on
-  every read: silent bit-rot or tampering in object storage surfaces as an error
-  instead of being served as if it were real.
-
-origofs isn't a wrapper over `git` or a VFS shim — it's a storage engine with these
-properties at its core, exposed through a CLI, a Rust SDK, Python bindings, an
-HTTP API, and real filesystem mounts (FUSE/NFS).
+|  |  |
+|---|---|
+| **Who wrote this line — a person or an agent?** | Every attributed write records the actor, session, and tool-call behind it. `origofs blame` reports it per line; the record survives commits, branch switches, and reformatting. |
+| **Can I undo just the agent's work?** | Revert an agent's entire session across every file it touched, keeping everyone else's edits intact. |
+| **Can I review before it lands?** | Agents can *propose* edits into a review queue instead of applying them; a human accepts (credited to the agent) or rejects. An actor can even be made *propose-only*, so its writes are gated into that queue automatically. |
+| **Can people and agents edit together, live?** | Opt-in CRDT co-editing lets humans, agents, and browser editors type into the same document at once and converge — with every character still attributed to whoever wrote it. |
+| **Will it hold up for a team?** | The Postgres backend is built for many concurrent writers — humans and agents — sharing one workspace, with a live change feed and presence so every client sees edits as they happen. |
+| **Can I trust what I read back?** | Content is BLAKE3-addressed and verified on every read: silent bit-rot or tampering in object storage surfaces as an error instead of being served as if it were real. |
 
 ## Install
 
@@ -289,16 +304,29 @@ same path as every other surface, so they land on the change feed and carry
 attribution:
 
 ```bash
-origofs --workspace "$WS" serve --addr 127.0.0.1:8080 &
-curl -X PUT --data-binary 'hello' http://127.0.0.1:8080/files/notes/a.txt
-curl 'http://127.0.0.1:8080/files/notes/a.txt'                   # → hello
-curl -X POST -d '{"author":"dan","message":"first"}' http://127.0.0.1:8080/commit
-curl 'http://127.0.0.1:8080/events?since=0'                      # the change feed
+origofs --workspace "$WS" serve --addr 127.0.0.1:8080 --auth-token "$TOKEN=$ACTOR" &
+AUTH=(-H "Authorization: Bearer $TOKEN")
+
+curl "${AUTH[@]}" -X PUT --data-binary 'hello' http://127.0.0.1:8080/v1/files/notes/a.txt
+curl 'http://127.0.0.1:8080/v1/files/notes/a.txt'                    # → hello
+curl "${AUTH[@]}" -X POST -d '{"message":"first"}' http://127.0.0.1:8080/v1/commit
+curl 'http://127.0.0.1:8080/v1/events?since=0'                       # the change feed
+curl 'http://127.0.0.1:8080/readyz'                                  # backends reachable?
 ```
 
-An attributed write is `PUT /files/x?actor=<id>&session=<id>`. Full routes cover
-files, dirs, stat, blame, rename, commit/log, branches/checkout, events,
-presence, actors, sessions, diff, suggestions, and the live co-editing WebSocket.
+The data surface is versioned under **`/v1`**; liveness (`/health`) and readiness
+(`/readyz`) stay at the root so an orchestrator probes them independent of the API
+version. Full routes cover files, dirs, stat, blame, rename, commit/log,
+branches/checkout, events, presence, actors, sessions, diff, suggestions, and the
+live co-editing WebSocket.
+
+**Attribution never comes from the request.** A write is attributed to the actor
+the *credential* resolves to — the request never names an actor, so a client can't
+forge blame, and a propose-only actor's `PUT` is routed into the review queue
+instead of landing. `--auth-token TOKEN=ACTOR[:SESSION]` is the built-in bearer
+mapping; `serve` refuses to bind a non-loopback address without one. Errors come
+back as a machine-readable envelope (`{"error":{"code","message","retryable"}}`)
+and every response carries an `x-request-id`.
 
 ## Built to not lose or corrupt data
 
