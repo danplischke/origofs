@@ -5,3 +5,6 @@ Cargo.lock.orig
 *.db-wal
 *.db-shm
 .origofs-cas/
+# cargo-mutants writes its per-run reports here (see .github/workflows/mutants.yml)
+mutants.out/
+mutants.out.old/

@@ -367,3 +367,67 @@ async fn bump_counter_is_atomic_and_distinct() {
     got.sort();
     assert_eq!(got, [3, 4, 5]);
 }
+
+// A6 (issue #70): path components are opaque, byte-exact UTF-8. The engine does
+// NOT Unicode-normalize or case-fold names, so the NFC and NFD encodings of the
+// same grapheme are two DISTINCT files, and case variants are distinct too. This
+// pins the contract — a future change that silently normalized names would alias
+// files and corrupt dedup/attribution keyed on the exact name — and documents the
+// boundary with case-insensitive host mounts (e.g. macOS/APFS default, some FUSE
+// layers), where it is the OS, not the engine, that may collapse these.
+#[tokio::test]
+async fn names_are_byte_exact_no_unicode_normalization_or_casefold() {
+    let fs = fixture().await;
+
+    // "café.txt" in NFC (U+00E9) vs NFD ("e" + U+0301 combining acute): same
+    // rendered glyph, different bytes.
+    let nfc = "/caf\u{00e9}.txt";
+    let nfd = "/cafe\u{0301}.txt";
+    assert_ne!(
+        nfc.as_bytes(),
+        nfd.as_bytes(),
+        "setup: NFC and NFD forms must differ at the byte level"
+    );
+
+    fs.write(nfc, b"nfc-body").await.unwrap();
+    fs.write(nfd, b"nfd-body").await.unwrap();
+
+    // Two distinct files, each with its own content — no aliasing/normalization.
+    assert_eq!(&fs.read(nfc).await.unwrap()[..], b"nfc-body");
+    assert_eq!(&fs.read(nfd).await.unwrap()[..], b"nfd-body");
+    let nfc_ino = fs
+        .vfs_lookup(INO_ROOT, "caf\u{00e9}.txt")
+        .await
+        .unwrap()
+        .unwrap()
+        .ino;
+    let nfd_ino = fs
+        .vfs_lookup(INO_ROOT, "cafe\u{0301}.txt")
+        .await
+        .unwrap()
+        .unwrap()
+        .ino;
+    assert_ne!(
+        nfc_ino, nfd_ino,
+        "NFC and NFD names must be separate inodes"
+    );
+
+    // Case is significant: "README" and "readme" are different files.
+    fs.write("/README", b"upper").await.unwrap();
+    fs.write("/readme", b"lower").await.unwrap();
+    assert_eq!(&fs.read("/README").await.unwrap()[..], b"upper");
+    assert_eq!(&fs.read("/readme").await.unwrap()[..], b"lower");
+    let upper = fs
+        .vfs_lookup(INO_ROOT, "README")
+        .await
+        .unwrap()
+        .unwrap()
+        .ino;
+    let lower = fs
+        .vfs_lookup(INO_ROOT, "readme")
+        .await
+        .unwrap()
+        .unwrap()
+        .ino;
+    assert_ne!(upper, lower, "case variants must be separate inodes");
+}

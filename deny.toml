@@ -1,0 +1,59 @@
+# Supply-chain policy for `cargo deny` (B4, #70): RUSTSEC advisories, a license
+# allow-list, and source pinning as a CI gate. Matters here given at-rest
+# encryption and a large transitive dep tree. Run: `cargo deny check`.
+
+[graph]
+# Evaluate the whole dependency graph, including the default-off surface
+# features (api/mcp/sandbox/git/fuse/nfs), coedit, and object-store backends —
+# otherwise optional deps escape the gate.
+all-features = true
+
+[advisories]
+# Only flag unmaintained crates we depend on directly; deep-transitive ones we
+# can't control (rustls-pemfile via object_store, smallstr via yrs) are noise.
+unmaintained = "workspace"
+# Documented, revisitable waivers. Both are the same quick-xml DoS class, pulled
+# transitively by object_store to parse S3/GCS XML list responses. No patched
+# quick-xml is published (0.38.4 is latest; object_store pins ^0.38), and the
+# path is only reachable from a malicious object-store endpoint — a trusted
+# backend in origofs's threat model. Drop these once a fix ships upstream.
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic-runtime DoS; transitive via object_store, no fixed release available yet, DoS-only from a trusted backend." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml namespace-allocation DoS (same crate/path as RUSTSEC-2026-0194); no fixed release available yet." },
+]
+
+[licenses]
+# Every license present in the tree today. All are permissive; note that
+# `r-efi` (a UEFI-only transitive dep) is `MIT OR Apache-2.0 OR
+# LGPL-2.1-or-later`, so allowing MIT/Apache satisfies it without allowing LGPL.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# A large tree legitimately carries duplicate versions, so surface them without
+# failing the build; genuine bans/wildcards are the enforced part.
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path deps (the workspace crates) may use a `*`-style version.
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io is allowed; a crate pulled from an unknown registry or a git
+# URL is a supply-chain red flag and fails the gate.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

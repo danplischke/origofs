@@ -640,3 +640,92 @@ async fn write_policy_gates_direct_writes_into_suggestions() {
     let blame = fs.blame("/doc").await.unwrap();
     assert!(blame.iter().all(|r| r.actor.id == ext));
 }
+
+// A9 (issue #70): `revert_session` must remove EXACTLY the lines an actor
+// authored in a session and leave everyone else's intact — for arbitrary
+// interleavings, not just the single hand-picked append covered above. This is a
+// randomized model test: it builds a random interleaving of human and agent
+// line-insertions (every line globally unique, so the line-diff attributes each
+// insertion unambiguously) while tracking a ground-truth `is_agent` owner per
+// line. After reverting the agent's session, both the file content and its blame
+// must equal exactly the human-authored lines, in original order. A regression
+// that over-reverts (drops a human line) or under-reverts (keeps an agent line)
+// fails on some seed.
+#[tokio::test]
+async fn revert_session_removes_exactly_that_actors_lines_under_interleaving() {
+    // xorshift64* — a tiny deterministic PRNG so failures reproduce by seed.
+    fn rng_next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn render(lines: &[(String, bool)]) -> Vec<u8> {
+        let mut s = String::new();
+        for (t, _) in lines {
+            s.push_str(t);
+            s.push('\n');
+        }
+        s.into_bytes()
+    }
+
+    for seed in 0..64u64 {
+        let fs = fixture().await;
+        let human = fs.create_human("h", None).await.unwrap();
+        let agent = fs.create_agent("a", "m", Some(human)).await.unwrap();
+        let sh = fs.create_session(human, None).await.unwrap();
+        let sa = fs.create_session(agent, None).await.unwrap();
+
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut lines: Vec<(String, bool)> = Vec::new(); // (text, is_agent)
+        let mut next = 0u64;
+
+        // Seed with one human line so the file exists and is never empty.
+        lines.push((format!("L{next}-human"), false));
+        next += 1;
+        fs.write_as(WriteCtx::session(human, sh), "/doc", &render(&lines))
+            .await
+            .unwrap();
+
+        // A random number of insertions, each a full-file rewrite that splices in
+        // one new unique line attributed to whoever "wrote" it.
+        let ops = 5 + (rng_next(&mut state) % 12) as usize;
+        for _ in 0..ops {
+            let is_agent = rng_next(&mut state) & 1 == 0;
+            let tag = if is_agent { "agent" } else { "human" };
+            let text = format!("L{next}-{tag}");
+            next += 1;
+            let pos = (rng_next(&mut state) as usize) % (lines.len() + 1);
+            lines.insert(pos, (text, is_agent));
+            let ctx = if is_agent {
+                WriteCtx::session(agent, sa)
+            } else {
+                WriteCtx::session(human, sh)
+            };
+            fs.write_as(ctx, "/doc", &render(&lines)).await.unwrap();
+        }
+
+        // Reverting the agent's session must strip exactly its lines.
+        fs.revert_session(agent, sa).await.unwrap();
+
+        // Oracle: only the human's lines survive, in their original order.
+        let expected: Vec<(String, bool)> = lines
+            .iter()
+            .filter(|(_, is_agent)| !*is_agent)
+            .cloned()
+            .collect();
+        assert_eq!(
+            fs.read("/doc").await.unwrap()[..],
+            render(&expected)[..],
+            "seed {seed}: content after reverting the agent session must be exactly the human lines"
+        );
+        for run in fs.blame("/doc").await.unwrap() {
+            assert_eq!(
+                run.actor.id, human,
+                "seed {seed}: a non-human line survived the agent-session revert"
+            );
+        }
+    }
+}

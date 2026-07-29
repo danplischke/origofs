@@ -2,7 +2,10 @@
 //! exercises the *same* adapter as S3, so passing here validates the S3 path
 //! (modulo network/credentials). A real S3 run is gated behind env vars below.
 
-use origofs_core::{ContentStore, Hash, LocalCasStore, MemStore, ObjectContentStore, TieredStore};
+use origofs_core::{
+    ContentStore, Hash, LocalCasStore, MemStore, ObjectContentStore, PackStore, S3Config,
+    TieredStore, VerifyingStore,
+};
 use std::sync::Arc;
 
 async fn suite<C: ContentStore>(store: C) {
@@ -67,24 +70,128 @@ async fn tiered_read_through_populates_cache() {
     );
 }
 
+/// Build an [`S3Config`] from the `ORIGOFS_S3_TEST_*` env vars (e.g. MinIO). Panics
+/// if the bucket var is unset — callers are `#[ignore]`d, so this only runs when a
+/// test is invoked explicitly with `--ignored` and the env is configured.
+fn s3_cfg_from_env(prefix: String) -> S3Config {
+    S3Config {
+        bucket: std::env::var("ORIGOFS_S3_TEST_BUCKET").expect("ORIGOFS_S3_TEST_BUCKET"),
+        region: std::env::var("ORIGOFS_S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".into()),
+        endpoint: std::env::var("ORIGOFS_S3_TEST_ENDPOINT").ok(),
+        allow_http: true,
+        access_key_id: std::env::var("ORIGOFS_S3_TEST_ACCESS_KEY_ID").ok(),
+        secret_access_key: std::env::var("ORIGOFS_S3_TEST_SECRET_ACCESS_KEY").ok(),
+        prefix: Some(prefix),
+    }
+}
+
+/// A per-run-unique object prefix so each gated test gets an isolated keyspace in
+/// a shared (possibly persistent) bucket.
+fn unique_prefix(label: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("origofs-test/{label}-{nanos}")
+}
+
 /// Real S3-compatible run. Set the env vars to enable (e.g. against MinIO):
 ///   ORIGOFS_S3_TEST_BUCKET, ORIGOFS_S3_TEST_REGION, ORIGOFS_S3_TEST_ENDPOINT,
 ///   ORIGOFS_S3_TEST_ACCESS_KEY_ID, ORIGOFS_S3_TEST_SECRET_ACCESS_KEY
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint; set ORIGOFS_S3_TEST_* to run"]
 async fn s3_backend() {
-    use origofs_core::S3Config;
-    let bucket = std::env::var("ORIGOFS_S3_TEST_BUCKET").expect("ORIGOFS_S3_TEST_BUCKET");
-    let cfg = S3Config {
-        bucket,
-        region: std::env::var("ORIGOFS_S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".into()),
-        endpoint: std::env::var("ORIGOFS_S3_TEST_ENDPOINT").ok(),
-        allow_http: true,
-        access_key_id: std::env::var("ORIGOFS_S3_TEST_ACCESS_KEY_ID").ok(),
-        secret_access_key: std::env::var("ORIGOFS_S3_TEST_SECRET_ACCESS_KEY").ok(),
-        prefix: Some("origofs-test".into()),
-    };
-    suite(ObjectContentStore::s3(cfg).unwrap()).await;
+    suite(ObjectContentStore::s3(s3_cfg_from_env("origofs-test".into())).unwrap()).await;
+}
+
+/// A8 (issue #70): real object-store semantics the in-memory adapter can't model
+/// — a multi-megabyte blob (multipart upload), ranged GETs across part
+/// boundaries, and durability that lives *in the bucket*: a fresh store over the
+/// same bucket+prefix, sharing no in-process state, reads the object back.
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint; set ORIGOFS_S3_TEST_* to run"]
+async fn s3_large_object_multipart_and_bucket_persistence() {
+    let prefix = unique_prefix("large");
+    let store = ObjectContentStore::s3(s3_cfg_from_env(prefix.clone())).unwrap();
+
+    // 6 MiB of non-uniform bytes (mod a prime, so no offset aligns with a power of
+    // two) — large enough to exercise multipart upload and cross-boundary reads.
+    let big: Vec<u8> = (0..6usize * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let h = store.put(&big).await.unwrap();
+    assert_eq!(h, Hash::of(&big));
+    assert_eq!(store.put(&big).await.unwrap(), h, "put is idempotent");
+    assert!(store.has(&h).await.unwrap());
+    assert_eq!(&store.get(&h).await.unwrap()[..], &big[..]);
+
+    // Ranged reads spanning MiB boundaries, and clamped past the end.
+    let mid = store.get_range(&h, 1_000_000, 2_000_000).await.unwrap();
+    assert_eq!(&mid[..], &big[1_000_000..3_000_000]);
+    let tail = store
+        .get_range(&h, big.len() as u64 - 10, 999)
+        .await
+        .unwrap();
+    assert_eq!(&tail[..], &big[big.len() - 10..]);
+    assert_eq!(
+        &store.get_range(&h, big.len() as u64, 16).await.unwrap()[..],
+        b"",
+        "a range at/after EOF is empty"
+    );
+
+    // Durability is in the bucket, not in-process: a fresh store reads it back.
+    let reopened = ObjectContentStore::s3(s3_cfg_from_env(prefix)).unwrap();
+    assert!(reopened.has(&h).await.unwrap());
+    assert_eq!(&reopened.get(&h).await.unwrap()[..], &big[..]);
+    assert!(
+        reopened.get(&Hash::of(b"absent")).await.is_err(),
+        "a missing key must error, not return empty"
+    );
+}
+
+/// A8 (issue #70): the production content stack — VerifyingStore(PackStore(s3)) —
+/// against a real bucket. Many small chunks batch into a few pack objects (few
+/// big PUTs), the integrity layer re-hashes on read, and a fresh stack over the
+/// same bucket+prefix and the same on-disk pack index recovers every chunk.
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint; set ORIGOFS_S3_TEST_* to run"]
+async fn s3_packed_verifying_stack_persists_in_bucket() {
+    async fn stack(prefix: String, index_dir: &std::path::Path) -> VerifyingStore {
+        let data: Arc<dyn ContentStore> =
+            Arc::new(ObjectContentStore::s3(s3_cfg_from_env(prefix)).unwrap());
+        let index: Arc<dyn ContentStore> = Arc::new(LocalCasStore::open(index_dir).await.unwrap());
+        // Small pack target so 200 chunks seal into several pack objects.
+        VerifyingStore::new(Arc::new(PackStore::with_target(data, index, 64 * 1024)))
+    }
+
+    let prefix = unique_prefix("packed");
+    let index_dir = tempfile::tempdir().unwrap();
+    let store = stack(prefix.clone(), index_dir.path()).await;
+
+    let mut chunks = Vec::new();
+    for i in 0..200u32 {
+        let body = format!("chunk-{i:04}-{}", "payload".repeat(60));
+        let h = store.put(body.as_bytes()).await.unwrap();
+        chunks.push((h, body));
+    }
+    // Seal the open pack so the whole set is durable in the bucket.
+    store.flush().await.unwrap();
+
+    // Read every chunk back through the verifying+packed stack.
+    for (h, body) in &chunks {
+        assert!(store.has(h).await.unwrap());
+        assert_eq!(&store.get(h).await.unwrap()[..], body.as_bytes());
+    }
+
+    // A fresh stack (same bucket+prefix, same on-disk pack index) recovers them —
+    // no reliance on in-process pending state.
+    let reopened = stack(prefix, index_dir.path()).await;
+    for (h, body) in &chunks {
+        assert!(
+            reopened.has(h).await.unwrap(),
+            "packed chunk must persist in the bucket"
+        );
+        assert_eq!(&reopened.get(h).await.unwrap()[..], body.as_bytes());
+    }
+    assert!(reopened.get(&Hash::of(b"absent")).await.is_err());
 }
 
 /// The native GCS adapter builds from an inline service-account key without any

@@ -1,0 +1,29 @@
+# Codecov config (B1, #70). `project` is informational so ordinary drift in
+# total coverage never blocks a PR; `patch` is the real signal — new/changed
+# lines should carry tests. Coverage is uploaded from the `coverage` CI job
+# (cargo-llvm-cov, lcov). Set the CODECOV_TOKEN repo secret to make uploads
+# reliable; tokenless works for public repos but can be flaky.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+        informational: true
+    patch:
+      default:
+        target: 60%
+        threshold: 5%
+        informational: false
+
+# Coverage of the tests, benchmarks, and examples themselves is noise — we care
+# about coverage of the library crates' `src/`.
+ignore:
+  - "**/tests/**"
+  - "**/benches/**"
+  - "examples/**"
+  - "crates/origofs-py/python/**"
+
+comment:
+  layout: "diff, files"
+  require_changes: true

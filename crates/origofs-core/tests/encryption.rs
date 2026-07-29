@@ -90,6 +90,48 @@ async fn wrong_key_fails_loudly() {
     assert_eq!(&ok.get(&hash).await.unwrap()[..], b"classified");
 }
 
+// A2 (issue #70): reopening an encrypted workspace with the WRONG key must fail
+// loudly on read *through the engine*, not just at the raw EncryptedStore layer.
+// This is the realistic "reopened with a different ORIGOFS_ENCRYPTION_KEY" case:
+// the metadata (the manifest hash on the inode) is intact, but the engine has to
+// fetch the encrypted manifest — and then the chunks — from the content store,
+// and decrypting them with the wrong key must surface an error, never plaintext
+// garbage or a silent short read.
+#[tokio::test]
+async fn reopen_with_wrong_key_fails_through_the_engine() {
+    let backend = Arc::new(MemStore::new());
+    let meta = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
+
+    // Author a workspace with key A. A multi-chunk body guarantees real chunk
+    // bytes (not just the manifest) flow through the encrypted content store.
+    let enc_a: Arc<dyn ContentStore> = Arc::new(EncryptedStore::new(backend.clone(), key(10)));
+    let fs_a = Fs::new(meta.clone(), enc_a);
+    fs_a.init().await.unwrap();
+    let payload = vec![42u8; 300 * 1024];
+    fs_a.write("/secret.bin", &payload).await.unwrap();
+    assert_eq!(&fs_a.read("/secret.bin").await.unwrap()[..], &payload[..]);
+
+    // Reopen the SAME metadata + SAME backend, but wrapped with key B. The inode
+    // and its manifest hash resolve fine; decrypting the content must fail loudly.
+    let enc_b: Arc<dyn ContentStore> = Arc::new(EncryptedStore::new(backend.clone(), key(11)));
+    let fs_b = Fs::new(meta.clone(), enc_b);
+    let err = fs_b.read("/secret.bin").await.unwrap_err();
+    assert!(
+        err.to_string().contains("decryption failed"),
+        "wrong-key reopen must fail loudly with a decryption error, got: {err}"
+    );
+    // A ranged read (separate code path) must fail loudly too.
+    assert!(
+        fs_b.read_range("/secret.bin", 10, 5).await.is_err(),
+        "wrong-key ranged read must also fail, not return garbage"
+    );
+
+    // The correct key reopens the same workspace and reads it back intact.
+    let enc_ok: Arc<dyn ContentStore> = Arc::new(EncryptedStore::new(backend, key(10)));
+    let fs_ok = Fs::new(meta, enc_ok);
+    assert_eq!(&fs_ok.read("/secret.bin").await.unwrap()[..], &payload[..]);
+}
+
 #[tokio::test]
 async fn gc_works_through_encryption() {
     let backend = Arc::new(MemStore::new());
