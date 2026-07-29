@@ -211,6 +211,24 @@ read replicas scale reads and give geo-distribution. SQLite gives none of this (
 **solo/offline** mode — and it preserves the "one portable file" property for local dev and disconnected
 work; solo edits reconcile on reconnect via the same merge machinery (§4c).
 
+**Reconnect reconciliation is a real operation, not a hope** (`resync`). It works between two workspaces with
+*independent* metadata and content backends — the whole point being the heterogeneous pair (offline
+SQLite + local CAS ↔ shared Postgres + object storage). It fetches the remote head first so every ancestry
+question resolves locally, then fast-forwards, pushes, or runs the ordinary three-way merge, and pushes a
+clean result back under a **compare-and-swap** on the branch ref; a lost CAS re-runs the attempt against the
+new remote head rather than forcing. Object transfer walks the same edges GC marks, cuts at anything the
+destination already has, and writes children before parents — so an object's presence implies its whole
+closure and an interrupted transfer leaves a prefix, never a hole.
+
+The subtle part is **attribution**, which lives only in the metadata DB (§4d) and would otherwise be lost
+exactly when it matters. Because blame is keyed by *content hash*, it can travel with the content — but the
+actor and session ids cannot be copied verbatim, since ids are local to a store and a raw copy lands the
+offline agent's work on whoever happens to hold that id remotely. They are **remapped** through the
+destination's identity space (resolved by `auth_subject`, with a stable synthetic subject as the fallback so
+repeated resyncs converge on one actor instead of cloning it), and a blob naming an actor that cannot be
+resolved is skipped whole rather than partially mis-credited. What is deliberately *not* carried: the op-log,
+audit log, change feed, presence, suggestions, and locks.
+
 **Dialect differences handled behind the trait** (not leaked to callers):
 
 | Concern | Postgres | SQLite |

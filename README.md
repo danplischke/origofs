@@ -293,6 +293,36 @@ branch. From Rust, `PostgresMetadataStore::subscribe(after_seq, branch)` returns
 a blocking `LISTEN`-backed subscription whose `recv()` wakes on every committed
 change — a real push, not a poll.
 
+### Working offline, then rejoining
+
+SQLite mode is the offline mode: one portable file, full speed, no server. When
+you reconnect, `resync` reconciles what you did with what everyone else did —
+through the same three-way merge that powers `origofs merge`, not a separate
+code path:
+
+```bash
+origofs --workspace ./offline resync --remote ./shared --branch main -m "back online"
+```
+
+```text
+main: merged as 3a9f21c8b4d0 and pushed
+  fetched 41 object(s), 2203648 B (6 already present)
+  pushed  17 object(s), 856064 B (3 already present)
+  blame carried: 12 in, 5 out
+```
+
+It works between **different backends** — your offline SQLite + local content
+store against the team's Postgres + object storage — because that is the whole
+point. A conflicting merge records conflicts exactly as an ordinary merge does
+and leaves the shared branch untouched until you resolve them, and the shared
+branch only ever moves under a compare-and-swap, so a teammate who pushed while
+you were merging is never clobbered.
+
+Crucially, **your attribution comes with you**: the lines an agent wrote offline
+are still credited to that agent on the server afterwards, with its identity
+mapped into the shared workspace rather than blindly copied onto whichever actor
+happens to hold that id there.
+
 ### Live co-editing (CRDT)
 
 Opt-in (the `coedit` feature): humans, agents, and browser editors type into the
