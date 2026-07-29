@@ -4,7 +4,20 @@
 
 use origofs_sdk::Workspace;
 use origofs_sdk::fuse::{mountable, spawn};
-use std::time::Duration;
+use std::io::{Read, Seek, SeekFrom};
+use std::time::{Duration, Instant};
+
+/// The entry/attr TTL the mount hands the kernel (`fuse::TTL`). Anything the
+/// kernel cached becomes fresh again on its own after this, so the
+/// invalidation tests below assert they see the change *sooner* than this —
+/// otherwise they'd pass on the TTL lapsing rather than on a notification.
+const MOUNT_TTL: Duration = Duration::from_secs(1);
+
+/// Slack for a loaded CI box: still comfortably inside [`MOUNT_TTL`].
+const INVALIDATION_BUDGET: Duration = Duration::from_millis(800);
+
+/// How long to wait before giving up on an invalidation entirely.
+const GIVE_UP: Duration = Duration::from_secs(10);
 
 #[test]
 fn fuse_mount_read_write_rename_delete() {
@@ -71,4 +84,242 @@ fn fuse_mount_read_write_rename_delete() {
     assert!(!mnt.join("renamed.txt").exists());
 
     drop(session); // unmounts
+}
+
+/// A remote writer changing a file's *bytes* must reach a reader on the mount.
+///
+/// This is the case a TTL cannot cover: the file is held open, so reads are
+/// served straight from the kernel's page cache, which is not on a timer at all.
+/// The replacement content is deliberately the **same length** as the original,
+/// so a size change can't smuggle the answer past a missing invalidation — only
+/// a real `inval_inode` makes the new bytes visible.
+#[test]
+fn fuse_mount_sees_remote_write() {
+    if !mountable() {
+        eprintln!("skipping: FUSE mount unavailable (need root + /dev/fuse)");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let ws = rt.block_on(async {
+        let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+            .await
+            .unwrap();
+        ws.write("/live.txt", b"AAAA").await.unwrap();
+        ws
+    });
+
+    // The mount gets its own handle; `ws` here plays the *other* writer (a second
+    // process, the HTTP API, an agent over MCP — the mount can't see their writes).
+    let session = spawn(ws.clone(), &mnt).unwrap();
+    std::thread::sleep(Duration::from_millis(300)); // let the mount settle
+
+    // Populate the page cache and keep the fd open: subsequent `pread`s are then
+    // answered from cache without a revalidating lookup/getattr.
+    let mut f = std::fs::File::open(mnt.join("live.txt")).unwrap();
+    let mut buf = [0u8; 4];
+    f.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"AAAA");
+
+    let wrote_at = Instant::now();
+    rt.block_on(ws.write("/live.txt", b"BBBB")).unwrap();
+
+    loop {
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        if &buf == b"BBBB" {
+            break;
+        }
+        assert!(
+            wrote_at.elapsed() < GIVE_UP,
+            "mount kept serving stale bytes {:?} after a remote write",
+            std::str::from_utf8(&buf),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    drop(session);
+}
+
+/// A remote *delete* must not keep resolving on the mount, and a remote *create*
+/// must show up — via both `stat` and `readdir`.
+///
+/// The delete half is the regression guard: the positive dentry and its
+/// attributes were just cached by the `exists()` probe, so within [`MOUNT_TTL`]
+/// the kernel answers `stat` entirely by itself. Only an `inval_entry` can make
+/// the path stop resolving before the TTL lapses — hence the deadline assert.
+#[test]
+fn fuse_mount_sees_remote_create_and_delete() {
+    if !mountable() {
+        eprintln!("skipping: FUSE mount unavailable (need root + /dev/fuse)");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let ws = rt.block_on(async {
+        let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+            .await
+            .unwrap();
+        ws.write("/doomed.txt", b"here for now\n").await.unwrap();
+        ws
+    });
+
+    let session = spawn(ws.clone(), &mnt).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Prime the kernel's dentry + attr cache for the doomed path.
+    assert!(mnt.join("doomed.txt").exists());
+
+    let removed_at = Instant::now();
+    rt.block_on(ws.remove("/doomed.txt")).unwrap();
+    while mnt.join("doomed.txt").exists() {
+        assert!(
+            removed_at.elapsed() < GIVE_UP,
+            "mount kept resolving a remotely deleted path"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let took = removed_at.elapsed();
+    assert!(
+        took < INVALIDATION_BUDGET,
+        "the deletion only became visible after {took:?}, i.e. plausibly by the \
+         {MOUNT_TTL:?} entry TTL lapsing rather than by an invalidation"
+    );
+
+    // And a remote create becomes visible through both stat and readdir.
+    let created_at = Instant::now();
+    rt.block_on(ws.write("/remote.txt", b"from another writer\n"))
+        .unwrap();
+    while !mnt.join("remote.txt").exists() {
+        assert!(
+            created_at.elapsed() < GIVE_UP,
+            "a remotely created file never appeared on the mount"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(mnt.join("remote.txt")).unwrap(),
+        b"from another writer\n"
+    );
+    let names: Vec<String> = std::fs::read_dir(&mnt)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec!["remote.txt".to_string()]);
+
+    drop(session);
+}
+
+/// Unmounting must take the change-feed watcher with it — the guard's `Drop`
+/// tears it down, so nothing keeps polling (or holding a `LISTEN` connection)
+/// after the mount is gone.
+#[test]
+fn fuse_unmount_stops_the_watcher() {
+    if !mountable() {
+        eprintln!("skipping: FUSE mount unavailable (need root + /dev/fuse)");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let ws = rt.block_on(async {
+        let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+            .await
+            .unwrap();
+        ws.write("/a.txt", b"a").await.unwrap();
+        ws
+    });
+
+    let session = spawn(ws.clone(), &mnt).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(std::fs::read(mnt.join("a.txt")).unwrap(), b"a");
+    drop(session); // unmounts; the filesystem (and with it the watcher) is dropped
+
+    // Give the session thread time to finish dropping the filesystem, then keep
+    // writing: a leaked watcher would go on notifying a dead kernel channel. The
+    // workspace must stay perfectly usable, and the process must not wedge.
+    std::thread::sleep(Duration::from_millis(500));
+    for i in 0..20 {
+        rt.block_on(ws.write("/a.txt", format!("a{i}").as_bytes()))
+            .unwrap();
+    }
+    assert_eq!(rt.block_on(ws.read("/a.txt")).unwrap().as_ref(), b"a19");
+    // The mountpoint is a plain empty directory again.
+    assert_eq!(std::fs::read_dir(&mnt).unwrap().count(), 0);
+}
+
+/// The same invalidation, over the **push** feed: a Postgres-backed workspace
+/// takes the `subscribe` (`LISTEN/NOTIFY`) branch rather than polling.
+/// Self-skips unless `ORIGOFS_PG_TEST_URL` points at a reachable database.
+///
+/// The Postgres test database is shared between tests, so this only touches a
+/// per-run-unique path and never asserts on directory listings.
+#[test]
+fn fuse_mount_sees_remote_write_over_postgres() {
+    if !mountable() {
+        eprintln!("skipping: FUSE mount unavailable (need root + /dev/fuse)");
+        return;
+    }
+    let Ok(dsn) = std::env::var("ORIGOFS_PG_TEST_URL") else {
+        eprintln!("skipping: ORIGOFS_PG_TEST_URL unset");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+
+    let tag = format!(
+        "fuse-notify-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let path = format!("/{tag}.txt");
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let ws = rt.block_on(async {
+        let ws = Workspace::open_pg(&dsn, std::sync::Arc::new(origofs_sdk::MemStore::new()))
+            .await
+            .unwrap();
+        ws.write(&path, b"AAAA").await.unwrap();
+        ws
+    });
+    assert!(ws.is_postgres(), "expected the push-feed backend");
+
+    let session = spawn(ws.clone(), &mnt).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut f = std::fs::File::open(mnt.join(format!("{tag}.txt"))).unwrap();
+    let mut buf = [0u8; 4];
+    f.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"AAAA");
+
+    let wrote_at = Instant::now();
+    rt.block_on(ws.write(&path, b"BBBB")).unwrap();
+    loop {
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        if &buf == b"BBBB" {
+            break;
+        }
+        assert!(
+            wrote_at.elapsed() < GIVE_UP,
+            "mount kept serving stale bytes {:?} after a remote write",
+            std::str::from_utf8(&buf),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    drop(session);
+    let _ = rt.block_on(ws.remove(&path));
 }
