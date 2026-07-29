@@ -1,30 +1,30 @@
 # origofs — an agent-and-human filesystem with object storage, Postgres, Gitflow versioning, and edit attribution
 
-> Design & implementation plan. This document specifies a custom, ground-up build inspired by
-> [`tursodatabase/agentfs`](https://github.com/tursodatabase/agentfs), extended with the four capabilities
-> we need: (1) object storage / remote content, (2) a pluggable metadata database (Postgres), (3) first-class
-> Git-style versioning and merging, and (4) per-actor edit attribution in a shared human+agent workspace.
+> Design & implementation plan. This document specifies a custom, ground-up build around the four
+> capabilities we need: (1) object storage / remote content, (2) a pluggable metadata database (Postgres),
+> (3) first-class Git-style versioning and merging, and (4) per-actor edit attribution in a shared
+> human+agent workspace.
 
 ---
 
-## 1. Vision — and what we change vs. agentfs
+## 1. Vision — and the four ceilings we design past
 
-agentfs is a filesystem for AI agents that records every file edit and every tool call into **one SQLite/libSQL
-file**, giving auditability, reproducibility (snapshot = copy the `.db`), and portability (one file). Its data
-model is a POSIX inode/dentry table set (`fs_inode`, `fs_dentry`), file bytes stored as fixed **4 KB BLOB chunks
-inside the DB** (`fs_data`, *not* content-addressed, no dedup), plus an **overlayfs-style copy-on-write** (a
-read-only base + a writable delta with `fs_whiteout`/`fs_origin`), a `tool_calls` audit log, and a `kv_store`.
+The obvious way to build a filesystem for AI agents is to record every file edit and every tool call into
+**one SQLite file**: a POSIX inode/dentry table set, file bytes stored as fixed-size BLOB chunks in the DB,
+an overlayfs-style copy-on-write layer, and a tool-call audit log. That buys auditability, reproducibility
+(snapshot = copy the `.db`), and portability (one file), and it is the right shape for a single agent on one
+machine.
 
-That design has four ceilings we hit:
+It has four ceilings, and a shared human+agent workspace hits all of them:
 
-| agentfs limit | Why it blocks us | What we build instead |
+| Ceiling | Why it blocks us | What we build instead |
 |---|---|---|
 | Content is BLOBs locked in one SQLite file | Can't hold large files; can't share content across machines; the DB *is* the data | **Content-addressed object store** with pluggable backends incl. **S3 / remote FS**; DB holds only metadata + hashes |
-| Storage engine hardwired to SQLite/libSQL | No real multi-writer; "remote" = copy the whole DB | **Pluggable metadata store**, **Postgres-first** for true concurrency; SQLite kept as a solo/offline mode |
+| Storage engine hardwired to SQLite | No real multi-writer; "remote" = copy the whole DB | **Pluggable metadata store**, **Postgres-first** for true concurrency; SQLite kept as a solo/offline mode |
 | "Versioning" = overlay layers + `cp agent.db` | No named branches, no history DAG, no merge | **Opt-in Git-style commit DAG**, branches/refs, **three-way merge** — plus a **git-interop mode you can drive with the real `git` CLI / GitHub** |
-| `tool_calls` records *tool calls*, not *who edited which bytes* | Can't tell agent-vs-human authorship inside a file | **Per-actor, per-range attribution** with blame + provenance, in a shared workspace |
+| An audit log records *tool calls*, not *who edited which bytes* | Can't tell agent-vs-human authorship inside a file | **Per-actor, per-range attribution** with blame + provenance, in a shared workspace |
 
-The organizing insight: agentfs's copy-on-write overlay is *already* a branch. We make that literal by adopting
+The organizing insight: a copy-on-write overlay is *already* a branch. We make that literal by adopting
 git's object model as the source of truth, and we split "the bytes" (immutable, content-addressed, in object
 storage) from "the names and versions" (mutable metadata, in Postgres).
 
@@ -105,10 +105,10 @@ This resolves the POSIX-mutability-vs-immutability tension exactly the way git d
   - `tree` = a directory: entries of `(name, mode, kind, object_hash)`.
   - `commit` = `(root tree hash, parent hashes[], author actor, committer actor, message, timestamp)`.
 - **Working tree + index (mutable):** per `(workspace, branch, session-or-shared)`, the metadata DB holds live
-  `inode`/`dentry` rows — essentially agentfs's tables — but they are an **overlay whose base is a commit
+  `inode`/`dentry` rows — an ordinary POSIX table set — but they are an **overlay whose base is a commit
   tree**. Reads fall through to the base tree (then to content chunks); writes copy-up into the working tree.
-  This is precisely agentfs's overlay CoW, except the "read-only base" is now an immutable commit and the
-  "delta" is the git index.
+  This is exactly overlayfs-style CoW, except the "read-only base" is an immutable commit and the "delta" is
+  the git index.
 
 How mutable POSIX semantics coexist with immutable objects:
 
@@ -135,8 +135,8 @@ extension). Object key (blob/tree/commit) = BLAKE3 of the canonical-serialized o
 us dedup, integrity verification (re-hash on read), and immutability — which is exactly what makes remote
 object storage and cheap snapshots work.
 
-**Chunking — content-defined, not fixed.** agentfs's fixed 4 KB chunks re-chunk the entire tail of a file on any
-insertion. We use **FastCDC** content-defined chunking so an edit only rewrites the chunks it touches:
+**Chunking — content-defined, not fixed.** Fixed-size chunking (say 4 KB blocks) re-chunks the entire tail of a
+file on any insertion. We use **FastCDC** content-defined chunking so an edit only rewrites the chunks it touches:
 
 - target/avg chunk **~64 KB**, min **16 KB**, max **256 KB** (rolling Gear hash boundaries).
 - files `≤` one min-chunk (say `≤ 16 KB`) are stored **inline** as a single chunk (optionally in-DB) to avoid
@@ -208,7 +208,7 @@ trait MetadataStore {
 **advisory locks** (`pg_advisory_xact_lock(hash(inode))`) serialize hot-inode writes without blocking the rest;
 **`LISTEN/NOTIFY`** is a native change feed for `watch`/FUSE cache-invalidation; **logical replication** and
 read replicas scale reads and give geo-distribution. SQLite gives none of this (single writer), so it is our
-**solo/offline** mode — and it preserves agentfs's "one portable file" property for local dev and disconnected
+**solo/offline** mode — and it preserves the "one portable file" property for local dev and disconnected
 work; solo edits reconcile on reconnect via the same merge machinery (§4c).
 
 **Dialect differences handled behind the trait** (not leaked to callers):
@@ -330,7 +330,7 @@ edit_op(id PK, session_id, actor_id, tool_call_id NULL,   -- links to tool_calls
         byte_start, byte_len,          -- the range touched (byte granularity, natural for pwrite)
         pre_hash NULL, post_hash NULL, -- manifest before/after (for exact reconstruction)
         ts)
-tool_calls(...)   -- agentfs's audit log, retained; edit_op.tool_call_id references it
+tool_calls(...)   -- the agent tool-call audit log; edit_op.tool_call_id references it
 ```
 
 Every `pwrite`/`truncate` records the actor + byte range. This is the durable, event-sourced truth of *who
@@ -576,7 +576,7 @@ each write is, and a storage engine that agents point at untrusted code and untr
 
 ## 8. Recommended tech stack
 
-- **Language: Rust** for the core (matches agentfs, best-in-class FUSE via `fuser`, zero-cost async, strong
+- **Language: Rust** for the core (best-in-class FUSE via `fuser`, zero-cost async, strong
   S3/Postgres crates, and it compiles to the native mount + the SDK). SDKs for **TypeScript/Python** via
   `napi-rs`/`pyo3` bindings over the same core. *Alternative:* Go (simpler concurrency, good FUSE via
   `bazil.org/fuse`) if team familiarity dominates — but we lose the single-core-shared-with-bindings advantage.
@@ -621,18 +621,3 @@ Each milestone is independently demoable; M1+M2+M3 in either order after M0.
 - **git-mode fidelity** — SHA-256 git objects + LFS pointers vs. what GitHub/hosts currently accept; confirm host
   support and the remote-helper/LFS bridge performance on very large histories, and whether a workspace should be
   able to switch `native`↔`git` in place or only export/import.
-
-## 11. Mapping: agentfs → origofs
-
-| agentfs | origofs |
-|---|---|
-| `fs_inode` / `fs_dentry` | `inode` / `dentry` — but a **mutable working-tree overlay over a base commit** |
-| `fs_data` (4 KB BLOB chunks in DB) | **content store**: FastCDC chunks, BLAKE3-addressed, in S3/local/inline; DB holds only `manifest_hash` |
-| `fs_whiteout` / `fs_origin` (overlay CoW) | same overlay idea, but base = an **immutable commit tree** |
-| snapshot = `cp agent.db` | **opt-in versioning**: `off` / `native` (chunked commit DAG) / `git`; branches = `ref` |
-| git not involved | **opt-in `git` mode**: SHA-256 git-compatible objects, `git-remote-origofs`, git-LFS bridge — usable with the real `git` CLI / GitHub |
-| `agentfs sync` (libSQL whole-DB) | content is content-addressed & remote by default; metadata via Postgres/replicas; branches merge |
-| `tool_calls` (audit) | retained `tool_calls` **+** `edit_op` op-log **+** `blame` index tying edits to **actors** |
-| SQLite/libSQL only | `MetadataStore` trait: **Postgres** (multi-writer) or SQLite (solo/offline) |
-| FUSE/NFS/MCP | same surfaces, each resolving an **actor+session** for attribution |
-| single-user | **shared human+agent workspace** with per-range human-vs-agent differentiation |

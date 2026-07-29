@@ -463,8 +463,7 @@ at ~1.3 GiB/s and reads reassemble at ~10 GiB/s; encryption at rest costs roughl
 
 The full design and rationale — the metadata/content split, the versioning model,
 attribution, and the failure-surface work — live in
-[`docs/DESIGN.md`](docs/DESIGN.md). origofs was inspired by
-[`tursodatabase/agentfs`](https://github.com/tursodatabase/agentfs).
+[`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## License
 

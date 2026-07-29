@@ -1,7 +1,7 @@
 //! Sandbox surface (`sandbox` feature) — run an unmodified process against an
 //! **isolated copy-on-write view** of an origofs workspace, then import what it
-//! changed back as an attributed commit (`docs/DESIGN.md` §4e; the agentfs `run`
-//! use case for overlay).
+//! changed back as an attributed commit (`docs/DESIGN.md` §4e — the overlay-backed
+//! "run an agent over a copy of the tree" use case).
 //!
 //! Flow:
 //! 1. **Materialize** the workspace's working tree to a real `lower/` directory.
