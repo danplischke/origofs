@@ -559,6 +559,18 @@ each write is, and a storage engine that agents point at untrusted code and untr
   **bubblewrap** in a fresh tmpfs root that hides the host filesystem (`meta.db`/`cas`, home, credentials) — a
   real *filesystem* boundary for untrusted code. Network egress is left shared on purpose (agents need it), so it
   is deliberately not a network boundary; the delta is captured and imported the same either way.
+- **Observability without hijacking the host process (M9):** both halves of observability are **emit-only** in
+  the library. `origofs-core`/`origofs-sdk` emit `tracing` spans/events and record metrics through the
+  [`metrics`](https://docs.rs/metrics) facade (`origofs-core::metrics`, behind an opt-in `metrics` feature that
+  compiles to nothing when off), but install **no subscriber, no exporter, and no listener** — a library that
+  only emits is a no-op until a binary opts in, so an embedder pays nothing and keeps their own telemetry stack.
+  The `origofs` binary is what opts in: `init_tracing` for logs (`--log-format json`, stderr) and `init_metrics`
+  for numbers (`serve --metrics` / `ORIGOFS_METRICS=1`), which installs a Prometheus recorder and hands its
+  renderer to the HTTP surface. Metrics are then scraped from `GET /metrics` on the API's own listener — root
+  level beside `/health` and `/readyz`, and unauthenticated like them, which is safe here because every label is
+  a closed set (error `code`/`class` from `OrigoFSError`, a fixed operation name, a *matched route template*)
+  and never a path, actor, hash, or content. Names follow Prometheus conventions (`origofs_` namespace, `_total`
+  counters, base units `_bytes`/`_seconds`).
 
 ---
 

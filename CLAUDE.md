@@ -192,6 +192,7 @@ Each is a module under `crates/origofs-sdk/src/`, gated by the matching feature
 | `fuse`, `nfs` | `origofs_sdk::fuse` / `::nfs` | POSIX mounts (FUSE on Linux; NFSv3 elsewhere). **Unix-only** (`cfg(unix)`). |
 | `git` | `origofs_sdk::git` | Real-`git` interop: export/import genuine git objects. The `git-remote-origofs` binary (shipped by `origofs-cli`, `git clone origofs://…`) builds on it. |
 | `coedit` | — | Opt-in CRDT co-editing (yrs); adds the y-sync WebSocket to the `api` surface. Kept separate from `full`. |
+| `metrics` | — | Opt-in metrics recording (emit-only, no exporter); adds `GET /metrics` + per-request instrumentation to the `api` surface. Kept separate from `full`. |
 
 ## Conventions & gotchas that will bite you
 
@@ -242,6 +243,17 @@ Each is a module under `crates/origofs-sdk/src/`, gated by the matching feature
   errors also carry a machine `code()` + `retryable()`/`class()` (`error.rs`) instead
   of a flat string, and `/readyz` (distinct from liveness `/health`) probes the
   stores via `MetadataStore::ping`/`ContentStore::ping`.
+  **Metrics work the same way** (`metrics` feature, default-off and deliberately
+  *not* in `full`): `origofs-core::metrics` records through the `metrics` facade —
+  the recording bodies are `#[cfg]`-gated, so call sites are unconditional and
+  compile to nothing when the feature is off — and links **no exporter**. The
+  binary installs one (`init_metrics`, `origofs serve --metrics` /
+  `ORIGOFS_METRICS=1`) and hands its renderer to `api::set_metrics_renderer`;
+  `GET /metrics` then serves Prometheus text, and answers `503` when no exporter
+  was installed (so a scraper reports a failed scrape rather than a missing
+  endpoint). It sits outside `/v1`, ungated like `/readyz` — safe only because
+  every metric label is a closed set (never a path, actor, or hash). **Keep it
+  that way when adding a metric.**
 - Integration tests live in each crate's `tests/` and are the clearest executable
   spec of behavior (e.g. `origofs-core/tests/{merge,attribution,recover,durability,
   integrity}.rs`). Mirror their style when adding coverage.

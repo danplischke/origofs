@@ -19,7 +19,11 @@ path = "src/bin/git-remote-origofs.rs"
 # Every access surface is now a feature-gated module of the sdk; `full` enables
 # them all (api, mcp, sandbox, git, fuse, nfs). Deliberately NOT `coedit`, so
 # `origofs serve` ships without the live co-editing WebSocket, exactly as before.
-origofs-sdk = { version = "0.1.0", path = "../origofs-sdk", features = ["full"] }
+#
+# `metrics` is enabled explicitly rather than folded into `full` (same treatment
+# as `coedit`): the library stays emit-only, and this binary is the one that
+# installs an exporter — see `init_metrics` below.
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk", features = ["full", "metrics"] }
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
 # Config-file backend selection (`--config`): pick Postgres/S3/GCS for the
@@ -30,6 +34,11 @@ tracing = "0.1"
 # The CLI is the binary that installs a tracing subscriber for the library's
 # spans/events; writes to stderr so `origofs mcp` keeps stdout for JSON-RPC.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# …and the binary that installs the metrics recorder, for the same reason. Only
+# `origofs serve --metrics` installs it; `default-features = false` drops the
+# exporter's own HTTP listener and push-gateway (origofs serves `/metrics` from its
+# axum router instead, so it inherits the API's bind address and middleware).
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # git-remote-origofs reads a byte at a time from stdin via libc::read.
 libc = "0.2.189"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }

@@ -328,6 +328,35 @@ mapping; `serve` refuses to bind a non-loopback address without one. Errors come
 back as a machine-readable envelope (`{"error":{"code","message","retryable"}}`)
 and every response carries an `x-request-id`.
 
+### Metrics
+
+origofs is **emit-only** for observability: the library records `tracing` spans and
+numeric measurements but installs no subscriber and no exporter, so embedding it
+costs nothing and you wire up your own. The binary opts in — `--log-format json`
+for logs, `--metrics` for numbers:
+
+```bash
+origofs --workspace "$WS" serve --addr 127.0.0.1:8080 --metrics   # or ORIGOFS_METRICS=1
+curl 'http://127.0.0.1:8080/metrics'      # Prometheus text exposition
+```
+
+`/metrics` sits at the root next to `/health` and `/readyz`, and gets the same
+treatment as `/readyz`: no credential required. Nothing sensitive is exposed —
+every label is a closed set (an error `code`/`class`, a fixed operation name, a
+*matched route template* like `/v1/files/{*path}`), so no path, actor, hash, or
+file content ever reaches a scrape. Without `--metrics` nothing is installed and
+the route answers `503 metrics not enabled`.
+
+Series: `origofs_writes_total` / `origofs_write_bytes_total`, `origofs_reads_total` /
+`origofs_read_bytes_total`, `origofs_chunks_put_total` / `origofs_chunks_deduped_total`
+(dedup hit rate), `origofs_commits_total`, `origofs_gc_objects_deleted_total` /
+`origofs_gc_bytes_freed_total`, `origofs_errors_total{code,class}` (keyed off the
+same machine-readable code the API error envelope returns), and the
+`origofs_op_duration_seconds{op}` / `origofs_http_request_duration_seconds{method,path}`
+histograms. Rust embedders record into the same facade — enable
+`origofs-core`'s `metrics` feature and install any [`metrics`](https://docs.rs/metrics)
+recorder.
+
 ## Built to not lose or corrupt data
 
 Because agents can generate a lot of churn against shared storage, correctness

@@ -64,8 +64,21 @@ full    = ["api", "mcp", "sandbox", "git", "fuse", "nfs"]
 # `all(feature = "api", feature = "coedit")`.
 coedit  = ["origofs-core/coedit", "axum?/ws"]
 
+# Opt-in metrics (roadmap M9). Turns on the core's emit-only recording and — when
+# `api` is also enabled — the per-request instrumentation plus the `GET /metrics`
+# Prometheus exposition endpoint. Kept **out of `full`**, exactly like `coedit`,
+# so a plain surface build records nothing and pulls no extra dependency;
+# `origofs-cli` enables it explicitly. Still emit-only: no exporter is linked here,
+# the binary installs one and hands its renderer to `api::set_metrics_renderer`.
+metrics = ["origofs-core/metrics"]
+
 [dev-dependencies]
 tempfile = "3.27.0"
+# tests/metrics.rs installs a real Prometheus recorder — the job a *binary* does —
+# so the `/metrics` test asserts against genuine exposition text. `default-features
+# = false` drops the exporter's HTTP listener / push-gateway (and their hyper +
+# rustls trees): we only need `install_recorder()` + `render()`.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # HTTP surface tests (api.rs): drive the axum router in-process.
 tower = { version = "0.5.2", features = ["util"] }
 http-body-util = "0.1.3"

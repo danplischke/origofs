@@ -287,6 +287,12 @@ enum Cmd {
         /// all writes are attributed to an auto-created local actor (dev only).
         #[arg(long = "auth-token", value_name = "TOKEN=ACTOR[:SESSION]")]
         auth_tokens: Vec<String>,
+        /// Install the Prometheus recorder and expose `GET /metrics` (also
+        /// `ORIGOFS_METRICS=1`). Off by default: without it nothing is exported and
+        /// that route answers `503 metrics not enabled`. Like `/readyz`, the
+        /// endpoint is unauthenticated.
+        #[arg(long)]
+        metrics: bool,
     },
     /// Serve the workspace over NFSv3 (blocks; mount with `-o vers=3,tcp,port=…`).
     Nfs {
@@ -344,6 +350,51 @@ fn init_tracing(format: LogFormat) {
         LogFormat::Json => builder.json().init(),
         LogFormat::Text => builder.init(),
     }
+}
+
+/// Latency buckets for the `_seconds` histograms, in seconds: sub-millisecond
+/// metadata operations through multi-second object-store round trips. Picking
+/// buckets is the *binary's* call — the library only records raw observations.
+const METRICS_BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// Install the Prometheus recorder — the metrics counterpart to [`init_tracing`],
+/// and for the same reason: origofs-core/-sdk only *record* measurements, they
+/// install no exporter and start no server, so a Rust embedder pays nothing and
+/// wires up their own. This is the one place the `origofs` binary opts in.
+///
+/// It installs a recorder, registers the `# HELP`/`# TYPE` metadata, and hands the
+/// exposition renderer to the HTTP surface, which serves it at **`GET /metrics`**
+/// on the same address as the API (no second listener, so the endpoint inherits
+/// the API's bind address and middleware). Until this runs, `/metrics` answers
+/// `503 metrics not enabled`.
+///
+/// Off unless `origofs serve --metrics` (or `ORIGOFS_METRICS=1`) asks for it, so a
+/// plain `origofs read`/`write` allocates no metrics registry.
+fn init_metrics() -> Result<()> {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    let handle = PrometheusBuilder::new()
+        .set_buckets(METRICS_BUCKETS)
+        .map_err(|e| anyhow::anyhow!("configuring metrics histogram buckets: {e}"))?
+        .install_recorder()
+        .map_err(|e| anyhow::anyhow!("installing the Prometheus recorder: {e}"))?;
+    origofs_sdk::api::describe_metrics();
+    if !origofs_sdk::api::set_metrics_renderer(move || handle.render()) {
+        anyhow::bail!("a metrics renderer is already installed in this process");
+    }
+    Ok(())
+}
+
+/// Whether an environment variable is set to a truthy value. Used for
+/// `ORIGOFS_METRICS`, the env-var twin of `serve --metrics`.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// Open the workspace the CLI operates on. With `--config` this selects the
@@ -860,8 +911,25 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Serve { addr, auth_tokens } => {
+        Cmd::Serve {
+            addr,
+            auth_tokens,
+            metrics,
+        } => {
             let auth = build_api_auth(&ws, &addr, &auth_tokens).await?;
+            if metrics || env_flag("ORIGOFS_METRICS") {
+                init_metrics()?;
+                // `/metrics` gets the same auth treatment as `/readyz`: open. Its
+                // labels are closed sets (error code/class, matched route
+                // template), so it exposes no path, actor, or content — but say so
+                // rather than letting a public bind surprise anyone.
+                if !addr.ip().is_loopback() {
+                    eprintln!(
+                        "warning: exposing unauthenticated Prometheus metrics at http://{addr}/metrics (non-loopback bind, same posture as /readyz); restrict it at your proxy if scrapes shouldn't be public"
+                    );
+                }
+                println!("exposing Prometheus metrics at http://{addr}/metrics");
+            }
             tracing::info!(%addr, "starting origofs HTTP API");
             println!("serving origofs at http://{addr} (Ctrl-C to stop)");
             origofs_sdk::api::serve(std::sync::Arc::new(ws), addr, auth).await?;

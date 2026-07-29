@@ -24,6 +24,12 @@ parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 similar = "3.1.1"
 thiserror = "2.0.19"
+# Metrics facade — the numeric counterpart to `tracing`. Same emit-only deal: the
+# library only *records*; it installs no exporter and starts no server, so with no
+# recorder installed every measurement hits the crate's global no-op recorder.
+# Optional so a default build pulls nothing; the CLI installs
+# `metrics-exporter-prometheus`. See `src/metrics.rs`.
+metrics = { version = "0.24", optional = true }
 # Structured, leveled instrumentation. A library only *emits*; it is a no-op
 # until a binary installs a subscriber, so an embedder pays nothing until they
 # opt in. The CLI installs one (see origofs-cli); Rust embedders install their own.
@@ -37,6 +43,10 @@ yrs = { version = "0.23", optional = true }
 
 [features]
 coedit = ["dep:yrs"]
+# Opt-in metrics recording (roadmap M9). Off by default: with the feature off the
+# `record_*` helpers in `metrics.rs` compile to nothing, so call sites stay
+# unconditional and an embedder who wants no metrics pays nothing.
+metrics = ["dep:metrics"]
 
 [dev-dependencies]
 criterion = "0.5.1"

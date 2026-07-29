@@ -19,6 +19,15 @@
 //! Files are transferred as raw bytes (`application/octet-stream`); everything
 //! else is JSON. Paths are the URL tail after the resource segment, e.g.
 //! `GET /files/notes/todo.txt` reads `/notes/todo.txt`.
+//!
+//! **Metrics** (`metrics` feature, M9). The surface records into the emit-only
+//! [`origofs_core::metrics`] facade — request counts, latencies, error codes — and
+//! serves the Prometheus text exposition at `GET /metrics`. Recording is
+//! unconditional and free without the feature; the *route* and the per-request
+//! middleware are feature-gated. The library still installs no exporter: a binary
+//! calls [`set_metrics_renderer`] with a renderer (the CLI's `origofs serve
+//! --metrics` does), and until it does `/metrics` answers `503 metrics not
+//! enabled`.
 
 use crate::{Workspace, WriteCtx, WriteOutcome};
 use axum::{
@@ -44,6 +53,23 @@ use tower_http::trace::TraceLayer;
 mod coedit;
 #[cfg(feature = "coedit")]
 pub use coedit::Coordinator;
+
+/// Install the closure that `GET /metrics` renders (Prometheus text format).
+///
+/// Re-exported from [`origofs_core::metrics::set_renderer`] so a binary that
+/// serves the API has one place to opt into metrics: install a recorder (e.g.
+/// `metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()`),
+/// then hand its `render` here. The library never calls this — see the
+/// "observability is emit-only" rule in `CLAUDE.md`.
+#[cfg(feature = "metrics")]
+pub use origofs_core::metrics::set_renderer as set_metrics_renderer;
+
+/// Register `# HELP`/`# TYPE`/unit metadata for every origofs metric. Call once
+/// from a binary after installing a recorder; re-exported from
+/// [`origofs_core::metrics::describe`] so the CLI needs no direct dependency on
+/// the core crate.
+#[cfg(feature = "metrics")]
+pub use origofs_core::metrics::describe as describe_metrics;
 
 type Shared = Arc<Workspace>;
 
@@ -252,13 +278,28 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
     {
         data = data.route("/coedit/{*path}", get(coedit::coedit_ws));
     }
+    // Per-request metrics wrap the *data* surface only, outside the read gate so a
+    // rejected (401) request is still counted. Liveness/readiness and the scrape
+    // endpoint itself are deliberately excluded — a probe every second would
+    // otherwise dominate the request rate. `route_layer` (not `layer`) means it
+    // runs only for a *matched* route, which is also what makes the `path` label
+    // safe: it is the route template, never the requested path.
+    #[cfg(feature = "metrics")]
+    {
+        data = data.route_layer(middleware::from_fn(track_metrics));
+    }
     // Versioned data surface. Liveness/readiness stay unversioned at the root so an
     // orchestrator probes them independent of the API version.
-    let app = Router::new()
+    #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
+    let mut app = Router::new()
         .nest("/v1", data)
         .route("/health", get(health))
-        .route("/readyz", get(readyz))
-        .with_state(state);
+        .route("/readyz", get(readyz));
+    #[cfg(feature = "metrics")]
+    {
+        app = app.route("/metrics", get(metrics_endpoint));
+    }
+    let app = app.with_state(state);
     // Cross-cutting middleware (outermost first): an `x-request-id` set on the
     // request and echoed on the response, a tracing span per request, a
     // request-body size cap, and CORS for browser clients. CORS sits innermost so
@@ -363,6 +404,10 @@ impl IntoResponse for ApiError {
                 (status, code, msg, false)
             }
             ApiError::OrigoFS(e) => {
+                // `origofs_errors_total{code,class}` — keyed off the stable machine
+                // code, so an alert on e.g. `code="corrupt"` or
+                // `class="unavailable"` survives message rewording.
+                origofs_core::metrics::record_error(&e);
                 let status = match &e {
                     NotFound(_) | ContentMissing(_) => StatusCode::NOT_FOUND,
                     AlreadyExists(_) | Conflict(_) => StatusCode::CONFLICT,
@@ -427,6 +472,91 @@ async fn readyz(State(ws): State<Shared>) -> Response {
     (status, Json(body)).into_response()
 }
 
+// --- metrics (M9) -----------------------------------------------------------
+
+/// Prometheus text exposition of everything the process has recorded.
+///
+/// **Authentication: the same treatment as `/readyz`.** It is registered at the
+/// root, outside the `/v1` data surface, so — like `/health` and `/readyz` — it is
+/// *not* covered by `gate_reads` and a scrape needs no credential. That is a
+/// deliberate choice, not an oversight: the exposition carries only counters and
+/// latencies labeled with closed sets (an error `code`/`class`, a fixed operation
+/// name, a *matched route template*), so no path, actor, hash, or workspace
+/// content can leak through it. If your `/readyz` is reachable from somewhere you
+/// would not want scraping this, restrict both the same way — at your proxy, or
+/// by binding the API to a private interface. `serve` already refuses to expose an
+/// unauthenticated *write* surface on a non-loopback address (see `build_api_auth`
+/// in the CLI); metrics change nothing about that posture.
+///
+/// Answers `503` with a plain-text `metrics not enabled` when the binary installed
+/// no exporter — the library never installs one, so this is the response until
+/// something calls [`set_metrics_renderer`]. A `503` (rather than a `404`) is what
+/// a Prometheus scraper reports as a failed scrape of an endpoint that *exists*,
+/// which is the honest signal.
+#[cfg(feature = "metrics")]
+async fn metrics_endpoint() -> Response {
+    match origofs_core::metrics::render() {
+        Some(body) => (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                origofs_core::metrics::EXPOSITION_CONTENT_TYPE,
+            )],
+            body,
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            "metrics not enabled: this process installed no exporter (try `origofs serve --metrics`)\n",
+        )
+            .into_response(),
+    }
+}
+
+/// Middleware recording one request: `origofs_http_requests_total{method,path,status}`
+/// and `origofs_http_request_duration_seconds{method,path}`. `path` is the matched
+/// route template (`/v1/files/{*path}`) so cardinality is bounded by the route
+/// table and no requested path reaches the exposition.
+#[cfg(feature = "metrics")]
+async fn track_metrics(req: Request, next: Next) -> Response {
+    let started = std::time::Instant::now();
+    let method = method_label(req.method());
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| origofs_core::metrics::UNMATCHED_ROUTE.to_owned());
+    let resp = next.run(req).await;
+    origofs_core::metrics::record_http_request(
+        method,
+        route,
+        resp.status().as_u16(),
+        started.elapsed().as_secs_f64(),
+    );
+    resp
+}
+
+/// Map a request method onto one of a fixed set of label values — an extension
+/// method must not become an unbounded label.
+#[cfg(feature = "metrics")]
+fn method_label(m: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *m {
+        _ if m == Method::GET => "GET",
+        _ if m == Method::POST => "POST",
+        _ if m == Method::PUT => "PUT",
+        _ if m == Method::DELETE => "DELETE",
+        _ if m == Method::PATCH => "PATCH",
+        _ if m == Method::HEAD => "HEAD",
+        _ if m == Method::OPTIONS => "OPTIONS",
+        _ => "other",
+    }
+}
+
 async fn read_file(State(ws): State<Shared>, Path(path): Path<String>) -> ApiResult<Response> {
     // Stream the body so an arbitrarily large file is never buffered server-side.
     // `read_stream` resolves and validates first, so a missing file (or a
@@ -434,9 +564,50 @@ async fn read_file(State(ws): State<Shared>, Path(path): Path<String>) -> ApiRes
     let stream = ws.read_stream(&abspath(&path)).await?;
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        Body::from_stream(stream),
+        Body::from_stream(CountedRead::new(stream)),
     )
         .into_response())
+}
+
+/// Counts a streamed read for metrics without buffering it: the only state is a
+/// byte tally, recorded once the body ends (or is dropped early, e.g. a client
+/// hang-up — which is why the count is "bytes served", not "file size").
+///
+/// This lives here rather than in the engine because the engine is where a
+/// follow-up will instrument reads properly; recording at the surface keeps the
+/// metric available today. The call is unconditional — `record_read` compiles to
+/// nothing without `origofs-core/metrics`.
+struct CountedRead {
+    inner: crate::BoxStream<'static, origofs_core::Result<bytes::Bytes>>,
+    bytes: u64,
+}
+
+impl CountedRead {
+    fn new(inner: crate::BoxStream<'static, origofs_core::Result<bytes::Bytes>>) -> Self {
+        Self { inner, bytes: 0 }
+    }
+}
+
+impl futures::Stream for CountedRead {
+    type Item = origofs_core::Result<bytes::Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let polled = this.inner.as_mut().poll_next(cx);
+        if let std::task::Poll::Ready(Some(Ok(chunk))) = &polled {
+            this.bytes += chunk.len() as u64;
+        }
+        polled
+    }
+}
+
+impl Drop for CountedRead {
+    fn drop(&mut self) {
+        origofs_core::metrics::record_read(self.bytes);
+    }
 }
 
 async fn write_file(
@@ -458,7 +629,10 @@ async fn write_file(
         .write_or_propose(principal.write_ctx(), &p, &body, None)
         .await?
     {
-        WriteOutcome::Wrote => Ok(Json(json!({ "path": p, "written": body.len() }))),
+        WriteOutcome::Wrote => {
+            origofs_core::metrics::record_write(body.len() as u64);
+            Ok(Json(json!({ "path": p, "written": body.len() })))
+        }
         WriteOutcome::Proposed(id) => Ok(Json(json!({ "path": p, "proposed": id }))),
     }
 }
@@ -578,6 +752,7 @@ async fn commit(
         .map(|a| a.display_name)
         .unwrap_or_else(|| format!("actor:{}", principal.actor));
     let hash = ws.commit(&author, &req.message).await?;
+    origofs_core::metrics::record_commit();
     Ok(Json(json!({ "hash": hash.to_hex() })))
 }
 
