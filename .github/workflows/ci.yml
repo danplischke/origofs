@@ -391,3 +391,63 @@ jobs:
         run: |
           cargo nextest run --profile ci -p origofs-core
           cargo nextest run --profile ci -p origofs-sdk --features api,mcp,sandbox,git,nfs
+
+  # B9 (#70): benchmark-regression signal. The criterion micro-benchmarks in
+  # benches/engine.rs cover the hot paths — content-defined-chunking writes,
+  # whole-file reads, the incremental copy-on-write edit, tree/commit building,
+  # and the overhead encryption-at-rest adds. Run them with criterion's
+  # `bencher` output format (the libtest `... bench: N ns/iter` shape
+  # github-action-benchmark parses) and diff each run against a baseline kept in
+  # the Actions cache — no gh-pages branch or push token needed. Shared CI
+  # runners are too noisy to gate a merge on, so a regression is surfaced in the
+  # job summary (and flagged past 2x) rather than failing the build.
+  bench:
+    name: Benchmarks (criterion regression)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--bench engine` scopes the run to the criterion target: a bare
+      # `cargo bench` would also start the lib's libtest harness, which rejects
+      # criterion's `--output-format` flag.
+      - name: Run benchmarks
+        run: cargo bench -p origofs-core --bench engine -- --output-format bencher | tee output.txt
+
+      # Restore the rolling benchmark history so the action has something to diff
+      # against. A per-run key with a shared prefix means each run saves a fresh
+      # entry the next run's restore-keys prefix match will pick up as the baseline.
+      - name: Restore benchmark baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: ./cache
+          key: bench-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            bench-${{ runner.os }}-
+
+      - name: Compare against baseline
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: origofs-core micro-benchmarks
+          tool: cargo
+          output-file-path: output.txt
+          external-data-json-path: ./cache/benchmark-data.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Flag a >2x slowdown. Kept non-failing because shared-runner variance
+          # would make a hard gate flaky; the alert lands in the job summary.
+          alert-threshold: "200%"
+          comment-on-alert: false
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Save benchmark baseline
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ./cache
+          key: bench-${{ runner.os }}-${{ github.run_id }}
