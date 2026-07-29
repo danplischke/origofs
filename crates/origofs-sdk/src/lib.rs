@@ -46,6 +46,24 @@ pub mod sandbox;
 type Meta = Arc<dyn MetadataStore>;
 type Content = Arc<dyn ContentStore>;
 
+/// The outcome of a [`Workspace::ready`] readiness probe: whether each backend
+/// answered. `None` for a store means it is reachable; `Some(msg)` carries why
+/// the probe failed. Backs the HTTP `/readyz` endpoint.
+#[derive(Debug, Clone)]
+pub struct ReadyReport {
+    /// `None` if the metadata store answered its probe; the error otherwise.
+    pub metadata: Option<String>,
+    /// `None` if the content store answered its probe; the error otherwise.
+    pub content: Option<String>,
+}
+
+impl ReadyReport {
+    /// Whether both backends are reachable — the service is ready to serve.
+    pub fn is_ready(&self) -> bool {
+        self.metadata.is_none() && self.content.is_none()
+    }
+}
+
 /// A workspace: a metadata store over a content store.
 ///
 /// Cheap to clone — it's a pair of `Arc` handles to the shared backends, so
@@ -147,6 +165,15 @@ impl Workspace {
         let mut ws = Self::open(pg.clone(), content).await?;
         ws.pg = Some(pg);
         Ok(ws)
+    }
+
+    /// Postgres metadata (multi-writer) + a local content-addressed store — the
+    /// single-host production pairing (one shared database, content on local disk).
+    /// For content shared across hosts use [`Workspace::open_pg_s3`] /
+    /// [`Workspace::open_pg_gcs`] instead.
+    pub async fn open_pg_local(dsn: &str, cas_dir: impl AsRef<Path>) -> Result<Self> {
+        let content: Content = Arc::new(LocalCasStore::open(cas_dir).await?);
+        Self::open_pg(dsn, content).await
     }
 
     /// Postgres metadata (multi-writer) + an S3-compatible object store for
@@ -255,6 +282,18 @@ impl Workspace {
         &self.fs
     }
 
+    /// Probe the metadata and content backends for a readiness check (the HTTP
+    /// `/readyz` endpoint). Both probes run concurrently; an unreachable backend
+    /// is reported per-store rather than collapsing the whole check. This is
+    /// distinct from liveness (`/health`), which only says the process is up.
+    pub async fn ready(&self) -> ReadyReport {
+        let (meta, content) = self.fs.probe().await;
+        ReadyReport {
+            metadata: meta.err().map(|e| e.to_string()),
+            content: content.err().map(|e| e.to_string()),
+        }
+    }
+
     // --- workspaces (multi-workspace in one store) -----------------------
 
     /// Open (creating on first use) another **workspace** inside this same store,
@@ -347,6 +386,7 @@ impl Workspace {
             .await;
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path, bytes = data.len()))]
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
         self.fs.write(path, data).await?;
         self.emit("write", path, None, None, None).await;
@@ -403,12 +443,14 @@ impl Workspace {
         self.fs.stat(path).await
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path))]
     pub async fn remove(&self, path: &str) -> Result<()> {
         self.fs.remove(path).await?;
         self.emit("remove", path, None, None, None).await;
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(from = %from, to = %to))]
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.fs.rename(from, to).await?;
         self.emit("rename", from, Some(to.to_string()), None, None)
@@ -430,6 +472,7 @@ impl Workspace {
     // --- versioning ------------------------------------------------------
 
     /// Snapshot the working tree into a commit on the current branch.
+    #[tracing::instrument(skip_all, fields(author = %author))]
     pub async fn commit(&self, author: &str, message: &str) -> Result<Hash> {
         let hash = self.fs.commit(author, message).await?;
         self.emit("commit", "/", Some(message.to_string()), None, None)
@@ -491,6 +534,7 @@ impl Workspace {
 
     /// Reclaim content-store objects unreachable from any ref or the live
     /// working tree. Run when the workspace is idle.
+    #[tracing::instrument(skip_all)]
     pub async fn gc(&self) -> Result<GcStats> {
         self.fs.gc().await
     }
@@ -536,6 +580,7 @@ impl Workspace {
     }
 
     /// Merge branch `name` into the current branch.
+    #[tracing::instrument(skip_all)]
     pub async fn merge_branch(
         &self,
         name: &str,
@@ -665,6 +710,7 @@ impl Workspace {
     }
 
     /// Attributed write: records the actor and updates per-line authorship.
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path, bytes = data.len()))]
     pub async fn write_as(&self, ctx: WriteCtx, path: &str, data: &[u8]) -> Result<()> {
         self.fs.write_as(ctx, path, data).await?;
         self.emit("write", path, None, Some(ctx.actor), ctx.session)
@@ -801,6 +847,7 @@ impl Workspace {
     }
 
     /// Revert every line an actor wrote in a session. Returns files changed.
+    #[tracing::instrument(skip_all, fields(actor = actor_id, session = session_id))]
     pub async fn revert_session(&self, actor_id: i64, session_id: i64) -> Result<usize> {
         self.fs.revert_session(actor_id, session_id).await
     }

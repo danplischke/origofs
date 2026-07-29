@@ -2,6 +2,7 @@
 name = "origofs-core"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 argon2 = "0.5.3"
@@ -23,6 +24,10 @@ parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 similar = "3.1.1"
 thiserror = "2.0.19"
+# Structured, leveled instrumentation. A library only *emits*; it is a no-op
+# until a binary installs a subscriber, so an embedder pays nothing until they
+# opt in. The CLI installs one (see origofs-cli); Rust embedders install their own.
+tracing = "0.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
 tokio-postgres = "0.7"
 # Opt-in CRDT co-editing (roadmap M8): a Yjs-in-Rust document whose per-span
@@ -35,6 +40,7 @@ coedit = ["dep:yrs"]
 
 [dev-dependencies]
 criterion = "0.5.1"
+proptest = "1"
 tempfile = "3.27.0"
 tokio-postgres = "0.7"
 # The coedit tests drive a *vanilla* Yjs client (a raw `yrs::Doc` + the stock

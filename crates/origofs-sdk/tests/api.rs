@@ -49,6 +49,180 @@ async fn fixture() -> Fixture {
     }
 }
 
+// --- readiness (M9) ---------------------------------------------------------
+
+#[tokio::test]
+async fn health_is_liveness_only() {
+    // `/health` does no I/O — it reports the process is up, nothing about the
+    // backends. Open (outside the read gate) and always 200.
+    let f = fixture().await;
+    let (status, body) = send(&f.app, get("/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(as_json(&body)["status"], json!("ok"));
+}
+
+#[tokio::test]
+async fn readyz_ok_when_backends_reachable() {
+    let f = fixture().await;
+    let (status, body) = send(&f.app, get("/readyz")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = as_json(&body);
+    assert_eq!(v["ready"], json!(true));
+    assert_eq!(v["metadata"]["ok"], json!(true));
+    assert_eq!(v["content"]["ok"], json!(true));
+}
+
+/// A fully functional content store whose readiness probe reports failure — to
+/// prove `/readyz` returns 503 (not 200) when a backend is unreachable, while a
+/// healthy metadata store is still reported `ok`.
+struct ContentPingDown(Arc<dyn origofs_core::ContentStore>);
+
+#[async_trait::async_trait]
+impl origofs_core::ContentStore for ContentPingDown {
+    async fn put(&self, bytes: &[u8]) -> origofs_core::Result<origofs_core::Hash> {
+        self.0.put(bytes).await
+    }
+    async fn put_keyed(&self, key: &origofs_core::Hash, bytes: &[u8]) -> origofs_core::Result<()> {
+        self.0.put_keyed(key, bytes).await
+    }
+    async fn get(&self, hash: &origofs_core::Hash) -> origofs_core::Result<bytes::Bytes> {
+        self.0.get(hash).await
+    }
+    async fn get_range(
+        &self,
+        hash: &origofs_core::Hash,
+        off: u64,
+        len: u64,
+    ) -> origofs_core::Result<bytes::Bytes> {
+        self.0.get_range(hash, off, len).await
+    }
+    async fn has(&self, hash: &origofs_core::Hash) -> origofs_core::Result<bool> {
+        self.0.has(hash).await
+    }
+    async fn list(&self) -> origofs_core::Result<Vec<origofs_core::Hash>> {
+        self.0.list().await
+    }
+    async fn delete(&self, hash: &origofs_core::Hash) -> origofs_core::Result<u64> {
+        self.0.delete(hash).await
+    }
+    async fn ping(&self) -> origofs_core::Result<()> {
+        Err(origofs_core::OrigoFSError::Backend {
+            origin: origofs_core::BackendOrigin::Content,
+            class: origofs_core::ErrorClass::Unavailable,
+            source: Box::new(std::io::Error::other("content store down")),
+        })
+    }
+}
+
+#[tokio::test]
+async fn readyz_503_when_a_backend_is_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn origofs_core::MetadataStore> =
+        Arc::new(origofs_core::SqliteMetadataStore::open(dir.path().join("meta.db")).unwrap());
+    let inner: Arc<dyn origofs_core::ContentStore> = Arc::new(
+        origofs_core::LocalCasStore::open(dir.path().join("cas"))
+            .await
+            .unwrap(),
+    );
+    let content: Arc<dyn origofs_core::ContentStore> = Arc::new(ContentPingDown(inner));
+    let ws = Workspace::open(meta, content).await.unwrap();
+    let app = router(Arc::new(ws), Arc::new(BearerAuth::new()));
+
+    let (status, body) = send(&app, get("/readyz")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let v = as_json(&body);
+    assert_eq!(v["ready"], json!(false));
+    assert_eq!(v["content"]["ok"], json!(false));
+    // The metadata store is healthy, so it is reported ok even while content is down.
+    assert_eq!(v["metadata"]["ok"], json!(true));
+}
+
+// --- v1 versioning, error envelope, middleware ------------------------------
+
+#[tokio::test]
+async fn data_routes_are_versioned_under_v1() {
+    let f = fixture().await;
+    // The unversioned path is gone — only /v1/... serves data.
+    let raw = Request::builder()
+        .uri("/files/x")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(&f.app, raw).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The versioned path resolves (a missing-file 404, proven by the error code,
+    // not a routing 404).
+    let (status, body) = send(&f.app, get("/files/x")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(as_json(&body)["error"]["code"], json!("not_found"));
+}
+
+#[tokio::test]
+async fn error_envelope_has_code_message_and_retryable() {
+    let f = fixture().await;
+    let (status, body) = send(&f.app, get("/files/missing")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let err = &as_json(&body)["error"];
+    assert_eq!(err["code"], json!("not_found"));
+    assert_eq!(err["retryable"], json!(false));
+    assert!(err["message"].as_str().unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn request_id_is_echoed_on_the_response() {
+    let f = fixture().await;
+    let resp = f.app.clone().oneshot(get("/readyz")).await.unwrap();
+    assert!(
+        resp.headers().get("x-request-id").is_some(),
+        "the request-id middleware should echo an id on every response"
+    );
+}
+
+#[tokio::test]
+async fn log_pagination_limits_results() {
+    let f = fixture().await;
+    for i in 0..3 {
+        send(&f.app, put_as(&format!("/files/f{i}.txt"), T_HUMAN, b"x")).await;
+        send(
+            &f.app,
+            post_json_as("/commit", T_HUMAN, json!({ "message": format!("c{i}") })),
+        )
+        .await;
+    }
+    let (status, body) = send(&f.app, get("/log?limit=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(as_json(&body).as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn cors_preflight_allows_a_configured_origin() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let app = router_with(
+        Arc::new(ws),
+        Arc::new(BearerAuth::new()),
+        ApiOptions {
+            cors_origins: vec!["https://app.example.com".into()],
+            ..Default::default()
+        },
+    );
+    let preflight = Request::builder()
+        .method("OPTIONS")
+        .uri("/v1/files/x")
+        .header("origin", "https://app.example.com")
+        .header("access-control-request-method", "PUT")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(preflight).await.unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .expect("configured origin must be allowed"),
+        "https://app.example.com"
+    );
+}
+
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
@@ -68,13 +242,22 @@ fn as_json(bytes: &[u8]) -> Value {
 
 // --- read builders (open) ---------------------------------------------------
 
+/// Prefix data-route paths with the API version; liveness/readiness stay at root.
+fn v1(uri: &str) -> String {
+    if uri == "/health" || uri == "/readyz" {
+        uri.to_string()
+    } else {
+        format!("/v1{uri}")
+    }
+}
+
 fn get(uri: &str) -> Request<Body> {
-    Request::builder().uri(uri).body(Body::empty()).unwrap()
+    Request::builder().uri(v1(uri)).body(Body::empty()).unwrap()
 }
 
 fn get_as(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
-        .uri(uri)
+        .uri(v1(uri))
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap()
@@ -85,7 +268,7 @@ fn get_as(uri: &str, token: &str) -> Request<Body> {
 fn put_bytes(uri: &str, body: &[u8]) -> Request<Body> {
     Request::builder()
         .method("PUT")
-        .uri(uri)
+        .uri(v1(uri))
         .body(Body::from(body.to_vec()))
         .unwrap()
 }
@@ -93,7 +276,7 @@ fn put_bytes(uri: &str, body: &[u8]) -> Request<Body> {
 fn post_json(uri: &str, v: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri(uri)
+        .uri(v1(uri))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&v).unwrap()))
         .unwrap()
@@ -104,7 +287,7 @@ fn post_json(uri: &str, v: Value) -> Request<Body> {
 fn put_as(uri: &str, token: &str, body: &[u8]) -> Request<Body> {
     Request::builder()
         .method("PUT")
-        .uri(uri)
+        .uri(v1(uri))
         .header("authorization", format!("Bearer {token}"))
         .body(Body::from(body.to_vec()))
         .unwrap()
@@ -113,7 +296,7 @@ fn put_as(uri: &str, token: &str, body: &[u8]) -> Request<Body> {
 fn delete_as(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
-        .uri(uri)
+        .uri(v1(uri))
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap()
@@ -122,7 +305,7 @@ fn delete_as(uri: &str, token: &str) -> Request<Body> {
 fn post_json_as(uri: &str, token: &str, v: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri(uri)
+        .uri(v1(uri))
         .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&v).unwrap()))
@@ -132,7 +315,7 @@ fn post_json_as(uri: &str, token: &str, v: Value) -> Request<Body> {
 fn post_bytes_as(uri: &str, token: &str, body: &[u8]) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri(uri)
+        .uri(v1(uri))
         .header("authorization", format!("Bearer {token}"))
         .body(Body::from(body.to_vec()))
         .unwrap()
@@ -141,7 +324,7 @@ fn post_bytes_as(uri: &str, token: &str, body: &[u8]) -> Request<Body> {
 fn post_empty_as(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri(uri)
+        .uri(v1(uri))
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap()
@@ -188,12 +371,7 @@ async fn missing_file_is_404_and_dir_read_is_400() {
     let app = &fx.app;
     let (st, body) = send(app, get("/files/nope.txt")).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
-    assert!(
-        as_json(&body)["error"]
-            .as_str()
-            .unwrap()
-            .contains("not found")
-    );
+    assert_eq!(as_json(&body)["error"]["code"], json!("not_found"));
 
     send(app, post_json_as("/dirs/adir", T_HUMAN, json!({}))).await;
     let (st, _) = send(app, get("/files/adir")).await; // reading a directory
@@ -457,7 +635,10 @@ async fn gate_reads_requires_a_credential_for_reads() {
     let app = router_with(
         Arc::new(ws),
         Arc::new(auth),
-        ApiOptions { gate_reads: true },
+        ApiOptions {
+            gate_reads: true,
+            ..Default::default()
+        },
     );
 
     // /health stays open even when reads are gated.

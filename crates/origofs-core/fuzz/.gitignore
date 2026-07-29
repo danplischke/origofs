@@ -1,0 +1,9 @@
+target
+artifacts
+coverage
+Cargo.lock
+# The corpus dir holds libFuzzer's evolving finds (ephemeral, regenerated each
+# run) — ignore them, but keep the curated `seed-*` inputs that ship the
+# entry-loop / anti-OOM-guard coverage into CI.
+corpus/*/*
+!corpus/*/seed-*

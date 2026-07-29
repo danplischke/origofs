@@ -11,7 +11,9 @@
 //! runs many rounds to shake out interleavings; a violation prints its round and
 //! the observed state.
 
-use origofs_core::{EventInit, Fs, MemStore, OrigoFSError, SqliteMetadataStore, WriteCtx};
+use origofs_core::{
+    EventInit, FileKind, Fs, MemStore, OrigoFSError, SqliteMetadataStore, WriteCtx,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -197,6 +199,9 @@ async fn concurrent_commits_never_lose_a_commit() {
                         Ok(h) => return h,
                         // The branch moved under us — retry against the new head.
                         Err(OrigoFSError::Metadata(_)) => continue,
+                        // A transient backend failure (serialization/deadlock/
+                        // contention) is likewise just a signal to retry.
+                        Err(e) if e.retryable() => continue,
                         Err(e) => panic!("round {round}: unexpected commit error: {e}"),
                     }
                 }
@@ -216,5 +221,70 @@ async fn concurrent_commits_never_lose_a_commit() {
                 "round {round}: a successfully-committed commit is not in history (lost/orphaned)"
             );
         }
+    }
+}
+
+/// A1 (issue #70) — `mkdir_p` is idempotent under concurrency (see the engine's
+/// `mkdir_p` docstring, C1/M6): when many tasks race to create the SAME deep
+/// path, each missing segment is created **exactly once** — a loser hits the
+/// dentry unique index, rolls back its just-created inode, and adopts the
+/// winner's directory rather than orphaning a second inode or forking the tree.
+/// So every racer must succeed and agree on the leaf inode, every component must
+/// resolve to a single directory, and no name may be duplicated in its parent (a
+/// botched rollback would leave two dentries).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_mkdir_p_is_idempotent_and_orphan_free() {
+    for round in 0..120u64 {
+        let fs = shared().await;
+        let path = "/x/y/z/w";
+        let n = 8;
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let fs = Arc::clone(&fs);
+            handles.push(tokio::spawn(async move { fs.mkdir_p(path).await }));
+        }
+
+        // Every racer succeeds and returns the SAME leaf inode (the tree never forks).
+        let mut leaves = Vec::new();
+        for h in handles {
+            leaves.push(
+                h.await
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("round {round}: mkdir_p failed under a race: {e}")),
+            );
+        }
+        let leaf = leaves[0];
+        for got in &leaves {
+            assert_eq!(
+                *got, leaf,
+                "round {round}: racers disagree on the leaf inode ({got} vs {leaf}) — tree forked"
+            );
+        }
+
+        // Each component resolves to a single directory, and no name is duplicated in
+        // its parent (the unique-index conflict + rollback left no second dentry).
+        for (parent, name) in [("/", "x"), ("/x", "y"), ("/x/y", "z"), ("/x/y/z", "w")] {
+            let dupes = fs
+                .ls(parent)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.name == name)
+                .count();
+            assert_eq!(
+                dupes, 1,
+                "round {round}: '{name}' under {parent} appears {dupes}× (dup dentry / orphan)"
+            );
+        }
+        let leaf_stat = fs.stat(path).await.unwrap();
+        assert_eq!(
+            leaf_stat.kind,
+            FileKind::Dir,
+            "round {round}: leaf is not a directory"
+        );
+        assert_eq!(
+            leaf_stat.ino, leaf,
+            "round {round}: leaf inode unstable after the race"
+        );
     }
 }

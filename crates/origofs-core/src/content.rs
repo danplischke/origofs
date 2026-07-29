@@ -65,6 +65,16 @@ pub trait ContentStore: Send + Sync {
     async fn repack(&self) -> Result<u64> {
         Ok(0)
     }
+
+    /// A cheap liveness probe of the content backend, for the readiness endpoint
+    /// (`/readyz`). The default is a no-op — an in-memory or always-present store
+    /// is always ready. Remote backends override it with a cheap reachability
+    /// check (an object store issues a single HEAD), and decorators forward to
+    /// their inner store, so a probe on the outermost store reaches the real
+    /// backend.
+    async fn ping(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A content-addressed store backed by a local directory.
@@ -221,6 +231,12 @@ impl ContentStore for LocalCasStore {
             Err(e) => Err(e.into()),
         }
     }
+
+    async fn ping(&self) -> Result<()> {
+        // The object root must exist and be reachable on the local filesystem.
+        tokio::fs::metadata(self.root.join("objects")).await?;
+        Ok(())
+    }
 }
 
 /// Delegating impl so `Arc<dyn ContentStore>` (and `Arc<ConcreteStore>`) is itself
@@ -253,6 +269,9 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
     }
     async fn repack(&self) -> Result<u64> {
         (**self).repack().await
+    }
+    async fn ping(&self) -> Result<()> {
+        (**self).ping().await
     }
 }
 
@@ -417,6 +436,11 @@ impl ContentStore for TieredStore {
         let _ = self.cache.delete(hash).await; // best-effort cache eviction
         Ok(freed)
     }
+
+    async fn ping(&self) -> Result<()> {
+        // The backend is authoritative for durability; the cache is best-effort.
+        self.backend.ping().await
+    }
 }
 
 /// A [`ContentStore`] decorator that **verifies integrity on read**: every
@@ -470,7 +494,12 @@ impl ContentStore for VerifyingStore {
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         let bytes = self.inner.get(hash).await?;
-        verify_integrity(hash, &bytes)?;
+        if let Err(e) = verify_integrity(hash, &bytes) {
+            // A bit-rotted / tampered object at the chunk-addressed boundary — the
+            // operator wants to know immediately (it points at storage corruption).
+            tracing::warn!(hash = %hash.to_hex(), "content failed integrity verification");
+            return Err(e);
+        }
         Ok(bytes)
     }
 
@@ -503,5 +532,9 @@ impl ContentStore for VerifyingStore {
 
     async fn repack(&self) -> Result<u64> {
         self.inner.repack().await
+    }
+
+    async fn ping(&self) -> Result<()> {
+        self.inner.ping().await
     }
 }

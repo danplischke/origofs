@@ -25,6 +25,10 @@ upath = ["universal_pathlib>=0.2.0", "fsspec>=2023.9.0"]
 llamaindex = ["llama-index-core>=0.11"]
 # `origofs.converters.MarkItDownConverter` — project PDFs/Office docs to Markdown.
 markitdown = ["markitdown"]
+# `origofs.db`: SQLAlchemy models of the metadata schema + Alembic migrations
+# for it (`origofs.db.upgrade`). Add a driver for your backend too, e.g.
+# `psycopg[binary]` for Postgres — sqlite3 is stdlib, no extra needed for it.
+db = ["sqlalchemy>=2.0", "alembic>=1.13"]
 
 # Register the "origofs://" protocol so `fsspec.filesystem("origofs", ...)` and
 # `pandas.read_*("origofs://…", storage_options=…)` resolve to our filesystem

@@ -1,6 +1,6 @@
 //! Live co-editing over a real WebSocket (roadmap M8): a genuine Yjs client — a
 //! raw `yrs::Doc` driven by the stock y-sync `DefaultProtocol`, exactly what
-//! PlateJS and `y-websocket` run — connects to `/coedit/{path}`, and its edits
+//! PlateJS and `y-websocket` run — connects to `/v1/coedit/{path}`, and its edits
 //! merge, fan out to a second client, and land attributed in blame. Requires the
 //! `coedit` feature.
 #![cfg(all(feature = "api", feature = "coedit"))]
@@ -84,7 +84,7 @@ async fn vanilla_yjs_clients_collaborate_over_websocket() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let url = |tok: &str| format!("ws://{addr}/coedit/doc.md?token={tok}");
+    let url = |tok: &str| format!("ws://{addr}/v1/coedit/doc.md?token={tok}");
     let (mut a, _) = tokio_tungstenite::connect_async(url("tok-alice"))
         .await
         .unwrap();

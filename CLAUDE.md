@@ -60,9 +60,13 @@ pytest tests/          # some tests also gate on ORIGOFS_PG_TEST_URL
 ### Toolchain note
 
 There is no `rust-toolchain` file. **`origofs-core`, `origofs-sdk`, and `origofs-cli`
-use `edition = "2024"`** (needs Rust ≥ 1.85); `origofs-py` inherits `edition = "2021"`
-from the workspace. CI lives at `.github/workflows/ci.yml` (fmt + clippy + tests, and
-an explicit `coedit` pass) and runs on stable. Use a recent stable toolchain.
+use `edition = "2024"`** (edition 2024 itself sets a Rust ≥ 1.85 *language* floor);
+`origofs-py` inherits `edition = "2021"` from the workspace. The **effective MSRV is
+1.88**, though — the code uses `let`-chains (stabilized in 1.88) and the dependency
+graph (`icu`, via `url`/`object_store`) needs ≥ 1.86 — and the `msrv` CI job pins it
+so an accidental newer-stdlib use or a dependency MSRV bump is caught. CI lives at
+`.github/workflows/ci.yml` (fmt + clippy + tests, an explicit `coedit` pass, and the
+`msrv` floor) and otherwise runs on stable. Use a recent stable toolchain.
 
 ## The one architectural idea everything hangs on
 
@@ -227,6 +231,17 @@ Each is a module under `crates/origofs-sdk/src/`, gated by the matching feature
   explicit runner (a normal `open` already migrates).
 - **`ORIGOFS_ENCRYPTION_KEY`** opts a workspace into encryption at rest (kept out of
   argv/history); the *same* value must be used on every open or reads fail loudly.
+- **Observability is emit-only in the library.** `origofs-core`/`origofs-sdk` emit
+  `tracing` spans/events (the `Workspace` write-path methods are `#[instrument]`ed;
+  `VerifyingStore` `warn!`s on a failed integrity check) but **install no
+  subscriber** — a library that only emits is a no-op until a binary opts in, so a
+  Rust embedder pays nothing and installs their own. The **CLI** installs one
+  (`init_tracing`, `crates/origofs-cli/src/main.rs`): level filter from
+  `ORIGOFS_LOG`/`RUST_LOG` (default `info`), `--log-format json|text`, always to
+  **stderr** so `origofs mcp` keeps stdout for its JSON-RPC transport. Backend
+  errors also carry a machine `code()` + `retryable()`/`class()` (`error.rs`) instead
+  of a flat string, and `/readyz` (distinct from liveness `/health`) probes the
+  stores via `MetadataStore::ping`/`ContentStore::ping`.
 - Integration tests live in each crate's `tests/` and are the clearest executable
   spec of behavior (e.g. `origofs-core/tests/{merge,attribution,recover,durability,
   integrity}.rs`). Mirror their style when adding coverage.

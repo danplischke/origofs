@@ -232,6 +232,84 @@ report = await ws.rebuild()                             # restores refs + workin
 Reading every object also integrity-checks it (`report["corrupt"]` counts any that
 failed). The DB stays the thing to back up — so also run Postgres PITR / a replica.
 
+## Alembic migrations for the metadata schema
+
+A workspace already migrates its own metadata schema forward automatically on
+open (`ws.schema_version()` / `ws.migrate()`) — `origofs.db` is for the times
+you want that schema managed by **Alembic** instead: a CI-driven migration
+step, a schema-diffing tool, or provisioning a fresh database before the
+engine ever touches it. `origofs.db.models` declares every table from
+`crates/origofs-core/src/migrations.rs` as SQLAlchemy models (the single
+source of truth `origofs.db`'s packaged migrations autogenerate against), so
+a database Alembic creates is fully interoperable with one the engine creates.
+Needs the `db` extra (`pip install "origofs[db]"`) plus a driver for your
+backend (Postgres: `psycopg[binary]`; SQLite's `sqlite3` is stdlib).
+
+**Provision or upgrade a database** — run this once (a deploy step, an init
+container, or before the first `origofs.Workspace.open_*`) and the workspace
+API opens straight into an already-migrated store:
+
+```python
+import origofs.db
+
+origofs.db.upgrade("sqlite:///meta.db")                          # dev/solo
+origofs.db.upgrade("postgresql+psycopg://user:pass@host/dbname")  # multi-writer/production
+
+# ...or skip passing a URL at all and set it once in the environment:
+#   os.environ["ORIGOFS_DATABASE_URL"] = "postgresql+psycopg://…"
+#   origofs.db.upgrade()
+```
+
+**Roll back or inspect history** — `get_alembic_config` hands you a real
+`alembic.config.Config` for anything beyond upgrade/downgrade:
+
+```python
+origofs.db.downgrade("sqlite:///meta.db")           # one revision back
+origofs.db.downgrade("sqlite:///meta.db", "base")   # drop every origofs table
+
+from alembic import command
+cfg = origofs.db.get_alembic_config("sqlite:///meta.db")
+command.current(cfg)   # the revision(s) currently applied
+command.history(cfg)   # the full revision list
+```
+
+**Two migration ledgers, one schema.** Alembic tracks its own progress in
+`alembic_version`; the engine tracks its own in `schema_meta`
+(`crates/origofs-core/src/migrations.rs`). The packaged initial revision
+creates every table *and* stamps `schema_meta` through the latest version the
+engine knows about, so both ledgers agree from the moment Alembic creates the
+database — the engine never re-runs (or, for the destructive V11/V13 table
+rebuilds, re-applies) a migration Alembic already handled. Whichever tool
+creates the database, `ws.schema_version()` reports `up_to_date: True`.
+
+**Query the schema directly** — every table is a plain SQLAlchemy model
+(`origofs.db.Actor`, `.EditOp`, `.BlobBlame`, `.Suggestion`, `.FsEvent`, …),
+handy for read-only reporting/analytics queries that sit alongside the async
+workspace API:
+
+```python
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session as DbSession   # origofs.db.Session is the *table* model
+from origofs.db import Actor, EditOp
+
+engine = create_engine("sqlite:///meta.db")
+with DbSession(engine) as db:
+    edits_by_actor = db.execute(
+        select(Actor.display_name, EditOp.path)
+        .join(EditOp, EditOp.actor_id == Actor.id)
+    ).all()
+```
+
+**Developing origofs itself** — after editing `python/origofs/db/models.py`,
+draft the next migration from the `origofs-py` crate root (uses the
+`alembic.ini` there, not `origofs.db`'s programmatic config):
+
+```bash
+cd crates/origofs-py
+alembic -x db_url=sqlite:///./dev.db revision --autogenerate -m "…"
+alembic -x db_url=sqlite:///./dev.db upgrade head
+```
+
 ## Examples
 
 - **`examples/collab_app.py`** — the one to start from. A complete little
@@ -269,4 +347,5 @@ Integrations (own extras): `origofs.fastapi` (HTTP router) · `origofs.fsspec`
 (`OrigoFileSystem`, the fsspec filesystem — also a `UPath("origofs://…")` via
 universal-pathlib) · `origofs.rag` (provenance-carrying passages) +
 `origofs.llamaindex` (`SimpleWorkspaceReader`) + `origofs.converters`
-(`MarkItDownConverter`) · `origofs.overlay` (agent overlay).
+(`MarkItDownConverter`) · `origofs.overlay` (agent overlay) · `origofs.db`
+(SQLAlchemy models + Alembic migrations for the metadata schema).

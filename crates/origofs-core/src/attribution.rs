@@ -888,3 +888,72 @@ fn diff_spans(old: &[u8], old_map: &BlameMap, new: &[u8], new_author: (i64, i64)
 fn normalize_line(line: &str) -> String {
     line.trim().to_string()
 }
+
+#[cfg(test)]
+mod blame_props {
+    //! B2 (issue #70): property tests for the pure blame interval math on
+    //! [`BlameMap`] — coalescing preserves the total byte count, the wire
+    //! encoding roundtrips, slicing the full range reconstructs the runs, and a
+    //! windowed slice returns exactly the overlap. These are the byte-range
+    //! invariants `write_as`/`revert_session` rely on.
+    use super::BlameMap;
+    use proptest::prelude::*;
+
+    /// Arbitrary `(actor, session, byte_len)` spans over a small actor/session
+    /// space (so adjacent same-author runs actually occur and get coalesced).
+    fn arb_spans() -> impl Strategy<Value = Vec<(i64, i64, u64)>> {
+        prop::collection::vec((0i64..4, 0i64..3, 0u64..1000), 0..32)
+    }
+
+    proptest! {
+        /// Coalescing adjacent same-author runs preserves the total byte count
+        /// (zero-length spans are dropped, contributing nothing).
+        #[test]
+        fn from_spans_preserves_total(spans in arb_spans()) {
+            let expect: u64 = spans.iter().filter(|(_, _, l)| *l > 0).map(|(_, _, l)| l).sum();
+            prop_assert_eq!(BlameMap::from_spans(&spans).total(), expect);
+        }
+
+        /// `from_spans` never leaves two adjacent runs with the same author.
+        #[test]
+        fn from_spans_coalesces_adjacent(spans in arb_spans()) {
+            let m = BlameMap::from_spans(&spans);
+            for w in m.runs.windows(2) {
+                prop_assert!(w[0].actor != w[1].actor || w[0].session != w[1].session);
+            }
+        }
+
+        /// The `actor,session,len;...` wire form roundtrips.
+        #[test]
+        fn encode_decode_roundtrips(spans in arb_spans()) {
+            let m = BlameMap::from_spans(&spans);
+            prop_assert_eq!(BlameMap::decode(&m.encode()).runs, m.runs);
+        }
+
+        /// Slicing the full `[0, total)` range and re-coalescing reconstructs the
+        /// original runs exactly.
+        #[test]
+        fn slice_full_range_reconstructs(spans in arb_spans()) {
+            let m = BlameMap::from_spans(&spans);
+            let total = m.total();
+            let sliced: Vec<(i64, i64, u64)> = m.slice(0, total);
+            prop_assert_eq!(BlameMap::from_spans(&sliced).runs, m.runs);
+        }
+
+        /// A windowed slice returns lengths summing to exactly the overlap of
+        /// `[start, start+len)` with the covered `[0, total)`.
+        #[test]
+        fn slice_window_sums_to_overlap(
+            spans in arb_spans(),
+            start in 0u64..2000,
+            len in 0u64..2000,
+        ) {
+            let m = BlameMap::from_spans(&spans);
+            let total = m.total();
+            let end = start.saturating_add(len);
+            let got: u64 = m.slice(start, len).iter().map(|(_, _, l)| l).sum();
+            let expect = total.min(end).saturating_sub(total.min(start));
+            prop_assert_eq!(got, expect);
+        }
+    }
+}

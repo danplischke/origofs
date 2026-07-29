@@ -1,0 +1,56 @@
+# cargo-fuzz targets for the content-addressed object decoders (B3, #70).
+#
+# This crate builds *only* under `cargo +nightly fuzz` — libfuzzer-sys links the
+# libFuzzer runtime and needs `-Z sanitizer`, so it must never be pulled into a
+# stable `cargo build --workspace`. The empty `[workspace]` table below detaches
+# it from the parent workspace to guarantee exactly that.
+[package]
+name = "origofs-core-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.origofs-core]
+path = ".."
+
+[profile.release]
+debug = 1
+
+# Each decoder is a self-contained `&[u8] -> Result<_>` boundary — the ideal
+# fuzz surface. `test`/`doc`/`bench` are off so these never enter a normal test
+# or doc build.
+[[bin]]
+name = "manifest_decode"
+path = "fuzz_targets/manifest_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree_decode"
+path = "fuzz_targets/tree_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "commit_decode"
+path = "fuzz_targets/commit_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "refsnapshot_decode"
+path = "fuzz_targets/refsnapshot_decode.rs"
+test = false
+doc = false
+bench = false
