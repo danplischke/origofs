@@ -72,21 +72,21 @@ class SimpleWorkspaceReader:
         self._db_path = db_path
         self._cas_dir = cas_dir
         self._convert = _resolve_convert(convert)
-        self._kw = dict(
-            root=root,
-            exts=exts,
-            segmentation=segmentation,
-            size=size,
-            overlap=overlap,
-            with_blame=with_blame,
-            text_exts=text_exts,
-            segment=segment,
-        )
+        self._root = root
+        self._exts = exts
+        self._segmentation = segmentation
+        self._size = size
+        self._overlap = overlap
+        self._with_blame = with_blame
+        self._text_exts = text_exts
+        self._segment = segment
 
     async def _get_ws(self) -> Any:
         if self._ws is None:
             import origofs
 
+            # The constructor guarantees these are set when ws was not provided.
+            assert self._db_path is not None and self._cas_dir is not None
             self._ws = await origofs.Workspace.open_local(self._db_path, self._cas_dir)
         return self._ws
 
@@ -95,7 +95,18 @@ class SimpleWorkspaceReader:
     async def aload_passages(self) -> list[Passage]:
         """The raw :class:`~origofs.rag.Passage` records (no LlamaIndex types)."""
         ws = await self._get_ws()
-        return await read_passages(ws, convert=self._convert, **self._kw)
+        return await read_passages(
+            ws,
+            root=self._root,
+            exts=self._exts,
+            segmentation=self._segmentation,
+            size=self._size,
+            overlap=self._overlap,
+            with_blame=self._with_blame,
+            convert=self._convert,
+            text_exts=self._text_exts,
+            segment=self._segment,
+        )
 
     # --- LlamaIndex documents / nodes --------------------------------------
 

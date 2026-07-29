@@ -55,12 +55,25 @@ python_version = "3.11"
 # `__init__.pyi` already describes that surface for anyone importing
 # `origofs`) — checking `__init__.py`'s own body would just fail to resolve
 # that import.
-files = ["tests", "python/origofs/fastapi.py", "python/origofs/db"]
+files = [
+    "tests",
+    "python/origofs/fastapi.py",
+    "python/origofs/db",
+    "python/origofs/rag.py",
+    "python/origofs/converters.py",
+    "python/origofs/llamaindex.py",
+]
 
 # fsspec's own test-support submodule ships no py.typed marker; that's a gap in
 # fsspec, not origofs, so don't let it show up as noise in our check.
 [[tool.mypy.overrides]]
 module = "fsspec.tests.*"
+ignore_missing_imports = true
+
+# MarkItDown ships no type stubs; the `origofs.converters` wrapper is defensive
+# about its API anyway (it's an optional, swappable converter).
+[[tool.mypy.overrides]]
+module = "markitdown"
 ignore_missing_imports = true
 
 [tool.maturin]
