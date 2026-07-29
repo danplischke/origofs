@@ -19,9 +19,10 @@
 use origofs_core::LocalCasStore;
 use origofs_sdk::{
     Actor, BlameRange, CommitInfo, DiffEntry, DiffStatus, DirEntry, Event, EventSubscription,
-    GcsConfig as CoreGcsConfig, Inode, Presence, RebuildReport, S3Config as CoreS3Config,
-    Suggestion, SuggestionStatus, Workspace as CoreWorkspace, WriteCtx as CoreWriteCtx,
-    WriteOutcome as CoreWriteOutcome, WritePolicy as CoreWritePolicy,
+    GcsConfig as CoreGcsConfig, Inode, Passage, PassageOptions, Presence, RebuildReport,
+    S3Config as CoreS3Config, Segmentation, Suggestion, SuggestionStatus,
+    Workspace as CoreWorkspace, WriteCtx as CoreWriteCtx, WriteOutcome as CoreWriteOutcome,
+    WritePolicy as CoreWritePolicy,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::{
@@ -151,6 +152,52 @@ fn blame_dict(py: Python<'_>, b: &BlameRange) -> PyResult<Py<PyAny>> {
     d.set_item("session", b.session)?;
     d.set_item("actor", actor_dict(py, &b.actor)?)?;
     Ok(d.into_any().unbind())
+}
+
+fn passage_dict(py: Python<'_>, p: &Passage) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("path", &p.path)?;
+    d.set_item("byte_start", p.byte_start)?;
+    d.set_item("byte_end", p.byte_end)?;
+    // Content address of the passage bytes — dedup / incremental-embedding key.
+    d.set_item("hash", p.hash.to_hex())?;
+    // Text is decoded as UTF-8 (lossily); `None` when text wasn't requested.
+    match &p.text {
+        Some(b) => d.set_item("text", String::from_utf8_lossy(b.as_ref()).into_owned())?,
+        None => d.set_item("text", py.None())?,
+    }
+    d.set_item(
+        "blame",
+        p.blame
+            .iter()
+            .map(|b| blame_dict(py, b))
+            .collect::<PyResult<Vec<_>>>()?,
+    )?;
+    Ok(d.into_any().unbind())
+}
+
+/// Build a core `Segmentation` from the Python-facing `(kind, size, overlap)`.
+/// `size`/`overlap` are reused per strategy (bytes for `fixed`, lines for
+/// `lines`, the content-defined average for `content_defined`).
+fn parse_segmentation(kind: &str, size: usize, overlap: usize) -> PyResult<Segmentation> {
+    Ok(match kind {
+        "whole_file" | "whole" => Segmentation::WholeFile,
+        "fixed" | "fixed_bytes" => Segmentation::FixedBytes { size, overlap },
+        "lines" => Segmentation::Lines {
+            max_lines: size,
+            overlap,
+        },
+        "content_defined" | "cdc" => Segmentation::ContentDefined {
+            min: size / 4,
+            avg: size,
+            max: size * 4,
+        },
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown segmentation {other:?} (expected whole_file | fixed | lines | content_defined)"
+            )));
+        }
+    })
 }
 
 fn event_dict(py: Python<'_>, e: &Event) -> PyResult<Py<PyAny>> {
@@ -1358,6 +1405,64 @@ impl Workspace {
         })
     }
 
+    /// Extract retrieval passages from the working tree — the technology-agnostic
+    /// half of RAG. Returns a list of dicts `{path, byte_start, byte_end, hash,
+    /// text, blame}`; `hash` is the passage's content address (dedup /
+    /// incremental-embedding key) and `blame` is its per-span authorship. No
+    /// embeddings/vectors — those live in userland (see `origofs.rag`).
+    ///
+    /// `segmentation` is one of `content_defined` (default; edit-stable, best for
+    /// incremental indexing), `fixed`, `lines`, or `whole_file`. `size`/`overlap`
+    /// are reused per strategy (bytes for `fixed`, lines for `lines`, the average
+    /// passage size for `content_defined`). `exts` filters by file extension.
+    #[pyo3(signature = (
+        root=None,
+        exts=None,
+        segmentation=None,
+        size=1024,
+        overlap=0,
+        with_text=true,
+        with_blame=true,
+        max_file_bytes=0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn passages<'py>(
+        &self,
+        py: Python<'py>,
+        root: Option<String>,
+        exts: Option<Vec<String>>,
+        segmentation: Option<String>,
+        size: usize,
+        overlap: usize,
+        with_text: bool,
+        with_blame: bool,
+        max_file_bytes: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        // Parse synchronously so a bad segmentation name errors on the call itself.
+        let seg = parse_segmentation(
+            segmentation.as_deref().unwrap_or("content_defined"),
+            size,
+            overlap,
+        )?;
+        let opts = PassageOptions {
+            root: root.unwrap_or_else(|| "/".to_string()),
+            exts,
+            segmentation: seg,
+            with_text,
+            with_blame,
+            max_file_bytes,
+        };
+        future_into_py(py, async move {
+            let ps = ws.passages(&opts).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                ps.iter()
+                    .map(|p| passage_dict(py, p))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
     /// Open a live co-editing document for `path` (roadmap M8): resume the CRDT
     /// from its persisted sidecar if one exists, else promote the file's current
     /// text into a fresh document attributed to `ctx`. Returns a [`CoeditDoc`] to
@@ -1797,6 +1902,15 @@ fn fuse_mountable() -> bool {
     false
 }
 
+/// The origofs content address (BLAKE3, hex) of `data` — the same hash a passage
+/// carries. Lets a Python pipeline key *derived* content (e.g. Markdown converted
+/// from a PDF) by the same scheme origofs uses, so dedup / incremental-embedding
+/// keys stay consistent across native and converted passages.
+#[pyfunction]
+fn content_hash(data: Vec<u8>) -> String {
+    origofs_sdk::Hash::of(&data).to_hex()
+}
+
 /// The compiled extension is imported as `origofs._origofs`; the pure-Python package
 /// `origofs` (see `python/origofs/__init__.py`) re-exports everything from it and adds
 /// optional integrations like `origofs.fastapi`.
@@ -1815,6 +1929,7 @@ fn _origofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(unix)]
     m.add_class::<Mount>()?;
     m.add_function(wrap_pyfunction!(fuse_mountable, m)?)?;
+    m.add_function(wrap_pyfunction!(content_hash, m)?)?;
     m.add("OrigoFSError", m.py().get_type::<OrigoFSError>())?;
     m.add("ConflictError", m.py().get_type::<ConflictError>())?;
     Ok(())

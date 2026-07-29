@@ -20,6 +20,11 @@ fastapi = ["fastapi", "uvicorn"]
 fsspec = ["fsspec>=2023.9.0"]
 # universal-pathlib: a pathlib-style `UPath("origofs://…")` over the filesystem.
 upath = ["universal_pathlib>=0.2.0", "fsspec>=2023.9.0"]
+# `origofs.llamaindex.SimpleWorkspaceReader` — RAG documents with provenance.
+# (`origofs.rag` itself needs no extra deps; it's built on the compiled core.)
+llamaindex = ["llama-index-core>=0.11"]
+# `origofs.converters.MarkItDownConverter` — project PDFs/Office docs to Markdown.
+markitdown = ["markitdown"]
 
 # Register the "origofs://" protocol so `fsspec.filesystem("origofs", ...)` and
 # `pandas.read_*("origofs://…", storage_options=…)` resolve to our filesystem

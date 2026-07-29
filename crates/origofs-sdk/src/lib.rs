@@ -17,9 +17,10 @@ pub use futures::stream::BoxStream;
 pub use origofs_core::{
     Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DiffEntry, DiffStatus, DirEntry,
     EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind, GcStats, GcsConfig,
-    Hash, Inode, MemStore, MergeOutcome, ObjectContentStore, OrigoFSError, PackStore, Presence,
-    RebuildReport, S3Config, Suggestion, SuggestionContent, SuggestionInit, SuggestionStatus,
-    TieredStore, ToolCallInit, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    Hash, Inode, MemStore, MergeOutcome, ObjectContentStore, OrigoFSError, PackStore, Passage,
+    PassageOptions, Presence, RebuildReport, S3Config, Segmentation, Suggestion, SuggestionContent,
+    SuggestionInit, SuggestionStatus, TieredStore, ToolCallInit, VerifyingStore, VersioningMode,
+    WriteCtx, WriteOutcome, WritePolicy,
 };
 #[cfg(feature = "coedit")]
 pub use origofs_core::{CoeditDoc, CoeditRelayNote, CoeditRelaySub};
@@ -783,6 +784,15 @@ impl Workspace {
     /// Per-line-range authorship for a path (human vs agent).
     pub async fn blame(&self, path: &str) -> Result<Vec<BlameRange>> {
         self.fs.blame(path).await
+    }
+
+    /// Extract retrieval [`Passage`]s from the working tree — the
+    /// technology-agnostic half of RAG. Each passage carries its path, byte range,
+    /// a content hash (dedup / incremental-embedding key), and per-passage blame.
+    /// No embeddings or vectors: those live in userland (see the Python
+    /// `SimpleWorkspaceReader`). See [`PassageOptions`] / [`Segmentation`].
+    pub async fn passages(&self, opts: &PassageOptions) -> Result<Vec<Passage>> {
+        self.fs.passages(opts).await
     }
 
     /// The edit-op log for an actor (optionally one session).

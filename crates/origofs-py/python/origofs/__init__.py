@@ -28,6 +28,7 @@ from ._origofs import (
     Workspace,
     WriteCtx,
     WriteOutcome,
+    content_hash,
     fuse_mountable,
 )
 
@@ -45,5 +46,6 @@ __all__ = [
     "Workspace",
     "WriteCtx",
     "WriteOutcome",
+    "content_hash",
     "fuse_mountable",
 ]
