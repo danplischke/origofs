@@ -104,9 +104,35 @@ def test_coedit_websocket_rejects_bad_token():
                 sock.receive_bytes()
 
 
+def test_coedit_websocket_closes_cleanly_on_malformed_frame():
+    # Regression test: a corrupt/malformed y-sync frame used to raise inside
+    # the endpoint uncaught, propagating out of the ASGI app instead of
+    # closing the socket -- the client saw a hard reset with no diagnostic,
+    # and the room's writer task / registry entry were left to the generic
+    # `finally` cleanup rather than a clean protocol-error close.
+    from starlette.testclient import WebSocketDisconnect
+
+    app, ws, _alice, _alice_s = _app_with_alice()
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            sock.receive_bytes()  # SyncStep1 greeting
+            sock.send_bytes(b"\xff\xff\xff not a y-sync frame at all \xff\xff")
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                sock.receive_bytes()
+        assert exc_info.value.code == 1002, exc_info.value
+
+        # The room still got torn down (checkpointed + evicted) despite the
+        # abnormal close -- a second connection to the same path starts fresh
+        # rather than hanging on a half-cleaned-up room.
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock2:
+            sock2.receive_bytes()  # would hang/error if the old room leaked
+
+
 if __name__ == "__main__":
     test_coedit_websocket_attributes_content_server_side()
     print("ok   attributes_content_server_side")
     test_coedit_websocket_rejects_bad_token()
     print("ok   rejects_bad_token")
+    test_coedit_websocket_closes_cleanly_on_malformed_frame()
+    print("ok   closes_cleanly_on_malformed_frame")
     print("ALL OK")

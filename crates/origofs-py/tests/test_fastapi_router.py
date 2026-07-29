@@ -159,7 +159,111 @@ def test_conflict_maps_409():
     assert r.status_code == 409, r.text
 
 
-# --- integration test (real workspace) --------------------------------------
+# --- integration tests (real workspace) --------------------------------------
+#
+# FakeWs above is enough for auth/attribution/error-mapping unit tests, but it
+# has no real directory/versioning/presence semantics -- these use a real
+# origofs.Workspace, the same pattern test_integration_attribution_end_to_end
+# below already uses.
+
+def _real_client_with_actor(**router_kw):
+    """A TestClient over a real workspace, plus a provisioned actor's auth header."""
+    d = tempfile.mkdtemp()
+
+    async def _setup():
+        ws = await origofs.Workspace.open_local(
+            os.path.join(d, "meta.db"), os.path.join(d, "cas")
+        )
+        dan = await ws.create_human("dan", None)
+        sess = await ws.create_session(dan, "test")
+        return ws, dan, sess
+
+    ws, dan, sess = asyncio.run(_setup())
+    c = _client(ws, **router_kw)
+    hdr = {"X-Actor-Id": str(dan), "X-Session-Id": str(sess)}
+    return c, ws, dan, sess, hdr
+
+
+def test_removing_a_nonempty_directory_maps_409_not_500():
+    # Regression test: DirectoryNotEmpty is the one origofs error the Rust
+    # binding maps to a plain OSError (see `to_pyerr` in origofs-py/src/lib.rs),
+    # rather than one of the specific subclasses _run() already handled -- it
+    # used to fall through uncaught and surface as a bare 500.
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    r = c.put("/files/adir/f.txt", content=b"hi", headers=hdr)
+    assert r.status_code == 200, r.text
+
+    r = c.delete("/files/adir", headers=hdr)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]  # a real message, not an empty/generic 500 body
+
+
+def test_directory_and_stat_routes():
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    assert c.post("/dirs/docs", headers=hdr).status_code == 200
+    assert c.put("/files/docs/a.txt", content=b"hello", headers=hdr).status_code == 200
+
+    listing = c.get("/dirs/docs").json()
+    assert any(e["name"] == "a.txt" for e in listing), listing
+
+    st = c.get("/stat/docs/a.txt").json()
+    assert st["kind"] == "file" and st["size"] == 5, st
+
+    r = c.post("/rename", json={"from": "/docs/a.txt", "to": "/docs/b.txt"}, headers=hdr)
+    assert r.status_code == 200, r.text
+    assert c.get("/files/docs/a.txt").status_code == 404
+    assert c.get("/files/docs/b.txt").content == b"hello"
+
+
+def test_versioning_routes_through_router():
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    c.put("/files/notes.txt", content=b"v1", headers=hdr)
+
+    r = c.post("/commit", json={"message": "base", "author": "dan"}, headers=hdr)
+    assert r.status_code == 200 and r.json()["hash"], r.text
+
+    log = c.get("/log").json()
+    assert len(log) == 1 and log[0]["message"] == "base", log
+
+    assert c.get("/status").json() == []  # clean working tree right after commit
+
+    assert c.post("/branches", json={"name": "feature"}, headers=hdr).status_code == 200
+    assert c.post("/checkout", json={"name": "feature"}, headers=hdr).status_code == 200
+    branches = {b["name"] for b in c.get("/branches").json()}
+    assert {"main", "feature"} <= branches, branches
+
+    c.put("/files/notes.txt", content=b"v2", headers=hdr)
+    c.post("/commit", json={"message": "work", "author": "dan"}, headers=hdr)
+
+    changes = {d["path"]: d["status"] for d in c.get("/diff", params={"from": "main", "to": "feature"}).json()}
+    assert changes == {"/notes.txt": "modified"}, changes
+
+    patch = c.get("/diff/file", params={"from": "main", "to": "feature", "path": "/notes.txt"}).text
+    assert "-v1" in patch and "+v2" in patch, patch
+
+
+def test_presence_and_events_routes():
+    c, _ws, dan, sess, hdr = _real_client_with_actor()
+    c.put("/files/notes.txt", content=b"hi", headers=hdr)
+
+    r = c.post("/presence/touch", json={"path": "/notes.txt"}, headers=hdr)
+    assert r.status_code == 200, r.text
+    present = c.get("/presence").json()
+    assert any(p["session_id"] == sess and p["actor_id"] == dan for p in present), present
+
+    events = c.get("/events").json()
+    assert any(e["path"] == "/notes.txt" for e in events), events
+    # `since` filters out everything already seen
+    assert c.get("/events", params={"since": events[-1]["seq"]}).json() == []
+
+
+def test_presence_touch_requires_a_session():
+    # touch() needs a session_id; a session-less WriteCtx.actor(...) is a clean
+    # 400, not a crash reaching into ws.touch() with session_id=None.
+    c = _client(FakeWs())
+    r = c.post("/presence/touch", json={"path": "/x"}, headers={"X-Actor-Id": "1"})
+    assert r.status_code == 400, r.text
+
 
 def test_integration_attribution_end_to_end():
     d = tempfile.mkdtemp()

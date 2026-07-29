@@ -127,6 +127,12 @@ async def _run(awaitable: Awaitable[Any]) -> Any:
         raise HTTPException(status_code=409, detail=str(e))
     except NotADirectoryError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except OSError as e:
+        # A non-empty directory (rmdir or a rename onto one) is the one origofs
+        # error the Rust binding maps to a plain OSError rather than one of the
+        # specific subclasses above (see `to_pyerr` in origofs-py/src/lib.rs) --
+        # catch it here so it doesn't fall through as an unhandled 500.
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except conflict_error as e:  # stale base on a suggestion accept
@@ -495,10 +501,25 @@ def build_router(
         # Greet the client with SyncStep1, then let the writer own all sends.
         conn.out.put_nowait(await room.doc.sync_start())
         writer_task = asyncio.create_task(writer())
+        _, origofs_error = _origofs_exc()
         try:
             while True:
                 data = await websocket.receive_bytes()
-                reply = await room.doc.handle_sync(ctx, data)
+                try:
+                    reply = await room.doc.handle_sync(ctx, data)
+                except ValueError as e:
+                    # A malformed/corrupt y-sync frame -- the binary protocol has
+                    # no way to resync mid-stream, so close cleanly (1002:
+                    # protocol error) instead of leaving this client with a hard
+                    # reset and crashing the ASGI app with an uncaught exception.
+                    await websocket.close(code=1002, reason=str(e)[:123])
+                    return
+                except origofs_error as e:
+                    # A valid frame that origofs couldn't apply for some other
+                    # reason (e.g. a content-store failure) -- not the client's
+                    # protocol fault, so 1011: internal error.
+                    await websocket.close(code=1011, reason=str(e)[:123])
+                    return
                 if reply.reply:
                     conn.out.put_nowait(reply.reply)
                 if reply.broadcast:
