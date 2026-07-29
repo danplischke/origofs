@@ -15,18 +15,38 @@ use fuser::{
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 
 const TTL: Duration = Duration::from_secs(1);
 
+/// Entries pulled from the store per round-trip while filling one `readdir`
+/// reply. A FUSE reply buffer is a few KiB — on the order of a hundred short
+/// names — so one page normally fills it outright, and a huge directory is never
+/// materialized in memory (M16).
+const READDIR_PAGE: usize = 128;
+
+/// Cap on the offset→cursor map below. The map is a pure accelerator (a miss
+/// falls back to a correct re-scan), so it is cleared wholesale when it grows
+/// past this rather than carrying LRU bookkeeping.
+const READDIR_CURSOR_CAP: usize = 4096;
+
 /// A FUSE filesystem backed by an origofs [`Workspace`].
 pub struct OrigoFSFuse {
     ws: Workspace,
     rt: Runtime,
+    /// `(dir ino, FUSE offset) → name of the entry that offset sits after`.
+    ///
+    /// FUSE resumes a `readdir` by a dense numeric offset, but the store pages by
+    /// *name* (a keyset scan — `Fs::vfs_readdir_page`). This remembers the
+    /// translation for the offsets this mount actually handed out, which is every
+    /// offset a sequentially-reading client will come back with.
+    cursors: Mutex<HashMap<(i64, u64), String>>,
 }
 
 impl OrigoFSFuse {
@@ -34,11 +54,69 @@ impl OrigoFSFuse {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        Ok(Self { ws, rt })
+        Ok(Self {
+            ws,
+            rt,
+            cursors: Mutex::new(HashMap::new()),
+        })
     }
 
     fn blk<F: Future>(&self, f: F) -> F::Output {
         self.rt.block_on(f)
+    }
+
+    /// Record that FUSE offset `offset` in directory `ino` sits just after `name`.
+    fn remember_cursor(&self, ino: i64, offset: u64, name: &str) {
+        let mut map = self.cursors.lock().unwrap_or_else(PoisonError::into_inner);
+        if map.len() >= READDIR_CURSOR_CAP {
+            map.clear();
+        }
+        map.insert((ino, offset), name.to_string());
+    }
+
+    /// Translate a FUSE `readdir` offset into the store's keyset cursor: the name
+    /// of the last entry already returned, or `None` to start from the beginning.
+    ///
+    /// `offset` counts `.` and `..` as the first two entries (see [`Filesystem::readdir`]
+    /// below), so `offset - 2` real entries have been consumed. The common case —
+    /// a client resuming from an offset this mount just handed out — is a map hit
+    /// and costs nothing. A cold offset (a `seekdir` to an arbitrary position, or
+    /// an offset evicted by the cap) falls back to walking pages to that index:
+    /// still correct, and no worse than the full listing every call used to do.
+    fn resume_cursor(&self, ino: i64, offset: u64) -> Result<Option<String>, OrigoFSError> {
+        let consumed = offset.saturating_sub(2);
+        if consumed == 0 {
+            return Ok(None);
+        }
+        let cached = self
+            .cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(ino, offset))
+            .cloned();
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        let mut cursor: Option<String> = None;
+        let mut skipped: u64 = 0;
+        loop {
+            let page = self.blk(self.ws.fs().vfs_readdir_page(
+                ino,
+                cursor.as_deref(),
+                READDIR_PAGE,
+            ))?;
+            if page.is_empty() {
+                // Past the end of the directory: the last name we saw is still the
+                // right cursor — the next page from it is empty, i.e. EOF.
+                return Ok(cursor);
+            }
+            let take = ((consumed - skipped) as usize).min(page.len());
+            skipped += take as u64;
+            cursor = Some(page[take - 1].name.clone());
+            if skipped == consumed || page.len() < READDIR_PAGE {
+                return Ok(cursor);
+            }
+        }
     }
 }
 
@@ -210,6 +288,27 @@ impl Filesystem for OrigoFSFuse {
         }
     }
 
+    /// Read a directory, pulling keyset pages from the store instead of listing
+    /// the whole directory and slicing it in memory (M16).
+    ///
+    /// # The offset contract, and how it maps onto keyset pages
+    ///
+    /// The cookie handed to the kernel is unchanged, so a `readdir` interrupted by
+    /// the old code resumes identically under the new: offsets are dense, `1` means
+    /// "after `.`", `2` means "after `..`", and `2 + k` means "after the k-th real
+    /// entry in name order". An offset is always the position *after* the entry it
+    /// was emitted with, which is what makes a resumed read continue rather than
+    /// repeat.
+    ///
+    /// The store, though, pages by *name* — `WHERE name > cursor` — because a
+    /// name cursor is the only one that cannot skip or duplicate an entry when the
+    /// directory is modified mid-scan. Bridging a numeric offset to a name cursor
+    /// is the one thing pure keyset paging cannot do by itself, so this keeps a
+    /// small `offset → name` map ([`Self::resume_cursor`]) populated from the
+    /// offsets it emits. A sequential reader — every real client, and the only
+    /// pattern the kernel's `readdir` cache produces — always hits it. A cold
+    /// offset (`seekdir` to an arbitrary position) falls back to walking pages up
+    /// to that index: **correctness first**, and still no full in-memory listing.
     fn readdir(
         &self,
         _req: &Request,
@@ -219,23 +318,55 @@ impl Filesystem for OrigoFSFuse {
         mut reply: ReplyDirectory,
     ) {
         let ino = ino.0 as i64;
-        let entries = match self.blk(self.ws.fs().vfs_readdir(ino)) {
-            Ok(v) => v,
+        let self_ino = INodeNo(ino as u64);
+        let mut next = offset;
+        if next == 0 {
+            if reply.add(self_ino, 1, FileType::Directory, ".") {
+                reply.ok();
+                return;
+            }
+            next = 1;
+        }
+        if next == 1 {
+            if reply.add(self_ino, 2, FileType::Directory, "..") {
+                reply.ok();
+                return;
+            }
+            next = 2;
+        }
+
+        let mut cursor = match self.resume_cursor(ino, next) {
+            Ok(c) => c,
             Err(e) => {
                 reply.error(errno(&e));
                 return;
             }
         };
-        let mut all: Vec<(u64, FileType, String)> = vec![
-            (ino as u64, FileType::Directory, ".".to_string()),
-            (ino as u64, FileType::Directory, "..".to_string()),
-        ];
-        for e in entries {
-            all.push((e.ino as u64, ftype(e.kind), e.name));
-        }
-        for (i, (child, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
-            // The next offset is i+1 so a resumed readdir continues correctly.
-            if reply.add(INodeNo(child), (i + 1) as u64, kind, &name) {
+        'fill: loop {
+            let page = match self.blk(self.ws.fs().vfs_readdir_page(
+                ino,
+                cursor.as_deref(),
+                READDIR_PAGE,
+            )) {
+                Ok(p) => p,
+                Err(e) => {
+                    reply.error(errno(&e));
+                    return;
+                }
+            };
+            let short = page.len() < READDIR_PAGE;
+            for e in page {
+                let off = next + 1;
+                // `add` returns true when the buffer is full — the entry was *not*
+                // added, so neither the offset nor the cursor may advance past it.
+                if reply.add(INodeNo(e.ino as u64), off, ftype(e.kind), &e.name) {
+                    break 'fill;
+                }
+                next = off;
+                self.remember_cursor(ino, off, &e.name);
+                cursor = Some(e.name);
+            }
+            if short {
                 break;
             }
         }

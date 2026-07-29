@@ -16,12 +16,17 @@ pub use bytes::Bytes;
 pub use futures::stream::BoxStream;
 pub use origofs_core::{
     Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DiffEntry, DiffStatus, DirEntry,
-    EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind, GcStats, GcsConfig,
-    Hash, Inode, MemStore, MergeOutcome, ObjectContentStore, OrigoFSError, PackStore, Passage,
-    PassageOptions, Presence, RebuildReport, S3Config, Segmentation, Suggestion, SuggestionContent,
-    SuggestionInit, SuggestionStatus, TieredStore, ToolCallInit, VerifyingStore, VersioningMode,
-    WriteCtx, WriteOutcome, WritePolicy,
+    DirEntryAttr, DirPage, EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind,
+    GcStats, GcsConfig, Hash, Inode, MemStore, MergeOutcome, ObjectContentStore, OrigoFSError,
+    PackStore, Passage, PassageOptions, Presence, RebuildReport, S3Config, Segmentation, Suggestion,
+    SuggestionContent, SuggestionInit, SuggestionStatus, TieredStore, ToolCallInit, VerifyingStore,
+    VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
+/// The emit-only metrics facade (`metrics` feature). A library only *records*;
+/// the binary installs an exporter and hands its renderer to
+/// [`api::set_metrics_renderer`], exactly as it installs a tracing subscriber.
+#[cfg(feature = "metrics")]
+pub use origofs_core::metrics;
 #[cfg(feature = "coedit")]
 pub use origofs_core::{CoeditDoc, CoeditRelayNote, CoeditRelaySub};
 

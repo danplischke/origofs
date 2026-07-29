@@ -664,6 +664,28 @@ impl MetadataStore for PostgresMetadataStore {
         }
     }
 
+    async fn get_inodes(&self, inos: &[Ino]) -> Result<Vec<Inode>> {
+        if inos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let c = self.client().await?;
+        // `= ANY($1)` passes the whole list as one array parameter, so there is no
+        // per-statement parameter ceiling to chunk around (unlike SQLite) and the
+        // plan stays a single index probe per key.
+        let rows = c
+            .query(
+                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                 FROM inode WHERE ino = ANY($1)",
+                &[&inos],
+            )
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(row_to_inode(&r)?);
+        }
+        Ok(out)
+    }
+
     async fn create_inode(&self, init: InodeInit) -> Result<Ino> {
         let c = self.client().await?;
         let now = now_secs();
@@ -771,6 +793,65 @@ impl MetadataStore for PostgresMetadataStore {
             });
         }
         Ok(out)
+    }
+
+    async fn list_dir_page(
+        &self,
+        parent: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>> {
+        let c = self.client().await?;
+        let limit = limit as i64;
+        // Two statements rather than one with `($2::text IS NULL OR d.name > $2)`:
+        // the OR would stop the planner using the `(parent_ino, name)` primary-key
+        // index as a range scan and re-read the whole directory per page.
+        let rows = match after_name {
+            Some(after) => {
+                c.query(
+                    "SELECT d.name, d.ino, i.kind
+                     FROM dentry d JOIN inode i ON i.ino = d.ino
+                     WHERE d.parent_ino = $1 AND d.name > $2
+                     ORDER BY d.name LIMIT $3",
+                    &[&parent, &after, &limit],
+                )
+                .await?
+            }
+            None => {
+                c.query(
+                    "SELECT d.name, d.ino, i.kind
+                     FROM dentry d JOIN inode i ON i.ino = d.ino
+                     WHERE d.parent_ino = $1
+                     ORDER BY d.name LIMIT $2",
+                    &[&parent, &limit],
+                )
+                .await?
+            }
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let kind_s: String = r.get(2);
+            let kind = FileKind::parse(&kind_s)
+                .ok_or_else(|| OrigoFSError::Metadata(format!("unknown inode kind {kind_s:?}")))?;
+            out.push(DirEntry {
+                name: r.get(0),
+                ino: r.get(1),
+                kind,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT name FROM dentry WHERE parent_ino = $1 AND ino = $2
+                 ORDER BY name LIMIT 1",
+                &[&parent, &ino],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
     }
 
     async fn child_count(&self, parent: Ino) -> Result<usize> {

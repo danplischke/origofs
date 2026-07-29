@@ -15,7 +15,7 @@
 //! `mount -t nfs -o vers=3,tcp,port=11111,mountport=11111,nolock host:/ /mnt`
 //! (needs the OS NFS client / `nfs-utils`).
 
-use crate::{DirEntry, FileKind, Inode, OrigoFSError, Workspace};
+use crate::{FileKind, Inode, OrigoFSError, Workspace};
 use async_trait::async_trait;
 use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_mode3,
@@ -276,40 +276,76 @@ impl NFSFileSystem for OrigoFSNfs {
             .map_err(stat)
     }
 
+    /// Read a directory as one store-side keyset page with batched attributes
+    /// (M16) — no full listing in memory, and no `getattr` per entry.
+    ///
+    /// # The cookie contract, and how it maps onto keyset pages
+    ///
+    /// NFSv3 resumes with the **fileid of the last entry returned**, so the cookie
+    /// is unchanged and an unknown one is still `NFS3ERR_BAD_COOKIE`. The store
+    /// pages by *name*, so the cookie is translated back into its name with a
+    /// single indexed dentry lookup ([`Fs::vfs_dentry_name`]) and used as the
+    /// keyset cursor. That translation is exact for any cookie this server ever
+    /// emitted, so resumption needs no server-side session state — the property
+    /// NFS's stateless readdir wants.
+    ///
+    /// Two deliberate consequences:
+    ///
+    /// * Entries now come back in **name** order rather than the inode order the
+    ///   old in-memory sort imposed. NFSv3 mandates no particular order, only that
+    ///   it be stable enough for the cookie to mean something — and a name order
+    ///   is both stable and what the underlying index already provides.
+    /// * `end` is reported when the store returns a short page. A directory whose
+    ///   remaining entries exactly fill `max_entries` therefore costs one extra
+    ///   (empty) `READDIR` to confirm EOF, instead of being called at the boundary.
+    ///   That is inherent to paging without a count, and clients handle it.
+    ///
+    /// [`Fs::vfs_dentry_name`]: origofs_core::vfs
     async fn readdir(
         &self,
         dirid: fileid3,
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        let mut entries: Vec<DirEntry> =
-            self.ws.fs().vfs_readdir(dirid as i64).await.map_err(stat)?;
-        entries.sort_by_key(|e| e.ino); // stable order so the cookie is meaningful
-
-        let start = if start_after == 0 {
-            0
+        let dirid = dirid as i64;
+        let after = if start_after == 0 {
+            None
         } else {
-            match entries.iter().position(|e| e.ino as fileid3 == start_after) {
-                Some(p) => p + 1,
+            match self
+                .ws
+                .fs()
+                .vfs_dentry_name(dirid, start_after as i64)
+                .await
+                .map_err(stat)?
+            {
+                Some(n) => Some(n),
                 None => return Err(nfsstat3::NFS3ERR_BAD_COOKIE),
             }
         };
 
-        let mut out = Vec::new();
-        let mut i = start;
-        while i < entries.len() && out.len() < max_entries {
-            let de = &entries[i];
-            let inode = self.ws.fs().vfs_getattr(de.ino).await.map_err(stat)?;
-            out.push(NfsDirEntry {
-                fileid: de.ino as fileid3,
-                name: nfsstring::from(de.name.as_bytes()),
-                attr: attr(&inode),
-            });
-            i += 1;
-        }
+        // A zero-entry request still has to answer "is there more?", so probe with
+        // a single row rather than asking the store for a zero-sized page.
+        let page = self
+            .ws
+            .fs()
+            .vfs_readdir_page_with_attrs(dirid, after.as_deref(), max_entries.max(1))
+            .await
+            .map_err(stat)?;
+        let entries = if max_entries == 0 {
+            Vec::new()
+        } else {
+            page.entries
+                .iter()
+                .map(|e| NfsDirEntry {
+                    fileid: e.entry.ino as fileid3,
+                    name: nfsstring::from(e.entry.name.as_bytes()),
+                    attr: attr(&e.inode),
+                })
+                .collect()
+        };
         Ok(ReadDirResult {
-            entries: out,
-            end: i >= entries.len(),
+            entries,
+            end: page.end,
         })
     }
 

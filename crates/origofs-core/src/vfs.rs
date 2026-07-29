@@ -10,8 +10,9 @@ use crate::content::ContentStore;
 use crate::engine::{Fs, validate_component};
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
-use crate::types::{DirEntry, FileKind, Ino, Inode, InodeInit};
+use crate::types::{DirEntry, DirEntryAttr, DirPage, FileKind, Ino, Inode, InodeInit};
 use bytes::{Bytes, BytesMut};
+use std::collections::HashMap;
 
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
@@ -34,9 +35,78 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .ok_or_else(|| OrigoFSError::NotFound(format!("ino {ino}")))
     }
 
-    /// Directory entries.
+    /// Directory entries — the whole directory, in name order.
+    ///
+    /// Prefer [`vfs_readdir_page`](Self::vfs_readdir_page) on a mount surface: a
+    /// large directory is materialized in full here, once per `readdir` call.
     pub async fn vfs_readdir(&self, ino: Ino) -> Result<Vec<DirEntry>> {
         self.meta.list_dir(ino).await
+    }
+
+    /// One keyset page of directory `ino`: up to `limit` entries whose name sorts
+    /// strictly after `after_name` (from the start when `None`), in name order.
+    ///
+    /// A thin pass-through to [`MetadataStore::list_dir_page`], so the store does
+    /// the paging as one indexed range scan instead of the surface slicing a full
+    /// listing in memory (M16). Resume by passing the last returned name back as
+    /// `after_name`. Use this when only names/kinds are needed; use
+    /// [`vfs_readdir_page_with_attrs`](Self::vfs_readdir_page_with_attrs) when the
+    /// reply also carries attributes.
+    pub async fn vfs_readdir_page(
+        &self,
+        ino: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>> {
+        self.meta.list_dir_page(ino, after_name, limit).await
+    }
+
+    /// One keyset page of directory `ino` with every entry's inode attributes
+    /// attached, fetched in a **single batched** inode query (M16).
+    ///
+    /// This is the N+1-free form of `readdir` + `getattr`: two store round-trips
+    /// per page regardless of the page size, versus one `getattr` per entry.
+    ///
+    /// An entry whose inode disappeared between the two queries (a concurrent
+    /// unlink) is dropped from [`DirPage::entries`], but
+    /// [`DirPage::next_after`] still advances past it, so a resumed scan can
+    /// never stall on it.
+    pub async fn vfs_readdir_page_with_attrs(
+        &self,
+        ino: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<DirPage> {
+        let page = self.meta.list_dir_page(ino, after_name, limit).await?;
+        let end = page.len() < limit;
+        let next_after = page.last().map(|e| e.name.clone());
+        let inos: Vec<Ino> = page.iter().map(|e| e.ino).collect();
+        let attrs = self.meta.get_inodes(&inos).await?;
+        // `get_inodes` returns rows in an unspecified order (and may omit or
+        // coalesce inos), so join on the inode number rather than by position.
+        let by_ino: HashMap<Ino, Inode> = attrs.into_iter().map(|i| (i.ino, i)).collect();
+        let entries = page
+            .into_iter()
+            .filter_map(|entry| {
+                let inode = by_ino.get(&entry.ino)?.clone();
+                Some(DirEntryAttr { entry, inode })
+            })
+            .collect();
+        Ok(DirPage {
+            entries,
+            next_after,
+            end,
+        })
+    }
+
+    /// The name `ino` is linked under in directory `parent`, or `None` if it is
+    /// not a child of `parent`.
+    ///
+    /// The inverse of [`vfs_lookup`](Self::vfs_lookup). A surface whose `readdir`
+    /// resume cookie is an inode number (NFSv3) uses this to translate that cookie
+    /// into the name cursor [`vfs_readdir_page`](Self::vfs_readdir_page) pages by.
+    pub async fn vfs_dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
+        self.meta.dentry_name(parent, ino).await
     }
 
     /// Read up to `size` bytes at `offset`, fetching only the covering chunks.

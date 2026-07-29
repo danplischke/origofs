@@ -24,6 +24,11 @@ use std::sync::Arc;
 
 const DIR_MODE: i64 = 0o040755;
 
+/// How many inode numbers one batched `get_inodes` query binds. SQLite's
+/// `SQLITE_MAX_VARIABLE_NUMBER` is 999 on builds before 3.32, so the IN-list is
+/// chunked well under it rather than trusting the caller's slice length.
+const INODE_BATCH: usize = 500;
+
 /// The workspace every store is bound to until re-scoped with `with_workspace`;
 /// its root is [`INO_ROOT`]. Backfilled by migration V11 (`docs/MULTI_TENANCY.md`).
 const DEFAULT_WORKSPACE: i64 = 1;
@@ -234,6 +239,44 @@ impl MetadataStore for SqliteMetadataStore {
         }
     }
 
+    async fn get_inodes(&self, inos: &[Ino]) -> Result<Vec<Inode>> {
+        if inos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut out = Vec::with_capacity(inos.len());
+        // SQLite caps bound parameters per statement (999 on older builds), so the
+        // IN-list is chunked rather than assuming the caller kept it small.
+        for chunk in inos.chunks(INODE_BATCH) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                 FROM inode WHERE ino IN ({placeholders})"
+            ))?;
+            let binds: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(binds.as_slice(), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            })?;
+            for row in rows {
+                out.push(build_inode(row?)?);
+            }
+        }
+        Ok(out)
+    }
+
     async fn create_inode(&self, init: InodeInit) -> Result<Ino> {
         let conn = self.lock();
         let now = now_secs();
@@ -329,6 +372,68 @@ impl MetadataStore for SqliteMetadataStore {
             out.push(DirEntry { name, ino, kind });
         }
         Ok(out)
+    }
+
+    async fn list_dir_page(
+        &self,
+        parent: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>> {
+        let conn = self.lock();
+        let limit = limit as i64;
+        // Two statements rather than one with `(?2 IS NULL OR d.name > ?2)`: the
+        // OR would defeat the `(parent_ino, name)` primary-key index and turn the
+        // page into a full scan of the directory, which is the whole point of the
+        // method. Both forms below are a bounded range scan on that index.
+        let mut stmt = conn.prepare(match after_name {
+            Some(_) => {
+                "SELECT d.name, d.ino, i.kind
+                 FROM dentry d JOIN inode i ON i.ino = d.ino
+                 WHERE d.parent_ino = ?1 AND d.name > ?2
+                 ORDER BY d.name LIMIT ?3"
+            }
+            None => {
+                "SELECT d.name, d.ino, i.kind
+                 FROM dentry d JOIN inode i ON i.ino = d.ino
+                 WHERE d.parent_ino = ?1
+                 ORDER BY d.name LIMIT ?2"
+            }
+        })?;
+        let row = |r: &rusqlite::Row<'_>| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        };
+        let raw: Vec<_> = match after_name {
+            Some(a) => stmt
+                .query_map(params![parent, a, limit], row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map(params![parent, limit], row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        let mut out = Vec::with_capacity(raw.len());
+        for (name, ino, kind) in raw {
+            let kind = FileKind::parse(&kind)
+                .ok_or_else(|| OrigoFSError::Metadata(format!("unknown inode kind {kind:?}")))?;
+            out.push(DirEntry { name, ino, kind });
+        }
+        Ok(out)
+    }
+
+    async fn dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT name FROM dentry WHERE parent_ino = ?1 AND ino = ?2
+             ORDER BY name LIMIT 1",
+            params![parent, ino],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     async fn child_count(&self, parent: Ino) -> Result<usize> {

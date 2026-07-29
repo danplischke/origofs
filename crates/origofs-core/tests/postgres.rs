@@ -669,3 +669,90 @@ async fn postgres_upgrade_preserves_data_and_backfills_default_workspace() {
         "new workspace root inode {root} collided with a pre-migration inode"
     );
 }
+
+/// Directory pagination on Postgres (M16, issue #75): the keyset `list_dir_page`
+/// and the batched `get_inodes` are separate hand-written SQL per backend, so the
+/// SQLite coverage in `tests/readdir_paging.rs` does not speak for this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_readdir_paging() {
+    let Some(dsn) = dsn() else {
+        eprintln!("skipping postgres_readdir_paging: ORIGOFS_PG_TEST_URL unset");
+        return;
+    };
+    let _guard = pg_lock().lock().await;
+    reset(&dsn).await;
+
+    let meta = PostgresMetadataStore::connect(&dsn).await.unwrap();
+    meta.init().await.unwrap();
+
+    // Creation order deliberately differs from name order, and the set includes
+    // names that differ only by a trailing byte plus non-ASCII ones — each is a
+    // potential page boundary for the `name > $2` cursor.
+    let names: Vec<String> = (0..120)
+        .map(|i| format!("f{:03}", (i * 47) % 120))
+        .chain(["a", "a ", "aa", "é", "éa", "日本", "日本語"].map(str::to_string))
+        .collect();
+    let mut inos = Vec::new();
+    for n in &names {
+        let ino = meta
+            .create_inode(InodeInit {
+                kind: FileKind::File,
+                mode: 0o100644,
+            })
+            .await
+            .unwrap();
+        meta.add_dentry(1, n, ino).await.unwrap();
+        inos.push(ino);
+    }
+
+    // The paged walk reproduces the full listing exactly, under Postgres's own
+    // collation (which is why this compares against `list_dir`, not a hardcoded
+    // order).
+    let full: Vec<String> = meta
+        .list_dir(1)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(full.len(), names.len());
+    for page_size in [1, 7, 120, 1000] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = meta
+                .list_dir_page(1, cursor.as_deref(), page_size)
+                .await
+                .unwrap();
+            assert!(page.len() <= page_size);
+            if page.is_empty() {
+                break;
+            }
+            cursor = Some(page.last().unwrap().name.clone());
+            seen.extend(page.into_iter().map(|e| e.name));
+            assert!(seen.len() <= names.len(), "paging did not terminate");
+        }
+        assert_eq!(seen, full, "page size {page_size}");
+    }
+
+    // Batched attrs: `= ANY($1)` tolerates a missing ino and a duplicate, and
+    // agrees with the one-at-a-time `get_inode`.
+    assert!(meta.get_inodes(&[]).await.unwrap().is_empty());
+    let mut asked = inos.clone();
+    asked.push(9_999_999);
+    asked.push(inos[0]);
+    let batched = meta.get_inodes(&asked).await.unwrap();
+    assert_eq!(batched.len(), inos.len(), "duplicates must coalesce");
+    for b in &batched {
+        let one = meta.get_inode(b.ino).await.unwrap().expect("inode");
+        assert_eq!((one.kind, one.mode, one.size), (b.kind, b.mode, b.size));
+    }
+    assert!(!batched.iter().any(|i| i.ino == 9_999_999));
+
+    // `dentry_name` is the inverse of `lookup` — the NFS cookie bridge.
+    assert_eq!(
+        meta.dentry_name(1, inos[0]).await.unwrap().as_deref(),
+        Some(names[0].as_str())
+    );
+    assert_eq!(meta.dentry_name(1, 9_999_999).await.unwrap(), None);
+}

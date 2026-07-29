@@ -49,6 +49,20 @@ pub trait MetadataStore: Send + Sync {
     /// Fetch an inode by number.
     async fn get_inode(&self, ino: Ino) -> Result<Option<Inode>>;
 
+    /// Fetch many inodes in one round-trip (M16).
+    ///
+    /// The batched counterpart of [`get_inode`](MetadataStore::get_inode), so a
+    /// `readdir` that needs attributes costs one query instead of one per entry.
+    /// Each backend issues a single `IN (…)` / `= ANY(…)` query per batch (SQLite
+    /// chunks the list to stay under its bound-parameter limit).
+    ///
+    /// Contract, deliberately forgiving so callers need not pre-clean their input:
+    /// an `ino` with no row is simply absent from the result, duplicates in `inos`
+    /// yield one row, and the order of the result is **unspecified** — index it by
+    /// [`Inode::ino`]. Like `get_inode`, the lookup is by inode number alone
+    /// (globally unique), so it is not workspace-filtered.
+    async fn get_inodes(&self, inos: &[Ino]) -> Result<Vec<Inode>>;
+
     /// Allocate a new inode. `nlink` starts at 1; size at 0; no content.
     async fn create_inode(&self, init: InodeInit) -> Result<Ino>;
 
@@ -72,7 +86,47 @@ pub trait MetadataStore: Send + Sync {
     async fn remove_dentry(&self, parent: Ino, name: &str) -> Result<()>;
 
     /// List the entries of directory `parent`, ordered by name.
+    ///
+    /// Reads the *whole* directory into memory. Prefer
+    /// [`list_dir_page`](MetadataStore::list_dir_page) on any path that serves a
+    /// user-sized directory (the FUSE/NFS `readdir` surfaces); this stays for the
+    /// many callers — commit, merge, gc, export — that genuinely walk everything.
     async fn list_dir(&self, parent: Ino) -> Result<Vec<DirEntry>>;
+
+    /// One keyset ("seek") page of directory `parent`, ordered by name (M16).
+    ///
+    /// Returns at most `limit` entries whose name sorts strictly after
+    /// `after_name` (from the start when `None`). Each backend implements this as
+    /// a single indexed query — `WHERE parent_ino = ? AND name > ? ORDER BY name
+    /// LIMIT ?` drives the `(parent_ino, name)` primary-key index as a range scan,
+    /// so the cost is proportional to the page, not to the directory.
+    ///
+    /// Resume by passing the last returned name back as `after_name`. Because the
+    /// cursor is a *name* and not an offset, entries created or removed before the
+    /// cursor cannot shift the page and make the scan skip or repeat an entry —
+    /// the property an `OFFSET`-based pager does not have.
+    ///
+    /// The ordering (and therefore the `>` comparison) is the backend's own text
+    /// ordering — SQLite's `BINARY`, Postgres's column collation. Both are
+    /// self-consistent within a store, which is all a keyset scan needs; the two
+    /// backends may order non-ASCII names differently from each other, exactly as
+    /// [`list_dir`](MetadataStore::list_dir) already does.
+    async fn list_dir_page(
+        &self,
+        parent: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>>;
+
+    /// The name `ino` is linked under in directory `parent`, or `None` if it is
+    /// not a child of `parent` (M16).
+    ///
+    /// The inverse of [`lookup`](MetadataStore::lookup), and the bridge for a
+    /// surface whose resume cookie is an inode number (NFSv3) onto the name-keyed
+    /// pages of [`list_dir_page`](MetadataStore::list_dir_page). If a hard link
+    /// gives `ino` several names in the same directory, the lexicographically
+    /// first is returned so the mapping is deterministic.
+    async fn dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>>;
 
     /// Number of entries directly under `parent`.
     async fn child_count(&self, parent: Ino) -> Result<usize>;
@@ -301,6 +355,9 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     async fn get_inode(&self, ino: Ino) -> Result<Option<Inode>> {
         (**self).get_inode(ino).await
     }
+    async fn get_inodes(&self, inos: &[Ino]) -> Result<Vec<Inode>> {
+        (**self).get_inodes(inos).await
+    }
     async fn create_inode(&self, init: InodeInit) -> Result<Ino> {
         (**self).create_inode(init).await
     }
@@ -324,6 +381,17 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn list_dir(&self, parent: Ino) -> Result<Vec<DirEntry>> {
         (**self).list_dir(parent).await
+    }
+    async fn list_dir_page(
+        &self,
+        parent: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>> {
+        (**self).list_dir_page(parent, after_name, limit).await
+    }
+    async fn dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
+        (**self).dentry_name(parent, ino).await
     }
     async fn child_count(&self, parent: Ino) -> Result<usize> {
         (**self).child_count(parent).await
