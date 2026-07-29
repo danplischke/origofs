@@ -74,6 +74,58 @@ attribution. Reads are open by default; pass `reader=<dependency>` to gate them,
 or `dependencies=[...]` (forwarded to `APIRouter`) to gate everything. Needs the
 `fastapi` extra (`pip install "origofs[fastapi]"`). See `examples/fastapi_router.py`.
 
+## fsspec filesystem (pandas / Dask / PyArrow / Zarr)
+
+`origofs.fsspec.OrigoFileSystem` exposes a workspace as an
+[fsspec](https://filesystem-spec.readthedocs.io/) filesystem, so the PyData stack
+can read and write origofs paths directly — and because every origofs I/O method is
+already a coroutine, it's a genuine `fsspec.asyn.AsyncFileSystem`: the same
+filesystem is usable synchronously (`fs.ls`, `fs.cat_file`, …) *and* by awaiting
+the `_`-prefixed coroutines on your own loop.
+
+```python
+import origofs.fsspec            # registers the "origofs://" protocol
+import pandas as pd
+
+# read/write straight from your usual tools:
+df = pd.read_parquet("origofs:///data/events.parquet",
+                     storage_options={"db_path": "meta.db", "cas_dir": "cas"})
+
+from origofs.fsspec import OrigoFileSystem
+fs = OrigoFileSystem(db_path="meta.db", cas_dir="cas")   # sync (fsspec loop)
+fs.pipe_file("/notes.txt", b"hello")
+fs.cat_file("/notes.txt", start=0, end=5)                # ranged read (only the covering chunks)
+
+afs = OrigoFileSystem(db_path="meta.db", cas_dir="cas", asynchronous=True)
+await afs._pipe_file("/notes.txt", b"hello")             # await on your loop
+```
+
+Point it at any backend with connection kwargs (`backend="pg_s3", dsn=…, s3={…}`)
+or hand it an already-open workspace (`OrigoFileSystem(ws=ws)`) to share one store
+with the rest of your app. **Attribution rides along**: pass `actor=`/`session=`
+(or a `ctx=origofs.WriteCtx`), and every write lands attributed — `fs.blame(path)`
+credits it — with the same per-call override (`fs.pipe_file(p, data, actor=42)`)
+and server-owns-identity discipline as the rest of origofs. Ranged reads go through
+`read_range`, so a large file isn't slurped whole. Listing caching is off by
+default (an origofs working tree is live and multi-writer). Needs the `fsspec` extra
+(`pip install "origofs[fsspec]"`).
+
+It passes fsspec's own conformance suite (`fsspec.tests.abstract` — copy/get/put/
+pipe/open, including the recursive, trailing-slash, and glob edge cases); see
+`tests/test_fsspec_compliance.py`.
+
+**Pathlib API** — because it's a well-behaved filesystem, it also works with
+[universal-pathlib](https://github.com/fsspec/universal_pathlib) as a first-class,
+explicitly-registered protocol (`pip install "origofs[upath]"`):
+
+```python
+from upath import UPath
+root = UPath("origofs:///", db_path="meta.db", cas_dir="cas")   # or storage_options=…
+(root / "notes.txt").write_text("hello")
+for child in root.iterdir():
+    print(child, child.stat().st_size)
+```
+
 ## Live change feed (push)
 
 On Postgres, `subscribe` gives a real push feed (LISTEN/NOTIFY) — `await recv()`
@@ -161,7 +213,7 @@ failed). The DB stays the thing to back up — so also run Postgres PITR / a rep
 
 `Workspace`: `open_local` · `open_local_packed` · `open_pg` · `open_s3` ·
 `open_s3_packed` · `open_pg_s3` · `open_pg_s3_packed` · `open_object_memory` ·
-`read` · `write` ·
+`read` · `read_range` · `write` ·
 `write_as` · `mkdir_p` · `ls` · `stat` · `remove` · `rename` · `commit` · `log` ·
 `status` · `diff` · `diff_file` · `create_branch` · `checkout` · `branches` ·
 `current_branch` · `rebuild` · `scan` ·
@@ -172,3 +224,7 @@ failed). The DB stays the thing to back up — so also run Postgres PITR / a rep
 `get_suggestion` · `suggestion_diff` · `suggestion_content` · `accept_suggestion` ·
 `reject_suggestion` ·
 `mount` · `serve_nfs`. Plus `WriteCtx`, `S3Config`, `Mount`, `fuse_mountable()`.
+
+Integrations (own extras): `origofs.fastapi` (HTTP router) · `origofs.fsspec`
+(`OrigoFileSystem`, the fsspec filesystem — also a `UPath("origofs://…")` via
+universal-pathlib) · `origofs.overlay` (agent overlay).
