@@ -132,6 +132,45 @@ for child in root.iterdir():
     print(child, child.stat().st_size)
 ```
 
+## RAG with provenance (passages that know who wrote them)
+
+Retrieval over origofs isn't "S3 + embeddings": every passage carries **who wrote
+it** (blame) and **where it came from**, and is keyed by a content hash so only
+genuinely-changed passages need re-embedding. The technology-agnostic half lives in
+the Rust core (`Workspace.passages`) — no embeddings, no vector store, no framework
+types — so any stack consumes the same records.
+
+```python
+# framework-neutral: provenance-carrying passage records
+from origofs.rag import read_passages
+passages = await read_passages(ws, root="/docs", segmentation="content_defined")
+for p in passages:
+    p.text, p.hash, p.authors        # -> who wrote this passage (precise, per-byte)
+
+# or drop straight into LlamaIndex — one Document per passage, provenance in metadata
+from origofs.llamaindex import SimpleWorkspaceReader
+from llama_index.core import VectorStoreIndex
+docs  = SimpleWorkspaceReader(ws, root="/docs", convert="markitdown").load_data()
+index = VectorStoreIndex.from_documents(docs)   # node.metadata = {path, authors, passage_hash, …}
+```
+
+**Segmentation** is a real choice: `content_defined` (the default) puts boundaries
+where the bytes decide, so an edit near the top of a file doesn't reshuffle every
+later passage's hash — that edit-stability is what makes incremental re-embedding
+cheap. Also `fixed`, `lines`, `whole_file`, or a custom splitter.
+
+**Non-text documents** (PDF, DOCX, images, …) go through a pluggable `Converter`
+that projects them to Markdown first; a converted passage's provenance is
+*document-level* (source path + who added it + which converter), since the
+extracted text no longer maps to the original bytes. `MarkItDownConverter` ships as
+the batteries-included one (`pip install "origofs[markitdown]"`), but you can pass
+`unstructured`, `pandoc`, an LLM, or a plain `callable(path, data, mime) -> str`.
+
+Needs the relevant extras: `pip install "origofs[llamaindex,markitdown]"` (the
+`origofs.rag` core needs none). See **`examples/rag_provenance.py`** — it plays the
+whole story (a human + an agent co-author docs, a PDF is converted, and each
+retrieved answer names its author and source) with no API keys.
+
 ## Live change feed (push)
 
 On Postgres, `subscribe` gives a real push feed (LISTEN/NOTIFY) — `await recv()`
@@ -303,13 +342,16 @@ alembic -x db_url=sqlite:///./dev.db upgrade head
 `current_branch` · `rebuild` · `scan` ·
 `create_human` · `create_agent` · `actor_by_subject` · `actor` · `list_actors` ·
 `find_or_create_human` · `find_or_create_agent` · `create_session` · `blame` ·
-`watch` · `subscribe` · `presence` · `touch` · `suggest` · `suggest_delete` ·
+`passages` (RAG) · `watch` · `subscribe` · `presence` · `touch` · `suggest` · `suggest_delete` ·
 `list_suggestions` ·
 `get_suggestion` · `suggestion_diff` · `suggestion_content` · `accept_suggestion` ·
 `reject_suggestion` ·
-`mount` · `serve_nfs`. Plus `WriteCtx`, `S3Config`, `Mount`, `fuse_mountable()`.
+`mount` · `serve_nfs`. Plus `WriteCtx`, `S3Config`, `Mount`, `content_hash()`,
+`fuse_mountable()`.
 
 Integrations (own extras): `origofs.fastapi` (HTTP router) · `origofs.fsspec`
 (`OrigoFileSystem`, the fsspec filesystem — also a `UPath("origofs://…")` via
-universal-pathlib) · `origofs.overlay` (agent overlay) · `origofs.db`
+universal-pathlib) · `origofs.rag` (provenance-carrying passages) +
+`origofs.llamaindex` (`SimpleWorkspaceReader`) + `origofs.converters`
+(`MarkItDownConverter`) · `origofs.overlay` (agent overlay) · `origofs.db`
 (SQLAlchemy models + Alembic migrations for the metadata schema).

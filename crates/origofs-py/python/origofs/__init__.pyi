@@ -226,6 +226,21 @@ class Workspace:
     # Each blame span is a dict with `byte_start`/`byte_end` (the ground-truth byte
     # range), the derived `line_start`/`line_end`, `session`, and `actor`.
     async def blame(self, path: str) -> list[dict[str, Any]]: ...
+    # Extract retrieval passages from the working tree (technology-agnostic RAG).
+    # Each dict carries `path`, `byte_start`/`byte_end`, a content-address `hash`
+    # (dedup / incremental key), `text`, and per-passage `blame`. `segmentation` is
+    # one of `content_defined` (default) | `fixed` | `lines` | `whole_file`.
+    async def passages(
+        self,
+        root: Optional[str] = None,
+        exts: Optional[list[str]] = None,
+        segmentation: Optional[str] = None,
+        size: int = 1024,
+        overlap: int = 0,
+        with_text: bool = True,
+        with_blame: bool = True,
+        max_file_bytes: int = 0,
+    ) -> list[dict[str, Any]]: ...
 
     # --- live co-editing (M8) ---
     async def open_coedit(self, ctx: WriteCtx, path: str) -> CoeditDoc: ...
@@ -264,6 +279,12 @@ class Workspace:
     else:
         def mount(self, mountpoint: str) -> NoReturn: ...
         def serve_nfs(self, addr: str) -> NoReturn: ...
+
+def content_hash(data: bytes) -> str:
+    """The origofs content address (BLAKE3, hex) of ``data`` — the same hash a
+    passage carries, so a Python pipeline can key derived/converted content by the
+    same scheme."""
+    ...
 
 def fuse_mountable() -> bool:
     """Whether a FUSE mount is possible here (``/dev/fuse`` present). Always
