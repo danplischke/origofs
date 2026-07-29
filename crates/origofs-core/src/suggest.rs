@@ -34,6 +34,47 @@ pub enum WriteOutcome {
     Proposed(i64),
 }
 
+/// What a suggestion proposes, and therefore how it is applied (issue #75 §3.2).
+///
+/// The two kinds differ in *what the base means*, which is what makes staleness
+/// mean something different for each:
+///
+/// * [`Bytes`](Self::Bytes) — a whole file body. `base_hash` is the file's content
+///   address when the proposal was computed, so accepting it is a conditional
+///   whole-file write: if the file moved on, applying the proposal would silently
+///   throw away the intervening change, so it must not be applied.
+/// * [`Crdt`](Self::Crdt) — a *merge* into a co-edited document. `base_hash`
+///   addresses the document's Yjs **state vector** and `proposed_hash` an opaque
+///   `encodeStateAsUpdate` blob, so accepting it is `applyUpdate`. A CRDT merge is
+///   defined for **any** pair of states, so a disjoint concurrent edit is not a
+///   conflict and must not be rejected — the byte-suggestion staleness guard would
+///   false-reject it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SuggestionKind {
+    /// A whole-file body (the classic path).
+    #[default]
+    Bytes,
+    /// A Yjs update to merge into a co-edited document.
+    Crdt,
+}
+
+impl SuggestionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SuggestionKind::Bytes => "bytes",
+            SuggestionKind::Crdt => "crdt",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "bytes" => SuggestionKind::Bytes,
+            "crdt" => SuggestionKind::Crdt,
+            _ => return None,
+        })
+    }
+}
+
 /// The lifecycle state of a suggestion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SuggestionStatus {
@@ -81,6 +122,8 @@ pub struct SuggestionInit {
     /// The content hash of the proposed body (`None` proposes a deletion).
     pub proposed_hash: Option<String>,
     pub summary: Option<String>,
+    /// What the two hashes above *mean* — see [`SuggestionKind`].
+    pub kind: SuggestionKind,
 }
 
 /// A recorded suggestion.
@@ -94,6 +137,7 @@ pub struct Suggestion {
     pub base_hash: Option<String>,
     pub proposed_hash: Option<String>,
     pub summary: Option<String>,
+    pub kind: SuggestionKind,
     pub status: SuggestionStatus,
     pub created_ts: i64,
     pub resolved_ts: Option<i64>,
@@ -104,10 +148,26 @@ pub struct Suggestion {
 /// and the proposed text. Lets a caller render an inline review straight from the
 /// store, instead of stashing the proposed bytes app-side. `proposed` is `None`
 /// when the suggestion proposes a deletion.
+///
+/// For a [`Crdt`](SuggestionKind::Crdt) suggestion the pair is instead the *effect
+/// of the merge* — the live document's text now, and its text with the proposed
+/// update applied — because neither of that kind's hashes addresses readable text
+/// (they are a state vector and an opaque Yjs update). Same shape, same rendering
+/// code in a reviewer UI; see [`Fs::suggestion_diff`](crate::Fs::suggestion_diff).
 #[derive(Clone, Debug)]
 pub struct SuggestionContent {
     pub base: String,
     pub proposed: Option<String>,
+}
+
+/// The error a CRDT suggestion raises in a build without the `coedit` feature:
+/// the review row is readable, but applying (or previewing) it needs the CRDT
+/// engine that feature compiles in.
+#[cfg(not(feature = "coedit"))]
+fn crdt_needs_feature(id: i64) -> OrigoFSError {
+    OrigoFSError::InvalidArgument(format!(
+        "suggestion #{id} is a CRDT suggestion; this build lacks the `coedit` feature"
+    ))
 }
 
 impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
@@ -175,8 +235,15 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                     .to_hex(),
             ),
         };
-        self.record_suggestion(ctx, path, base_hash, proposed_hash, summary)
-            .await
+        self.record_suggestion(
+            ctx,
+            path,
+            base_hash,
+            proposed_hash,
+            summary,
+            SuggestionKind::Bytes,
+        )
+        .await
     }
 
     /// Propose deleting `path` (a suggestion with no proposed content).
@@ -191,17 +258,18 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         // path genuinely doesn't exist.
         self.resolve(path).await?;
         let base_hash = self.current_content_hex(path).await?;
-        self.record_suggestion(ctx, path, base_hash, None, summary)
+        self.record_suggestion(ctx, path, base_hash, None, summary, SuggestionKind::Bytes)
             .await
     }
 
-    async fn record_suggestion(
+    pub(crate) async fn record_suggestion(
         &self,
         ctx: WriteCtx,
         path: &str,
         base_hash: Option<String>,
         proposed_hash: Option<String>,
         summary: Option<&str>,
+        kind: SuggestionKind,
     ) -> Result<i64> {
         let branch = self.current_branch().await.ok().flatten();
         let id = self
@@ -215,6 +283,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                     base_hash,
                     proposed_hash,
                     summary: summary.map(str::to_string),
+                    kind,
                 },
                 self.now_secs(),
             )
@@ -232,7 +301,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     }
 
     /// The current content hash of `path` in hex, or `None` if it doesn't exist.
-    async fn current_content_hex(&self, path: &str) -> Result<Option<String>> {
+    pub(crate) async fn current_content_hex(&self, path: &str) -> Result<Option<String>> {
         match self.resolve(path).await {
             Ok(ino) => {
                 let inode = self
@@ -262,15 +331,44 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     }
 
     /// Render a suggestion as a unified line diff (`base` → `proposed`).
+    ///
+    /// For a [`Crdt`](SuggestionKind::Crdt) suggestion neither hash addresses
+    /// readable text (they are a state vector and an opaque update), so the diff is
+    /// instead rendered from the *effect* of the merge: the live document's text
+    /// now, versus its text with the proposed update applied to a throwaway copy.
+    /// That is what a reviewer actually needs to see, and — because the merge is
+    /// recomputed against the current document — it stays accurate as the document
+    /// moves on underneath.
     pub async fn suggestion_diff(&self, id: i64) -> Result<String> {
         let s = self
             .meta
             .get_suggestion(id)
             .await?
             .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
-        let old = self.hex_to_text(s.base_hash.as_deref()).await?;
-        let new = self.hex_to_text(s.proposed_hash.as_deref()).await?;
-        Ok(diffy::create_patch(&old, &new).to_string())
+        let (old, new) = self.suggestion_texts(&s).await?;
+        Ok(diffy::create_patch(&old, &new.unwrap_or_default()).to_string())
+    }
+
+    /// The `(base, proposed)` text a review renders, per suggestion kind. `proposed`
+    /// is `None` only for a proposed deletion.
+    async fn suggestion_texts(&self, s: &Suggestion) -> Result<(String, Option<String>)> {
+        match s.kind {
+            SuggestionKind::Bytes => {
+                let base = self.hex_to_text(s.base_hash.as_deref()).await?;
+                let proposed = match s.proposed_hash.as_deref() {
+                    Some(h) => Some(self.hex_to_text(Some(h)).await?),
+                    None => None,
+                };
+                Ok((base, proposed))
+            }
+            #[cfg(feature = "coedit")]
+            SuggestionKind::Crdt => {
+                let (before, after) = self.preview_coedit_suggestion(s).await?;
+                Ok((before, Some(after)))
+            }
+            #[cfg(not(feature = "coedit"))]
+            SuggestionKind::Crdt => Err(crdt_needs_feature(s.id)),
+        }
     }
 
     /// A suggestion's base and proposed **content**, read from the store — so a
@@ -282,11 +380,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             .get_suggestion(id)
             .await?
             .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
-        let base = self.hex_to_text(s.base_hash.as_deref()).await?;
-        let proposed = match s.proposed_hash.as_deref() {
-            Some(h) => Some(self.hex_to_text(Some(h)).await?),
-            None => None,
-        };
+        let (base, proposed) = self.suggestion_texts(&s).await?;
         Ok(SuggestionContent { base, proposed })
     }
 
@@ -302,11 +396,24 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         }
     }
 
-    /// Accept a pending suggestion: apply it to the working tree and mark it
-    /// accepted. The applied write is attributed to the **original author**
-    /// (so blame credits the agent), while `approver` is recorded as who
-    /// accepted it. Fails with [`OrigoFSError::Conflict`] if the file changed since
-    /// the suggestion was made (a stale base) — re-diff and re-suggest.
+    /// Accept a pending suggestion: apply it and mark it accepted. The applied
+    /// edit is attributed to the **original author** (so blame credits the agent),
+    /// while `approver` is recorded as who accepted it — and must be a different
+    /// actor.
+    ///
+    /// **Staleness depends on the kind** ([`SuggestionKind`]).
+    ///
+    /// * A [`Bytes`](SuggestionKind::Bytes) suggestion replaces the whole file, so
+    ///   a moved base means applying it would silently discard the intervening
+    ///   change. It is refused with [`OrigoFSError::Conflict`] *and* resolved to
+    ///   [`Superseded`](SuggestionStatus::Superseded) — the honest terminal state
+    ///   for "this proposal is about a version of the file that no longer exists".
+    ///   Re-diff and re-suggest.
+    /// * A [`Crdt`](SuggestionKind::Crdt) suggestion is a *merge*, and a CRDT merge
+    ///   is defined for any pair of states: a disjoint concurrent edit is not a
+    ///   conflict. Applying it can therefore never discard anything, so it is
+    ///   **not** subject to the staleness guard — that guard false-rejected every
+    ///   concurrent edit over an always-mergeable document.
     pub async fn accept_suggestion(&self, id: i64, approver: WriteCtx) -> Result<()> {
         let s = self
             .meta
@@ -330,44 +437,18 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             )));
         }
 
-        // Staleness: the file must still be what the proposal was based on.
-        let current = self.current_content_hex(&s.path).await?;
-        if current != s.base_hash {
-            return Err(OrigoFSError::Conflict(format!(
-                "suggestion #{id}: {} changed since it was proposed",
-                s.path
-            )));
-        }
-
         let author = WriteCtx {
             actor: s.actor_id,
             session: s.session_id,
             tool_call: None,
         };
-        // The base the proposal was diffed against, as the CAS expectation below.
-        let expected_base = match &s.base_hash {
-            Some(hex) => Some(
-                Hash::from_hex(hex)
-                    .ok_or_else(|| OrigoFSError::Metadata("bad base hash".into()))?,
-            ),
-            None => None,
-        };
-        match &s.proposed_hash {
-            Some(hex) => {
-                let hash = Hash::from_hex(hex)
-                    .ok_or_else(|| OrigoFSError::Metadata("bad proposed hash".into()))?;
-                let bytes = self.content_bytes(&hash).await?;
-                // Apply atomically: the write only lands if the file is *still* at
-                // the base it was proposed against, so a change that slipped in
-                // after the staleness check above can't be silently clobbered.
-                self.write_as_expecting(author, &s.path, &bytes, expected_base)
-                    .await?;
-            }
-            None => {
-                // Proposed deletion. (The staleness pre-check above guards it; a
-                // conditional delete would close its narrower remaining window.)
-                self.remove(&s.path).await?;
-            }
+
+        match s.kind {
+            SuggestionKind::Bytes => self.apply_byte_suggestion(&s, author).await?,
+            #[cfg(feature = "coedit")]
+            SuggestionKind::Crdt => self.apply_coedit_suggestion(&s, author).await?,
+            #[cfg(not(feature = "coedit"))]
+            SuggestionKind::Crdt => return Err(crdt_needs_feature(s.id)),
         }
 
         self.meta
@@ -387,7 +468,123 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             branch: self.current_branch().await.ok().flatten(),
         })
         .await?;
+        // The accept moved the file, so any *other* pending byte proposal against
+        // the old base is now about a version that no longer exists. Retire those
+        // to `Superseded` instead of leaving them Pending forever for a reviewer to
+        // discover one failed accept at a time.
+        self.supersede_stale_byte_suggestions(&s.path, Some(id))
+            .await?;
         Ok(())
+    }
+
+    /// Apply a whole-file byte suggestion, guarding the base it was proposed
+    /// against. A stale base is refused *and* recorded as
+    /// [`Superseded`](SuggestionStatus::Superseded) — never silently clobbered.
+    async fn apply_byte_suggestion(&self, s: &Suggestion, author: WriteCtx) -> Result<()> {
+        let current = self.current_content_hex(&s.path).await?;
+        if current != s.base_hash {
+            return Err(self.mark_superseded(s).await);
+        }
+        // The base the proposal was diffed against, as the CAS expectation below.
+        let expected_base = match &s.base_hash {
+            Some(hex) => Some(
+                Hash::from_hex(hex)
+                    .ok_or_else(|| OrigoFSError::Metadata("bad base hash".into()))?,
+            ),
+            None => None,
+        };
+        match &s.proposed_hash {
+            Some(hex) => {
+                let hash = Hash::from_hex(hex)
+                    .ok_or_else(|| OrigoFSError::Metadata("bad proposed hash".into()))?;
+                let bytes = self.content_bytes(&hash).await?;
+                // Apply atomically: the write only lands if the file is *still* at
+                // the base it was proposed against, so a change that slipped in
+                // after the staleness check above can't be silently clobbered.
+                match self
+                    .write_as_expecting(author, &s.path, &bytes, expected_base)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    // Lost the race in the window between the check and the write:
+                    // same situation, same terminal state.
+                    Err(OrigoFSError::Conflict(_)) => Err(self.mark_superseded(s).await),
+                    Err(e) => Err(e),
+                }
+            }
+            None => {
+                // Proposed deletion. (The staleness pre-check above guards it; a
+                // conditional delete would close its narrower remaining window.)
+                self.remove(&s.path).await
+            }
+        }
+    }
+
+    /// Retire `s` as [`Superseded`](SuggestionStatus::Superseded) and return the
+    /// `Conflict` to report. Resolving it is best-effort: failing to *record* the
+    /// outcome must not turn a clean "your base moved" into a backend error, and
+    /// the caller's contract — "a stale byte suggestion is never applied" — holds
+    /// either way.
+    async fn mark_superseded(&self, s: &Suggestion) -> OrigoFSError {
+        let _ = self
+            .meta
+            .resolve_suggestion(s.id, SuggestionStatus::Superseded, None, self.now_secs())
+            .await;
+        let _ = self
+            .record_event(EventInit {
+                actor_id: Some(s.actor_id),
+                session_id: s.session_id,
+                kind: "supersede".to_string(),
+                path: s.path.clone(),
+                detail: Some(format!("suggestion #{}", s.id)),
+                branch: self.current_branch().await.ok().flatten(),
+            })
+            .await;
+        OrigoFSError::Conflict(format!(
+            "suggestion #{}: {} changed since it was proposed; marked superseded — re-diff and re-suggest",
+            s.id, s.path
+        ))
+    }
+
+    /// Resolve every pending **byte** suggestion on `path` whose base no longer
+    /// matches the file to [`Superseded`](SuggestionStatus::Superseded), skipping
+    /// `except`. CRDT suggestions are deliberately untouched: they merge into
+    /// whatever the document has become, so a moved file does not invalidate them.
+    /// Returns how many were retired.
+    pub async fn supersede_stale_byte_suggestions(
+        &self,
+        path: &str,
+        except: Option<i64>,
+    ) -> Result<usize> {
+        let current = self.current_content_hex(path).await?;
+        let pending = self
+            .meta
+            .list_suggestions(Some(SuggestionStatus::Pending), Some(path))
+            .await?;
+        let mut n = 0;
+        for s in pending {
+            if Some(s.id) == except
+                || s.kind != SuggestionKind::Bytes
+                || s.base_hash == current
+                || !self
+                    .meta
+                    .resolve_suggestion(s.id, SuggestionStatus::Superseded, None, self.now_secs())
+                    .await?
+            {
+                continue;
+            }
+            n += 1;
+            self.record_event(EventInit {
+                actor_id: Some(s.actor_id),
+                session_id: s.session_id,
+                kind: "supersede".to_string(),
+                path: s.path.clone(),
+                detail: Some(format!("suggestion #{}", s.id)),
+                branch: self.current_branch().await.ok().flatten(),
+            })
+            .await?;
+        }
+        Ok(n)
     }
 
     /// Reject a pending suggestion without applying it.

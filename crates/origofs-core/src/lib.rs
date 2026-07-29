@@ -43,8 +43,8 @@ pub use attribution::{
 pub use chunk::{AVG_CHUNK, ChunkRef, MAX_CHUNK, MIN_CHUNK, Manifest};
 pub use clock::{Clock, SystemClock};
 #[cfg(feature = "coedit")]
-pub use coedit::CoeditDoc;
-pub use collab::{EVENT_CHANNEL, Event, EventInit, PRESENCE_WINDOW_SECS, Presence};
+pub use coedit::{COEDIT_SIDECAR_DIR, CoeditDoc, coedit_sidecar_path};
+pub use collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, PRESENCE_WINDOW_SECS, Presence};
 pub use content::{ContentStore, LocalCasStore, MemStore, TieredStore, VerifyingStore};
 pub use corpus::{Passage, PassageOptions, Segmentation};
 pub use encrypt::EncryptedStore;
@@ -66,7 +66,7 @@ pub use postgres::{CoeditRelayNote, CoeditRelaySub};
 pub use postgres::{EventSubscription, PostgresMetadataStore};
 pub use recover::RebuildReport;
 pub use sqlite::SqliteMetadataStore;
-pub use suggest::{Suggestion, SuggestionContent, SuggestionInit, SuggestionStatus, WriteOutcome};
-pub use types::{
-    DirEntry, DirEntryAttr, DirPage, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit,
+pub use suggest::{
+    Suggestion, SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, WriteOutcome,
 };
+pub use types::{DirEntry, DirEntryAttr, DirPage, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit};

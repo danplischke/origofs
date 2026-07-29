@@ -165,8 +165,11 @@ impl Coordinator {
 
     /// Detach from the room for `path`. When the last socket leaves, checkpoint the
     /// document (landing every collaborator's byte spans in blame and persisting
-    /// the CRDT sidecar) and evict the room. The checkpoint runs under the registry
-    /// lock so a concurrent join can't fork a fresh room off a half-written sidecar.
+    /// the CRDT sidecar), clear the path's **live** marker so byte readers stop
+    /// being told the durable blob may lag, and evict the room. The checkpoint runs
+    /// under the registry lock so a concurrent join can't fork a fresh room off a
+    /// half-written sidecar — or clear the marker out from under a room that is
+    /// still taking edits.
     async fn leave(&self, path: &str, ctx: WriteCtx) {
         let mut rooms = self.rooms.lock().await;
         let evict = match rooms.get_mut(path) {
@@ -183,6 +186,9 @@ impl Coordinator {
                 // it does mean this room's since-last edits aren't yet durable.
                 let _ = self.ws.checkpoint_coedit(ctx, path, &doc).await;
             }
+            // Only after the final checkpoint: until it lands, the durable blob
+            // really does lag the document, and the marker is what says so.
+            let _ = self.ws.end_coedit(path).await;
             rooms.remove(path);
         }
     }

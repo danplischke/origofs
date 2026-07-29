@@ -109,6 +109,15 @@ impl CoeditDoc {
             .encode_state_as_update_v1(&StateVector::default())
     }
 
+    /// This document's encoded **state vector** — the compact "what I already
+    /// have" summary Yjs peers exchange. It is what a CRDT suggestion records as
+    /// its base: unlike a content hash it does not say "the file must still be
+    /// exactly this", it says "this proposal was computed knowing these ops",
+    /// which is all a merge needs.
+    pub fn state_vector(&self) -> Vec<u8> {
+        self.doc.transact().state_vector().encode_v1()
+    }
+
     /// Merge a peer's update into this document (idempotent and commutative).
     pub fn apply_update(&self, update: &[u8]) -> Result<()> {
         let update = Update::decode_v1(update)
@@ -314,6 +323,82 @@ impl CoeditDoc {
         Ok(this)
     }
 
+    /// Make this document's text become `text` by applying the *difference* as
+    /// attributed CRDT operations — inserts and deletes — rather than by replacing
+    /// the document. Inserted runs take their author from `spans`, the
+    /// `(actor, session, byte_len)` tiling of `text` (as
+    /// [`from_blamed`](Self::from_blamed) uses); a run under actor `0`, or past the
+    /// end of `spans`, is inserted unattributed.
+    ///
+    /// Because the edits are CRDT operations, they merge: a replica that has this
+    /// change and a replica that has a concurrent one converge on both. That is
+    /// what [`Fs::checkpoint_coedit`] uses to fold an out-of-band write into a live
+    /// document instead of racing it.
+    ///
+    /// Character-level, so it is called on documents of editor size; it is not a
+    /// bulk-import path.
+    pub fn reconcile_with(&self, text: &str, spans: &[(i64, i64, u64)]) -> Result<()> {
+        let before = self.text();
+        if before == text {
+            return Ok(());
+        }
+        let diff = TextDiff::from_chars(before.as_str(), text);
+        let mut txn = self.doc.transact_mut();
+        let mut idx: u32 = 0; // UTF-16 offset into the document, as we mutate it
+        let mut authors = SpanCursor::new(spans);
+        // The open insert run: its author and the text accumulated so far. Runs are
+        // batched so a word typed by one author is one CRDT insert, not N.
+        let mut pending: Option<((i64, i64), String)> = None;
+
+        // Flush the open insert run at the current index, advancing past it.
+        macro_rules! flush {
+            () => {
+                if let Some((author, piece)) = pending.take() {
+                    if author.0 != 0 {
+                        let attrs = Self::author_attrs(WriteCtx::session(author.0, author.1));
+                        self.text
+                            .insert_with_attributes(&mut txn, idx, &piece, attrs);
+                    } else {
+                        self.text.insert(&mut txn, idx, &piece);
+                    }
+                    idx += utf16_len(&piece);
+                }
+            };
+        }
+
+        for change in diff.iter_all_changes() {
+            let value = change.value();
+            match change.tag() {
+                ChangeTag::Equal => {
+                    flush!();
+                    idx += utf16_len(value);
+                    authors.advance(value.len());
+                }
+                // Present in the document, absent from `text`: delete it. The
+                // document shrinks under `idx`, so `idx` does not move.
+                ChangeTag::Delete => {
+                    flush!();
+                    self.text.remove_range(&mut txn, idx, utf16_len(value));
+                }
+                ChangeTag::Insert => {
+                    let author = authors.author();
+                    match &mut pending {
+                        Some((a, piece)) if *a == author => piece.push_str(value),
+                        _ => {
+                            flush!();
+                            pending = Some((author, value.to_string()));
+                        }
+                    }
+                    authors.advance(value.len());
+                }
+            }
+        }
+        flush!();
+        let _ = idx; // the trailing flush's advance is dead, but keeps `flush!` uniform
+        drop(txn);
+        Ok(())
+    }
+
     /// The current text together with its per-span `(actor, session, byte_len)`
     /// authorship, both walked from one CRDT diff so they always agree. A run with
     /// no recorded author (which should not occur — every insert is attributed)
@@ -334,6 +419,51 @@ impl CoeditDoc {
             spans.push((actor, session, piece.len() as u64));
         }
         (text, spans)
+    }
+}
+
+/// A forward-only cursor over a `(actor, session, byte_len)` span tiling, for
+/// looking up the author at a byte offset that only ever moves forward.
+struct SpanCursor<'a> {
+    spans: &'a [(i64, i64, u64)],
+    /// Index of the span the cursor currently sits in.
+    at: usize,
+    /// Bytes consumed within `spans[at]`.
+    used: u64,
+}
+
+impl<'a> SpanCursor<'a> {
+    fn new(spans: &'a [(i64, i64, u64)]) -> Self {
+        Self {
+            spans,
+            at: 0,
+            used: 0,
+        }
+    }
+
+    /// The author at the current offset, or `(0, 0)` past the end of the tiling.
+    fn author(&self) -> (i64, i64) {
+        match self.spans.get(self.at) {
+            Some(&(actor, session, _)) => (actor, session),
+            None => (0, 0),
+        }
+    }
+
+    /// Move `bytes` forward, stepping into later spans as needed.
+    fn advance(&mut self, bytes: usize) {
+        let mut left = bytes as u64;
+        while left > 0 {
+            let Some(&(_, _, len)) = self.spans.get(self.at) else {
+                return;
+            };
+            let take = left.min(len - self.used);
+            self.used += take;
+            left -= take;
+            if self.used == len {
+                self.at += 1;
+                self.used = 0;
+            }
+        }
     }
 }
 
@@ -406,11 +536,18 @@ fn inserted_ranges(before: &str, after: &str) -> Vec<(u32, u32)> {
 }
 
 /// Hidden directory holding persisted co-edit CRDT sidecars.
-const COEDIT_SIDECAR_DIR: &str = "/.origofs/ydoc";
+///
+/// It is an ordinary directory in the working tree, so a sidecar is an ordinary
+/// file: it is walked by `commit` into the commit tree, and marked reachable by
+/// `gc` from *both* the live-working-tree root and every commit tree. Nothing
+/// pins it specially, and nothing needs to — see
+/// `origofs-core/tests/coedit_sidecar_gc.rs`, which proves the property rather
+/// than assuming it.
+pub const COEDIT_SIDECAR_DIR: &str = "/.origofs/ydoc";
 
 /// The sidecar path for a co-edited `path`, hex-encoded so it needs no nested
 /// directories and can't collide with another document's sidecar.
-fn coedit_sidecar_path(path: &str) -> String {
+pub fn coedit_sidecar_path(path: &str) -> String {
     format!("{COEDIT_SIDECAR_DIR}/{}", hex::encode(path.as_bytes()))
 }
 
@@ -474,6 +611,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         path: &str,
         doc: &CoeditDoc,
     ) -> Result<()> {
+        self.reconcile_out_of_band(ctx, path, doc).await?;
         let (text, mut spans) = doc.snapshot();
         for span in &mut spans {
             if span.0 == 0 {
@@ -497,18 +635,90 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         blob.extend_from_slice(blake3::hash(text.as_bytes()).as_bytes());
         blob.extend_from_slice(&state);
         self.write(&coedit_sidecar_path(path), &blob).await?;
+        // Refresh the live marker's coherence hash to what we just wrote, so the
+        // *next* checkpoint can again tell an out-of-band write from our own. Only
+        // a *refresh*: checkpointing does not by itself make a path live — that is
+        // `open_coedit`'s job — so a one-off checkpoint by a Rust caller holding a
+        // `CoeditDoc` leaves no marker behind for a reader to trip over.
+        if self.meta.get_live_doc(path).await?.is_some() {
+            self.mark_live(ctx, path).await?;
+        }
         Ok(())
     }
 
-    /// Open a co-edited document for `path`: restore the live CRDT from its
-    /// persisted sidecar — but only if the sidecar is still **coherent** with the
-    /// file (the file hashes to what the sidecar crystallized). If the file moved on
-    /// underneath — an accepted suggestion, a branch merge, a plain write — the
-    /// sidecar is stale, so rebuild the live doc from the durable truth (the file's
-    /// text + its blame) instead, losing no change and preserving authorship. With
-    /// no sidecar at all, likewise promote the file (an empty document if it's
-    /// absent or binary).
-    pub async fn open_coedit(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
+    /// Fold an **out-of-band** write into the live document before it is
+    /// checkpointed (issue #75 §3.4).
+    ///
+    /// A path can be live in a co-editing room *and* written through an ordinary
+    /// `write`/`write_as`/suggestion-accept at the same time. Without this the two
+    /// simply race: the next checkpoint crystallizes the CRDT over the file and the
+    /// out-of-band change vanishes with no conflict and no trace.
+    ///
+    /// The detector is the live marker's `content_hash` — the content address this
+    /// document last checkpointed. If the file's address has moved, somebody else
+    /// wrote it.
+    ///
+    /// Reconciliation then reuses exactly the machinery that already exists rather
+    /// than inventing a merge algorithm: the **sidecar** holds this document's state
+    /// as of the last checkpoint, so we load it as a *replica*, replay the
+    /// out-of-band change onto that replica as attributed CRDT operations
+    /// ([`reconcile_with`](CoeditDoc::reconcile_with), authors recovered from the
+    /// file's blame exactly as [`open_coedit`](Self::open_coedit) recovers them for
+    /// a stale sidecar), and then merge the replica back into the live document.
+    /// The replica diverged from the same checkpoint the live document did, so the
+    /// two sets of edits are genuinely concurrent and the CRDT merges them — every
+    /// edit survives, each keeping its own author. No three-way text merge, no
+    /// conflict markers, no lost write.
+    ///
+    /// A no-op when the path is not live, the file has not moved, or there is no
+    /// coherent sidecar to fork the replica from (nothing to merge *against*, so
+    /// the existing whole-file behaviour stands).
+    async fn reconcile_out_of_band(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditDoc,
+    ) -> Result<()> {
+        let Some(live) = self.meta.get_live_doc(path).await? else {
+            return Ok(());
+        };
+        let current = self.current_content_hex(path).await?;
+        if current == live.content_hash {
+            return Ok(()); // nobody wrote around us
+        }
+        let bytes = match self.read(path).await {
+            Ok(b) => b,
+            Err(OrigoFSError::NotFound(_)) => return Ok(()), // removed: nothing to fold in
+            Err(e) => return Err(e),
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Ok(()); // binary now: not reconcilable as text
+        };
+        // The replica: this document as it stood at the last checkpoint.
+        let sidecar = match self.read(&coedit_sidecar_path(path)).await {
+            Ok(b) => b,
+            Err(OrigoFSError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let Some((_, ydoc)) = parse_sidecar(&sidecar) else {
+            return Ok(());
+        };
+        let replica = CoeditDoc::load(ydoc)?;
+        let ranges = self.blame(path).await.unwrap_or_default();
+        let spans = blame_to_spans(text, ranges, (ctx.actor, ctx.session.unwrap_or(0)));
+        replica.reconcile_with(text, &spans)?;
+        // Merge the out-of-band branch back in. `apply_update` (not
+        // `apply_update_as`) on purpose: the replica's inserts already carry the
+        // authors blame recorded for them, and re-stamping would credit this
+        // checkpoint's actor with someone else's out-of-band edit.
+        doc.apply_update(&replica.state_update())
+    }
+
+    /// Load the co-edited document for `path` **without** marking it live: the
+    /// read-only half of [`open_coedit`](Self::open_coedit), used where a doc is
+    /// materialized to inspect it (a suggestion preview, an accept) rather than to
+    /// start editing it.
+    pub(crate) async fn load_coedit(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
         match self.read(&coedit_sidecar_path(path)).await {
             Ok(blob) => {
                 if let Some((flat_hash, ydoc)) = parse_sidecar(&blob) {
@@ -527,6 +737,163 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             Err(e) => return Err(e),
         }
         self.rebuild_coedit(ctx, path).await
+    }
+
+    /// Open a co-edited document for `path`: restore the live CRDT from its
+    /// persisted sidecar — but only if the sidecar is still **coherent** with the
+    /// file (the file hashes to what the sidecar crystallized). If the file moved on
+    /// underneath — an accepted suggestion, a branch merge, a plain write — the
+    /// sidecar is stale, so rebuild the live doc from the durable truth (the file's
+    /// text + its blame) instead, losing no change and preserving authorship. With
+    /// no sidecar at all, likewise promote the file (an empty document if it's
+    /// absent or binary).
+    ///
+    /// Opening also **marks the path live** (`docs/DESIGN.md` §4e; issue #75 §3.4),
+    /// so a byte reader can tell that the durable blob may lag this document. Call
+    /// [`end_coedit`](Self::end_coedit) when the session finishes to clear it.
+    pub async fn open_coedit(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
+        let doc = self.load_coedit(ctx, path).await?;
+        self.mark_live(ctx, path).await?;
+        Ok(doc)
+    }
+
+    // --- CRDT-shaped suggestions (issue #75 §3.2) -------------------------
+
+    /// Propose a change to a co-edited `path` as a **CRDT merge** instead of a
+    /// whole file body: the recorded base is the workspace document's Yjs state
+    /// vector and the proposal is `doc`'s opaque `encodeStateAsUpdate` blob.
+    /// Accepting it is `applyUpdate` — see
+    /// [`accept_suggestion`](Self::accept_suggestion).
+    ///
+    /// This is the propose-and-review path for a document people are *live editing*.
+    /// A byte suggestion over such a document is wrong twice over: its base is a
+    /// content hash that goes stale on every keystroke elsewhere in the file, and
+    /// accepting it replaces the whole body, discarding concurrent work. A CRDT
+    /// proposal has neither problem — it merges.
+    ///
+    /// Both blobs go into the **content** store; the review row holds only their
+    /// addresses, exactly as a byte suggestion does, so the metadata database still
+    /// never sees document bytes and ordinary GC still reaches them through the
+    /// pending-suggestion root.
+    pub async fn suggest_coedit(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditDoc,
+        summary: Option<&str>,
+    ) -> Result<i64> {
+        // The base is where the *workspace's* document stood when this was
+        // proposed — the reviewer's "you were looking at this much of it". It is
+        // deliberately not a gate: a CRDT merge is defined against any later state.
+        let base = self.load_coedit(ctx, path).await?.state_vector();
+        self.suggest_coedit_update(ctx, path, &base, &doc.state_update(), summary)
+            .await
+    }
+
+    /// The primitive behind [`suggest_coedit`](Self::suggest_coedit), for a client
+    /// that already holds the two Yjs blobs — a browser editor proposes with
+    /// `encodeStateVector(doc)` as `base_sv` and `encodeStateAsUpdate(doc)` (or a
+    /// diff against the server's vector) as `update`.
+    pub async fn suggest_coedit_update(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        base_sv: &[u8],
+        update: &[u8],
+        summary: Option<&str>,
+    ) -> Result<i64> {
+        if update.is_empty() {
+            return Err(OrigoFSError::InvalidArgument(
+                "co-edit suggestion: empty update proposes nothing".into(),
+            ));
+        }
+        // Reject a malformed blob at propose time rather than at review time — a
+        // suggestion nobody can apply is worse than a refused proposal.
+        Update::decode_v1(update)
+            .map_err(|e| OrigoFSError::InvalidArgument(format!("bad co-edit update: {e}")))?;
+        let base_hash = Some(self.put_opaque(base_sv).await?);
+        let proposed_hash = Some(self.put_opaque(update).await?);
+        self.record_suggestion(
+            ctx,
+            path,
+            base_hash,
+            proposed_hash,
+            summary,
+            crate::suggest::SuggestionKind::Crdt,
+        )
+        .await
+    }
+
+    /// Store an opaque blob in the CAS and return its manifest hash in hex. An
+    /// empty blob still gets an explicit empty manifest, so `Some(hash)` never
+    /// collapses into the `None` that means "propose a deletion".
+    async fn put_opaque(&self, blob: &[u8]) -> Result<String> {
+        Ok(match self.store_body(blob).await?.0 {
+            Some(h) => h.to_hex(),
+            None => self
+                .content
+                .put(&crate::chunk::Manifest::default().encode())
+                .await?
+                .to_hex(),
+        })
+    }
+
+    /// Read a suggestion's proposed Yjs update back out of the CAS.
+    async fn coedit_suggestion_update(
+        &self,
+        s: &crate::suggest::Suggestion,
+    ) -> Result<bytes::Bytes> {
+        let hex = s.proposed_hash.as_deref().ok_or_else(|| {
+            OrigoFSError::InvalidArgument(format!(
+                "suggestion #{}: a CRDT suggestion cannot propose a deletion",
+                s.id
+            ))
+        })?;
+        let hash = crate::types::Hash::from_hex(hex)
+            .ok_or_else(|| OrigoFSError::Metadata("bad proposed hash".into()))?;
+        self.content_bytes(&hash).await
+    }
+
+    /// Apply an accepted CRDT suggestion: merge its update into the live document
+    /// and checkpoint. Never a whole-file `write_as`, so a concurrent disjoint edit
+    /// survives the accept instead of being clobbered.
+    ///
+    /// Attribution is unchanged from the byte path and just as strict:
+    /// [`apply_update_as`](CoeditDoc::apply_update_as) stamps the text this update
+    /// actually *introduces* with the **original author** — server-side, overriding
+    /// any authorship the blob claims — and text already in the document keeps the
+    /// author it already had. The checkpoint then lands those exact spans in blame.
+    /// The approver is recorded by the caller on the review row and the feed.
+    pub(crate) async fn apply_coedit_suggestion(
+        &self,
+        s: &crate::suggest::Suggestion,
+        author: WriteCtx,
+    ) -> Result<()> {
+        let update = self.coedit_suggestion_update(s).await?;
+        let doc = self.load_coedit(author, &s.path).await?;
+        doc.apply_update_as(author, &update)?;
+        self.checkpoint_coedit(author, &s.path, &doc).await
+    }
+
+    /// The `(before, after)` text of applying a CRDT suggestion, for review. The
+    /// merge is computed on a throwaway copy of the current document and never
+    /// persisted, so previewing has no effect on the workspace — and because it
+    /// re-merges against the document *as it is now*, the preview stays truthful as
+    /// the document moves on.
+    pub(crate) async fn preview_coedit_suggestion(
+        &self,
+        s: &crate::suggest::Suggestion,
+    ) -> Result<(String, String)> {
+        let update = self.coedit_suggestion_update(s).await?;
+        let author = WriteCtx {
+            actor: s.actor_id,
+            session: s.session_id,
+            tool_call: None,
+        };
+        let doc = self.load_coedit(author, &s.path).await?;
+        let before = doc.text();
+        doc.apply_update(&update)?;
+        Ok((before, doc.text()))
     }
 
     /// Build a live doc from the durable truth — the file's current text plus its

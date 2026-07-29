@@ -571,10 +571,14 @@ async fn main() -> Result<()> {
                 println!("no suggestions");
             }
             for s in list {
+                // The kind matters to a reviewer: a `crdt` proposal merges into a
+                // live document (and is never stale), a `bytes` one replaces the
+                // file and can be superseded when the base moves.
                 println!(
-                    "#{:<4} {:<9} actor={} {}{}",
+                    "#{:<4} {:<10} {:<5} actor={} {}{}",
                     s.id,
                     s.status.as_str(),
+                    s.kind.as_str(),
                     s.actor_id,
                     s.path,
                     s.summary.map(|m| format!("  — {m}")).unwrap_or_default(),

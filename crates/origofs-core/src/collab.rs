@@ -65,6 +65,31 @@ pub struct Presence {
 /// Default presence window: sessions seen within this many seconds are "active".
 pub const PRESENCE_WINDOW_SECS: i64 = 60;
 
+/// A path with an **open live CRDT document** (roadmap M8; issue #75 §3.4).
+///
+/// While a path is live, its durable CAS blob is a *checkpoint* — a real,
+/// attributed state of the document, but possibly behind the `Y.Doc` people are
+/// currently typing into. Byte readers ([`Fs::read`], the three-way merge, the git
+/// export path) consult this so they can tell "these bytes are the whole truth"
+/// from "these bytes may lag an open editor".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveDoc {
+    /// The co-edited path.
+    pub path: String,
+    /// The session that most recently opened or checkpointed the document.
+    pub session_id: Option<i64>,
+    /// The actor behind that session.
+    pub actor_id: i64,
+    /// The file's content address (hex manifest hash) as of the last checkpoint,
+    /// or `None` if the file was empty/absent then. This is the marker that makes
+    /// an **out-of-band** write to a live path detectable: if the file's current
+    /// content address differs, somebody wrote around the live document, and the
+    /// next checkpoint reconciles instead of clobbering.
+    pub content_hash: Option<String>,
+    /// When the path first became live.
+    pub since: i64,
+}
+
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Append an event to the change feed, returning its `seq` cursor.
     pub async fn record_event(&self, ev: EventInit) -> Result<i64> {
@@ -100,5 +125,78 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// grace comfortably larger than the presence window. Returns rows reaped.
     pub async fn reap_presence(&self, grace_secs: i64) -> Result<u64> {
         self.meta.reap_presence(self.now_secs() - grace_secs).await
+    }
+
+    // --- live CRDT documents (issue #75 §3.4) -----------------------------
+
+    /// Mark `path` as having an open live CRDT document, recording the file's
+    /// current content address as the coherence marker. Called by
+    /// [`open_coedit`](Self::open_coedit) and refreshed by
+    /// [`checkpoint_coedit`](Self::checkpoint_coedit); cleared by
+    /// [`end_coedit`](Self::end_coedit).
+    pub async fn mark_live(&self, ctx: crate::attribution::WriteCtx, path: &str) -> Result<()> {
+        let content = self.current_content_hex(path).await?;
+        self.meta
+            .set_live_doc(
+                path,
+                ctx.session,
+                ctx.actor,
+                content.as_deref(),
+                self.now_secs(),
+            )
+            .await
+    }
+
+    /// Clear `path`'s live marker — the co-editing session is over and the durable
+    /// blob is once again the whole truth. Idempotent.
+    ///
+    /// A marker left behind (a crashed worker, a `open_coedit` whose caller simply
+    /// dropped the doc) is deliberately the *safe* failure direction: a reader is
+    /// told the bytes may lag when they in fact do not, which costs it a needless
+    /// re-check. The opposite — a live document with no marker — is the one that
+    /// would mislead, and that cannot happen because the marker is written before
+    /// the document is handed out.
+    pub async fn end_coedit(&self, path: &str) -> Result<()> {
+        self.meta.clear_live_doc(path).await
+    }
+
+    /// The live marker for `path`, or `None` when nothing has it open.
+    pub async fn live_doc(&self, path: &str) -> Result<Option<LiveDoc>> {
+        self.meta.get_live_doc(path).await
+    }
+
+    /// Every path currently marked live, ordered by path.
+    pub async fn live_paths(&self) -> Result<Vec<LiveDoc>> {
+        self.meta.list_live_docs().await
+    }
+
+    /// Read `path` **and** report whether it is live — the byte reader's version of
+    /// [`read`](Self::read) for callers that care whether the bytes may lag an open
+    /// `Y.Doc` (the git export path, a three-way merge, a UI that wants to warn).
+    ///
+    /// # What a byte reader should do when a path is live
+    ///
+    /// **Surface the staleness; do not block, fail, or force a checkpoint.** That is
+    /// the least surprising behaviour, for three reasons:
+    ///
+    /// 1. *A read must not write.* Forcing a checkpoint would make reading a file
+    ///    mutate the workspace, append to the op-log, and need an actor to attribute
+    ///    the checkpoint to — a reader has none.
+    /// 2. *The engine cannot force one anyway.* The live `Y.Doc` is in-process state
+    ///    owned by a co-editing room, quite possibly in a different worker. The
+    ///    metadata store knows a document is open; it does not have the document.
+    ///    The only component that can checkpoint is the room itself
+    ///    (`origofs_sdk::api::Coordinator::checkpoint_all`).
+    /// 3. *The durable bytes are never garbage.* They are a previously checkpointed,
+    ///    fully attributed state — just possibly an older one. Returning them with a
+    ///    "may lag" flag is honest; erroring out because a colleague has an editor
+    ///    open is not.
+    ///
+    /// So: `read` keeps its contract unchanged, and a caller that needs the freshest
+    /// bytes asks the co-editing coordinator to checkpoint first, then reads.
+    pub async fn read_live(&self, path: &str) -> Result<(bytes::Bytes, Option<LiveDoc>)> {
+        let bytes = self.read(path).await?;
+        let live = self.meta.get_live_doc(path).await?;
+        Ok((bytes, live))
     }
 }

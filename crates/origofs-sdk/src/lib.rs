@@ -14,21 +14,21 @@ use std::sync::Arc;
 
 pub use bytes::Bytes;
 pub use futures::stream::BoxStream;
-pub use origofs_core::{
-    Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DiffEntry, DiffStatus, DirEntry,
-    DirEntryAttr, DirPage, EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind,
-    GcStats, GcsConfig, Hash, Inode, MemStore, MergeOutcome, ObjectContentStore, OrigoFSError,
-    PackStore, Passage, PassageOptions, Presence, RebuildReport, S3Config, Segmentation, Suggestion,
-    SuggestionContent, SuggestionInit, SuggestionStatus, TieredStore, ToolCallInit, VerifyingStore,
-    VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
-};
 /// The emit-only metrics facade (`metrics` feature). A library only *records*;
 /// the binary installs an exporter and hands its renderer to
 /// [`api::set_metrics_renderer`], exactly as it installs a tracing subscriber.
 #[cfg(feature = "metrics")]
 pub use origofs_core::metrics;
+pub use origofs_core::{
+    Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DiffEntry, DiffStatus, DirEntry,
+    DirEntryAttr, DirPage, EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind,
+    GcStats, GcsConfig, Hash, Inode, LiveDoc, MemStore, MergeOutcome, ObjectContentStore,
+    OrigoFSError, PackStore, Passage, PassageOptions, Presence, RebuildReport, S3Config,
+    Segmentation, Suggestion, SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus,
+    TieredStore, ToolCallInit, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+};
 #[cfg(feature = "coedit")]
-pub use origofs_core::{CoeditDoc, CoeditRelayNote, CoeditRelaySub};
+pub use origofs_core::{COEDIT_SIDECAR_DIR, CoeditDoc, CoeditRelayNote, CoeditRelaySub};
 
 // ── Access surfaces ─────────────────────────────────────────────────────────
 // Each surface that was formerly its own crate is now an opt-in, feature-gated
@@ -926,6 +926,48 @@ impl Workspace {
         self.fs.checkpoint_coedit(ctx, path, doc).await
     }
 
+    /// Propose a change to a co-edited `path` as a **CRDT merge** rather than a
+    /// whole file body (issue #75 §3.2): the review row records the document's Yjs
+    /// state vector as its base and `doc`'s opaque `encodeStateAsUpdate` blob as the
+    /// proposal, both in the content store. Accepting it merges (`applyUpdate`)
+    /// instead of overwriting, so a concurrent disjoint edit is never clobbered and
+    /// never false-rejected as stale. Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn suggest_coedit(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditDoc,
+        summary: Option<&str>,
+    ) -> Result<i64> {
+        self.fs.suggest_coedit(ctx, path, doc, summary).await
+    }
+
+    /// The primitive behind [`suggest_coedit`](Self::suggest_coedit), for a client
+    /// that already holds the Yjs blobs (a browser editor sends
+    /// `encodeStateVector` + `encodeStateAsUpdate`). Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn suggest_coedit_update(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        base_sv: &[u8],
+        update: &[u8],
+        summary: Option<&str>,
+    ) -> Result<i64> {
+        self.fs
+            .suggest_coedit_update(ctx, path, base_sv, update, summary)
+            .await
+    }
+
+    /// End a live co-editing session for `path`: clear its live marker so byte
+    /// readers stop being told the durable blob may lag. Checkpoint *first* — this
+    /// only drops the flag. Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn end_coedit(&self, path: &str) -> Result<()> {
+        self.fs.end_coedit(path).await
+    }
+
     /// Ensure the cross-worker relay's backing table exists (idempotent). Call it
     /// before a room starts accepting edits, so the first publish can't race the
     /// table into existence. Requires the Postgres backend + the `coedit` feature.
@@ -980,6 +1022,43 @@ impl Workspace {
     /// Sessions active within the last `window_secs` seconds.
     pub async fn presence(&self, window_secs: i64) -> Result<Vec<Presence>> {
         self.fs.presence(window_secs).await
+    }
+
+    /// The live-document marker for `path`, or `None` when nothing has it open.
+    ///
+    /// A byte reader (`read`, three-way merge, git export) consults this to tell
+    /// "these bytes are the whole truth" from "these bytes may lag an open
+    /// `Y.Doc`". See [`read_live`](Self::read_live) for what to do about it.
+    pub async fn live_doc(&self, path: &str) -> Result<Option<LiveDoc>> {
+        self.fs.live_doc(path).await
+    }
+
+    /// Every path currently open in a live co-editing session.
+    ///
+    /// A caller that needs the freshest bytes for *all* of them — the git export
+    /// path, a release build, a full-tree merge — checkpoints the co-editing
+    /// coordinator (`api::Coordinator::checkpoint_all`) before reading, then reads
+    /// normally.
+    pub async fn live_paths(&self) -> Result<Vec<LiveDoc>> {
+        self.fs.live_paths().await
+    }
+
+    /// Read `path` and report whether it is live — the staleness-aware read. The
+    /// bytes are exactly what [`read`](Self::read) returns; the second element is
+    /// `Some` when an open CRDT document may be ahead of them. Reading never
+    /// blocks, fails, or forces a checkpoint on account of a live path; see
+    /// `origofs_core::Fs::read_live` for why that is the least surprising rule.
+    pub async fn read_live(&self, path: &str) -> Result<(Bytes, Option<LiveDoc>)> {
+        self.fs.read_live(path).await
+    }
+
+    /// Retire every pending **byte** suggestion on `path` whose base no longer
+    /// matches the file, resolving them to
+    /// [`Superseded`](SuggestionStatus::Superseded). Returns how many were retired.
+    /// CRDT suggestions are untouched — they merge into whatever the document has
+    /// become, so a moved file does not invalidate them.
+    pub async fn supersede_stale_suggestions(&self, path: &str) -> Result<usize> {
+        self.fs.supersede_stale_byte_suggestions(path, None).await
     }
 
     /// Reap presence rows older than `grace_secs` (keeps the table bounded).

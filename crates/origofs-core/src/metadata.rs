@@ -3,7 +3,7 @@
 //! (`docs/DESIGN.md` §4b).
 
 use crate::attribution::{Actor, ActorInit, EditOp, EditOpInit, ToolCallInit, WritePolicy};
-use crate::collab::{Event, EventInit, Presence};
+use crate::collab::{Event, EventInit, LiveDoc, Presence};
 use crate::error::Result;
 use crate::suggest::{Suggestion, SuggestionInit, SuggestionStatus};
 use crate::types::{DirEntry, Hash, Ino, Inode, InodeInit};
@@ -260,6 +260,26 @@ pub trait MetadataStore: Send + Sync {
     /// growing without bound — one row accretes per session otherwise). Returns
     /// the number reaped.
     async fn reap_presence(&self, older_than: i64) -> Result<u64>;
+
+    // --- live CRDT documents ---------------------------------------------
+
+    /// Upsert the live-document marker for `path` (see [`LiveDoc`]). `since` is
+    /// only set when the row is created, so re-marking an already-live path keeps
+    /// the time it first went live.
+    async fn set_live_doc(
+        &self,
+        path: &str,
+        session_id: Option<i64>,
+        actor_id: i64,
+        content_hash: Option<&str>,
+        at: i64,
+    ) -> Result<()>;
+    /// The live marker for `path`, if it has one.
+    async fn get_live_doc(&self, path: &str) -> Result<Option<LiveDoc>>;
+    /// Every live marker in this workspace, ordered by path.
+    async fn list_live_docs(&self) -> Result<Vec<LiveDoc>>;
+    /// Drop `path`'s live marker (no-op if absent).
+    async fn clear_live_doc(&self, path: &str) -> Result<()>;
 
     // --- agent-suggestion review queue -----------------------------------
 
@@ -519,6 +539,27 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn reap_presence(&self, older_than: i64) -> Result<u64> {
         (**self).reap_presence(older_than).await
+    }
+    async fn set_live_doc(
+        &self,
+        path: &str,
+        session_id: Option<i64>,
+        actor_id: i64,
+        content_hash: Option<&str>,
+        at: i64,
+    ) -> Result<()> {
+        (**self)
+            .set_live_doc(path, session_id, actor_id, content_hash, at)
+            .await
+    }
+    async fn get_live_doc(&self, path: &str) -> Result<Option<LiveDoc>> {
+        (**self).get_live_doc(path).await
+    }
+    async fn list_live_docs(&self) -> Result<Vec<LiveDoc>> {
+        (**self).list_live_docs().await
+    }
+    async fn clear_live_doc(&self, path: &str) -> Result<()> {
+        (**self).clear_live_doc(path).await
     }
     async fn create_suggestion(&self, init: SuggestionInit, ts: i64) -> Result<i64> {
         (**self).create_suggestion(init, ts).await

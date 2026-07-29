@@ -655,3 +655,120 @@ async fn gate_reads_requires_a_credential_for_reads() {
     let (st, _) = send(&app, get_as("/log", T_HUMAN)).await;
     assert_eq!(st, StatusCode::OK);
 }
+
+// --- presence heartbeat (issue #75 §3.1) ------------------------------------
+
+// `POST /v1/presence` lets a plain HTTP client (a browser, an agent runtime)
+// heartbeat itself into the presence list — previously only readable, so a client
+// could see everyone but never appear. Identity comes from the credential.
+#[tokio::test]
+async fn presence_heartbeat_records_the_authenticated_session() {
+    let fx = fixture().await;
+    let app = &fx.app;
+
+    // nothing is present until somebody beats
+    let (st, body) = send(app, get("/presence")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(as_json(&body).as_array().unwrap().is_empty());
+
+    // an empty body is fine — "I'm here", no current path
+    let (st, body) = send(app, post_empty_as("/presence", T_AGENT)).await;
+    assert_eq!(st, StatusCode::OK);
+    let v = as_json(&body);
+    assert_eq!(v["actor_id"].as_i64(), Some(fx.agent));
+    assert_eq!(v["session_id"].as_i64(), Some(fx.session));
+    assert_eq!(v["path"], Value::Null);
+
+    // ...and a path is recorded, normalized to an absolute workspace path
+    let (st, _) = send(
+        app,
+        post_json_as("/presence", T_AGENT, json!({"path": "notes/todo.txt"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, body) = send(app, get("/presence")).await;
+    assert_eq!(st, StatusCode::OK);
+    let list = as_json(&body);
+    let entries = list.as_array().unwrap();
+    assert_eq!(entries.len(), 1, "one session, upserted — not appended");
+    assert_eq!(entries[0]["session_id"].as_i64(), Some(fx.session));
+    assert_eq!(entries[0]["actor_id"].as_i64(), Some(fx.agent));
+    assert_eq!(entries[0]["display_name"], "claude");
+    assert_eq!(entries[0]["kind"], "agent");
+    assert_eq!(entries[0]["path"], "/notes/todo.txt");
+}
+
+// SEC: the heartbeat is a mutation, so it needs a credential — and the credential
+// is the *only* thing that decides who is recorded. A client cannot beat as
+// someone else by naming them in the body.
+#[tokio::test]
+async fn presence_heartbeat_is_authenticated_and_unforgeable() {
+    let fx = fixture().await;
+    let app = &fx.app;
+
+    // no credential -> 401, and nobody is recorded
+    let (st, _) = send(app, post_json("/presence", json!({"path": "/x"}))).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (_st, body) = send(app, get("/presence")).await;
+    assert!(as_json(&body).as_array().unwrap().is_empty());
+
+    // a bogus token -> 401
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/presence")
+        .header("authorization", "Bearer nope")
+        .body(Body::empty())
+        .unwrap();
+    let (st, _) = send(app, req).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // the agent's token beats, but the body tries to name the human and another
+    // session: both are ignored — the recorded row is the token's own identity.
+    let (st, _) = send(
+        app,
+        post_json_as(
+            "/presence",
+            T_AGENT,
+            json!({
+                "actor": fx.human,
+                "actor_id": fx.human,
+                "session_id": 4242,
+                "path": "/spoof.txt",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (_st, body) = send(app, get("/presence")).await;
+    let list = as_json(&body);
+    let entries = list.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0]["actor_id"].as_i64(),
+        Some(fx.agent),
+        "presence must follow the credential, not the request body"
+    );
+    assert_eq!(entries[0]["session_id"].as_i64(), Some(fx.session));
+    assert_eq!(entries[0]["display_name"], "claude");
+}
+
+// A credential bound to an actor but no session cannot heartbeat: presence rows
+// are keyed by session, and the server will not mint one on a client's behalf.
+#[tokio::test]
+async fn presence_heartbeat_requires_a_session_bound_credential() {
+    let fx = fixture().await;
+    let (st, body) = send(&fx.app, post_empty_as("/presence", T_HUMAN)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let v = as_json(&body);
+    assert_eq!(v["error"]["code"], "invalid_argument");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not bound to a session")
+    );
+    let (_st, body) = send(&fx.app, get("/presence")).await;
+    assert!(as_json(&body).as_array().unwrap().is_empty());
+}

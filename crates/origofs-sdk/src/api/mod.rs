@@ -256,7 +256,7 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
         .route("/branches", get(list_branches).post(create_branch))
         .route("/checkout", post(checkout))
         .route("/events", get(events))
-        .route("/presence", get(presence))
+        .route("/presence", get(presence).post(heartbeat_presence))
         .route(
             "/suggestions",
             get(list_suggestions).post(create_suggestion),
@@ -873,6 +873,9 @@ struct SuggestionDto {
     base_hash: Option<String>,
     proposed_hash: Option<String>,
     summary: Option<String>,
+    /// `bytes` (a whole file body) or `crdt` (a Yjs update to merge) — it decides
+    /// what `base_hash`/`proposed_hash` mean and how `accept` applies it.
+    kind: String,
     status: String,
     created_ts: i64,
     resolved_ts: Option<i64>,
@@ -890,6 +893,7 @@ impl From<crate::Suggestion> for SuggestionDto {
             base_hash: s.base_hash,
             proposed_hash: s.proposed_hash,
             summary: s.summary,
+            kind: s.kind.as_str().to_string(),
             status: s.status.as_str().to_string(),
             created_ts: s.created_ts,
             resolved_ts: s.resolved_ts,
@@ -1157,6 +1161,55 @@ async fn presence(
         })
         .collect();
     Ok(Json(out))
+}
+
+/// The body of `POST /v1/presence`. It carries **no** actor and **no** session
+/// on purpose: like every other mutating route, identity is resolved server-side
+/// from the credential, so a client can only ever heartbeat *itself* — naming
+/// someone else is not expressible, let alone honoured.
+#[derive(Deserialize, Default)]
+struct PresenceBeatReq {
+    /// The path this session is currently working on, if any. Normalized to an
+    /// absolute workspace path; an empty string means "no current path".
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// `POST /v1/presence` — heartbeat the authenticated caller's presence, so a
+/// browser client can appear in `GET /v1/presence` without an in-process SDK
+/// bridge holding a [`Workspace`]. The body is optional (`{}` or nothing);
+/// `{"path": "/notes.md"}` also records where the session is working.
+///
+/// Presence is keyed by **session**, so the credential must be bound to one — a
+/// bare actor token gets a `400` telling it to create a session first. Minting a
+/// session here instead would let a heartbeat loop create unbounded session rows,
+/// and would make the presence list a directory of connections rather than of
+/// working sessions.
+async fn heartbeat_presence(
+    State(ws): State<Shared>,
+    Auth(principal): Auth,
+    body: Option<Json<PresenceBeatReq>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let session = principal.session.ok_or_else(|| {
+        crate::OrigoFSError::InvalidArgument(
+            "this credential is not bound to a session; create one (POST /v1/sessions) and \
+             present a session-bound credential to heartbeat presence"
+                .into(),
+        )
+    })?;
+    let path = req
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(abspath);
+    ws.touch(principal.actor, session, path.as_deref()).await?;
+    Ok(Json(json!({
+        "session_id": session,
+        "actor_id": principal.actor,
+        "path": path,
+    })))
 }
 
 // --- actors + sessions ------------------------------------------------------
