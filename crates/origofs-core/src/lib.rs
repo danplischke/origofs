@@ -30,6 +30,7 @@ pub mod objectstore;
 pub mod pack;
 pub mod postgres;
 pub mod recover;
+pub mod resync;
 pub mod sqlite;
 pub mod suggest;
 pub mod types;
@@ -65,6 +66,9 @@ pub use pack::{DEFAULT_PACK_SIZE, PackStore};
 pub use postgres::{CoeditRelayNote, CoeditRelaySub};
 pub use postgres::{EventSubscription, PostgresMetadataStore};
 pub use recover::RebuildReport;
+pub use resync::{
+    IdentityMap, ResyncOutcome, ResyncReport, TransferStats, carry_blame, resync, transfer,
+};
 pub use sqlite::SqliteMetadataStore;
 pub use suggest::{
     Suggestion, SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, WriteOutcome,

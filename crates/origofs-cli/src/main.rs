@@ -154,6 +154,28 @@ enum Cmd {
         #[arg(short, long)]
         message: Option<String>,
     },
+    /// Reconcile this (offline/solo) workspace with a remote one over a branch,
+    /// merging any divergence with the ordinary three-way merge engine. Objects
+    /// move both ways as needed and per-line blame travels with them; the remote
+    /// branch only advances by compare-and-swap. Both working trees must be clean.
+    /// E.g. `origofs resync --remote-config team.toml` or `origofs resync --remote ../shared`.
+    Resync {
+        /// The remote workspace directory (holds `meta.db` and `cas/`, like
+        /// `--workspace`). Also roots any path defaulted by `--remote-config`.
+        #[arg(long, value_name = "DIR")]
+        remote: Option<PathBuf>,
+        /// Backend configuration file (TOML) for the remote workspace — the same
+        /// format as `--config`, for a Postgres/S3/GCS remote.
+        #[arg(long, value_name = "FILE")]
+        remote_config: Option<PathBuf>,
+        /// Branch to reconcile (defaults to the local current branch).
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, default_value = "origofs")]
+        author: String,
+        #[arg(short, long)]
+        message: Option<String>,
+    },
     /// List unresolved merge conflicts.
     Conflicts,
     /// Acquire an exclusive lock on a path.
@@ -651,6 +673,95 @@ async fn main() -> Result<()> {
                         println!("  {} {}", c.kind, c.path);
                     }
                 }
+            }
+        }
+        Cmd::Resync {
+            remote,
+            remote_config,
+            branch,
+            author,
+            message,
+        } => {
+            if remote.is_none() && remote_config.is_none() {
+                anyhow::bail!(
+                    "resync needs a remote: pass --remote <DIR> and/or --remote-config <FILE>"
+                );
+            }
+            // `--remote` alone means a plain local SQLite + local-CAS workspace at
+            // that directory; `--remote-config` selects the backends, rooting any
+            // defaulted path at `--remote` (or the config file's own directory).
+            let remote_root = remote.clone().unwrap_or_else(|| {
+                remote_config
+                    .as_ref()
+                    .and_then(|p| p.parent().map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+            let remote_cfg = match &remote_config {
+                Some(path) => config::Config::load(path)?,
+                None => config::Config::default(),
+            };
+            std::fs::create_dir_all(&remote_root)?;
+            let remote_ws = remote_cfg.open(&remote_root).await?;
+
+            let branch = match branch {
+                Some(b) => b,
+                None => ws.current_branch().await?.ok_or_else(|| {
+                    anyhow::anyhow!("HEAD is detached; pass --branch to name the branch to resync")
+                })?,
+            };
+            let msg = message.unwrap_or_else(|| format!("resync {branch}"));
+            let report = ws.resync(&remote_ws, &branch, &author, &msg).await?;
+
+            match &report.outcome {
+                origofs_sdk::ResyncOutcome::UpToDate => {
+                    println!("{}: already up to date", report.branch)
+                }
+                origofs_sdk::ResyncOutcome::Pushed(h) => println!(
+                    "{}: pushed {} to the remote",
+                    report.branch,
+                    &h.to_hex()[..12]
+                ),
+                origofs_sdk::ResyncOutcome::FastForwarded(h) => {
+                    println!("{}: fast-forwarded to {}", report.branch, &h.to_hex()[..12])
+                }
+                origofs_sdk::ResyncOutcome::Merged(h) => println!(
+                    "{}: merged as {} and pushed",
+                    report.branch,
+                    &h.to_hex()[..12]
+                ),
+                origofs_sdk::ResyncOutcome::Conflicted => println!(
+                    "{}: merge stopped with {} conflict(s); the remote was not advanced — \
+                     resolve, commit, then resync again:",
+                    report.branch,
+                    report.conflicts.len()
+                ),
+            }
+            for c in &report.conflicts {
+                println!("  {} {}", c.kind, c.path);
+            }
+            println!(
+                "  fetched {} object(s), {} B ({} already present)",
+                report.fetched.objects, report.fetched.bytes, report.fetched.skipped
+            );
+            println!(
+                "  pushed  {} object(s), {} B ({} already present)",
+                report.pushed.objects, report.pushed.bytes, report.pushed.skipped
+            );
+            println!(
+                "  blame carried: {} in, {} out",
+                report.blame_fetched, report.blame_pushed
+            );
+            if report.cas_retries > 0 {
+                println!(
+                    "  retried {} time(s) after a concurrent remote push",
+                    report.cas_retries
+                );
+            }
+            if report.remote_tree_updated {
+                println!("  the remote working tree was rematerialized at the new head");
+            }
+            for p in &report.stale_live_paths {
+                println!("  warning: {p} has an open live document; its merged bytes may lag it");
             }
         }
         Cmd::Conflicts => {

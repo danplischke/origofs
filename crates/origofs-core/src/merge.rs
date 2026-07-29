@@ -7,8 +7,17 @@
 //! binary: `ours` kept plus a `<name>.theirs` sibling), record the conflicts, and
 //! set `MERGE_HEAD` — the next `commit` picks up the second parent and clears the
 //! merge state.
+//!
+//! # Live co-editing documents
+//!
+//! A path with an open live CRDT document ([`LiveDoc`], roadmap M8) has a durable
+//! blob that is a *checkpoint*: real, attributed, and possibly behind what people
+//! are typing into the `Y.Doc` right now. A three-way merge that touches such a
+//! path is therefore merging bytes that may lag. [`Fs::merge_live`] reports those
+//! paths alongside the outcome, and [`Fs::merge`] logs them.
 
 use crate::chunk::Manifest;
+use crate::collab::LiveDoc;
 use crate::content::ContentStore;
 use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
@@ -128,7 +137,49 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     // --- merge ------------------------------------------------------------
 
     /// Merge commit `theirs` into the current branch.
+    ///
+    /// Identical to [`merge_live`](Self::merge_live), discarding its live-document
+    /// warnings after logging them — see there for what those are and why they are
+    /// a warning rather than a conflict.
     pub async fn merge(&self, theirs: Hash, author: &str, message: &str) -> Result<MergeOutcome> {
+        let (outcome, stale) = self.merge_live(theirs, author, message).await?;
+        for doc in &stale {
+            tracing::warn!(
+                path = %doc.path,
+                "merged a path with an open live co-editing document; its durable bytes \
+                 may lag the Y.Doc — checkpoint the co-editing room and re-check"
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// [`merge`](Self::merge), also reporting every merged path that had an **open
+    /// live CRDT document** at merge time (`docs/DESIGN.md` §7 / roadmap M8).
+    ///
+    /// While a path is live its durable blob is a checkpoint that may be behind the
+    /// `Y.Doc` collaborators are typing into ([`LiveDoc`]), so a three-way merge
+    /// over it merges bytes that may lag. This surfaces those paths so a caller —
+    /// [`crate::resync`], a UI, a release build — can say so, or checkpoint the
+    /// co-editing room and merge again.
+    ///
+    /// **It is a warning, not a conflict, and never blocks the merge.** That is the
+    /// same rule [`read_live`](Self::read_live) documents, for the same reasons: the
+    /// engine cannot force a checkpoint (the `Y.Doc` is in-process state owned by a
+    /// co-editing room, possibly in another worker), the durable bytes are a real
+    /// attributed state rather than garbage, and recording a conflict would set
+    /// `MERGE_HEAD` and demand manual resolution of a file on which nothing actually
+    /// conflicts — surprising, and it would make merging impossible for as long as
+    /// anyone keeps an editor open. Reporting the fact leaves the choice with the
+    /// caller.
+    ///
+    /// Works with the `coedit` feature off: nothing sets the marker then, so the
+    /// reported list is simply always empty.
+    pub async fn merge_live(
+        &self,
+        theirs: Hash,
+        author: &str,
+        message: &str,
+    ) -> Result<(MergeOutcome, Vec<LiveDoc>)> {
         self.ensure_commits_enabled().await?;
         let branch = self.current_branch().await?.ok_or_else(|| {
             OrigoFSError::InvalidArgument("cannot merge with a detached HEAD".into())
@@ -138,8 +189,19 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         })?;
 
         if ours == theirs || self.is_ancestor(theirs, ours).await? {
-            return Ok(MergeOutcome::AlreadyUpToDate);
+            return Ok((MergeOutcome::AlreadyUpToDate, Vec::new()));
         }
+
+        // Live co-editing markers, keyed by path. One query, and usually empty —
+        // the whole live-document check below costs nothing when nobody is
+        // co-editing (and always, with the `coedit` feature off).
+        let live: HashMap<String, LiveDoc> = self
+            .live_paths()
+            .await?
+            .into_iter()
+            .map(|d| (d.path.clone(), d))
+            .collect();
+
         if self.is_ancestor(ours, theirs).await? {
             let theirs_commit = self.commit_at(&theirs).await?;
             // Advance the ref FIRST (checked): if the branch moved concurrently
@@ -154,9 +216,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                     "branch {branch} moved concurrently; retry the merge"
                 )));
             }
+            // A fast-forward doesn't merge bytes, it materializes theirs wholesale
+            // — which still overwrites a live path. Report the ones it changes.
+            let stale = self.live_changed_between(ours, theirs, &live).await?;
             self.replace_working_tree(theirs_commit.tree).await?;
             self.mirror_refs().await?;
-            return Ok(MergeOutcome::FastForward(theirs));
+            return Ok((MergeOutcome::FastForward(theirs), stale));
         }
 
         let base = self.merge_base(ours, theirs).await?;
@@ -168,6 +233,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let theirs_tree = self.commit_at(&theirs).await?.tree;
 
         let mut conflicts = Vec::new();
+        let mut stale = Vec::new();
         let merged_tree = self
             .merge_trees(
                 base_tree,
@@ -175,6 +241,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 Some(theirs_tree),
                 "",
                 &mut conflicts,
+                &live,
+                &mut stale,
             )
             .await?;
 
@@ -201,7 +269,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
             self.replace_working_tree(merged_tree).await?;
             self.mirror_refs().await?;
-            Ok(MergeOutcome::Merged(commit_hash))
+            Ok((MergeOutcome::Merged(commit_hash), stale))
         } else {
             // Conflicts: reflect the merge (with markers) and record MERGE_HEAD;
             // the ref intentionally does NOT advance until the user commits.
@@ -212,13 +280,34 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
             self.meta.set_ref(MERGE_HEAD, &theirs.to_hex()).await?;
             self.mirror_refs().await?;
-            Ok(MergeOutcome::Conflicts(conflicts))
+            Ok((MergeOutcome::Conflicts(conflicts), stale))
         }
     }
 
+    /// The live documents among `live` whose content differs between commits `a`
+    /// and `b` — the fast-forward path's version of "this merge touched a path
+    /// whose durable bytes may lag". Short-circuits when nothing is live.
+    async fn live_changed_between(
+        &self,
+        a: Hash,
+        b: Hash,
+        live: &HashMap<String, LiveDoc>,
+    ) -> Result<Vec<LiveDoc>> {
+        if live.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .diff(&a.to_hex(), &b.to_hex())
+            .await?
+            .into_iter()
+            .filter_map(|d| live.get(&d.path).cloned())
+            .collect())
+    }
+
     /// Three-way merge of directory trees; returns the merged tree hash and
-    /// accumulates conflicts.
+    /// accumulates conflicts (and any live-document warnings).
     #[async_recursion]
+    #[allow(clippy::too_many_arguments)]
     async fn merge_trees(
         &self,
         base: Option<Hash>,
@@ -226,6 +315,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         theirs: Option<Hash>,
         prefix: &str,
         conflicts: &mut Vec<Conflict>,
+        live: &HashMap<String, LiveDoc>,
+        stale: &mut Vec<LiveDoc>,
     ) -> Result<Hash> {
         let bt = self.load_tree_opt(base).await?;
         let ot = self.load_tree_opt(ours).await?;
@@ -249,7 +340,13 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             match (o, t) {
                 (None, None) => {}
                 (Some(oe), None) => {
-                    if b == Some(oe) {
+                    if b.is_none() {
+                        // Absent from the base and from theirs: *we added it*.
+                        // Nothing to reconcile — keep it. (Without this case, two
+                        // sides adding different files — the ordinary offline
+                        // divergence — would conflict on every added path.)
+                        merged.push(oe.clone());
+                    } else if b == Some(oe) {
                         // ours unchanged, theirs deleted -> delete
                     } else {
                         merged.push(oe.clone());
@@ -260,7 +357,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                     }
                 }
                 (None, Some(te)) => {
-                    if b == Some(te) {
+                    if b.is_none() {
+                        // They added it and we never had it: take it.
+                        merged.push(te.clone());
+                    } else if b == Some(te) {
                         // theirs unchanged, ours deleted -> delete
                     } else {
                         merged.push(te.clone());
@@ -271,6 +371,15 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                     }
                 }
                 (Some(oe), Some(te)) => {
+                    // The two sides disagree about this path, so whatever we pick
+                    // replaces its bytes. If a live CRDT document is open on it,
+                    // the bytes we are reasoning about may already be stale — say
+                    // so (advisory; it never blocks the merge).
+                    if oe != te
+                        && let Some(doc) = live.get(&path)
+                    {
+                        stale.push(doc.clone());
+                    }
                     if oe == te {
                         merged.push(oe.clone());
                     } else if b == Some(oe) {
@@ -280,7 +389,15 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                     } else if oe.kind == TreeKind::Dir && te.kind == TreeKind::Dir {
                         let base_sub = b.filter(|e| e.kind == TreeKind::Dir).map(|e| e.hash);
                         let sub = self
-                            .merge_trees(base_sub, Some(oe.hash), Some(te.hash), &path, conflicts)
+                            .merge_trees(
+                                base_sub,
+                                Some(oe.hash),
+                                Some(te.hash),
+                                &path,
+                                conflicts,
+                                live,
+                                stale,
+                            )
                             .await?;
                         merged.push(TreeEntry {
                             name: name.clone(),

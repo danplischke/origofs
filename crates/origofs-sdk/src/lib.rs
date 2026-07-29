@@ -23,9 +23,10 @@ pub use origofs_core::{
     Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DiffEntry, DiffStatus, DirEntry,
     DirEntryAttr, DirPage, EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind,
     GcStats, GcsConfig, Hash, Inode, LiveDoc, MemStore, MergeOutcome, ObjectContentStore,
-    OrigoFSError, PackStore, Passage, PassageOptions, Presence, RebuildReport, S3Config,
-    Segmentation, Suggestion, SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus,
-    TieredStore, ToolCallInit, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    OrigoFSError, PackStore, Passage, PassageOptions, Presence, RebuildReport, ResyncOutcome,
+    ResyncReport, S3Config, Segmentation, Suggestion, SuggestionContent, SuggestionInit,
+    SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats, VerifyingStore,
+    VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
 #[cfg(feature = "coedit")]
 pub use origofs_core::{COEDIT_SIDECAR_DIR, CoeditDoc, CoeditRelayNote, CoeditRelaySub};
@@ -606,6 +607,64 @@ impl Workspace {
     /// Unresolved merge conflicts as `(path, kind)`.
     pub async fn conflicts(&self) -> Result<Vec<(String, String)>> {
         self.fs.conflicts().await
+    }
+
+    // --- offline → reconnect resync --------------------------------------
+
+    /// Reconcile this (offline/solo) workspace with `remote` over `branch`, using
+    /// the ordinary three-way merge engine for any divergence — the reconnect path
+    /// `docs/DESIGN.md` §4b promises for SQLite solo mode.
+    ///
+    /// The two workspaces need not share **either** backend: a laptop's SQLite +
+    /// local CAS reconciles with a team's Postgres + S3. Commits, trees, manifests
+    /// and chunks are copied both ways as needed; the remote branch only ever moves
+    /// by compare-and-swap, retried against a fresh head if a concurrent writer
+    /// wins, never forced.
+    ///
+    /// Per-byte-range **blame travels with the content** in both directions, with
+    /// actors matched on `auth_subject` (so the same person resolves to one actor
+    /// across resyncs) — the op-log, audit log, change feed and pending suggestions
+    /// do not. Both working trees must be clean, both workspaces must have
+    /// versioning enabled, and `branch` must be the local current branch. See
+    /// [`origofs_core::resync`] for the full contract and the reasoning.
+    ///
+    /// A conflicted merge leaves the conflicts in *this* workspace's working tree
+    /// (with `MERGE_HEAD` set, exactly like [`merge`](Self::merge)) and does not
+    /// advance the remote branch: resolve, commit, and resync again.
+    #[tracing::instrument(skip_all, fields(branch = %branch))]
+    pub async fn resync(
+        &self,
+        remote: &Workspace,
+        branch: &str,
+        author: &str,
+        message: &str,
+    ) -> Result<ResyncReport> {
+        let report = origofs_core::resync(&self.fs, &remote.fs, branch, author, message).await?;
+        if let Some(head) = report.outcome.head() {
+            self.emit(
+                "resync",
+                "/",
+                Some(format!("{} {}", report.outcome.as_str(), head.to_hex())),
+                None,
+                None,
+            )
+            .await;
+        }
+        Ok(report)
+    }
+
+    /// Copy the commit closure reachable from `head` into `remote`'s content store,
+    /// stopping at objects it already has. The push half of [`resync`](Self::resync)
+    /// on its own — it moves objects only and never touches a ref, so it is safe to
+    /// run ahead of time to make a later resync cheap.
+    pub async fn push_objects(&self, remote: &Workspace, head: Hash) -> Result<TransferStats> {
+        origofs_core::transfer(&self.fs, &remote.fs, head).await
+    }
+
+    /// The fetch half: copy the closure of `head` **from** `remote` into this
+    /// workspace's content store. Refs are untouched.
+    pub async fn fetch_objects(&self, remote: &Workspace, head: Hash) -> Result<TransferStats> {
+        origofs_core::transfer(&remote.fs, &self.fs, head).await
     }
 
     pub async fn lock(&self, path: &str, owner: &str) -> Result<bool> {
