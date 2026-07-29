@@ -237,4 +237,15 @@ impl ContentStore for ObjectContentStore {
             Err(e) => Err(OrigoFSError::from(e)),
         }
     }
+
+    async fn ping(&self) -> Result<()> {
+        // A HEAD on a sentinel path: a NotFound means the bucket answered (it is
+        // reachable and we are authenticated); any other error means we could not
+        // reach or authenticate to it, which fails readiness.
+        let probe = self.path_for(&Hash::of(b"origofs-health-probe"));
+        match self.store.head(&probe).await {
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(OrigoFSError::from(e)),
+        }
+    }
 }

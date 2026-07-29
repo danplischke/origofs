@@ -340,6 +340,12 @@ impl ContentStore for PackStore {
         Ok(out)
     }
 
+    async fn ping(&self) -> Result<()> {
+        // The data store is the (possibly remote) backend whose reachability
+        // gates readiness; the index is a local sidecar.
+        self.data.ping().await
+    }
+
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         let staged = {
             let mut p = self.pending.lock().unwrap();

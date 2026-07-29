@@ -132,6 +132,15 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(())
     }
 
+    /// Probe both backends for a readiness check: are the metadata and content
+    /// stores reachable right now? Runs the two probes concurrently and returns
+    /// their results; an unreachable backend is a classified
+    /// [`OrigoFSError::Backend`](crate::OrigoFSError) of class `Unavailable`. This
+    /// backs the SDK/HTTP `/readyz` endpoint (`docs/DESIGN.md` M9 — hardening).
+    pub async fn probe(&self) -> (Result<()>, Result<()>) {
+        futures::join!(self.meta.ping(), self.content.ping())
+    }
+
     // --- path helpers -----------------------------------------------------
 
     /// Split an absolute path into its non-empty segments, rejecting any

@@ -26,14 +26,26 @@ fn backend_class_drives_retryable() {
 #[test]
 fn machine_codes_are_stable() {
     assert_eq!(backend(ErrorClass::Retryable).code(), "backend_retryable");
-    assert_eq!(backend(ErrorClass::Unavailable).code(), "backend_unavailable");
+    assert_eq!(
+        backend(ErrorClass::Unavailable).code(),
+        "backend_unavailable"
+    );
     assert_eq!(backend(ErrorClass::Fatal).code(), "backend_error");
 
     assert_eq!(OrigoFSError::NotFound("x".into()).code(), "not_found");
-    assert_eq!(OrigoFSError::AlreadyExists("x".into()).code(), "already_exists");
+    assert_eq!(
+        OrigoFSError::AlreadyExists("x".into()).code(),
+        "already_exists"
+    );
     assert_eq!(OrigoFSError::Conflict("x".into()).code(), "conflict");
-    assert_eq!(OrigoFSError::InvalidArgument("x".into()).code(), "invalid_argument");
-    assert_eq!(OrigoFSError::ContentMissing("x".into()).code(), "content_missing");
+    assert_eq!(
+        OrigoFSError::InvalidArgument("x".into()).code(),
+        "invalid_argument"
+    );
+    assert_eq!(
+        OrigoFSError::ContentMissing("x".into()).code(),
+        "content_missing"
+    );
 }
 
 #[test]
@@ -49,5 +61,8 @@ fn conflict_is_not_retryable() {
 fn backend_error_exposes_class_and_source() {
     let e = backend(ErrorClass::Unavailable);
     assert_eq!(e.class(), Some(ErrorClass::Unavailable));
-    assert!(e.source().is_some(), "the driver cause must survive for logging");
+    assert!(
+        e.source().is_some(),
+        "the driver cause must survive for logging"
+    );
 }

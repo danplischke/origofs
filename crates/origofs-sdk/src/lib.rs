@@ -45,6 +45,24 @@ pub mod sandbox;
 type Meta = Arc<dyn MetadataStore>;
 type Content = Arc<dyn ContentStore>;
 
+/// The outcome of a [`Workspace::ready`] readiness probe: whether each backend
+/// answered. `None` for a store means it is reachable; `Some(msg)` carries why
+/// the probe failed. Backs the HTTP `/readyz` endpoint.
+#[derive(Debug, Clone)]
+pub struct ReadyReport {
+    /// `None` if the metadata store answered its probe; the error otherwise.
+    pub metadata: Option<String>,
+    /// `None` if the content store answered its probe; the error otherwise.
+    pub content: Option<String>,
+}
+
+impl ReadyReport {
+    /// Whether both backends are reachable — the service is ready to serve.
+    pub fn is_ready(&self) -> bool {
+        self.metadata.is_none() && self.content.is_none()
+    }
+}
+
 /// A workspace: a metadata store over a content store.
 ///
 /// Cheap to clone — it's a pair of `Arc` handles to the shared backends, so
@@ -252,6 +270,18 @@ impl Workspace {
     /// Access the underlying engine for operations not surfaced here.
     pub fn fs(&self) -> &Fs<Meta, Content> {
         &self.fs
+    }
+
+    /// Probe the metadata and content backends for a readiness check (the HTTP
+    /// `/readyz` endpoint). Both probes run concurrently; an unreachable backend
+    /// is reported per-store rather than collapsing the whole check. This is
+    /// distinct from liveness (`/health`), which only says the process is up.
+    pub async fn ready(&self) -> ReadyReport {
+        let (meta, content) = self.fs.probe().await;
+        ReadyReport {
+            metadata: meta.err().map(|e| e.to_string()),
+            content: content.err().map(|e| e.to_string()),
+        }
     }
 
     // --- workspaces (multi-workspace in one store) -----------------------

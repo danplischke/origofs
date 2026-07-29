@@ -231,7 +231,9 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
     {
         app = app.route("/coedit/{*path}", get(coedit::coedit_ws));
     }
-    app.route("/health", get(health)).with_state(state)
+    app.route("/health", get(health))
+        .route("/readyz", get(readyz))
+        .with_state(state)
 }
 
 /// Middleware that rejects with `401` unless the request carries a credential the
@@ -312,8 +314,33 @@ type ApiResult<T> = Result<T, ApiError>;
 
 // --- files ------------------------------------------------------------------
 
+/// Liveness: the process is up and serving HTTP. Does no I/O, so it stays `200`
+/// even while a backend is down — that is what `/readyz` is for.
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
+}
+
+/// Readiness: probe the backing stores. `200` when both answer, `503` (with the
+/// per-store detail) when either is unreachable — so a load balancer or a k8s
+/// readiness probe pulls this instance out of rotation until its database and
+/// content store recover, instead of routing requests it cannot serve.
+async fn readyz(State(ws): State<Shared>) -> Response {
+    let report = ws.ready().await;
+    let store = |probe: &Option<String>| match probe {
+        Some(err) => json!({ "ok": false, "error": err }),
+        None => json!({ "ok": true }),
+    };
+    let body = json!({
+        "ready": report.is_ready(),
+        "metadata": store(&report.metadata),
+        "content": store(&report.content),
+    });
+    let status = if report.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(body)).into_response()
 }
 
 async fn read_file(State(ws): State<Shared>, Path(path): Path<String>) -> ApiResult<Response> {

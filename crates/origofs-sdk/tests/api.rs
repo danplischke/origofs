@@ -49,6 +49,94 @@ async fn fixture() -> Fixture {
     }
 }
 
+// --- readiness (M9) ---------------------------------------------------------
+
+#[tokio::test]
+async fn health_is_liveness_only() {
+    // `/health` does no I/O — it reports the process is up, nothing about the
+    // backends. Open (outside the read gate) and always 200.
+    let f = fixture().await;
+    let (status, body) = send(&f.app, get("/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(as_json(&body)["status"], json!("ok"));
+}
+
+#[tokio::test]
+async fn readyz_ok_when_backends_reachable() {
+    let f = fixture().await;
+    let (status, body) = send(&f.app, get("/readyz")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = as_json(&body);
+    assert_eq!(v["ready"], json!(true));
+    assert_eq!(v["metadata"]["ok"], json!(true));
+    assert_eq!(v["content"]["ok"], json!(true));
+}
+
+/// A fully functional content store whose readiness probe reports failure — to
+/// prove `/readyz` returns 503 (not 200) when a backend is unreachable, while a
+/// healthy metadata store is still reported `ok`.
+struct ContentPingDown(Arc<dyn origofs_core::ContentStore>);
+
+#[async_trait::async_trait]
+impl origofs_core::ContentStore for ContentPingDown {
+    async fn put(&self, bytes: &[u8]) -> origofs_core::Result<origofs_core::Hash> {
+        self.0.put(bytes).await
+    }
+    async fn put_keyed(&self, key: &origofs_core::Hash, bytes: &[u8]) -> origofs_core::Result<()> {
+        self.0.put_keyed(key, bytes).await
+    }
+    async fn get(&self, hash: &origofs_core::Hash) -> origofs_core::Result<bytes::Bytes> {
+        self.0.get(hash).await
+    }
+    async fn get_range(
+        &self,
+        hash: &origofs_core::Hash,
+        off: u64,
+        len: u64,
+    ) -> origofs_core::Result<bytes::Bytes> {
+        self.0.get_range(hash, off, len).await
+    }
+    async fn has(&self, hash: &origofs_core::Hash) -> origofs_core::Result<bool> {
+        self.0.has(hash).await
+    }
+    async fn list(&self) -> origofs_core::Result<Vec<origofs_core::Hash>> {
+        self.0.list().await
+    }
+    async fn delete(&self, hash: &origofs_core::Hash) -> origofs_core::Result<u64> {
+        self.0.delete(hash).await
+    }
+    async fn ping(&self) -> origofs_core::Result<()> {
+        Err(origofs_core::OrigoFSError::Backend {
+            origin: origofs_core::BackendOrigin::Content,
+            class: origofs_core::ErrorClass::Unavailable,
+            source: Box::new(std::io::Error::other("content store down")),
+        })
+    }
+}
+
+#[tokio::test]
+async fn readyz_503_when_a_backend_is_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn origofs_core::MetadataStore> =
+        Arc::new(origofs_core::SqliteMetadataStore::open(dir.path().join("meta.db")).unwrap());
+    let inner: Arc<dyn origofs_core::ContentStore> = Arc::new(
+        origofs_core::LocalCasStore::open(dir.path().join("cas"))
+            .await
+            .unwrap(),
+    );
+    let content: Arc<dyn origofs_core::ContentStore> = Arc::new(ContentPingDown(inner));
+    let ws = Workspace::open(meta, content).await.unwrap();
+    let app = router(Arc::new(ws), Arc::new(BearerAuth::new()));
+
+    let (status, body) = send(&app, get("/readyz")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let v = as_json(&body);
+    assert_eq!(v["ready"], json!(false));
+    assert_eq!(v["content"]["ok"], json!(false));
+    // The metadata store is healthy, so it is reported ok even while content is down.
+    assert_eq!(v["metadata"]["ok"], json!(true));
+}
+
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();

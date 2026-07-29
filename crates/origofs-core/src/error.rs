@@ -274,8 +274,10 @@ mod tests {
     fn sqlite_busy_and_locked_are_retryable() {
         // SQLITE_BUSY (5) / SQLITE_LOCKED (6): another writer holds the lock.
         for raw in [5, 6] {
-            let err =
-                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(raw), Some("locked".into()));
+            let err = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(raw),
+                Some("locked".into()),
+            );
             let e: OrigoFSError = err.into();
             assert!(e.retryable(), "raw {raw} should be retryable, got {e:?}");
             assert_eq!(e.code(), "backend_retryable");
@@ -298,9 +300,11 @@ mod tests {
     #[test]
     fn backend_error_preserves_the_source_chain() {
         use std::error::Error as _;
-        let err =
-            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(5), Some("busy".into()));
+        let err = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(5), Some("busy".into()));
         let e: OrigoFSError = err.into();
-        assert!(e.source().is_some(), "driver error must survive as the source");
+        assert!(
+            e.source().is_some(),
+            "driver error must survive as the source"
+        );
     }
 }
