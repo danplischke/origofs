@@ -248,4 +248,4 @@ Each is a module under `crates/origofs-sdk/src/`, gated by the matching feature
 
 ## License
 
-MIT OR Apache-2.0
+MIT

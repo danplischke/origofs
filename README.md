@@ -1,3 +1,9 @@
+> [!WARNING]
+> **This is vibe-coded software.** origofs was built largely by AI agents and has
+> only been **partially reviewed** by a human. Treat it as an experiment, not as
+> production software: read the code before you run it, expect rough edges and
+> breaking changes, and don't point it at data you can't afford to lose.
+
 <div align="center">
 
 # origofs
@@ -6,7 +12,7 @@
 and every byte knows who wrote it.**
 
 [![CI](https://github.com/danplischke/origofs/actions/workflows/ci.yml/badge.svg)](https://github.com/danplischke/origofs/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.88%2B-dea584)](#install)
 [![design](https://img.shields.io/badge/docs-DESIGN.md-informational)](docs/DESIGN.md)
 
@@ -439,4 +445,4 @@ attribution, and the failure-surface work — live in
 
 ## License
 
-MIT OR Apache-2.0
+[MIT](LICENSE).
