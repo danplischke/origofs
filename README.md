@@ -304,16 +304,29 @@ same path as every other surface, so they land on the change feed and carry
 attribution:
 
 ```bash
-origofs --workspace "$WS" serve --addr 127.0.0.1:8080 &
-curl -X PUT --data-binary 'hello' http://127.0.0.1:8080/files/notes/a.txt
-curl 'http://127.0.0.1:8080/files/notes/a.txt'                   # → hello
-curl -X POST -d '{"author":"dan","message":"first"}' http://127.0.0.1:8080/commit
-curl 'http://127.0.0.1:8080/events?since=0'                      # the change feed
+origofs --workspace "$WS" serve --addr 127.0.0.1:8080 --auth-token "$TOKEN=$ACTOR" &
+AUTH=(-H "Authorization: Bearer $TOKEN")
+
+curl "${AUTH[@]}" -X PUT --data-binary 'hello' http://127.0.0.1:8080/v1/files/notes/a.txt
+curl 'http://127.0.0.1:8080/v1/files/notes/a.txt'                    # → hello
+curl "${AUTH[@]}" -X POST -d '{"message":"first"}' http://127.0.0.1:8080/v1/commit
+curl 'http://127.0.0.1:8080/v1/events?since=0'                       # the change feed
+curl 'http://127.0.0.1:8080/readyz'                                  # backends reachable?
 ```
 
-An attributed write is `PUT /files/x?actor=<id>&session=<id>`. Full routes cover
-files, dirs, stat, blame, rename, commit/log, branches/checkout, events,
-presence, actors, sessions, diff, suggestions, and the live co-editing WebSocket.
+The data surface is versioned under **`/v1`**; liveness (`/health`) and readiness
+(`/readyz`) stay at the root so an orchestrator probes them independent of the API
+version. Full routes cover files, dirs, stat, blame, rename, commit/log,
+branches/checkout, events, presence, actors, sessions, diff, suggestions, and the
+live co-editing WebSocket.
+
+**Attribution never comes from the request.** A write is attributed to the actor
+the *credential* resolves to — the request never names an actor, so a client can't
+forge blame, and a propose-only actor's `PUT` is routed into the review queue
+instead of landing. `--auth-token TOKEN=ACTOR[:SESSION]` is the built-in bearer
+mapping; `serve` refuses to bind a non-loopback address without one. Errors come
+back as a machine-readable envelope (`{"error":{"code","message","retryable"}}`)
+and every response carries an `x-request-id`.
 
 ## Built to not lose or corrupt data
 
