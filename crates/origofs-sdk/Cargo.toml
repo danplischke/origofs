@@ -9,6 +9,7 @@ bytes = "1.12.1"
 futures = "0.3.33"
 getrandom = "0.2"
 thiserror = "2.0.19"
+tracing = "0.1"
 # The union of the tokio features every surface needs: `process` (sandbox),
 # `net`/`sync` (api, nfs), `io-std` (mcp stdio), plus the façade's own
 # `fs`/`io-util`/`rt-multi-thread`/`macros`/`time`.

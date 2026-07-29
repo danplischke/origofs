@@ -494,7 +494,12 @@ impl ContentStore for VerifyingStore {
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         let bytes = self.inner.get(hash).await?;
-        verify_integrity(hash, &bytes)?;
+        if let Err(e) = verify_integrity(hash, &bytes) {
+            // A bit-rotted / tampered object at the chunk-addressed boundary — the
+            // operator wants to know immediately (it points at storage corruption).
+            tracing::warn!(hash = %hash.to_hex(), "content failed integrity verification");
+            return Err(e);
+        }
         Ok(bytes)
     }
 
