@@ -6,7 +6,7 @@ directly JSON-serializable.
 """
 from __future__ import annotations
 import sys
-from typing import Any, NoReturn, Optional
+from typing import Any, Awaitable, NoReturn, Optional
 
 class OrigoFSError(Exception):
     """Base origofs error (raised for errors without a more specific mapping)."""
@@ -275,10 +275,20 @@ class Workspace:
     # produce. Use the HTTP API (origofs.fastapi) or embed the SDK there instead.
     if sys.platform != "win32":
         def mount(self, mountpoint: str) -> Mount: ...
-        async def serve_nfs(self, addr: str) -> None: ...
+        async def serve_nfs(
+            self, addr: str, shutdown: Optional[Awaitable[Any]] = None
+        ) -> None:
+            """Serve NFSv3 at ``addr`` until cancelled, until ``shutdown`` (any
+            awaitable, e.g. ``asyncio.Event().wait()``) resolves, or until the
+            server fails. Either way the server is fully torn down before the
+            call ends: the listener's fd/port is released and every
+            per-connection task and socket goes with it."""
+            ...
     else:
         def mount(self, mountpoint: str) -> NoReturn: ...
-        def serve_nfs(self, addr: str) -> NoReturn: ...
+        def serve_nfs(
+            self, addr: str, shutdown: Optional[Awaitable[Any]] = None
+        ) -> NoReturn: ...
 
 def content_hash(data: bytes) -> str:
     """The origofs content address (BLAKE3, hex) of ``data`` — the same hash a

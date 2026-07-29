@@ -509,6 +509,106 @@ impl Mount {
     }
 }
 
+// --- NFS server teardown ----------------------------------------------------
+
+/// A running NFSv3 server together with everything needed to shut it down —
+/// the guard behind [`Workspace.serve_nfs`].
+///
+/// Two levers, because a dropped future cannot await:
+///
+/// - a `watch` flag + a [`tokio::task::JoinSet`] holding the accept loop, so a
+///   *graceful* shutdown asks the loop to stop and then awaits it;
+/// - a private runtime, because `nfsserve`'s accept loop `tokio::spawn`s a
+///   **detached** task per connection (which spawns another for its read half).
+///   A `JoinSet` here can only reach the accept loop itself: aborting that frees
+///   the listener fd, but every live connection's task and socket would survive
+///   it. Owning the runtime makes teardown total — shutting it down drops every
+///   task spawned on it, closing their sockets with them.
+#[cfg(unix)]
+struct NfsServer {
+    /// Set to `true` to ask the accept loop to stop accepting.
+    stop: tokio::sync::watch::Sender<bool>,
+    /// The accept-loop task, so shutdown can await (or abort) it.
+    tasks: tokio::task::JoinSet<std::io::Result<()>>,
+    /// `None` once the runtime has been handed off for shutdown.
+    rt: Option<tokio::runtime::Runtime>,
+}
+
+#[cfg(unix)]
+impl NfsServer {
+    /// Start serving `ws` at `addr` on a private runtime. Binding happens inside
+    /// the accept-loop task, so a bind failure surfaces from [`Self::joined`].
+    fn start(ws: CoreWorkspace, addr: String) -> std::io::Result<Self> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("origofs-nfs")
+            .build()?;
+        let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn_on(
+            async move {
+                tokio::select! {
+                    r = origofs_sdk::nfs::serve(ws, &addr) => r,
+                    // Returning here drops the accept loop, and with it the
+                    // listener — its fd (and port) is released right now.
+                    _ = stop_rx.changed() => Ok(()),
+                }
+            },
+            rt.handle(),
+        );
+        Ok(Self {
+            stop,
+            tasks,
+            rt: Some(rt),
+        })
+    }
+
+    /// Wait for the accept loop to finish — which it normally never does, so this
+    /// is the "run forever" arm; it returns early on a bind failure or a panic.
+    /// Cancel-safe (`JoinSet::join_next` is), so it can be raced in a `select!`.
+    async fn joined(&mut self) -> std::io::Result<()> {
+        match self.tasks.join_next().await {
+            Some(Ok(r)) => r,
+            Some(Err(e)) if e.is_cancelled() => Ok(()),
+            Some(Err(e)) => Err(std::io::Error::other(format!("NFS server panicked: {e}"))),
+            None => Ok(()),
+        }
+    }
+
+    /// Graceful, awaited teardown: stop accepting, drain the accept loop, then
+    /// shut the runtime down so every per-connection task and socket goes with
+    /// it. On return the port is free.
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        let _ = self.stop.send(true);
+        let outcome = self.joined().await;
+        if let Some(rt) = self.rt.take() {
+            // `shutdown_timeout` blocks, so keep it off an async worker thread.
+            let _ = tokio::task::spawn_blocking(move || {
+                rt.shutdown_timeout(std::time::Duration::from_secs(5))
+            })
+            .await;
+        }
+        outcome
+    }
+}
+
+#[cfg(unix)]
+impl Drop for NfsServer {
+    /// The cancellation path: the awaiting Python task was cancelled, so this
+    /// future is being dropped and has no chance to await. Tear down without
+    /// blocking — nothing may outlive the call.
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        self.tasks.abort_all();
+        if let Some(rt) = self.rt.take() {
+            // Never blocks (so it is safe even though we are being dropped from
+            // inside a runtime) and still drops every task the runtime owns,
+            // closing their sockets.
+            rt.shutdown_background();
+        }
+    }
+}
+
 // --- live co-editing (M8) ---------------------------------------------------
 
 /// The routing for one processed y-sync payload (see [`CoeditDoc.handle_sync`]):
@@ -1874,23 +1974,73 @@ impl Workspace {
         Err(unsupported("FUSE mounting"))
     }
 
-    /// Serve this workspace over NFSv3 at `addr` (e.g. `127.0.0.1:11111`). The
-    /// returned awaitable runs until cancelled — drive it as a background task
-    /// (`task = asyncio.create_task(ws.serve_nfs(addr))`) and `task.cancel()`
-    /// to stop. Unix only.
+    /// Serve this workspace over NFSv3 at `addr` (e.g. `127.0.0.1:11111`).
+    ///
+    /// The returned awaitable runs until it is **cancelled**, until the optional
+    /// `shutdown` awaitable resolves, or until the server itself fails. In every
+    /// case the server is torn down before the call ends: the accept loop stops,
+    /// the listener's fd (and with it the port) is released, and every
+    /// per-connection task and socket goes with it — nothing outlives the call.
+    ///
+    /// ```python
+    /// # cancel-driven (unchanged from before) -- `ensure_future`, not
+    /// # `create_task`, since this returns a future rather than a coroutine:
+    /// task = asyncio.ensure_future(ws.serve_nfs("127.0.0.1:11111"))
+    /// task.cancel()
+    ///
+    /// # or graceful and awaited -- `await task` returns once teardown is done:
+    /// stop = asyncio.Event()
+    /// task = asyncio.ensure_future(ws.serve_nfs(addr, shutdown=stop.wait()))
+    /// stop.set()
+    /// await task
+    /// ```
+    ///
+    /// `shutdown` is any awaitable (an `asyncio.Event().wait()` coroutine, a
+    /// future, another task); its result is ignored — only its completion is a
+    /// signal. It is the deterministic one of the two: it tears the server down
+    /// *before* the `await` returns, whereas a cancellation is delivered by the
+    /// event loop's done-callback and then completes in the background (so a
+    /// caller that cancels and immediately blocks the loop delays the teardown
+    /// it asked for — ordinary asyncio semantics). Unix only.
     #[cfg(unix)]
-    fn serve_nfs<'py>(&self, py: Python<'py>, addr: String) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (addr, shutdown = None))]
+    fn serve_nfs<'py>(
+        &self,
+        py: Python<'py>,
+        addr: String,
+        shutdown: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
+        // Converted while we hold the GIL; the resulting future is plain Rust.
+        let stopper = shutdown
+            .map(pyo3_async_runtimes::tokio::into_future)
+            .transpose()?;
         future_into_py(py, async move {
-            origofs_sdk::nfs::serve(ws, &addr).await.map_err(io_err)?;
-            Ok(())
+            // Dropping `server` (which is what a cancelled Python task does to
+            // this future) is itself a full teardown — see `NfsServer::drop`.
+            let mut server = NfsServer::start(ws, addr).map_err(io_err)?;
+            let Some(stopper) = stopper else {
+                // No explicit handle: run until the caller cancels us.
+                return server.joined().await.map_err(io_err);
+            };
+            let served = tokio::select! {
+                r = server.joined() => Some(r),
+                _ = stopper => None,
+            };
+            match served {
+                Some(r) => r.map_err(io_err),
+                // Asked to stop: drain the accept loop and reap the connections
+                // before returning, so the port is free once `await` completes.
+                None => server.shutdown().await.map_err(io_err),
+            }
         })
     }
 
     /// NFS serving is not available on this platform (Unix only). Use the HTTP
     /// API (`origofs.fastapi`) or embed the SDK directly.
     #[cfg(not(unix))]
-    fn serve_nfs(&self, _addr: String) -> PyResult<()> {
+    #[pyo3(signature = (_addr, _shutdown = None))]
+    fn serve_nfs(&self, _addr: String, _shutdown: Option<Bound<'_, PyAny>>) -> PyResult<()> {
         Err(unsupported("NFS serving"))
     }
 }
