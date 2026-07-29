@@ -53,6 +53,16 @@ class FakeWs:
             raise FileNotFoundError(path)
         return self.files[path]
 
+    async def stat(self, path):
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return {"kind": "file", "size": len(self.files[path])}
+
+    async def read_range(self, path, off, length):
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return self.files[path][off : off + length]
+
     async def mkdir_p(self, path):
         pass
 
@@ -263,6 +273,114 @@ def test_presence_touch_requires_a_session():
     c = _client(FakeWs())
     r = c.post("/presence/touch", json={"path": "/x"}, headers={"X-Actor-Id": "1"})
     assert r.status_code == 400, r.text
+
+
+def test_read_file_streams_large_content_correctly():
+    # A file spanning several internal read_range() chunks (_STREAM_CHUNK is
+    # 1 MiB) -- regression coverage for the chunked reassembly loop that
+    # replaced buffering the whole file in one `ws.read()` call.
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    content = bytes((i % 251) for i in range(2 * 1024 * 1024 + 12345))
+    assert c.put("/files/big.bin", content=content, headers=hdr).status_code == 200
+    r = c.get("/files/big.bin")
+    assert r.status_code == 200
+    assert r.headers["content-length"] == str(len(content))
+    assert r.content == content
+
+
+def test_read_file_range_requests():
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    body = b"0123456789" * 5  # 50 bytes
+    c.put("/files/small.txt", content=body, headers=hdr)
+
+    r = c.get("/files/small.txt", headers={"Range": "bytes=10-19"})
+    assert r.status_code == 206 and r.content == body[10:20]
+    assert r.headers["content-range"] == "bytes 10-19/50"
+
+    r = c.get("/files/small.txt", headers={"Range": "bytes=40-"})
+    assert r.status_code == 206 and r.content == body[40:]
+
+    r = c.get("/files/small.txt", headers={"Range": "bytes=-10"})
+    assert r.status_code == 206 and r.content == body[-10:]
+
+    # unsatisfiable -- starts past EOF
+    r = c.get("/files/small.txt", headers={"Range": "bytes=1000-2000"})
+    assert r.status_code == 416
+    assert r.headers["content-range"] == "bytes */50"
+
+    # a Range we don't parse (multi-range, bad unit, ...) falls back to a
+    # full 200 response rather than erroring -- RFC 7233 permits ignoring it
+    r = c.get("/files/small.txt", headers={"Range": "not-a-range"})
+    assert r.status_code == 200 and r.content == body
+
+
+def test_read_directory_maps_409():
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    c.post("/dirs/adir", headers=hdr)
+    r = c.get("/files/adir")
+    assert r.status_code == 409, r.text
+
+
+def test_create_actor_and_session_via_router():
+    c, _ws, dan, _sess, hdr = _real_client_with_actor()
+
+    r = c.post("/actors", json={"name": "new-user"}, headers=hdr)
+    assert r.status_code == 200, r.text
+    new_id = r.json()["id"]
+    assert new_id != dan
+
+    r = c.post(
+        "/actors",
+        json={"name": "claude", "agent": True, "model": "opus", "controller": dan},
+        headers=hdr,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] != new_id
+
+    r = c.post("/sessions", json={"actor": new_id, "client": "web"}, headers=hdr)
+    assert r.status_code == 200, r.text
+    new_sid = r.json()["id"]
+
+    # the freshly-minted actor/session pair is immediately usable
+    r = c.post(
+        "/presence/touch",
+        json={"path": "/x"},
+        headers={"X-Actor-Id": str(new_id), "X-Session-Id": str(new_sid)},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_actor_and_session_routes_require_auth():
+    # Mirrors the Rust HTTP API: minting a new actor/session requires an
+    # already-authenticated caller (a trusted backend provisioning identities
+    # for new users), not anonymous self-registration.
+    c = _client(FakeWs())
+    assert c.post("/actors", json={"name": "x"}).status_code == 401
+    assert c.post("/sessions", json={"actor": 1}).status_code == 401
+
+
+def test_suggest_delete_via_router():
+    c, ws, dan, _sess, hdr = _real_client_with_actor()
+    c.put("/files/deleteme.txt", content=b"bye", headers=hdr)
+
+    async def _make_reviewer():
+        return await ws.create_human("reviewer", None)
+
+    reviewer = asyncio.run(_make_reviewer())
+
+    r = c.post(
+        "/suggestions",
+        params={"path": "/deleteme.txt", "delete": "true", "summary": "cleanup"},
+        headers=hdr,
+    )
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
+    # not applied yet -- still a review-queue entry, not a landed delete
+    assert c.get("/files/deleteme.txt").status_code == 200
+
+    r = c.post(f"/suggestions/{sid}/accept", headers={"X-Actor-Id": str(reviewer)})
+    assert r.status_code == 200, r.text
+    assert c.get("/files/deleteme.txt").status_code == 404
 
 
 def test_integration_attribution_end_to_end():

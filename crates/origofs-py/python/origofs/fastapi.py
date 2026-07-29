@@ -2,12 +2,15 @@
 
 origofs deliberately has no built-in authentication: an attributed write is only as
 trustworthy as the identity behind it, and *you* own that. This module gives you
-every workspace endpoint (files, blame, versioning, diff, suggestions, the change
-feed, presence) wired up — plus a live co-editing WebSocket (``/coedit/{path}``)
-that speaks the Yjs y-sync protocol, so an unmodified editor (PlateJS,
-``y-websocket``) collaborates in real time — and lets you plug in your own auth as
-an ordinary FastAPI dependency that resolves a request to the actor it should be
-attributed to.
+every workspace endpoint (files, blame, versioning, diff, suggestions incl.
+propose-a-deletion, actors/sessions, the change feed, presence) wired up — plus a
+live co-editing WebSocket (``/coedit/{path}``) that speaks the Yjs y-sync
+protocol, so an unmodified editor (PlateJS, ``y-websocket``) collaborates in real
+time — and lets you plug in your own auth as an ordinary FastAPI dependency that
+resolves a request to the actor it should be attributed to. File reads stream
+(never buffering a whole file in memory) and honor a single-range ``Range``
+request header (``206``/``416``), so large files and partial fetches (seeking,
+resumable downloads) work the same as any static file server.
 
     from fastapi import FastAPI, Header, HTTPException
     import origofs
@@ -41,13 +44,14 @@ try:
         APIRouter,
         Body,
         Depends,
+        Header,
         HTTPException,
         Query,
         Response,
         WebSocket,
         WebSocketDisconnect,
     )
-    from fastapi.responses import PlainTextResponse
+    from fastapi.responses import PlainTextResponse, StreamingResponse
     from pydantic import BaseModel, Field
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
@@ -87,6 +91,18 @@ class _Name(BaseModel):
 
 class _Touch(BaseModel):
     path: Optional[str] = None
+
+
+class _CreateActor(BaseModel):
+    name: str
+    agent: bool = False
+    model: Optional[str] = None
+    controller: Optional[int] = None
+
+
+class _CreateSession(BaseModel):
+    actor: int
+    client: Optional[str] = None
 
 
 # --- error translation ------------------------------------------------------
@@ -143,6 +159,38 @@ async def _run(awaitable: Awaitable[Any]) -> Any:
 
 def _abs(path: str) -> str:
     return path if path.startswith("/") else "/" + path
+
+
+_STREAM_CHUNK = 1 << 20  # 1 MiB per read_range() call when streaming a full file
+
+
+# A single-range `Range: bytes=start-end` (also `bytes=start-` and the suffix
+# form `bytes=-N`). Multi-range (`bytes=0-10,20-30`) and non-byte units fall
+# back to `None` -- RFC 7233 permits a server to just ignore a Range header it
+# doesn't support and return the whole entity, which is what the caller does.
+def _parse_range(range_header: Optional[str], size: int) -> Optional[tuple]:
+    if not range_header or "," in range_header or not range_header.startswith("bytes="):
+        return None
+    spec = range_header[len("bytes="):].strip()
+    start_s, sep, end_s = spec.partition("-")
+    if not sep:
+        return None
+    if start_s == "":
+        # Suffix range: the last `end_s` bytes.
+        if not end_s.isdigit():
+            return None
+        suffix = int(end_s)
+        if suffix == 0:
+            raise HTTPException(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        start, end = max(0, size - suffix), size - 1
+    else:
+        if not start_s.isdigit():
+            return None
+        start = int(start_s)
+        end = int(end_s) if end_s.isdigit() else size - 1
+    if size == 0 or start >= size or start > end:
+        raise HTTPException(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+    return start, min(end, size - 1)
 
 
 # --- live co-editing rooms --------------------------------------------------
@@ -338,9 +386,48 @@ def build_router(
     # --- files --------------------------------------------------------------
 
     @router.get("/files/{path:path}", dependencies=[Depends(_read_gate)])
-    async def read_file(path: str) -> Response:
-        data = await _run(ws.read(_abs(path)))
-        return Response(content=bytes(data), media_type="application/octet-stream")
+    async def read_file(path: str, range: Optional[str] = Header(default=None)):
+        p = _abs(path)
+        # stat() first so a missing file or a directory is a clean error BEFORE
+        # any bytes are sent -- once a StreamingResponse has started, the status
+        # code can't change (this is the same guarantee the Rust HTTP API's
+        # read_stream gets from resolving before it starts streaming).
+        st = await _run(ws.stat(p))
+        if st["kind"] != "file":
+            raise HTTPException(status_code=409, detail=f"not a file: {p}")
+        size = st["size"]
+
+        parsed = _parse_range(range, size) if range else None
+        if parsed is not None:
+            start, end = parsed
+            data = await _run(ws.read_range(p, start, end - start + 1))
+            return Response(
+                content=bytes(data),
+                status_code=206,
+                media_type="application/octet-stream",
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{size}",
+                    "Accept-Ranges": "bytes",
+                },
+            )
+
+        # No (usable) Range header: stream the whole file in bounded chunks
+        # rather than buffering it all in memory -- a large file is otherwise
+        # loaded whole before a single byte reaches the client.
+        async def chunks():
+            offset = 0
+            while offset < size:
+                chunk = await ws.read_range(p, offset, min(_STREAM_CHUNK, size - offset))
+                if not chunk:
+                    return
+                yield bytes(chunk)
+                offset += len(chunk)
+
+        return StreamingResponse(
+            chunks(),
+            media_type="application/octet-stream",
+            headers={"Content-Length": str(size), "Accept-Ranges": "bytes"},
+        )
 
     @router.put("/files/{path:path}")
     async def write_file(path: str, body: bytes = Body(default=b""), ctx: Any = Depends(authn)):
@@ -433,8 +520,11 @@ def build_router(
         path: str = Query(...),
         body: bytes = Body(default=b""),
         summary: Optional[str] = Query(default=None),
+        delete: bool = Query(default=False),
         ctx: Any = Depends(authn),
     ):
+        if delete:
+            return {"id": await _run(ws.suggest_delete(ctx, _abs(path), summary))}
         return {"id": await _run(ws.suggest(ctx, _abs(path), body, summary))}
 
     @router.get("/suggestions", dependencies=[Depends(_read_gate)])
@@ -475,6 +565,25 @@ def build_router(
             raise HTTPException(status_code=400, detail="presence requires a session (WriteCtx.session)")
         await _run(ws.touch(ctx.actor_id, ctx.session_id, _abs(req.path) if req.path else None))
         return {"ok": True}
+
+    # --- actors + sessions ---------------------------------------------------
+    # Gated by `authn` like every other mutating route: an already-authenticated
+    # caller mints new actor/session identities (e.g. a trusted backend
+    # provisioning an actor for a newly-signed-up user) -- not public
+    # self-registration. `authn`'s own return value is unused here, same as
+    # `make_dir`/`create_branch` above.
+
+    @router.post("/actors")
+    async def create_actor(req: _CreateActor, _ctx: Any = Depends(authn)):
+        if req.agent:
+            actor_id = await _run(ws.create_agent(req.name, req.model or "unknown", req.controller))
+        else:
+            actor_id = await _run(ws.create_human(req.name, None))
+        return {"id": actor_id}
+
+    @router.post("/sessions")
+    async def create_session(req: _CreateSession, _ctx: Any = Depends(authn)):
+        return {"id": await _run(ws.create_session(req.actor, req.client))}
 
     # --- live co-editing (Yjs y-sync) ---------------------------------------
 
