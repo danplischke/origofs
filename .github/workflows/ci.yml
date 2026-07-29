@@ -177,6 +177,39 @@ jobs:
         with:
           command: check
 
+  # B5 (#70): MSRV floor. edition 2024 sets a 1.85 *language* floor, but the real
+  # minimum is higher — the code uses let-chains (stabilized in 1.88), and the
+  # dependency graph (icu, via url/object_store) needs >= 1.86 — so 1.88 is the
+  # true floor. Pinning it catches an accidental newer-stdlib use (or a
+  # dependency MSRV bump) before it silently raises the minimum. `cargo check`
+  # only — compilation is what MSRV is about — and `--locked` so the committed
+  # Cargo.lock (not a fresh, newer-dep resolution) is what gets verified.
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      # origofs-py is a pyo3 extension, so building the workspace needs a Python
+      # interpreter available for it to link against.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: cargo check on the MSRV toolchain
+        run: |
+          cargo check --workspace --locked
+          # The default-off origofs-sdk surfaces (api/mcp/sandbox/git/fuse/nfs)
+          # aren't built by --workspace; check them on the MSRV toolchain too.
+          cargo check -p origofs-sdk --features full --locked
+
   python:
     name: Python bindings (maturin + pytest)
     runs-on: ubuntu-latest
