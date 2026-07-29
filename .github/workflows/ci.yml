@@ -210,6 +210,44 @@ jobs:
           # aren't built by --workspace; check them on the MSRV toolchain too.
           cargo check -p origofs-sdk --features full --locked
 
+  # B3 (#70): fuzz the content-addressed object decoders. Every blob/tree/commit/
+  # ref-snapshot object is parsed from untrusted bytes on read (a bare bucket, a
+  # bit-rotted or tampered store), so each `&[u8] -> Result` decoder is a
+  # hostile-input boundary with explicit anti-OOM guards. cargo-fuzz (libFuzzer)
+  # needs nightly. This is a bounded *smoke* run on every push — enough to catch
+  # panics, aborts, OOMs, and encode↔decode asymmetry; longer campaigns run
+  # out-of-band. The fuzz crate (crates/origofs-core/fuzz) is detached from the
+  # workspace, so it never enters a stable build.
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/origofs-core/fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Each target runs briefly: -runs caps iterations so fast targets exit
+      # promptly, -max_total_time bounds the rest, and -rss_limit_mb turns a
+      # runaway allocation (a defeated anti-OOM guard) into a hard failure. A
+      # crash writes a reproducer under fuzz/artifacts and fails the job.
+      - name: Fuzz each decoder (bounded)
+        working-directory: crates/origofs-core
+        run: |
+          for t in manifest_decode tree_decode commit_decode refsnapshot_decode; do
+            echo "::group::fuzz $t"
+            cargo fuzz run "$t" -- -max_total_time=45 -runs=3000000 -rss_limit_mb=2048
+            echo "::endgroup::"
+          done
+
   python:
     name: Python bindings (maturin + pytest)
     runs-on: ubuntu-latest
