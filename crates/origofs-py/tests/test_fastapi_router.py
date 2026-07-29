@@ -53,6 +53,16 @@ class FakeWs:
             raise FileNotFoundError(path)
         return self.files[path]
 
+    async def stat(self, path):
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return {"kind": "file", "size": len(self.files[path])}
+
+    async def read_range(self, path, off, length):
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return self.files[path][off : off + length]
+
     async def mkdir_p(self, path):
         pass
 
@@ -159,7 +169,282 @@ def test_conflict_maps_409():
     assert r.status_code == 409, r.text
 
 
-# --- integration test (real workspace) --------------------------------------
+# --- integration tests (real workspace) --------------------------------------
+#
+# FakeWs above is enough for auth/attribution/error-mapping unit tests, but it
+# has no real directory/versioning/presence semantics -- these use a real
+# origofs.Workspace, the same pattern test_integration_attribution_end_to_end
+# below already uses.
+
+def _real_client_with_actor(**router_kw):
+    """A TestClient over a real workspace, plus a provisioned actor's auth header."""
+    d = tempfile.mkdtemp()
+
+    async def _setup():
+        ws = await origofs.Workspace.open_local(
+            os.path.join(d, "meta.db"), os.path.join(d, "cas")
+        )
+        dan = await ws.create_human("dan", None)
+        sess = await ws.create_session(dan, "test")
+        return ws, dan, sess
+
+    ws, dan, sess = asyncio.run(_setup())
+    c = _client(ws, **router_kw)
+    hdr = {"X-Actor-Id": str(dan), "X-Session-Id": str(sess)}
+    return c, ws, dan, sess, hdr
+
+
+def test_removing_a_nonempty_directory_maps_409_not_500():
+    # Regression test: DirectoryNotEmpty is the one origofs error the Rust
+    # binding maps to a plain OSError (see `to_pyerr` in origofs-py/src/lib.rs),
+    # rather than one of the specific subclasses _run() already handled -- it
+    # used to fall through uncaught and surface as a bare 500.
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    r = c.put("/files/adir/f.txt", content=b"hi", headers=hdr)
+    assert r.status_code == 200, r.text
+
+    r = c.delete("/files/adir", headers=hdr)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]  # a real message, not an empty/generic 500 body
+
+
+def test_directory_and_stat_routes():
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    assert c.post("/dirs/docs", headers=hdr).status_code == 200
+    assert c.put("/files/docs/a.txt", content=b"hello", headers=hdr).status_code == 200
+
+    listing = c.get("/dirs/docs").json()
+    assert any(e["name"] == "a.txt" for e in listing), listing
+
+    st = c.get("/stat/docs/a.txt").json()
+    assert st["kind"] == "file" and st["size"] == 5, st
+
+    r = c.post("/rename", json={"from": "/docs/a.txt", "to": "/docs/b.txt"}, headers=hdr)
+    assert r.status_code == 200, r.text
+    assert c.get("/files/docs/a.txt").status_code == 404
+    assert c.get("/files/docs/b.txt").content == b"hello"
+
+
+def test_versioning_routes_through_router():
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    c.put("/files/notes.txt", content=b"v1", headers=hdr)
+
+    r = c.post("/commit", json={"message": "base", "author": "dan"}, headers=hdr)
+    assert r.status_code == 200 and r.json()["hash"], r.text
+
+    log = c.get("/log").json()
+    assert len(log) == 1 and log[0]["message"] == "base", log
+
+    assert c.get("/status").json() == []  # clean working tree right after commit
+
+    assert c.post("/branches", json={"name": "feature"}, headers=hdr).status_code == 200
+    assert c.post("/checkout", json={"name": "feature"}, headers=hdr).status_code == 200
+    branches = {b["name"] for b in c.get("/branches").json()}
+    assert {"main", "feature"} <= branches, branches
+
+    c.put("/files/notes.txt", content=b"v2", headers=hdr)
+    c.post("/commit", json={"message": "work", "author": "dan"}, headers=hdr)
+
+    changes = {d["path"]: d["status"] for d in c.get("/diff", params={"from": "main", "to": "feature"}).json()}
+    assert changes == {"/notes.txt": "modified"}, changes
+
+    patch = c.get("/diff/file", params={"from": "main", "to": "feature", "path": "/notes.txt"}).text
+    assert "-v1" in patch and "+v2" in patch, patch
+
+
+def test_presence_and_events_routes():
+    c, _ws, dan, sess, hdr = _real_client_with_actor()
+    c.put("/files/notes.txt", content=b"hi", headers=hdr)
+
+    r = c.post("/presence/touch", json={"path": "/notes.txt"}, headers=hdr)
+    assert r.status_code == 200, r.text
+    present = c.get("/presence").json()
+    assert any(p["session_id"] == sess and p["actor_id"] == dan for p in present), present
+
+    events = c.get("/events").json()
+    assert any(e["path"] == "/notes.txt" for e in events), events
+    # `since` filters out everything already seen
+    assert c.get("/events", params={"since": events[-1]["seq"]}).json() == []
+
+
+def test_presence_touch_requires_a_session():
+    # touch() needs a session_id; a session-less WriteCtx.actor(...) is a clean
+    # 400, not a crash reaching into ws.touch() with session_id=None.
+    c = _client(FakeWs())
+    r = c.post("/presence/touch", json={"path": "/x"}, headers={"X-Actor-Id": "1"})
+    assert r.status_code == 400, r.text
+
+
+def test_read_file_streams_large_content_correctly():
+    # A file spanning several internal read_range() chunks (_STREAM_CHUNK is
+    # 1 MiB) -- regression coverage for the chunked reassembly loop that
+    # replaced buffering the whole file in one `ws.read()` call.
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    content = bytes((i % 251) for i in range(2 * 1024 * 1024 + 12345))
+    assert c.put("/files/big.bin", content=content, headers=hdr).status_code == 200
+    r = c.get("/files/big.bin")
+    assert r.status_code == 200
+    assert r.headers["content-length"] == str(len(content))
+    assert r.content == content
+
+
+class _FlakyReadRangeProxy:
+    """Forwards everything to a real Workspace except read_range, which fails
+    on its Nth call -- simulating a concurrent delete/change mid-stream. A
+    real compiled Workspace doesn't allow attribute assignment (`ws.read_range
+    = ...` raises AttributeError: read-only), so this wraps it instead;
+    build_router accepts "any object with the same async methods"."""
+
+    def __init__(self, real, fail_on_call: int):
+        self._real = real
+        self._fail_on_call = fail_on_call
+        self.calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    async def read_range(self, path, off, length):
+        self.calls += 1
+        if self.calls == self._fail_on_call:
+            raise FileNotFoundError(path)
+        return await self._real.read_range(path, off, length)
+
+
+def test_read_file_streaming_ends_cleanly_on_a_mid_stream_error():
+    # Regression test: the chunked-reassembly generator's read_range() call
+    # wasn't wrapped in error handling, so a concurrent delete/change between
+    # stat() and a later chunk (origofs is multi-writer by design) propagated
+    # uncaught into the ASGI layer instead of just ending the response.
+    _c, ws, _dan, sess, hdr = _real_client_with_actor()
+    content = bytes((i % 251) for i in range(3 * 1024 * 1024))
+    _c.put("/files/big.bin", content=content, headers=hdr)
+
+    proxy = _FlakyReadRangeProxy(ws, fail_on_call=2)
+    c = _client(proxy)
+    r = c.get("/files/big.bin")
+
+    # Whatever exact status/body FastAPI produces for a generator failing
+    # after headers may already be sent (version-dependent), the important
+    # thing already happened: this line was reached at all -- an uncaught
+    # exception from the generator would have propagated out of .get() itself
+    # (TestClient's default raise_server_exceptions=True) instead of
+    # returning a response.
+    assert proxy.calls >= 2
+    assert len(r.content) < len(content)
+
+
+def test_read_file_range_requests():
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    body = b"0123456789" * 5  # 50 bytes
+    c.put("/files/small.txt", content=body, headers=hdr)
+
+    r = c.get("/files/small.txt", headers={"Range": "bytes=10-19"})
+    assert r.status_code == 206 and r.content == body[10:20]
+    assert r.headers["content-range"] == "bytes 10-19/50"
+
+    r = c.get("/files/small.txt", headers={"Range": "bytes=40-"})
+    assert r.status_code == 206 and r.content == body[40:]
+
+    r = c.get("/files/small.txt", headers={"Range": "bytes=-10"})
+    assert r.status_code == 206 and r.content == body[-10:]
+
+    # unsatisfiable -- starts past EOF
+    r = c.get("/files/small.txt", headers={"Range": "bytes=1000-2000"})
+    assert r.status_code == 416
+    assert r.headers["content-range"] == "bytes */50"
+
+    # a Range we don't parse (multi-range, bad unit, ...) falls back to a
+    # full 200 response rather than erroring -- RFC 7233 permits ignoring it
+    r = c.get("/files/small.txt", headers={"Range": "not-a-range"})
+    assert r.status_code == 200 and r.content == body
+
+
+def test_read_directory_maps_409():
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    c.post("/dirs/adir", headers=hdr)
+    r = c.get("/files/adir")
+    assert r.status_code == 409, r.text
+
+
+def test_create_actor_and_session_via_router():
+    c, _ws, dan, _sess, hdr = _real_client_with_actor()
+
+    r = c.post("/actors", json={"name": "new-user"}, headers=hdr)
+    assert r.status_code == 200, r.text
+    new_id = r.json()["id"]
+    assert new_id != dan
+
+    r = c.post(
+        "/actors",
+        json={"name": "claude", "agent": True, "model": "opus", "controller": dan},
+        headers=hdr,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] != new_id
+
+    r = c.post("/sessions", json={"actor": new_id, "client": "web"}, headers=hdr)
+    assert r.status_code == 200, r.text
+    new_sid = r.json()["id"]
+
+    # the freshly-minted actor/session pair is immediately usable
+    r = c.post(
+        "/presence/touch",
+        json={"path": "/x"},
+        headers={"X-Actor-Id": str(new_id), "X-Session-Id": str(new_sid)},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_create_agent_preserves_an_explicit_empty_model():
+    # Regression test: `req.model or "unknown"` would also replace an
+    # explicit "" (falsy), diverging from the Rust API's
+    # `req.model.as_deref().unwrap_or("unknown")`, which only substitutes on
+    # None. "" is a deliberately odd input, but the point is `is not None` is
+    # the correct check either way.
+    c, ws, dan, _sess, hdr = _real_client_with_actor()
+    r = c.post("/actors", json={"name": "claude", "agent": True, "model": ""}, headers=hdr)
+    assert r.status_code == 200, r.text
+    agent_id = r.json()["id"]
+
+    async def _check():
+        return await ws.actor(agent_id)
+
+    info = asyncio.run(_check())
+    assert info["agent_model"] == ""
+
+
+def test_actor_and_session_routes_require_auth():
+    # Mirrors the Rust HTTP API: minting a new actor/session requires an
+    # already-authenticated caller (a trusted backend provisioning identities
+    # for new users), not anonymous self-registration.
+    c = _client(FakeWs())
+    assert c.post("/actors", json={"name": "x"}).status_code == 401
+    assert c.post("/sessions", json={"actor": 1}).status_code == 401
+
+
+def test_suggest_delete_via_router():
+    c, ws, dan, _sess, hdr = _real_client_with_actor()
+    c.put("/files/deleteme.txt", content=b"bye", headers=hdr)
+
+    async def _make_reviewer():
+        return await ws.create_human("reviewer", None)
+
+    reviewer = asyncio.run(_make_reviewer())
+
+    r = c.post(
+        "/suggestions",
+        params={"path": "/deleteme.txt", "delete": "true", "summary": "cleanup"},
+        headers=hdr,
+    )
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
+    # not applied yet -- still a review-queue entry, not a landed delete
+    assert c.get("/files/deleteme.txt").status_code == 200
+
+    r = c.post(f"/suggestions/{sid}/accept", headers={"X-Actor-Id": str(reviewer)})
+    assert r.status_code == 200, r.text
+    assert c.get("/files/deleteme.txt").status_code == 404
+
 
 def test_integration_attribution_end_to_end():
     d = tempfile.mkdtemp()

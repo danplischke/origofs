@@ -39,10 +39,22 @@ async def _exercise():
     await ws.checkout("feature")
     await ws.write("/notes.txt", b"line one\nline TWO\n")
     await ws.write("/new.txt", b"added\n")
+
+    # rename -- called with `from_=` (a keyword), not `from=`: `from` is a
+    # Python keyword, so pyo3 exposing an argument literally named `from` would
+    # make it impossible to ever pass by keyword (a SyntaxError at the call
+    # site). Keyword-calling here pins the binding to the name the .pyi stub
+    # actually promises, so a future rename back to `from` fails this test
+    # immediately (TypeError: unexpected keyword argument) instead of silently
+    # drifting from the stub. Same reason `diff`/`diff_file` below are called
+    # with `from_=` too.
+    await ws.rename(from_="/new.txt", to="/renamed.txt")
+    assert bytes(await ws.read("/renamed.txt")) == b"added\n"
+
     await ws.commit("dan", "work")
-    changes = {c["path"]: c["status"] for c in await ws.diff("main", "feature")}
-    assert changes == {"/notes.txt": "modified", "/new.txt": "added"}, changes
-    patch = await ws.diff_file("main", "feature", "/notes.txt")
+    changes = {c["path"]: c["status"] for c in await ws.diff(from_="main", to="feature")}
+    assert changes == {"/notes.txt": "modified", "/renamed.txt": "added"}, changes
+    patch = await ws.diff_file(from_="main", to="feature", path="/notes.txt")
     assert "-line two" in patch and "+line TWO" in patch, patch
 
     # suggestion lifecycle

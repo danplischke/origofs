@@ -2,12 +2,15 @@
 
 origofs deliberately has no built-in authentication: an attributed write is only as
 trustworthy as the identity behind it, and *you* own that. This module gives you
-every workspace endpoint (files, blame, versioning, diff, suggestions, the change
-feed, presence) wired up — plus a live co-editing WebSocket (``/coedit/{path}``)
-that speaks the Yjs y-sync protocol, so an unmodified editor (PlateJS,
-``y-websocket``) collaborates in real time — and lets you plug in your own auth as
-an ordinary FastAPI dependency that resolves a request to the actor it should be
-attributed to.
+every workspace endpoint (files, blame, versioning, diff, suggestions incl.
+propose-a-deletion, actors/sessions, the change feed, presence) wired up — plus a
+live co-editing WebSocket (``/coedit/{path}``) that speaks the Yjs y-sync
+protocol, so an unmodified editor (PlateJS, ``y-websocket``) collaborates in real
+time — and lets you plug in your own auth as an ordinary FastAPI dependency that
+resolves a request to the actor it should be attributed to. File reads stream
+(never buffering a whole file in memory) and honor a single-range ``Range``
+request header (``206``/``416``), so large files and partial fetches (seeking,
+resumable downloads) work the same as any static file server.
 
     from fastapi import FastAPI, Header, HTTPException
     import origofs
@@ -41,13 +44,14 @@ try:
         APIRouter,
         Body,
         Depends,
+        Header,
         HTTPException,
         Query,
         Response,
         WebSocket,
         WebSocketDisconnect,
     )
-    from fastapi.responses import PlainTextResponse
+    from fastapi.responses import PlainTextResponse, StreamingResponse
     from pydantic import BaseModel, Field
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
@@ -89,6 +93,18 @@ class _Touch(BaseModel):
     path: Optional[str] = None
 
 
+class _CreateActor(BaseModel):
+    name: str
+    agent: bool = False
+    model: Optional[str] = None
+    controller: Optional[int] = None
+
+
+class _CreateSession(BaseModel):
+    actor: int
+    client: Optional[str] = None
+
+
 # --- error translation ------------------------------------------------------
 
 _ORIGOFS_EXC: Optional[tuple] = None
@@ -127,6 +143,12 @@ async def _run(awaitable: Awaitable[Any]) -> Any:
         raise HTTPException(status_code=409, detail=str(e))
     except NotADirectoryError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except OSError as e:
+        # A non-empty directory (rmdir or a rename onto one) is the one origofs
+        # error the Rust binding maps to a plain OSError rather than one of the
+        # specific subclasses above (see `to_pyerr` in origofs-py/src/lib.rs) --
+        # catch it here so it doesn't fall through as an unhandled 500.
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except conflict_error as e:  # stale base on a suggestion accept
@@ -137,6 +159,48 @@ async def _run(awaitable: Awaitable[Any]) -> Any:
 
 def _abs(path: str) -> str:
     return path if path.startswith("/") else "/" + path
+
+
+_STREAM_CHUNK = 1 << 20  # 1 MiB per read_range() call when streaming a full file
+
+
+# A single-range `Range: bytes=start-end` (also `bytes=start-` and the suffix
+# form `bytes=-N`). Multi-range (`bytes=0-10,20-30`) and non-byte units fall
+# back to `None` -- RFC 7233 permits a server to just ignore a Range header it
+# doesn't support and return the whole entity, which is what the caller does.
+def _parse_range(range_header: Optional[str], size: int) -> Optional[tuple]:
+    if not range_header or "," in range_header or not range_header.startswith("bytes="):
+        return None
+    spec = range_header[len("bytes="):].strip()
+    start_s, sep, end_s = spec.partition("-")
+    if not sep:
+        return None
+    if start_s == "":
+        # Suffix range: the last `end_s` bytes.
+        if not end_s.isdigit():
+            return None
+        suffix = int(end_s)
+        if suffix == 0:
+            raise HTTPException(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        start, end = max(0, size - suffix), size - 1
+    else:
+        if not start_s.isdigit():
+            return None
+        start = int(start_s)
+        end = int(end_s) if end_s.isdigit() else size - 1
+    if size == 0 or start >= size or start > end:
+        raise HTTPException(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+    return start, min(end, size - 1)
+
+
+async def _safe_close(websocket: WebSocket, code: int, reason: str) -> None:
+    """Close a websocket, tolerating one that's already gone (the peer
+    disconnected concurrently, racing this same close) instead of letting
+    that failure become another uncaught exception."""
+    try:
+        await websocket.close(code=code, reason=reason[:123])
+    except Exception:
+        pass
 
 
 # --- live co-editing rooms --------------------------------------------------
@@ -332,9 +396,57 @@ def build_router(
     # --- files --------------------------------------------------------------
 
     @router.get("/files/{path:path}", dependencies=[Depends(_read_gate)])
-    async def read_file(path: str) -> Response:
-        data = await _run(ws.read(_abs(path)))
-        return Response(content=bytes(data), media_type="application/octet-stream")
+    async def read_file(path: str, range: Optional[str] = Header(default=None)):
+        p = _abs(path)
+        # stat() first so a missing file or a directory is a clean error BEFORE
+        # any bytes are sent -- once a StreamingResponse has started, the status
+        # code can't change (this is the same guarantee the Rust HTTP API's
+        # read_stream gets from resolving before it starts streaming).
+        st = await _run(ws.stat(p))
+        if st["kind"] != "file":
+            raise HTTPException(status_code=409, detail=f"not a file: {p}")
+        size = st["size"]
+
+        parsed = _parse_range(range, size) if range else None
+        if parsed is not None:
+            start, end = parsed
+            data = await _run(ws.read_range(p, start, end - start + 1))
+            return Response(
+                content=bytes(data),
+                status_code=206,
+                media_type="application/octet-stream",
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{size}",
+                    "Accept-Ranges": "bytes",
+                },
+            )
+
+        # No (usable) Range header: stream the whole file in bounded chunks
+        # rather than buffering it all in memory -- a large file is otherwise
+        # loaded whole before a single byte reaches the client.
+        async def chunks():
+            offset = 0
+            while offset < size:
+                try:
+                    chunk = await ws.read_range(p, offset, min(_STREAM_CHUNK, size - offset))
+                except Exception:
+                    # The file changed or vanished between stat() and this read
+                    # (a concurrent writer -- origofs is multi-writer by design).
+                    # The response is likely already committed to 200 with a
+                    # Content-Length, so a clean status change isn't possible at
+                    # this point; end the stream rather than let the error
+                    # propagate uncaught into the ASGI layer.
+                    return
+                if not chunk:
+                    return
+                yield bytes(chunk)
+                offset += len(chunk)
+
+        return StreamingResponse(
+            chunks(),
+            media_type="application/octet-stream",
+            headers={"Content-Length": str(size), "Accept-Ranges": "bytes"},
+        )
 
     @router.put("/files/{path:path}")
     async def write_file(path: str, body: bytes = Body(default=b""), ctx: Any = Depends(authn)):
@@ -427,8 +539,11 @@ def build_router(
         path: str = Query(...),
         body: bytes = Body(default=b""),
         summary: Optional[str] = Query(default=None),
+        delete: bool = Query(default=False),
         ctx: Any = Depends(authn),
     ):
+        if delete:
+            return {"id": await _run(ws.suggest_delete(ctx, _abs(path), summary))}
         return {"id": await _run(ws.suggest(ctx, _abs(path), body, summary))}
 
     @router.get("/suggestions", dependencies=[Depends(_read_gate)])
@@ -470,6 +585,29 @@ def build_router(
         await _run(ws.touch(ctx.actor_id, ctx.session_id, _abs(req.path) if req.path else None))
         return {"ok": True}
 
+    # --- actors + sessions ---------------------------------------------------
+    # Gated by `authn` like every other mutating route: an already-authenticated
+    # caller mints new actor/session identities (e.g. a trusted backend
+    # provisioning an actor for a newly-signed-up user) -- not public
+    # self-registration. `authn`'s own return value is unused here, same as
+    # `make_dir`/`create_branch` above.
+
+    @router.post("/actors")
+    async def create_actor(req: _CreateActor, _ctx: Any = Depends(authn)):
+        if req.agent:
+            # `is not None`, not `or`: an explicit empty-string model should be
+            # preserved (matches the Rust API's `req.model.as_deref().unwrap_or(…)`,
+            # which only substitutes on None) -- `or` would also replace "".
+            model = req.model if req.model is not None else "unknown"
+            actor_id = await _run(ws.create_agent(req.name, model, req.controller))
+        else:
+            actor_id = await _run(ws.create_human(req.name, None))
+        return {"id": actor_id}
+
+    @router.post("/sessions")
+    async def create_session(req: _CreateSession, _ctx: Any = Depends(authn)):
+        return {"id": await _run(ws.create_session(req.actor, req.client))}
+
     # --- live co-editing (Yjs y-sync) ---------------------------------------
 
     @router.websocket("/coedit/{path:path}")
@@ -498,7 +636,25 @@ def build_router(
         try:
             while True:
                 data = await websocket.receive_bytes()
-                reply = await room.doc.handle_sync(ctx, data)
+                try:
+                    reply = await room.doc.handle_sync(ctx, data)
+                except ValueError as e:
+                    # A malformed/corrupt y-sync frame -- the binary protocol has
+                    # no way to resync mid-stream, so close cleanly (1002:
+                    # protocol error) instead of leaving this client with a hard
+                    # reset and crashing the ASGI app with an uncaught exception.
+                    await _safe_close(websocket, 1002, str(e))
+                    return
+                except Exception as e:
+                    # Anything else handle_sync raises (an origofs-side failure
+                    # applying an otherwise-valid frame, or a type this router
+                    # doesn't specifically anticipate) -- not the client's
+                    # protocol fault, so 1011: internal error. Broad on purpose:
+                    # the whole point is that nothing from handle_sync should be
+                    # able to crash the connection uncleanly, not just the two
+                    # exception shapes observed so far.
+                    await _safe_close(websocket, 1011, str(e))
+                    return
                 if reply.reply:
                     conn.out.put_nowait(reply.reply)
                 if reply.broadcast:
