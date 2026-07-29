@@ -39,6 +39,7 @@ coedit = ["dep:yrs"]
 
 [dev-dependencies]
 criterion = "0.5.1"
+proptest = "1"
 tempfile = "3.27.0"
 tokio-postgres = "0.7"
 # The coedit tests drive a *vanilla* Yjs client (a raw `yrs::Doc` + the stock
