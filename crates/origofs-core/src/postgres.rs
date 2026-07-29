@@ -60,9 +60,7 @@ impl PostgresMetadataStore {
     /// Connect to Postgres. `dsn` is a libpq DSN or URL, e.g.
     /// `postgres://user:pass@host/db` or `host=/var/run/postgresql dbname=origofs`.
     pub async fn connect(dsn: &str) -> Result<Self> {
-        let cfg: tokio_postgres::Config = dsn
-            .parse()
-            .map_err(|e: tokio_postgres::Error| OrigoFSError::Metadata(e.to_string()))?;
+        let cfg: tokio_postgres::Config = dsn.parse()?;
         let mgr = Manager::new(cfg, NoTls);
         // Bound acquisition: without a wait timeout, exhausting the pool makes
         // `client()` hang forever instead of surfacing a retriable error. A
@@ -82,10 +80,10 @@ impl PostgresMetadataStore {
     }
 
     async fn client(&self) -> Result<deadpool_postgres::Object> {
-        self.pool
-            .get()
-            .await
-            .map_err(|e| OrigoFSError::Metadata(e.to_string()))
+        // A pool error (exhaustion, acquisition timeout, a dead connection) is a
+        // classified `Backend` error (`Unavailable`) via `From<PoolError>`, so a
+        // caller can tell "the store is unreachable" from a logic error.
+        Ok(self.pool.get().await?)
     }
 
     /// A concrete handle to this store bound to `workspace_id`, sharing the same
