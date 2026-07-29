@@ -166,6 +166,15 @@ impl Workspace {
         Ok(ws)
     }
 
+    /// Postgres metadata (multi-writer) + a local content-addressed store — the
+    /// single-host production pairing (one shared database, content on local disk).
+    /// For content shared across hosts use [`Workspace::open_pg_s3`] /
+    /// [`Workspace::open_pg_gcs`] instead.
+    pub async fn open_pg_local(dsn: &str, cas_dir: impl AsRef<Path>) -> Result<Self> {
+        let content: Content = Arc::new(LocalCasStore::open(cas_dir).await?);
+        Self::open_pg(dsn, content).await
+    }
+
     /// Postgres metadata (multi-writer) + an S3-compatible object store for
     /// content — the production pairing for a shared human+agent workspace: many
     /// writers on one database, one shared content store. Reads are integrity-

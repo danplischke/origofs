@@ -15,6 +15,8 @@ use origofs_sdk::{MergeOutcome, SuggestionStatus, Workspace, WriteCtx};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+mod config;
+
 #[derive(Parser)]
 #[command(
     name = "origofs",
@@ -30,6 +32,12 @@ struct Cli {
     /// filter comes from `ORIGOFS_LOG` (or `RUST_LOG`), defaulting to `info`.
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
+
+    /// Backend configuration file (TOML). Without it, a local SQLite + local-CAS
+    /// workspace under `--workspace`; with it, the metadata/content backends it
+    /// names (Postgres, S3, GCS). See `deploy/config.example.toml`.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -321,9 +329,11 @@ enum GitCmd {
 fn init_tracing(format: LogFormat) {
     use tracing_subscriber::fmt::format::FmtSpan;
     use tracing_subscriber::{EnvFilter, fmt};
+    // Default to `info`, but quiet the Postgres driver — it forwards benign server
+    // NOTICEs (e.g. "relation already exists" from idempotent migrations) at info.
     let filter = EnvFilter::try_from_env("ORIGOFS_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new("info,tokio_postgres=warn"));
     // Log each instrumented operation once when its span closes, with the elapsed
     // time — so the spans double as per-operation latency records.
     let builder = fmt()
@@ -336,19 +346,24 @@ fn init_tracing(format: LogFormat) {
     }
 }
 
+/// Open the workspace the CLI operates on. With `--config` this selects the
+/// Postgres/S3/GCS backends the file names; without it, the default local
+/// SQLite/local-CAS workspace under `--workspace` (honoring `ORIGOFS_ENCRYPTION_KEY`
+/// for encryption at rest), exactly as before.
+async fn open_workspace(cli: &Cli) -> Result<Workspace> {
+    let cfg = match &cli.config {
+        Some(path) => config::Config::load(path)?,
+        None => config::Config::default(),
+    };
+    cfg.open(&cli.workspace).await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.log_format);
     std::fs::create_dir_all(&cli.workspace)?;
-    let db = cli.workspace.join("meta.db");
-    let cas = cli.workspace.join("cas");
-    // Opt into encryption at rest by setting ORIGOFS_ENCRYPTION_KEY (kept out of
-    // argv/history); the same value must be used every time for this workspace.
-    let ws = match std::env::var("ORIGOFS_ENCRYPTION_KEY") {
-        Ok(k) if !k.is_empty() => Workspace::open_local_encrypted(&db, &cas, &k).await?,
-        _ => Workspace::open_local(&db, &cas).await?,
-    };
+    let ws = open_workspace(&cli).await?;
 
     match cli.cmd {
         Cmd::Init => {
