@@ -8,7 +8,8 @@
 //! 2. Mount an **unprivileged overlayfs** (`lower` + a scratch `upper`/`work`) in a
 //!    user+mount namespace and `exec` the command with cwd in the merged view.
 //! 3. On exit, the overlay `upper/` holds exactly the delta (created/modified
-//!    files, plus whiteouts for deletions).
+//!    files, plus whiteouts for deletions — either a character-device whiteout
+//!    per removed name, or an *opaque* directory marker; see [`is_opaque_dir`]).
 //! 4. **Import** that delta back into origofs via attributed writes (blame + edit-op),
 //!    or `--discard` it.
 //!
@@ -138,7 +139,7 @@ pub async fn run(ws: &Workspace, opts: RunOpts, cmd: &[String]) -> Result<Outcom
             Some(a) => Some(ws.create_session(a, Some("sandbox")).await?),
             None => None,
         };
-        let n = import_delta(ws, &upper, &upper, opts.actor, session).await?;
+        let n = import_upper(ws, &upper, opts.actor, session).await?;
         (true, n)
     };
 
@@ -390,7 +391,181 @@ async fn export_tree(ws: &Workspace, origofs_dir: &str, host_dir: &Path) -> Resu
     Ok(())
 }
 
+/// The origofs path an `upper/`-relative host path imports to. The root of the
+/// upper layer itself maps to `/`.
+fn origofs_path_for(root: &Path, host: &Path) -> String {
+    let rel = host.strip_prefix(root).unwrap_or(host);
+    if rel.as_os_str().is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", rel.to_string_lossy())
+    }
+}
+
+/// The xattr names overlayfs uses to mark a directory **opaque** — "this upper
+/// directory *replaces* the lower one; ignore every lower entry under it". The
+/// kernel writes `trusted.overlay.*`; rootless/unprivileged setups (which can't
+/// set `trusted.`) use the `user.overlay.*` alias, so both are honored.
+const OPAQUE_XATTRS: [&str; 2] = ["trusted.overlay.opaque", "user.overlay.opaque"];
+/// The redirect marker: this upper directory stands in for a *differently named*
+/// lower directory (a rename). We don't follow it — we only warn, so the import
+/// isn't silently wrong. See [`import_delta`].
+const REDIRECT_XATTRS: [&str; 2] = ["trusted.overlay.redirect", "user.overlay.redirect"];
+
+/// Read an extended attribute without following symlinks; `None` when it is
+/// absent, or when the platform/filesystem has no xattrs at all.
+///
+/// Declared here rather than pulled from `libc` because `libc` is an optional,
+/// `fuse`-gated dependency of this crate and the sandbox surface must not need it.
+#[cfg(target_os = "linux")]
+fn lgetxattr_value(path: &Path, name: &str) -> Option<Vec<u8>> {
+    use std::ffi::{CString, c_char, c_void};
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn lgetxattr(
+            path: *const c_char,
+            name: *const c_char,
+            value: *mut c_void,
+            size: usize,
+        ) -> isize;
+    }
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let c_name = CString::new(name).ok()?;
+    // A zero-size probe returns the value's length (or -1), so an arbitrarily
+    // long value (a `redirect` path) never trips ERANGE.
+    // SAFETY: both pointers are NUL-terminated and live for the call; a null
+    // value buffer with size 0 is the documented "how big is it?" form.
+    let len = unsafe { lgetxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
+    if len < 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    if buf.is_empty() {
+        return Some(buf);
+    }
+    // SAFETY: `buf` is a live allocation of exactly `buf.len()` writable bytes.
+    let n = unsafe {
+        lgetxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            buf.as_mut_ptr().cast::<c_void>(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(buf)
+}
+
+/// Non-Linux hosts have no overlayfs markers to read: always "absent".
+#[cfg(not(target_os = "linux"))]
+fn lgetxattr_value(_path: &Path, _name: &str) -> Option<Vec<u8>> {
+    None
+}
+
+/// Whether `path` is an overlayfs **opaque directory** — an upper-layer directory
+/// carrying `trusted.overlay.opaque` (or the unprivileged `user.overlay.opaque`)
+/// with the value `"y"`.
+///
+/// Opaque means the upper directory *replaces* the lower one instead of merging
+/// with it: every lower-layer entry under that path is invisible in the merged
+/// view. It is the second way overlayfs records deletions (the first being a
+/// character-device whiteout), and the one the kernel uses after e.g.
+/// `rm -rf dir && mkdir dir`. Importing such a directory as a plain merge would
+/// let the deleted children silently reappear, so both the one-shot
+/// [`import_upper`] and the incremental [`LiveSync`] prune them.
+///
+/// Always `false` off Linux, where there is no overlayfs to mark anything.
+pub fn is_opaque_dir(path: &Path) -> bool {
+    OPAQUE_XATTRS
+        .iter()
+        .any(|name| lgetxattr_value(path, name).as_deref() == Some(b"y"))
+}
+
+/// The overlayfs `redirect` marker on `path`, if any (a lower-layer path this
+/// upper directory stands in for after a rename). We don't act on it; callers
+/// warn so a redirected rename isn't imported as if it were nothing.
+fn redirect_marker(path: &Path) -> Option<String> {
+    REDIRECT_XATTRS
+        .iter()
+        .find_map(|name| lgetxattr_value(path, name))
+        .map(|v| String::from_utf8_lossy(&v).into_owned())
+}
+
+/// Apply an opaque directory to the workspace: every workspace child of
+/// `origofs_dir` that the upper layer does **not** list is removed, recursively,
+/// so the upper directory replaces the lower one instead of merging with it.
+/// `present` holds the upper directory's entry names (whiteouts included — those
+/// are deletions the normal import path handles). Returns the origofs paths removed.
+async fn apply_opaque(
+    ws: &Workspace,
+    origofs_dir: &str,
+    present: &HashSet<String>,
+) -> Result<Vec<String>> {
+    let Ok(existing) = ws.ls(origofs_dir).await else {
+        return Ok(Vec::new()); // nothing on the origofs side to replace
+    };
+    let mut removed = Vec::new();
+    for e in existing {
+        if present.contains(&e.name) {
+            continue;
+        }
+        // Defense-in-depth, same rule as `export_tree`: never build a path out of
+        // a component that could traverse, even one that came back from origofs.
+        if e.name.is_empty() || e.name == "." || e.name == ".." || e.name.contains('/') {
+            bail!("refusing to delete unsafe path component {:?}", e.name);
+        }
+        let victim = join_origofs(origofs_dir, &e.name);
+        origofs_rm_rf(ws, &victim).await?;
+        removed.push(victim);
+    }
+    Ok(removed)
+}
+
+/// Snapshot a host directory's entries as `(names, paths)`. Read up front because
+/// an opaque marker has to be applied against the *whole* name set before any
+/// entry is imported.
+async fn read_dir_snapshot(dir: &Path) -> std::io::Result<(HashSet<String>, Vec<PathBuf>)> {
+    let mut names = HashSet::new();
+    let mut paths = Vec::new();
+    let mut rd = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        // Lossy, exactly like the origofs path built from it below, so the name a
+        // whiteout/opaque decision is keyed on is the name that gets imported.
+        names.insert(entry.file_name().to_string_lossy().into_owned());
+        paths.push(entry.path());
+    }
+    Ok((names, paths))
+}
+
+/// Import an overlay `upper/` delta into `ws` in one shot: the write layer of a
+/// finished [`run`], turned into attributed writes and deletions against the
+/// workspace. Returns the number of origofs paths mutated.
+///
+/// Exposed so a caller that drives its own overlay (or a test with a hand-built
+/// `upper/` tree) can reuse exactly the import the sandbox uses — including
+/// whiteout and opaque-directory handling. Pass both `actor` and `session` for
+/// attributed writes (blame + edit-ops); otherwise the writes are unattributed.
+pub async fn import_upper(
+    ws: &Workspace,
+    upper: &Path,
+    actor: Option<i64>,
+    session: Option<i64>,
+) -> Result<usize> {
+    Box::pin(import_delta(ws, upper, upper, actor, session)).await
+}
+
 /// Import the overlay `upper` delta under `dir` back into `ws`.
+///
+/// Deletions arrive two ways and both are honored: a character-device whiteout
+/// (rdev 0) removes that one path, and an *opaque* directory ([`is_opaque_dir`])
+/// removes every workspace child the upper directory doesn't list. A `redirect`
+/// marker (a renamed directory) is not followed, but is logged rather than
+/// silently mis-imported.
 async fn import_delta(
     ws: &Workspace,
     root: &Path,
@@ -399,11 +574,22 @@ async fn import_delta(
     session: Option<i64>,
 ) -> Result<usize> {
     let mut count = 0;
-    let mut rd = tokio::fs::read_dir(dir).await?;
-    while let Some(entry) = rd.next_entry().await? {
-        let host = entry.path();
-        let rel = host.strip_prefix(root).unwrap_or(&host);
-        let origofs_path = format!("/{}", rel.to_string_lossy());
+    let (names, hosts) = read_dir_snapshot(dir).await?;
+    if is_opaque_dir(dir) {
+        count += apply_opaque(ws, &origofs_path_for(root, dir), &names)
+            .await?
+            .len();
+    }
+    if let Some(target) = redirect_marker(dir) {
+        tracing::warn!(
+            dir = %dir.display(),
+            redirect = %target,
+            "overlay redirect marker on an imported directory is not followed; \
+             the renamed directory's lower contents are left where they were"
+        );
+    }
+    for host in hosts {
+        let origofs_path = origofs_path_for(root, &host);
         let md = tokio::fs::symlink_metadata(&host).await?;
         let ft = md.file_type();
 
@@ -436,7 +622,7 @@ async fn import_delta(
 
 /// A stateful, incremental sync of an overlay `upper/` delta into origofs.
 ///
-/// Unlike the one-shot [`import_delta`], a `LiveSync` remembers what it has
+/// Unlike the one-shot [`import_upper`], a `LiveSync` remembers what it has
 /// already pushed, so repeated calls import only the files the agent has changed
 /// since the last tick — the basis of a *live* overlay mount that streams the
 /// agent's edits into origofs (attributed, on the change feed) as it works, instead
@@ -451,6 +637,10 @@ pub struct LiveSync {
     seen: HashMap<String, (i64, u64)>,
     /// Paths a whiteout deletion has already been applied for (apply once).
     deleted: HashSet<String>,
+    /// Directories an opaque marker has already been applied for (apply once, so
+    /// a later tick doesn't re-prune children a *different* writer legitimately
+    /// added to the workspace after the replacement).
+    opaque: HashSet<String>,
     actor: Option<i64>,
     session: Option<i64>,
 }
@@ -462,6 +652,7 @@ impl LiveSync {
         Self {
             seen: HashMap::new(),
             deleted: HashSet::new(),
+            opaque: HashSet::new(),
             actor,
             session,
         }
@@ -475,15 +666,24 @@ impl LiveSync {
 
     async fn sync_dir(&mut self, ws: &Workspace, root: &Path, dir: &Path) -> Result<usize> {
         let mut count = 0;
-        let mut rd = match tokio::fs::read_dir(dir).await {
-            Ok(rd) => rd,
+        let (names, hosts) = match read_dir_snapshot(dir).await {
+            Ok(snapshot) => snapshot,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e.into()),
         };
-        while let Some(entry) = rd.next_entry().await? {
-            let host = entry.path();
-            let rel = host.strip_prefix(root).unwrap_or(&host);
-            let origofs_path = format!("/{}", rel.to_string_lossy());
+        // An opaque directory replaces the lower one: prune the workspace children
+        // the agent's write layer no longer lists (once — see `opaque`).
+        let dir_path = origofs_path_for(root, dir);
+        if is_opaque_dir(dir) && self.opaque.insert(dir_path.clone()) {
+            for victim in apply_opaque(ws, &dir_path, &names).await? {
+                let sub = format!("{victim}/");
+                self.seen
+                    .retain(|p, _| p != &victim && !p.starts_with(&sub));
+                count += 1;
+            }
+        }
+        for host in hosts {
+            let origofs_path = origofs_path_for(root, &host);
             let md = tokio::fs::symlink_metadata(&host).await?;
             let ft = md.file_type();
 

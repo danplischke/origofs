@@ -4,13 +4,93 @@
 //! Self-skips where unprivileged overlayfs isn't available.
 #![cfg(feature = "sandbox")]
 
-use origofs_sdk::sandbox::{LiveSync, RunOpts, overlay_supported, run};
+use origofs_sdk::sandbox::{
+    LiveSync, RunOpts, import_upper, is_opaque_dir, overlay_supported, run,
+};
 use origofs_sdk::{ActorKind, Workspace};
 
 async fn workspace(dir: &std::path::Path) -> Workspace {
     Workspace::open_local(dir.join("meta.db"), dir.join("cas"))
         .await
         .unwrap()
+}
+
+/// Mark a host directory the way overlayfs marks an **opaque** directory ("this
+/// upper dir replaces the lower one"). Uses the `user.` name because `trusted.`
+/// needs CAP_SYS_ADMIN; the import honors both.
+///
+/// Returns `false` when the filesystem under the temp dir has no user xattrs (or
+/// we're not on Linux), so the test can self-skip the way the Postgres-backed
+/// tests do without `ORIGOFS_PG_TEST_URL`. Support is probed with the test's own
+/// `lgetxattr` read-back rather than through [`is_opaque_dir`], so a regression in
+/// the detection under test fails the test instead of silently skipping it.
+#[cfg(target_os = "linux")]
+fn mark_opaque(path: &std::path::Path) -> bool {
+    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn lsetxattr(
+            path: *const c_char,
+            name: *const c_char,
+            value: *const c_void,
+            size: usize,
+            flags: c_int,
+        ) -> c_int;
+        fn lgetxattr(
+            path: *const c_char,
+            name: *const c_char,
+            value: *mut c_void,
+            size: usize,
+        ) -> isize;
+    }
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let c_name = CString::new("user.overlay.opaque").unwrap();
+    // SAFETY: both strings are NUL-terminated and outlive the call; `value` points
+    // at exactly `size` readable bytes.
+    let rc = unsafe {
+        lsetxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            b"y".as_ptr().cast::<c_void>(),
+            1,
+            0,
+        )
+    };
+    if rc != 0 {
+        return false; // no user xattrs here (EOPNOTSUPP on some filesystems)
+    }
+    // Read it back independently: a filesystem that accepts the set but can't
+    // return the value is no use to us either.
+    let mut buf = [0u8; 8];
+    // SAFETY: `buf` is a live allocation of exactly `buf.len()` writable bytes.
+    let n = unsafe {
+        lgetxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            buf.as_mut_ptr().cast::<c_void>(),
+            buf.len(),
+        )
+    };
+    n == 1 && buf[0] == b'y'
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mark_opaque(_path: &std::path::Path) -> bool {
+    false
+}
+
+async fn names(ws: &Workspace, dir: &str) -> Vec<String> {
+    let mut n: Vec<String> = ws
+        .ls(dir)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    n.sort();
+    n
 }
 
 #[tokio::test]
@@ -93,6 +173,162 @@ async fn discard_leaves_workspace_untouched() {
     // Nothing changed in origofs.
     assert_eq!(&ws.read("/f.txt").await.unwrap()[..], b"before\n");
     assert!(ws.stat("/extra.txt").await.is_err());
+}
+
+// --- opaque directories (no overlay mount / root needed) --------------------
+//
+// overlayfs records a deletion two ways: a character-device whiteout per removed
+// name, and an *opaque directory* — an upper dir carrying `…overlay.opaque=y`,
+// meaning "this replaces the lower dir; ignore every lower entry under it" (what
+// the kernel writes for e.g. `rm -rf d && mkdir d`). The import must prune, or
+// the deleted children silently reappear. A real overlay mount needs privileges,
+// so these drive the import against a hand-built `upper/` tree.
+
+/// The marker itself is detected — and only the marker.
+#[test]
+fn is_opaque_dir_reads_the_overlay_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain");
+    let marked = dir.path().join("marked");
+    std::fs::create_dir(&plain).unwrap();
+    std::fs::create_dir(&marked).unwrap();
+    assert!(!is_opaque_dir(&plain), "an unmarked dir is not opaque");
+    if !mark_opaque(&marked) {
+        eprintln!(
+            "skipping: no user xattr support on this filesystem (needed to mark an opaque dir)"
+        );
+        return;
+    }
+    assert!(is_opaque_dir(&marked), "user.overlay.opaque=y is opaque");
+    assert!(!is_opaque_dir(&plain));
+}
+
+/// An opaque upper dir *replaces* the workspace dir: children it doesn't list are
+/// deleted, recursively — files and subtrees alike.
+#[tokio::test]
+async fn opaque_upper_dir_replaces_workspace_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = workspace(dir.path()).await;
+    let agent = ws.create_agent("opaque", "m", None).await.unwrap();
+    let session = ws.create_session(agent, Some("sandbox")).await.unwrap();
+
+    ws.mkdir_p("/d/sub").await.unwrap();
+    ws.write("/d/a.txt", b"old-a\n").await.unwrap();
+    ws.write("/d/b.txt", b"b\n").await.unwrap();
+    ws.write("/d/c.txt", b"c\n").await.unwrap();
+    ws.write("/d/sub/deep.txt", b"deep\n").await.unwrap();
+    ws.write("/outside.txt", b"untouched\n").await.unwrap();
+
+    // The write layer: `d/` was replaced, and only `a.txt` survives in it.
+    let upper = dir.path().join("upper");
+    let upper_d = upper.join("d");
+    tokio::fs::create_dir_all(&upper_d).await.unwrap();
+    tokio::fs::write(upper_d.join("a.txt"), b"new-a\n")
+        .await
+        .unwrap();
+    if !mark_opaque(&upper_d) {
+        eprintln!(
+            "skipping: no user xattr support on this filesystem (needed to mark an opaque dir)"
+        );
+        return;
+    }
+
+    let n = import_upper(&ws, &upper, Some(agent), Some(session))
+        .await
+        .unwrap();
+    assert!(n >= 4, "3 pruned children + 1 import, got {n}");
+
+    // Only what the opaque dir listed survives.
+    assert_eq!(names(&ws, "/d").await, vec!["a.txt".to_string()]);
+    assert_eq!(&ws.read("/d/a.txt").await.unwrap()[..], b"new-a\n");
+    assert!(
+        ws.stat("/d/b.txt").await.is_err(),
+        "b.txt was replaced away"
+    );
+    assert!(
+        ws.stat("/d/c.txt").await.is_err(),
+        "c.txt was replaced away"
+    );
+    assert!(ws.stat("/d/sub").await.is_err(), "the subtree went with it");
+    assert!(ws.stat("/d/sub/deep.txt").await.is_err());
+    // Nothing outside the opaque dir is touched.
+    assert_eq!(&ws.read("/outside.txt").await.unwrap()[..], b"untouched\n");
+
+    // The surviving file is attributed to the sandbox's agent.
+    assert_eq!(ws.blame("/d/a.txt").await.unwrap()[0].actor.id, agent);
+}
+
+/// Control: the same upper dir *without* the marker merges, as before — the
+/// workspace children the agent didn't touch stay put.
+#[tokio::test]
+async fn non_opaque_upper_dir_still_merges() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = workspace(dir.path()).await;
+
+    ws.mkdir_p("/d").await.unwrap();
+    ws.write("/d/a.txt", b"old-a\n").await.unwrap();
+    ws.write("/d/b.txt", b"b\n").await.unwrap();
+    ws.write("/d/c.txt", b"c\n").await.unwrap();
+
+    let upper = dir.path().join("upper");
+    let upper_d = upper.join("d");
+    tokio::fs::create_dir_all(&upper_d).await.unwrap();
+    tokio::fs::write(upper_d.join("a.txt"), b"new-a\n")
+        .await
+        .unwrap();
+
+    import_upper(&ws, &upper, None, None).await.unwrap();
+
+    assert_eq!(
+        names(&ws, "/d").await,
+        vec![
+            "a.txt".to_string(),
+            "b.txt".to_string(),
+            "c.txt".to_string()
+        ]
+    );
+    assert_eq!(&ws.read("/d/a.txt").await.unwrap()[..], b"new-a\n");
+    assert_eq!(&ws.read("/d/b.txt").await.unwrap()[..], b"b\n");
+}
+
+/// The live overlay sync honors the same marker — and applies it once, so a later
+/// tick doesn't keep re-pruning the directory.
+#[tokio::test]
+async fn live_sync_applies_opaque_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = workspace(dir.path()).await;
+    let agent = ws.create_agent("live-opaque", "m", None).await.unwrap();
+    let session = ws.create_session(agent, Some("overlay")).await.unwrap();
+
+    ws.mkdir_p("/d").await.unwrap();
+    ws.write("/d/a.txt", b"old-a\n").await.unwrap();
+    ws.write("/d/b.txt", b"b\n").await.unwrap();
+
+    let upper = dir.path().join("upper");
+    let upper_d = upper.join("d");
+    tokio::fs::create_dir_all(&upper_d).await.unwrap();
+    tokio::fs::write(upper_d.join("a.txt"), b"new-a\n")
+        .await
+        .unwrap();
+    if !mark_opaque(&upper_d) {
+        eprintln!(
+            "skipping: no user xattr support on this filesystem (needed to mark an opaque dir)"
+        );
+        return;
+    }
+
+    let mut sync = LiveSync::new(Some(agent), Some(session));
+    assert_eq!(sync.sync(&ws, &upper).await.unwrap(), 2); // 1 pruned + 1 imported
+    assert_eq!(names(&ws, "/d").await, vec!["a.txt".to_string()]);
+
+    // A file another writer adds afterwards isn't re-pruned on the next tick: the
+    // replacement is a one-time event, not a standing rule.
+    ws.write("/d/other.txt", b"from elsewhere\n").await.unwrap();
+    assert_eq!(sync.sync(&ws, &upper).await.unwrap(), 0);
+    assert_eq!(
+        names(&ws, "/d").await,
+        vec!["a.txt".to_string(), "other.txt".to_string()]
+    );
 }
 
 // --- live incremental sync (no overlay / root needed) -----------------------
