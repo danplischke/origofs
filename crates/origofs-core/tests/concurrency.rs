@@ -197,6 +197,9 @@ async fn concurrent_commits_never_lose_a_commit() {
                         Ok(h) => return h,
                         // The branch moved under us — retry against the new head.
                         Err(OrigoFSError::Metadata(_)) => continue,
+                        // A transient backend failure (serialization/deadlock/
+                        // contention) is likewise just a signal to retry.
+                        Err(e) if e.retryable() => continue,
                         Err(e) => panic!("round {round}: unexpected commit error: {e}"),
                     }
                 }

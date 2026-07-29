@@ -46,7 +46,7 @@ pub use collab::{EVENT_CHANNEL, Event, EventInit, PRESENCE_WINDOW_SECS, Presence
 pub use content::{ContentStore, LocalCasStore, MemStore, TieredStore, VerifyingStore};
 pub use encrypt::EncryptedStore;
 pub use engine::Fs;
-pub use error::{OrigoFSError, Result};
+pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
 pub use gc::GcStats;
 pub use merge::{Conflict, MergeOutcome};
 pub use metadata::{MetaTxn, MetadataStore};
