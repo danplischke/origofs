@@ -163,3 +163,14 @@ export interface AppConfig {
   demo: boolean;
   tokens: DemoToken[];
 }
+
+/**
+ * The result of a write. A `direct` actor's write lands (`written` bytes); a
+ * `propose`-only actor's write is routed into the suggestion queue for review
+ * (`proposed` is the new suggestion id) and the file is left unchanged.
+ */
+export interface WriteResult {
+  path: string;
+  written?: number;
+  proposed?: number;
+}

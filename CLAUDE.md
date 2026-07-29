@@ -24,13 +24,14 @@ model, attribution, and the failure-surface work are the way they are. The
 
 ```bash
 cargo build --release                 # ./target/release/origofs
-cargo install --path crates/origofs-cli   # installs the `origofs` binary
+cargo install --path crates/origofs-cli   # installs the `origofs` + `git-remote-origofs` binaries
 cargo run -p origofs-cli -- --workspace ./ws init   # run the CLI without installing
 
 cargo test --workspace                # all Rust tests
 cargo test -p origofs-core                # one crate
 cargo test -p origofs-core --test merge   # one integration-test file (tests/merge.rs)
 cargo test -p origofs-core roundtrip      # filter by test-name substring (single test)
+cargo test -p origofs-sdk --features full # exercise the access surfaces (api/mcp/fuse/nfs/sandbox/git)
 
 cargo clippy --workspace --all-targets
 cargo fmt                             # no rustfmt.toml — plain default style
@@ -58,9 +59,10 @@ pytest tests/          # some tests also gate on ORIGOFS_PG_TEST_URL
 
 ### Toolchain note
 
-There is no `rust-toolchain` file and no CI config in the repo. **`origofs-core`
-uses `edition = "2024"`** (needs Rust ≥ 1.85), while the other crates inherit
-`edition = "2021"` from the workspace. Use a recent stable toolchain.
+There is no `rust-toolchain` file. **`origofs-core`, `origofs-sdk`, and `origofs-cli`
+use `edition = "2024"`** (needs Rust ≥ 1.85); `origofs-py` inherits `edition = "2021"`
+from the workspace. CI lives at `.github/workflows/ci.yml` (fmt + clippy + tests, and
+an explicit `coedit` pass) and runs on stable. Use a recent stable toolchain.
 
 ## The one architectural idea everything hangs on
 
@@ -90,7 +92,8 @@ Every surface funnels down to the same core, so a behavior change usually
 belongs in `origofs-core`, not in each surface:
 
 ```
-CLI / MCP / HTTP API / FUSE / NFS / Python   (access surfaces, one crate each)
+CLI · Python (own crates)  +  api · mcp · fuse · nfs · sandbox · git   (access
+        │        surfaces — the latter six are feature-gated origofs-sdk modules)
         │  each resolves the caller → (actor, session)
         ▼
 origofs-sdk::Workspace          ergonomic façade; `open_*` constructors wire backends
@@ -153,24 +156,38 @@ write path enforces this and you must not weaken it:
 
 Opt-in, three modes (`VersioningMode` in `objectgraph.rs`): `off` (working tree +
 attribution only), `native` (origofs's own chunked commit DAG — the default when a
-workspace is initialized), and `git` (native DAG *plus* the `origofs-git`
-export/import + `git-remote-origofs` bridge to genuine git objects). `native` and
+workspace is initialized), and `git` (native DAG *plus* the `origofs-sdk` `git`
+module's export/import + the `git-remote-origofs` bridge to genuine git objects,
+behind the `git` feature). `native` and
 `git` share one commit-DAG and merge engine (three-way / diff3, conflicts, LFS-style
 `lock`s for binaries); they differ only in on-disk object encoding.
 
 ## Crate map
 
+Four crates. The many *access surfaces* are no longer separate crates — they are
+opt-in, feature-gated **modules of `origofs-sdk`** (default-off, so a plain
+`origofs-sdk` build stays lean).
+
 | Crate | Role |
 |---|---|
 | `origofs-core` | The engine. Both trait abstractions, all content backends, chunking, versioning, merge, attribution, gc, recovery, migrations. Everything else depends on it. (`edition 2024`) |
-| `origofs-sdk` | `Workspace` — the ergonomic façade over `origofs-core::Fs`. The API every other surface calls. |
-| `origofs-cli` | The `origofs` binary (clap). A thin shell over `origofs-sdk`; the best index of what the system can do. |
-| `origofs-sandbox` | Overlay / sandbox edit-capture: run a process over a copy-on-write view, import its delta as attributed writes. Not a security boundary by default; opt-in bubblewrap *filesystem* isolation via `--isolate` (see below). |
-| `origofs-fuse`, `origofs-nfs` | POSIX mounts (FUSE on Linux; NFSv3 elsewhere). |
-| `origofs-mcp` | MCP server — agents call filesystem tools over stdio, auto-attributed. |
-| `origofs-git` | Real-`git` interop: export/import genuine git objects; ships the `git-remote-origofs` helper binary (`git clone origofs://…`). |
-| `origofs-api` | HTTP/JSON server (axum). `Authenticator`/`BearerAuth` resolve identity server-side. |
-| `origofs-py` | pyo3/maturin bindings: async-native (`await` every I/O), a FastAPI router (`origofs.fastapi`), and overlay orchestration (`origofs.overlay`). |
+| `origofs-sdk` | `Workspace` — the ergonomic façade over `origofs-core::Fs`, **plus every access surface as a feature-gated module** (table below). The library every other surface calls. (`edition 2024`) |
+| `origofs-cli` | The `origofs` binary **and** the `git-remote-origofs` helper (clap). A thin shell over `origofs-sdk` with all surfaces (`full`) enabled; the best index of what the system can do. (`edition 2024`) |
+| `origofs-py` | pyo3/maturin bindings: async-native (`await` every I/O), a FastAPI router (`origofs.fastapi`), and overlay orchestration (`origofs.overlay`). Enables `origofs-sdk`'s `coedit` (always) + `fuse`/`nfs` (on Unix). |
+
+### `origofs-sdk` access-surface features
+
+Each is a module under `crates/origofs-sdk/src/`, gated by the matching feature
+(default-off). `full` turns them all on (but not `coedit`); `origofs-cli` uses `full`.
+
+| Feature | Module | Role |
+|---|---|---|
+| `api` | `origofs_sdk::api` | HTTP/JSON server (axum). `Authenticator`/`BearerAuth` resolve identity server-side. |
+| `mcp` | `origofs_sdk::mcp` | MCP server — agents call filesystem tools over stdio, auto-attributed. |
+| `sandbox` | `origofs_sdk::sandbox` | Overlay / sandbox edit-capture: run a process over a copy-on-write view, import its delta as attributed writes. Not a security boundary by default; opt-in bubblewrap *filesystem* isolation via `--isolate` (see below). |
+| `fuse`, `nfs` | `origofs_sdk::fuse` / `::nfs` | POSIX mounts (FUSE on Linux; NFSv3 elsewhere). **Unix-only** (`cfg(unix)`). |
+| `git` | `origofs_sdk::git` | Real-`git` interop: export/import genuine git objects. The `git-remote-origofs` binary (shipped by `origofs-cli`, `git clone origofs://…`) builds on it. |
+| `coedit` | — | Opt-in CRDT co-editing (yrs); adds the y-sync WebSocket to the `api` surface. Kept separate from `full`. |
 
 ## Conventions & gotchas that will bite you
 

@@ -72,6 +72,11 @@ pub struct Fs<M: MetadataStore, C: ContentStore> {
     /// presence, locks, sessions). Injectable so a deterministic simulation can
     /// reproduce every timestamp — and thus every commit hash — from a seed.
     pub(crate) clock: Arc<dyn Clock>,
+    /// The root directory inode this engine resolves paths from. `INO_ROOT` for a
+    /// store's `default` workspace; a distinct inode for any other workspace in the
+    /// same store, so many workspaces coexist (`docs/MULTI_TENANCY.md`). Every
+    /// path walk starts here, so a workspace only ever reaches its own subtree.
+    pub(crate) root_ino: Ino,
 }
 
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
@@ -80,6 +85,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             meta,
             content,
             clock: Arc::new(SystemClock),
+            root_ino: INO_ROOT,
         }
     }
 
@@ -91,6 +97,23 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             meta,
             content,
             clock,
+            root_ino: INO_ROOT,
+        }
+    }
+
+    /// Build a sibling `Fs` bound to a different metadata handle and root inode,
+    /// sharing this one's content store and clock — used to open another workspace
+    /// living in the same stores (`docs/MULTI_TENANCY.md`). Pair with
+    /// [`MetadataStore::with_workspace`] and [`MetadataStore::create_workspace`].
+    pub fn rebind(&self, meta: M, root_ino: Ino) -> Self
+    where
+        C: Clone,
+    {
+        Self {
+            meta,
+            content: self.content.clone(),
+            clock: self.clock.clone(),
+            root_ino,
         }
     }
 
@@ -128,7 +151,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Resolve an absolute path to its inode.
     pub(crate) async fn resolve(&self, path: &str) -> Result<Ino> {
-        let mut ino = INO_ROOT;
+        let mut ino = self.root_ino;
         for seg in Self::split(path)? {
             ino = self
                 .meta
@@ -145,7 +168,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let (name, dirs) = segs
             .split_last()
             .ok_or_else(|| OrigoFSError::InvalidPath(format!("no basename in {path}")))?;
-        let mut ino = INO_ROOT;
+        let mut ino = self.root_ino;
         for &seg in dirs {
             ino = self
                 .meta
@@ -194,7 +217,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Create a directory and any missing parents (like `mkdir -p`).
     /// Returns the inode of the final component (root for `/`).
     pub async fn mkdir_p(&self, path: &str) -> Result<Ino> {
-        let mut ino = INO_ROOT;
+        let mut ino = self.root_ino;
         for seg in Self::split(path)? {
             match self.meta.lookup(ino, seg).await? {
                 Some(child) => {

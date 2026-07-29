@@ -279,7 +279,7 @@ pub enum VersioningMode {
     Off,
     /// origofs's native content-addressed commit DAG.
     Native,
-    /// Native commit DAG plus git interop: the `origofs-git` bridge exports/imports
+    /// Native commit DAG plus git interop: the `origofs-sdk` `git` module exports/imports
     /// genuine git objects (SHA-1 or SHA-256) so the real `git` CLI can drive it.
     Git,
 }

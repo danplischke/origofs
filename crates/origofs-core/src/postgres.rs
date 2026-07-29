@@ -22,10 +22,15 @@ use async_trait::async_trait;
 use deadpool_postgres::{Manager, Object, Pool};
 use futures::StreamExt;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{AsyncMessage, NoTls, Row};
 
 const DIR_MODE: i64 = 0o040755;
+
+/// The workspace every store is bound to until re-scoped with `with_workspace`;
+/// its root is inode 1. Backfilled by migration V11 (`docs/MULTI_TENANCY.md`).
+const DEFAULT_WORKSPACE: i64 = 1;
 
 /// Advisory-lock key that serializes concurrent schema bootstraps (`init`).
 const MIGRATION_LOCK_KEY: i64 = 0x0af5_0000_dbdb;
@@ -45,6 +50,10 @@ pub struct PostgresMetadataStore {
     /// Kept so [`Self::subscribe`] can open a dedicated `LISTEN` connection
     /// (pooled connections can't surface async notifications).
     dsn: String,
+    /// The workspace this handle is bound to (default = 1). Workspace-scoped
+    /// statements stamp/filter by it; [`PostgresMetadataStore::with_workspace`]
+    /// rebinds a handle sharing this pool (`docs/MULTI_TENANCY.md`).
+    workspace_id: i64,
 }
 
 impl PostgresMetadataStore {
@@ -68,6 +77,7 @@ impl PostgresMetadataStore {
         Ok(Self {
             pool,
             dsn: dsn.to_string(),
+            workspace_id: DEFAULT_WORKSPACE,
         })
     }
 
@@ -76,6 +86,18 @@ impl PostgresMetadataStore {
             .get()
             .await
             .map_err(|e| OrigoFSError::Metadata(e.to_string()))
+    }
+
+    /// A concrete handle to this store bound to `workspace_id`, sharing the same
+    /// pool + DSN. The typed counterpart to [`MetadataStore::with_workspace`], for
+    /// the SDK to re-scope the Postgres-only push feed (`subscribe`) to the
+    /// workspace it is serving (`docs/MULTI_TENANCY.md`).
+    pub fn for_workspace(&self, workspace_id: i64) -> Arc<PostgresMetadataStore> {
+        Arc::new(PostgresMetadataStore {
+            pool: self.pool.clone(),
+            dsn: self.dsn.clone(),
+            workspace_id,
+        })
     }
 
     // A session-level `pg_advisory_lock` helper used to live here (H11). It was
@@ -152,6 +174,7 @@ impl PostgresMetadataStore {
             wakeups: rx,
             cursor: after_seq,
             branch,
+            workspace_id: self.workspace_id,
             driver,
         })
     }
@@ -164,6 +187,9 @@ pub struct EventSubscription {
     wakeups: tokio::sync::mpsc::Receiver<()>,
     cursor: i64,
     branch: Option<String>,
+    /// The workspace this feed is scoped to — the change feed is per-workspace
+    /// (`docs/MULTI_TENANCY.md`), so every drain filters by it.
+    workspace_id: i64,
     /// The task draining the dedicated connection and forwarding NOTIFYs. Held
     /// so it is aborted when the subscription drops, rather than leaked (L5).
     driver: tokio::task::JoinHandle<()>,
@@ -201,8 +227,9 @@ impl EventSubscription {
                 self.client
                     .query(
                         "SELECT seq, actor_id, session_id, kind, path, detail, ts, branch
-                         FROM fs_event WHERE seq > $1 AND branch = $2 ORDER BY seq LIMIT $3",
-                        &[&self.cursor, b, &DRAIN_BATCH],
+                         FROM fs_event WHERE workspace_id = $1 AND seq > $2 AND branch = $3
+                         ORDER BY seq LIMIT $4",
+                        &[&self.workspace_id, &self.cursor, b, &DRAIN_BATCH],
                     )
                     .await
             }
@@ -210,8 +237,8 @@ impl EventSubscription {
                 self.client
                     .query(
                         "SELECT seq, actor_id, session_id, kind, path, detail, ts, branch
-                         FROM fs_event WHERE seq > $1 ORDER BY seq LIMIT $2",
-                        &[&self.cursor, &DRAIN_BATCH],
+                         FROM fs_event WHERE workspace_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+                        &[&self.workspace_id, &self.cursor, &DRAIN_BATCH],
                     )
                     .await
             }
@@ -228,7 +255,10 @@ impl EventSubscription {
             // so we don't rescan the same non-matching rows every wakeup.
             let max: Option<i64> = self
                 .client
-                .query_opt("SELECT max(seq) FROM fs_event", &[])
+                .query_opt(
+                    "SELECT max(seq) FROM fs_event WHERE workspace_id = $1",
+                    &[&self.workspace_id],
+                )
                 .await
                 .map_err(|e| OrigoFSError::Metadata(e.to_string()))?
                 .and_then(|row| row.get(0));
@@ -510,6 +540,29 @@ fn row_to_inode(r: &Row) -> Result<Inode> {
     })
 }
 
+/// Clear only workspace `ws`'s working tree (checkout/merge/rebuild). Mirrors the
+/// SQLite helper: `dentry`/`symlink` carry no `workspace_id`, so they are cleared
+/// via inode ownership; the workspace's own root inode is kept.
+async fn truncate_workspace_tree_pg(c: &tokio_postgres::Client, ws: i64) -> Result<()> {
+    c.execute(
+        "DELETE FROM dentry WHERE parent_ino IN (SELECT ino FROM inode WHERE workspace_id = $1)",
+        &[&ws],
+    )
+    .await?;
+    c.execute(
+        "DELETE FROM symlink WHERE ino IN (SELECT ino FROM inode WHERE workspace_id = $1)",
+        &[&ws],
+    )
+    .await?;
+    c.execute(
+        "DELETE FROM inode WHERE workspace_id = $1
+           AND ino <> (SELECT root_ino FROM workspace WHERE id = $1)",
+        &[&ws],
+    )
+    .await?;
+    Ok(())
+}
+
 #[async_trait]
 impl MetadataStore for PostgresMetadataStore {
     async fn init(&self) -> Result<()> {
@@ -546,8 +599,8 @@ impl MetadataStore for PostgresMetadataStore {
         }
         // Root directory (ino=1), then advance the identity sequence past it.
         tx.execute(
-            "INSERT INTO inode(ino, kind, mode, nlink, size, content_hash, mtime, ctime)
-             VALUES (1, 'dir', $1, 1, 0, NULL, $2, $2) ON CONFLICT (ino) DO NOTHING",
+            "INSERT INTO inode(ino, workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+             VALUES (1, 1, 'dir', $1, 1, 0, NULL, $2, $2) ON CONFLICT (ino) DO NOTHING",
             &[&DIR_MODE, &now],
         )
         .await?;
@@ -579,7 +632,10 @@ impl MetadataStore for PostgresMetadataStore {
         // the pool only on commit or rollback.
         let obj = self.client().await?;
         obj.batch_execute("BEGIN").await?;
-        Ok(Box::new(PostgresTxn { obj: Some(obj) }))
+        Ok(Box::new(PostgresTxn {
+            obj: Some(obj),
+            workspace_id: self.workspace_id,
+        }))
     }
 
     async fn get_inode(&self, ino: Ino) -> Result<Option<Inode>> {
@@ -603,9 +659,9 @@ impl MetadataStore for PostgresMetadataStore {
         let mode = init.mode as i64;
         let row = c
             .query_one(
-                "INSERT INTO inode(kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES ($1, $2, 1, 0, NULL, $3, $3) RETURNING ino",
-                &[&init.kind.as_str(), &mode, &now],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4) RETURNING ino",
+                &[&self.workspace_id, &init.kind.as_str(), &mode, &now],
             )
             .await?;
         Ok(row.get(0))
@@ -739,7 +795,10 @@ impl MetadataStore for PostgresMetadataStore {
     async fn get_ref(&self, name: &str) -> Result<Option<String>> {
         let c = self.client().await?;
         let row = c
-            .query_opt("SELECT value FROM ref WHERE name = $1", &[&name])
+            .query_opt(
+                "SELECT value FROM ref WHERE workspace_id = $1 AND name = $2",
+                &[&self.workspace_id, &name],
+            )
             .await?;
         Ok(row.map(|r| r.get(0)))
     }
@@ -747,9 +806,9 @@ impl MetadataStore for PostgresMetadataStore {
     async fn set_ref(&self, name: &str, value: &str) -> Result<()> {
         let c = self.client().await?;
         c.execute(
-            "INSERT INTO ref(name, value) VALUES ($1, $2)
-             ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
-            &[&name, &value],
+            "INSERT INTO ref(workspace_id, name, value) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, name) DO UPDATE SET value = EXCLUDED.value",
+            &[&self.workspace_id, &name, &value],
         )
         .await?;
         Ok(())
@@ -760,15 +819,16 @@ impl MetadataStore for PostgresMetadataStore {
         let changed = match expect {
             None => {
                 c.execute(
-                    "INSERT INTO ref(name, value) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
-                    &[&name, &new],
+                    "INSERT INTO ref(workspace_id, name, value) VALUES ($1, $2, $3)
+                     ON CONFLICT (workspace_id, name) DO NOTHING",
+                    &[&self.workspace_id, &name, &new],
                 )
                 .await?
             }
             Some(v) => {
                 c.execute(
-                    "UPDATE ref SET value = $1 WHERE name = $2 AND value = $3",
-                    &[&new, &name, &v],
+                    "UPDATE ref SET value = $1 WHERE workspace_id = $2 AND name = $3 AND value = $4",
+                    &[&new, &self.workspace_id, &name, &v],
                 )
                 .await?
             }
@@ -778,15 +838,21 @@ impl MetadataStore for PostgresMetadataStore {
 
     async fn delete_ref(&self, name: &str) -> Result<()> {
         let c = self.client().await?;
-        c.execute("DELETE FROM ref WHERE name = $1", &[&name])
-            .await?;
+        c.execute(
+            "DELETE FROM ref WHERE workspace_id = $1 AND name = $2",
+            &[&self.workspace_id, &name],
+        )
+        .await?;
         Ok(())
     }
 
     async fn list_refs(&self) -> Result<Vec<(String, String)>> {
         let c = self.client().await?;
         let rows = c
-            .query("SELECT name, value FROM ref ORDER BY name", &[])
+            .query(
+                "SELECT name, value FROM ref WHERE workspace_id = $1 ORDER BY name",
+                &[&self.workspace_id],
+            )
             .await?;
         Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
     }
@@ -794,7 +860,10 @@ impl MetadataStore for PostgresMetadataStore {
     async fn get_config(&self, key: &str) -> Result<Option<String>> {
         let c = self.client().await?;
         let row = c
-            .query_opt("SELECT value FROM config WHERE key = $1", &[&key])
+            .query_opt(
+                "SELECT value FROM config WHERE workspace_id = $1 AND key = $2",
+                &[&self.workspace_id, &key],
+            )
             .await?;
         Ok(row.map(|r| r.get(0)))
     }
@@ -802,9 +871,9 @@ impl MetadataStore for PostgresMetadataStore {
     async fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let c = self.client().await?;
         c.execute(
-            "INSERT INTO config(key, value) VALUES ($1, $2)
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            &[&key, &value],
+            "INSERT INTO config(workspace_id, key, value) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, key) DO UPDATE SET value = EXCLUDED.value",
+            &[&self.workspace_id, &key, &value],
         )
         .await?;
         Ok(())
@@ -815,34 +884,94 @@ impl MetadataStore for PostgresMetadataStore {
         // One atomic upsert: create at 1, else increment the stored integer.
         let row = c
             .query_one(
-                "INSERT INTO config(key, value) VALUES ($1, '1')
-                 ON CONFLICT (key) DO UPDATE SET value = (config.value::bigint + 1)::text
+                "INSERT INTO config(workspace_id, key, value) VALUES ($1, $2, '1')
+                 ON CONFLICT (workspace_id, key) DO UPDATE SET value = (config.value::bigint + 1)::text
                  RETURNING value::bigint",
-                &[&key],
+                &[&self.workspace_id, &key],
             )
             .await?;
         Ok(row.get(0))
     }
 
-    async fn truncate_tree(&self) -> Result<()> {
-        let c = self.client().await?;
-        // Blame is keyed by content hash (blob_blame), not by inode, so it is
-        // deliberately not cleared here — a rematerialized tree points its inodes
-        // back at the same content and its blame comes with it.
-        c.batch_execute(
-            "DELETE FROM dentry; DELETE FROM symlink;
-             DELETE FROM inode WHERE ino <> 1;",
+    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore> {
+        Arc::new(PostgresMetadataStore {
+            pool: self.pool.clone(),
+            dsn: self.dsn.clone(),
+            workspace_id,
+        })
+    }
+
+    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)> {
+        let mut c = self.client().await?;
+        let now = now_secs();
+        let tx = c.transaction().await?;
+        // Reserve the row (fails on a duplicate name), give it its own root
+        // directory inode, then point the row at that inode — all atomic.
+        let id: i64 = match tx
+            .query_one(
+                "INSERT INTO workspace(name, root_ino, created_at) VALUES ($1, 0, $2) RETURNING id",
+                &[&name, &now],
+            )
+            .await
+        {
+            Ok(row) => row.get(0),
+            Err(e) if e.code() == Some(&SqlState::UNIQUE_VIOLATION) => {
+                return Err(OrigoFSError::AlreadyExists(format!("workspace {name}")));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mode = DIR_MODE;
+        let root_ino: i64 = tx
+            .query_one(
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+                 VALUES ($1, 'dir', $2, 1, 0, NULL, $3, $3) RETURNING ino",
+                &[&id, &mode, &now],
+            )
+            .await?
+            .get(0);
+        tx.execute(
+            "UPDATE workspace SET root_ino = $1 WHERE id = $2",
+            &[&root_ino, &id],
         )
         .await?;
+        tx.commit().await?;
+        Ok((id, root_ino))
+    }
+
+    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT id, root_ino FROM workspace WHERE name = $1",
+                &[&name],
+            )
+            .await?;
+        Ok(row.map(|r| (r.get(0), r.get(1))))
+    }
+
+    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>> {
+        let c = self.client().await?;
+        let rows = c
+            .query("SELECT id, name, root_ino FROM workspace ORDER BY id", &[])
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
+    }
+
+    async fn truncate_tree(&self) -> Result<()> {
+        let c = self.client().await?;
+        truncate_workspace_tree_pg(&c, self.workspace_id).await?;
         Ok(())
     }
 
     async fn set_conflict(&self, path: &str, kind: &str) -> Result<()> {
         let c = self.client().await?;
         c.execute(
-            "INSERT INTO conflict(path, kind) VALUES ($1, $2)
-             ON CONFLICT (path) DO UPDATE SET kind = EXCLUDED.kind",
-            &[&path, &kind],
+            "INSERT INTO conflict(workspace_id, path, kind) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, path) DO UPDATE SET kind = EXCLUDED.kind",
+            &[&self.workspace_id, &path, &kind],
         )
         .await?;
         Ok(())
@@ -851,14 +980,21 @@ impl MetadataStore for PostgresMetadataStore {
     async fn list_conflicts(&self) -> Result<Vec<(String, String)>> {
         let c = self.client().await?;
         let rows = c
-            .query("SELECT path, kind FROM conflict ORDER BY path", &[])
+            .query(
+                "SELECT path, kind FROM conflict WHERE workspace_id = $1 ORDER BY path",
+                &[&self.workspace_id],
+            )
             .await?;
         Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
     async fn clear_conflicts(&self) -> Result<()> {
         let c = self.client().await?;
-        c.execute("DELETE FROM conflict", &[]).await?;
+        c.execute(
+            "DELETE FROM conflict WHERE workspace_id = $1",
+            &[&self.workspace_id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -866,9 +1002,9 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let changed = c
             .execute(
-                "INSERT INTO file_lock(path, owner, acquired_at) VALUES ($1, $2, $3)
-                 ON CONFLICT (path) DO NOTHING",
-                &[&path, &owner, &at],
+                "INSERT INTO file_lock(workspace_id, path, owner, acquired_at) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (workspace_id, path) DO NOTHING",
+                &[&self.workspace_id, &path, &owner, &at],
             )
             .await?;
         Ok(changed == 1)
@@ -878,8 +1014,8 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let changed = c
             .execute(
-                "DELETE FROM file_lock WHERE path = $1 AND owner = $2",
-                &[&path, &owner],
+                "DELETE FROM file_lock WHERE workspace_id = $1 AND path = $2 AND owner = $3",
+                &[&self.workspace_id, &path, &owner],
             )
             .await?;
         Ok(changed == 1)
@@ -889,8 +1025,8 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let rows = c
             .query(
-                "SELECT path, owner, acquired_at FROM file_lock ORDER BY path",
-                &[],
+                "SELECT path, owner, acquired_at FROM file_lock WHERE workspace_id = $1 ORDER BY path",
+                &[&self.workspace_id],
             )
             .await?;
         Ok(rows
@@ -1043,10 +1179,10 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let row = c
             .query_one(
-                "INSERT INTO edit_op(session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
+                "INSERT INTO edit_op(workspace_id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
                 &[
-                    &op.session_id, &op.actor_id, &op.tool_call_id, &op.ino, &op.path, &op.op,
+                    &self.workspace_id, &op.session_id, &op.actor_id, &op.tool_call_id, &op.ino, &op.path, &op.op,
                     &op.byte_start, &op.byte_len, &op.pre_hash, &op.post_hash, &op.ts,
                 ],
             )
@@ -1059,8 +1195,8 @@ impl MetadataStore for PostgresMetadataStore {
         let rows = c
             .query(
                 "SELECT id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts
-                 FROM edit_op WHERE actor_id = $1 AND ($2::bigint IS NULL OR session_id = $2::bigint) ORDER BY id",
-                &[&actor_id, &session_id],
+                 FROM edit_op WHERE workspace_id = $1 AND actor_id = $2 AND ($3::bigint IS NULL OR session_id = $3::bigint) ORDER BY id",
+                &[&self.workspace_id, &actor_id, &session_id],
             )
             .await?;
         Ok(rows
@@ -1086,9 +1222,9 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let hex = content.to_hex();
         c.execute(
-            "INSERT INTO blob_blame(content_hash, runs) VALUES ($1, $2)
-             ON CONFLICT (content_hash) DO UPDATE SET runs = EXCLUDED.runs",
-            &[&hex, &runs],
+            "INSERT INTO blob_blame(workspace_id, content_hash, runs) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, content_hash) DO UPDATE SET runs = EXCLUDED.runs",
+            &[&self.workspace_id, &hex, &runs],
         )
         .await?;
         Ok(())
@@ -1099,8 +1235,8 @@ impl MetadataStore for PostgresMetadataStore {
         let hex = content.to_hex();
         let row = c
             .query_opt(
-                "SELECT runs FROM blob_blame WHERE content_hash = $1",
-                &[&hex],
+                "SELECT runs FROM blob_blame WHERE workspace_id = $1 AND content_hash = $2",
+                &[&self.workspace_id, &hex],
             )
             .await?;
         Ok(row.map(|r| r.get(0)))
@@ -1125,9 +1261,10 @@ impl MetadataStore for PostgresMetadataStore {
             .await?;
         let row = tx
             .query_one(
-                "INSERT INTO fs_event(actor_id, session_id, kind, path, detail, ts, branch)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING seq",
+                "INSERT INTO fs_event(workspace_id, actor_id, session_id, kind, path, detail, ts, branch)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING seq",
                 &[
+                    &self.workspace_id,
                     &ev.actor_id,
                     &ev.session_id,
                     &ev.kind,
@@ -1155,8 +1292,8 @@ impl MetadataStore for PostgresMetadataStore {
         let rows = c
             .query(
                 "SELECT seq, actor_id, session_id, kind, path, detail, ts, branch FROM fs_event
-                 WHERE seq > $1 ORDER BY seq LIMIT $2",
-                &[&after_seq, &limit],
+                 WHERE workspace_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+                &[&self.workspace_id, &after_seq, &limit],
             )
             .await?;
         Ok(rows.iter().map(row_to_event).collect())
@@ -1171,10 +1308,11 @@ impl MetadataStore for PostgresMetadataStore {
     ) -> Result<()> {
         let c = self.client().await?;
         c.execute(
-            "INSERT INTO presence(session_id, actor_id, path, last_seen) VALUES ($1, $2, $3, $4)
+            "INSERT INTO presence(session_id, workspace_id, actor_id, path, last_seen) VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (session_id) DO UPDATE SET
-                 actor_id = EXCLUDED.actor_id, path = EXCLUDED.path, last_seen = EXCLUDED.last_seen",
-            &[&session_id, &actor_id, &path, &at],
+                 workspace_id = EXCLUDED.workspace_id, actor_id = EXCLUDED.actor_id,
+                 path = EXCLUDED.path, last_seen = EXCLUDED.last_seen",
+            &[&session_id, &self.workspace_id, &actor_id, &path, &at],
         )
         .await?;
         Ok(())
@@ -1186,8 +1324,8 @@ impl MetadataStore for PostgresMetadataStore {
             .query(
                 "SELECT p.session_id, p.actor_id, a.display_name, a.kind, p.path, p.last_seen
                  FROM presence p JOIN actor a ON a.id = p.actor_id
-                 WHERE p.last_seen >= $1 ORDER BY p.last_seen DESC",
-                &[&since_ts],
+                 WHERE p.workspace_id = $1 AND p.last_seen >= $2 ORDER BY p.last_seen DESC",
+                &[&self.workspace_id, &since_ts],
             )
             .await?;
         Ok(rows
@@ -1208,8 +1346,13 @@ impl MetadataStore for PostgresMetadataStore {
 
     async fn reap_presence(&self, older_than: i64) -> Result<u64> {
         let c = self.client().await?;
+        // Scoped to this workspace (see the SQLite twin): a store-wide reap would
+        // evict other workspaces' presence rows, including their live sessions.
         let n = c
-            .execute("DELETE FROM presence WHERE last_seen < $1", &[&older_than])
+            .execute(
+                "DELETE FROM presence WHERE workspace_id = $1 AND last_seen < $2",
+                &[&self.workspace_id, &older_than],
+            )
             .await?;
         Ok(n)
     }
@@ -1218,10 +1361,11 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let row = c
             .query_one(
-                "INSERT INTO suggestion(actor_id, session_id, branch, path, base_hash,
+                "INSERT INTO suggestion(workspace_id, actor_id, session_id, branch, path, base_hash,
                      proposed_hash, summary, status, created_ts)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
                 &[
+                    &self.workspace_id,
                     &init.actor_id,
                     &init.session_id,
                     &init.branch,
@@ -1243,8 +1387,8 @@ impl MetadataStore for PostgresMetadataStore {
             .query_opt(
                 "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
                      summary, status, created_ts, resolved_ts, resolved_by
-                 FROM suggestion WHERE id = $1",
-                &[&id],
+                 FROM suggestion WHERE id = $1 AND workspace_id = $2",
+                &[&id, &self.workspace_id],
             )
             .await?;
         Ok(row.as_ref().map(row_to_suggestion))
@@ -1262,9 +1406,9 @@ impl MetadataStore for PostgresMetadataStore {
                 "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
                      summary, status, created_ts, resolved_ts, resolved_by
                  FROM suggestion
-                 WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR path = $2)
+                 WHERE workspace_id = $1 AND ($2::text IS NULL OR status = $2) AND ($3::text IS NULL OR path = $3)
                  ORDER BY id DESC",
-                &[&st, &path],
+                &[&self.workspace_id, &st, &path],
             )
             .await?;
         Ok(rows.iter().map(row_to_suggestion).collect())
@@ -1281,8 +1425,8 @@ impl MetadataStore for PostgresMetadataStore {
         let n = c
             .execute(
                 "UPDATE suggestion SET status = $1, resolved_by = $2, resolved_ts = $3
-                 WHERE id = $4 AND status = 'pending'",
-                &[&status.as_str(), &resolved_by, &ts, &id],
+                 WHERE id = $4 AND workspace_id = $5 AND status = 'pending'",
+                &[&status.as_str(), &resolved_by, &ts, &id, &self.workspace_id],
             )
             .await?;
         Ok(n == 1)
@@ -1297,6 +1441,8 @@ impl MetadataStore for PostgresMetadataStore {
 struct PostgresTxn {
     /// `Some` while open; `commit`/`Drop` take it to close exactly once.
     obj: Option<Object>,
+    /// The workspace this txn is scoped to (inherited from the store handle).
+    workspace_id: i64,
 }
 
 impl PostgresTxn {
@@ -1310,12 +1456,13 @@ impl MetaTxn for PostgresTxn {
     async fn create_inode(&mut self, init: InodeInit) -> Result<Ino> {
         let now = now_secs();
         let mode = init.mode as i64;
+        let ws = self.workspace_id;
         let row = self
             .conn()
             .query_one(
-                "INSERT INTO inode(kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES ($1, $2, 1, 0, NULL, $3, $3) RETURNING ino",
-                &[&init.kind.as_str(), &mode, &now],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4) RETURNING ino",
+                &[&ws, &init.kind.as_str(), &mode, &now],
             )
             .await?;
         Ok(row.get(0))
@@ -1416,25 +1563,27 @@ impl MetaTxn for PostgresTxn {
     }
 
     async fn set_blob_blame(&mut self, content: &Hash, runs: &str) -> Result<()> {
+        let ws = self.workspace_id;
         let hex = content.to_hex();
         self.conn()
             .execute(
-                "INSERT INTO blob_blame(content_hash, runs) VALUES ($1, $2)
-                 ON CONFLICT (content_hash) DO UPDATE SET runs = EXCLUDED.runs",
-                &[&hex, &runs],
+                "INSERT INTO blob_blame(workspace_id, content_hash, runs) VALUES ($1, $2, $3)
+                 ON CONFLICT (workspace_id, content_hash) DO UPDATE SET runs = EXCLUDED.runs",
+                &[&ws, &hex, &runs],
             )
             .await?;
         Ok(())
     }
 
     async fn append_edit_op(&mut self, op: EditOpInit) -> Result<i64> {
+        let ws = self.workspace_id;
         let row = self
             .conn()
             .query_one(
-                "INSERT INTO edit_op(session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
+                "INSERT INTO edit_op(workspace_id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
                 &[
-                    &op.session_id, &op.actor_id, &op.tool_call_id, &op.ino, &op.path, &op.op,
+                    &ws, &op.session_id, &op.actor_id, &op.tool_call_id, &op.ino, &op.path, &op.op,
                     &op.byte_start, &op.byte_len, &op.pre_hash, &op.post_hash, &op.ts,
                 ],
             )
@@ -1444,12 +1593,8 @@ impl MetaTxn for PostgresTxn {
 
     async fn truncate_tree(&mut self) -> Result<()> {
         // Same as MetadataStore::truncate_tree, staged in this transaction.
-        self.conn()
-            .batch_execute(
-                "DELETE FROM dentry; DELETE FROM symlink;
-                 DELETE FROM inode WHERE ino <> 1;",
-            )
-            .await?;
+        let ws = self.workspace_id;
+        truncate_workspace_tree_pg(self.conn(), ws).await?;
         Ok(())
     }
 

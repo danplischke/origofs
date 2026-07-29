@@ -692,3 +692,50 @@ code {
   border-color: var(--del-ink);
   color: var(--del-ink);
 }
+
+/* --- live co-editing pane -------------------------------------------------- */
+.coedit-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  gap: 8px;
+}
+.coedit-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted, #667);
+}
+.coedit-status .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.coedit-status .dot-on {
+  background: #2ecc71;
+}
+.coedit-status .dot-off {
+  background: #e0a800;
+}
+.coedit-peers {
+  color: var(--fg, #223);
+}
+.coedit-hint {
+  color: var(--muted, #99a);
+}
+.coedit-textarea {
+  flex: 1;
+  width: 100%;
+  min-height: 320px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 12px;
+  border: 1px solid var(--border, #dde);
+  border-radius: 8px;
+  box-sizing: border-box;
+}

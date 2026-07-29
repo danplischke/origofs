@@ -1747,7 +1747,7 @@ impl Workspace {
         let ws = self.inner.clone();
         let mp = mountpoint.clone();
         let session = py
-            .detach(move || origofs_fuse::spawn(ws, Path::new(&mp)))
+            .detach(move || origofs_sdk::fuse::spawn(ws, Path::new(&mp)))
             .map_err(io_err)?;
         Ok(Mount {
             session: Some(session),
@@ -1770,7 +1770,7 @@ impl Workspace {
     fn serve_nfs<'py>(&self, py: Python<'py>, addr: String) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            origofs_nfs::serve(ws, &addr).await.map_err(io_err)?;
+            origofs_sdk::nfs::serve(ws, &addr).await.map_err(io_err)?;
             Ok(())
         })
     }
@@ -1788,7 +1788,7 @@ impl Workspace {
 #[cfg(unix)]
 #[pyfunction]
 fn fuse_mountable() -> bool {
-    origofs_fuse::mountable()
+    origofs_sdk::fuse::mountable()
 }
 
 #[cfg(not(unix))]

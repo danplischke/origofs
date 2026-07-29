@@ -27,10 +27,12 @@ pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
 # FUSE mount + NFS serving are Unix-only; gating them here lets the extension
 # build on Windows (exposing the portable surface: files, versioning,
 # attribution, suggestions, the feed, and every backend). The mount/serve_nfs
-# methods raise a clear error on platforms without them.
+# methods raise a clear error on platforms without them. They are now feature-
+# gated modules of the sdk, enabled here — Cargo unions these features with the
+# base `coedit` above, so on Unix the extension gets coedit + fuse + nfs.
 [target.'cfg(unix)'.dependencies]
-origofs-fuse = { version = "0.0.0", path = "../origofs-fuse" }
-origofs-nfs = { version = "0.0.0", path = "../origofs-nfs" }
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk", features = ["fuse", "nfs"] }
+# `fuser::BackgroundSession` is held directly in a pyclass field (src/lib.rs).
 fuser = "0.17"
 
 [features]

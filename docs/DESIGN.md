@@ -601,7 +601,9 @@ Each milestone is independently demoable; M1+M2+M3 in either order after M0.
 - **Semantic/structured merge** scope (which file types get AST merge) — start text-only, add JSON later.
 - **CRDT ↔ commit reconciliation** — exact checkpoint cadence and how CRDT history maps into the op-log.
 - **Multi-tenant dedup vs. privacy** — convergent encryption default (per-workspace keys = no cross-tenant
-  dedup) vs. global dedup.
+  dedup) vs. global dedup. See `docs/MULTI_TENANCY.md` for the full tenancy concept: it rules for
+  per-tenant isolation by default (silo metadata + key-separated content) and treats global cross-tenant
+  dedup as an explicit, trust-scoped opt-in because a shared convergent store is a cross-tenant existence oracle.
 - **Blame at massive scale** — coalescing keeps it small, but confirm with a benchmark on multi-GB files.
 - **Consistency knob** — is close-to-open enough for all agent workflows, or do some need linearizable reads?
 - **git-mode fidelity** — SHA-256 git objects + LFS pointers vs. what GitHub/hosts currently accept; confirm host
