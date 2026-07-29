@@ -21,6 +21,10 @@ path = "src/bin/git-remote-origofs.rs"
 origofs-sdk = { version = "0.1.0", path = "../origofs-sdk", features = ["full"] }
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
+# Config-file backend selection (`--config`): pick Postgres/S3/GCS for the
+# shipped `serve`/`nfs`/`mcp`/`mount` daemons instead of only local SQLite.
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.8"
 tracing = "0.1"
 # The CLI is the binary that installs a tracing subscriber for the library's
 # spans/events; writes to stderr so `origofs mcp` keeps stdout for JSON-RPC.

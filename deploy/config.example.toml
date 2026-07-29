@@ -1,0 +1,34 @@
+# origofs backend configuration — pass with `origofs --config <file>`.
+#
+# Without a config, origofs uses a local SQLite + local-CAS workspace under
+# `--workspace`. This file selects the metadata store and content store instead,
+# so the shipped `origofs serve` / `nfs` / `mcp` / `mount` daemons can front a
+# production (Postgres + object-store) backend with no custom host program.
+#
+# Encryption at rest (ORIGOFS_ENCRYPTION_KEY) is currently supported only with
+# the sqlite + local backend; it is rejected with any other backend here.
+
+# --- metadata store ---------------------------------------------------------
+# backend = "sqlite"   # solo/offline (the default)
+#   path = "/data/meta.db"        # optional; default <workspace>/meta.db
+# backend = "postgres" # multi-writer/production
+[metadata]
+backend = "postgres"
+dsn = "host=postgres user=origofs password=origofs dbname=origofs"
+
+# --- content store ----------------------------------------------------------
+# backend = "local"    # a sharded directory (default <workspace>/cas)
+#   path = "/data/cas"
+# backend = "s3"       # S3 / R2 / MinIO, or GCS via S3 interop
+# backend = "gcs"      # native Google Cloud Storage (JSON API + OAuth2)
+[content]
+backend = "s3"
+bucket = "origofs-content"
+region = "us-east-1"
+# endpoint = "http://minio:9000"  # for MinIO / R2 / a custom endpoint
+# allow_http = true               # only with a custom endpoint (e.g. MinIO over HTTP)
+# access_key_id = "..."           # omit to use the ambient AWS credential chain
+# secret_access_key = "..."
+# prefix = "objects"              # key prefix (default "objects")
+packed = true                     # batch chunks into pack objects (recommended for object stores)
+# index_dir = "/data/index"       # per-chunk pack index (default <workspace>/index)
