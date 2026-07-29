@@ -1919,6 +1919,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "origofs-embed-example"
+version = "0.1.0"
+dependencies = [
+ "origofs-sdk",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "origofs-py"
 version = "0.0.0"
 dependencies = [

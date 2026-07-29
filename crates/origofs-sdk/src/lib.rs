@@ -5,7 +5,16 @@
 //! tier). Both sides are `Arc<dyn …>`, so the backend is chosen at runtime. Later
 //! milestones add commits and attribution behind the same façade.
 
-use origofs_core::{
+// The engine vocabulary, re-exported rather than merely imported: a downstream
+// crate must be able to *name* what this crate's public signatures mention.
+// `fs()` returns a `Fs<…>`, fallible methods return `Result<…>`, and
+// `Workspace::open` takes the two store traits — so all of them are part of this
+// crate's public API whether or not they are declared here. Without the
+// `pub`, an embedder cannot write a signature over `fs()`, cannot use `Result`
+// in their own helpers, and cannot implement a backend at all. See
+// `examples/embed`, which exercises exactly that and would stop compiling if
+// these went private again.
+pub use origofs_core::{
     ContentStore, Fs, LocalCasStore, MetadataStore, PostgresMetadataStore, Result,
     SqliteMetadataStore,
 };
@@ -14,19 +23,24 @@ use std::sync::Arc;
 
 pub use bytes::Bytes;
 pub use futures::stream::BoxStream;
+/// The `#[async_trait]` attribute, re-exported so implementing [`MetadataStore`]
+/// or [`ContentStore`] needs no separate `async-trait` dependency — and, more
+/// importantly, cannot pick a version that disagrees with the one the traits
+/// were declared with.
+pub use origofs_core::async_trait;
 /// The emit-only metrics facade (`metrics` feature). A library only *records*;
 /// the binary installs an exporter and hands its renderer to
 /// [`api::set_metrics_renderer`], exactly as it installs a tracing subscriber.
 #[cfg(feature = "metrics")]
 pub use origofs_core::metrics;
 pub use origofs_core::{
-    Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DiffEntry, DiffStatus, DirEntry,
-    DirEntryAttr, DirPage, EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind,
-    GcStats, GcsConfig, Hash, Inode, LiveDoc, MemStore, MergeOutcome, ObjectContentStore,
-    OrigoFSError, PackStore, Passage, PassageOptions, Presence, RebuildReport, ResyncOutcome,
-    ResyncReport, S3Config, Segmentation, Suggestion, SuggestionContent, SuggestionInit,
-    SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats, VerifyingStore,
-    VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    Actor, ActorInit, ActorKind, BackendOrigin, BlameRange, CommitInfo, Conflict, DiffEntry,
+    DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, EncryptedStore, ErrorClass, Event,
+    EventInit, EventSubscription, FileKind, GcStats, GcsConfig, Hash, Inode, LiveDoc, MemStore,
+    MergeOutcome, MetaTxn, ObjectContentStore, OrigoFSError, PackStore, Passage, PassageOptions,
+    Presence, RebuildReport, ResyncOutcome, ResyncReport, S3Config, Segmentation, Suggestion,
+    SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit,
+    TransferStats, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
 #[cfg(feature = "coedit")]
 pub use origofs_core::{COEDIT_SIDECAR_DIR, CoeditDoc, CoeditRelayNote, CoeditRelaySub};

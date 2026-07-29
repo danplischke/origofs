@@ -1,0 +1,15 @@
+[package]
+name = "origofs-embed-example"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Deliberately depends on `origofs-sdk` ONLY. A downstream crate should never
+# need `origofs-core` to use the SDK's own public signatures — this example is
+# the compile-time proof of that, so do not add it here to "fix" a build break.
+# If this stops compiling, the SDK stopped re-exporting something it exposes.
+[dependencies]
+origofs-sdk = { path = "../../crates/origofs-sdk" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3.27.0"

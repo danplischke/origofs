@@ -38,6 +38,13 @@ mod util;
 pub mod version;
 pub mod vfs;
 
+/// The `#[async_trait]` attribute the [`MetadataStore`] and [`ContentStore`]
+/// traits are declared with. Re-exported because implementing either trait
+/// outside this crate requires the *same* `async-trait` version: a downstream
+/// crate that picks its own can get a mismatched desugaring, so it should reach
+/// for this one rather than declare the dependency itself.
+pub use async_trait::async_trait;
+
 pub use attribution::{
     Actor, ActorInit, ActorKind, BlameRange, EditOp, ToolCallInit, WriteCtx, WritePolicy,
 };

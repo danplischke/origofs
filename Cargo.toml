@@ -1,6 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/origofs-core", "crates/origofs-sdk", "crates/origofs-cli", "crates/origofs-py"]
+members = [
+    "crates/origofs-core",
+    "crates/origofs-sdk",
+    "crates/origofs-cli",
+    "crates/origofs-py",
+    # A third-party-shaped consumer of `origofs-sdk`, kept in the workspace so
+    # `cargo build --workspace` / `clippy --all-targets` compile the *embedding*
+    # path too. Nothing depends on it; it exists to fail loudly if the SDK stops
+    # exporting something its own public API mentions. Not published.
+    "examples/embed",
+]
 
 [workspace.package]
 version = "0.0.0"

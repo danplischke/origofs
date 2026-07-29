@@ -506,6 +506,28 @@ origofs --workspace "$WS" gc     # run when idle — not safe alongside active w
 | **Overlay mount** | Running an agent live in a fast native mount |
 | **FUSE / NFS** | Mounting the workspace as a POSIX filesystem |
 
+Embedding from Rust needs one dependency — `origofs-sdk` re-exports everything
+its own signatures mention (`Fs`, `Result`, `MetadataStore`, `ContentStore`, the
+concrete stores, and the `#[async_trait]` the traits are declared with), so a
+consumer never reaches for `origofs-core`:
+
+```rust
+use origofs_sdk::{ContentStore, MetadataStore, SqliteMetadataStore, Workspace, WriteCtx};
+use std::sync::Arc;
+
+// A convenience constructor, or wire the two backends yourself:
+let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open("meta.db")?);
+let content: Arc<dyn ContentStore> = Arc::new(my_own_backend);   // impl ContentStore
+let ws = Workspace::open(meta, content).await?;
+
+ws.write_as(WriteCtx::actor(actor_id), "/notes.md", b"hello").await?;  // → blame
+```
+
+[`examples/embed`](examples/embed) is a complete, compiling version of that — a
+workspace member depending on `origofs-sdk` alone, including a custom
+`ContentStore` implementation — so the embedding path is covered by
+`cargo build --workspace` rather than only by documentation.
+
 Python, for example, keeps every I/O method awaitable so it composes with
 FastAPI, and lets you inject the user/agent behind each write:
 

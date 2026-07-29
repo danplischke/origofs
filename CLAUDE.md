@@ -179,6 +179,13 @@ opt-in, feature-gated **modules of `origofs-sdk`** (default-off, so a plain
 | `origofs-cli` | The `origofs` binary **and** the `git-remote-origofs` helper (clap). A thin shell over `origofs-sdk` with all surfaces (`full`) enabled; the best index of what the system can do. (`edition 2024`) |
 | `origofs-py` | pyo3/maturin bindings: async-native (`await` every I/O), a FastAPI router (`origofs.fastapi`), and overlay orchestration (`origofs.overlay`). Enables `origofs-sdk`'s `coedit` (always) + `fuse`/`nfs` (on Unix). |
 
+A fifth workspace member, `examples/embed`, is **not** part of the library: it is
+a third-party-shaped consumer that depends on `origofs-sdk` alone (never
+`origofs-core`) and implements a custom `ContentStore`. It is in the workspace so
+`cargo build --workspace` compiles the *embedding* path — if `origofs-sdk` stops
+re-exporting a type its own public signatures mention, that example is what
+fails. Don't add `origofs-core` to it to fix a build break; fix the re-export.
+
 ### `origofs-sdk` access-surface features
 
 Each is a module under `crates/origofs-sdk/src/`, gated by the matching feature
