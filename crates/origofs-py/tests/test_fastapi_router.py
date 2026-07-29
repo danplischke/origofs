@@ -288,6 +288,51 @@ def test_read_file_streams_large_content_correctly():
     assert r.content == content
 
 
+class _FlakyReadRangeProxy:
+    """Forwards everything to a real Workspace except read_range, which fails
+    on its Nth call -- simulating a concurrent delete/change mid-stream. A
+    real compiled Workspace doesn't allow attribute assignment (`ws.read_range
+    = ...` raises AttributeError: read-only), so this wraps it instead;
+    build_router accepts "any object with the same async methods"."""
+
+    def __init__(self, real, fail_on_call: int):
+        self._real = real
+        self._fail_on_call = fail_on_call
+        self.calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    async def read_range(self, path, off, length):
+        self.calls += 1
+        if self.calls == self._fail_on_call:
+            raise FileNotFoundError(path)
+        return await self._real.read_range(path, off, length)
+
+
+def test_read_file_streaming_ends_cleanly_on_a_mid_stream_error():
+    # Regression test: the chunked-reassembly generator's read_range() call
+    # wasn't wrapped in error handling, so a concurrent delete/change between
+    # stat() and a later chunk (origofs is multi-writer by design) propagated
+    # uncaught into the ASGI layer instead of just ending the response.
+    _c, ws, _dan, sess, hdr = _real_client_with_actor()
+    content = bytes((i % 251) for i in range(3 * 1024 * 1024))
+    _c.put("/files/big.bin", content=content, headers=hdr)
+
+    proxy = _FlakyReadRangeProxy(ws, fail_on_call=2)
+    c = _client(proxy)
+    r = c.get("/files/big.bin")
+
+    # Whatever exact status/body FastAPI produces for a generator failing
+    # after headers may already be sent (version-dependent), the important
+    # thing already happened: this line was reached at all -- an uncaught
+    # exception from the generator would have propagated out of .get() itself
+    # (TestClient's default raise_server_exceptions=True) instead of
+    # returning a response.
+    assert proxy.calls >= 2
+    assert len(r.content) < len(content)
+
+
 def test_read_file_range_requests():
     c, _ws, _dan, _sess, hdr = _real_client_with_actor()
     body = b"0123456789" * 5  # 50 bytes
@@ -348,6 +393,24 @@ def test_create_actor_and_session_via_router():
         headers={"X-Actor-Id": str(new_id), "X-Session-Id": str(new_sid)},
     )
     assert r.status_code == 200, r.text
+
+
+def test_create_agent_preserves_an_explicit_empty_model():
+    # Regression test: `req.model or "unknown"` would also replace an
+    # explicit "" (falsy), diverging from the Rust API's
+    # `req.model.as_deref().unwrap_or("unknown")`, which only substitutes on
+    # None. "" is a deliberately odd input, but the point is `is not None` is
+    # the correct check either way.
+    c, ws, dan, _sess, hdr = _real_client_with_actor()
+    r = c.post("/actors", json={"name": "claude", "agent": True, "model": ""}, headers=hdr)
+    assert r.status_code == 200, r.text
+    agent_id = r.json()["id"]
+
+    async def _check():
+        return await ws.actor(agent_id)
+
+    info = asyncio.run(_check())
+    assert info["agent_model"] == ""
 
 
 def test_actor_and_session_routes_require_auth():

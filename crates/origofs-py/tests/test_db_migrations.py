@@ -15,7 +15,7 @@ origofs_db = pytest.importorskip("origofs.db")
 
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 
 def _sqlite_url(tmpdir: str) -> str:
@@ -115,6 +115,93 @@ def test_get_alembic_config_falls_back_to_env_var(monkeypatch):
 
     cfg = origofs_db.get_alembic_config()
     assert cfg.get_main_option("sqlalchemy.url") == url
+
+
+# --- Postgres (self-skips unless ORIGOFS_PG_TEST_URL is set, same convention
+# as test_subscribe.py / test_coedit_cluster.py) -----------------------------
+#
+# Its own dedicated database, not the shared `dbname=origofs` those tests use:
+# this suite does full-schema create_all()/drop_all(), which would be
+# destructive against a database other tests keep workspace-scoped state in.
+
+def _pg_admin_and_test_urls():
+    """Parse the libpq keyword/value DSN in ORIGOFS_PG_TEST_URL (host=... "
+    port=... user=... password=... dbname=...) into two SQLAlchemy URLs on the
+    same server: one to the admin-supplied dbname (for CREATE/DROP DATABASE),
+    one to a dedicated `origofs_py_db_test` database for the actual test."""
+    dsn = os.environ.get("ORIGOFS_PG_TEST_URL")
+    if not dsn:
+        return None, None
+    parts = dict(p.split("=", 1) for p in dsn.split())
+    host = parts.get("host", "localhost")
+    port = parts.get("port", "5432")
+    user = parts.get("user", "postgres")
+    password = parts.get("password")
+    auth = f"{user}:{password}" if password else user
+    admin_url = f"postgresql+psycopg://{auth}@{host}:{port}/{parts.get('dbname', 'postgres')}"
+    test_url = f"postgresql+psycopg://{auth}@{host}:{port}/origofs_py_db_test"
+    return admin_url, test_url
+
+
+def _fresh_pg_test_db():
+    """(test_url, or None if ORIGOFS_PG_TEST_URL is unset) -- (re)creates the
+    dedicated test database empty each call."""
+    admin_url, test_url = _pg_admin_and_test_urls()
+    if admin_url is None:
+        return None
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    with admin_engine.connect() as conn:
+        conn.exec_driver_sql("DROP DATABASE IF EXISTS origofs_py_db_test")
+        conn.exec_driver_sql("CREATE DATABASE origofs_py_db_test")
+    admin_engine.dispose()
+    return test_url
+
+
+def test_pg_upgrade_seeds_rows_and_advances_sequences_without_collision():
+    """Regression test for the Postgres setval guard (mirrors the Rust fix
+    'don't reset the inode identity sequence on every open'): after the
+    initial revision seeds workspace id=1 / inode ino=1, a real
+    nextval-driven insert (the shape the engine's own writes take) must get
+    the NEXT id, not collide with the seeded row."""
+    test_url = _fresh_pg_test_db()
+    if test_url is None:
+        pytest.skip("ORIGOFS_PG_TEST_URL unset")
+
+    origofs_db.upgrade(test_url)
+    origofs_db.upgrade(test_url)  # idempotency, same as the SQLite test above
+
+    engine = create_engine(test_url)
+    with engine.connect() as conn:
+        versions = [v for (v,) in conn.execute(text("SELECT version FROM schema_meta ORDER BY version"))]
+        assert versions == list(range(1, origofs_db.SCHEMA_VERSION + 1))
+        assert list(conn.execute(text("SELECT id, name, root_ino FROM workspace"))) == [(1, "default", 1)]
+        assert list(conn.execute(text(
+            "SELECT ino, workspace_id, kind, mode FROM inode WHERE ino = 1"
+        ))) == [(1, 1, "dir", 0o040755)]
+
+        # The actual bug: a real nextval-driven insert must not collide with
+        # the explicitly-seeded id=1 rows.
+        conn.execute(text("INSERT INTO workspace(name, root_ino, created_at) VALUES ('second', 1, 0)"))
+        conn.execute(text(
+            "INSERT INTO inode(workspace_id, kind, mode, mtime, ctime) VALUES (1, 'dir', 16877, 0, 0)"
+        ))
+        conn.commit()
+        assert list(conn.execute(text("SELECT id, name FROM workspace ORDER BY id"))) == [
+            (1, "default"), (2, "second"),
+        ]
+        assert list(conn.execute(text("SELECT ino, kind FROM inode ORDER BY ino"))) == [
+            (1, "dir"), (2, "dir"),
+        ]
+
+        ctx = MigrationContext.configure(conn)
+        assert compare_metadata(ctx, origofs_db.Base.metadata) == []
+
+    origofs_db.downgrade(test_url, "base")
+    with engine.connect() as conn:
+        tables = [r[0] for r in conn.execute(text(
+            "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename != 'alembic_version'"
+        ))]
+        assert tables == []
 
 
 def _run_all():

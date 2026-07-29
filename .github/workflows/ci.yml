@@ -137,12 +137,15 @@ jobs:
           # fastapi + httpx are needed by tests/test_fastapi_router.py — it
           # imports origofs.fastapi (the router integration) and fastapi's TestClient,
           # which rides on httpx. fsspec/universal_pathlib/sqlalchemy/alembic cover
-          # the other optional integrations' own test files. mypy is dev-only (not
-          # a runtime dep of origofs). None of these are needed to build/use origofs
-          # itself -- they're here so every test file (and the type-check below)
-          # can actually import what it needs.
+          # the other optional integrations' own test files. psycopg[binary] is the
+          # Postgres driver test_db_migrations.py's PG-gated test needs (it self
+          # -skips without ORIGOFS_PG_TEST_URL, same as the other PG-gated suites,
+          # but this job sets it and has the postgres service above). mypy is
+          # dev-only (not a runtime dep of origofs). None of these are needed to
+          # build/use origofs itself -- they're here so every test file (and the
+          # type-check below) can actually import what it needs.
           pip install maturin pytest fastapi httpx fsspec universal_pathlib \
-            sqlalchemy alembic mypy
+            sqlalchemy alembic "psycopg[binary]" mypy
           maturin develop
           pytest -q tests
 

@@ -193,6 +193,16 @@ def _parse_range(range_header: Optional[str], size: int) -> Optional[tuple]:
     return start, min(end, size - 1)
 
 
+async def _safe_close(websocket: WebSocket, code: int, reason: str) -> None:
+    """Close a websocket, tolerating one that's already gone (the peer
+    disconnected concurrently, racing this same close) instead of letting
+    that failure become another uncaught exception."""
+    try:
+        await websocket.close(code=code, reason=reason[:123])
+    except Exception:
+        pass
+
+
 # --- live co-editing rooms --------------------------------------------------
 
 
@@ -417,7 +427,16 @@ def build_router(
         async def chunks():
             offset = 0
             while offset < size:
-                chunk = await ws.read_range(p, offset, min(_STREAM_CHUNK, size - offset))
+                try:
+                    chunk = await ws.read_range(p, offset, min(_STREAM_CHUNK, size - offset))
+                except Exception:
+                    # The file changed or vanished between stat() and this read
+                    # (a concurrent writer -- origofs is multi-writer by design).
+                    # The response is likely already committed to 200 with a
+                    # Content-Length, so a clean status change isn't possible at
+                    # this point; end the stream rather than let the error
+                    # propagate uncaught into the ASGI layer.
+                    return
                 if not chunk:
                     return
                 yield bytes(chunk)
@@ -576,7 +595,11 @@ def build_router(
     @router.post("/actors")
     async def create_actor(req: _CreateActor, _ctx: Any = Depends(authn)):
         if req.agent:
-            actor_id = await _run(ws.create_agent(req.name, req.model or "unknown", req.controller))
+            # `is not None`, not `or`: an explicit empty-string model should be
+            # preserved (matches the Rust API's `req.model.as_deref().unwrap_or(…)`,
+            # which only substitutes on None) -- `or` would also replace "".
+            model = req.model if req.model is not None else "unknown"
+            actor_id = await _run(ws.create_agent(req.name, model, req.controller))
         else:
             actor_id = await _run(ws.create_human(req.name, None))
         return {"id": actor_id}
@@ -610,7 +633,6 @@ def build_router(
         # Greet the client with SyncStep1, then let the writer own all sends.
         conn.out.put_nowait(await room.doc.sync_start())
         writer_task = asyncio.create_task(writer())
-        _, origofs_error = _origofs_exc()
         try:
             while True:
                 data = await websocket.receive_bytes()
@@ -621,13 +643,17 @@ def build_router(
                     # no way to resync mid-stream, so close cleanly (1002:
                     # protocol error) instead of leaving this client with a hard
                     # reset and crashing the ASGI app with an uncaught exception.
-                    await websocket.close(code=1002, reason=str(e)[:123])
+                    await _safe_close(websocket, 1002, str(e))
                     return
-                except origofs_error as e:
-                    # A valid frame that origofs couldn't apply for some other
-                    # reason (e.g. a content-store failure) -- not the client's
-                    # protocol fault, so 1011: internal error.
-                    await websocket.close(code=1011, reason=str(e)[:123])
+                except Exception as e:
+                    # Anything else handle_sync raises (an origofs-side failure
+                    # applying an otherwise-valid frame, or a type this router
+                    # doesn't specifically anticipate) -- not the client's
+                    # protocol fault, so 1011: internal error. Broad on purpose:
+                    # the whole point is that nothing from handle_sync should be
+                    # able to crash the connection uncleanly, not just the two
+                    # exception shapes observed so far.
+                    await _safe_close(websocket, 1011, str(e))
                     return
                 if reply.reply:
                     conn.out.put_nowait(reply.reply)
