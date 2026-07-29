@@ -18,6 +18,25 @@ jobs:
   rust:
     name: Rust (clippy + test)
     runs-on: ubuntu-latest
+    # Exercise the Postgres (multi-writer / production) metadata backend. Without
+    # ORIGOFS_PG_TEST_URL the PG-gated suites (postgres.rs, concurrency.rs,
+    # subscribe.rs) self-skip and only the SQLite path is tested.
+    env:
+      ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: origofs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -76,6 +95,23 @@ jobs:
   python:
     name: Python bindings (maturin + pytest)
     runs-on: ubuntu-latest
+    # The Python suite has PG-gated tests too; give it the same backend.
+    env:
+      ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: origofs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
