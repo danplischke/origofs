@@ -71,8 +71,14 @@ app.include_router(build_router(ws, authn=authn), prefix="/fs")
 Every mutating route depends on `authn` and passes its `WriteCtx` straight to the
 workspace — the request body never names an actor, so a client can't forge
 attribution. Reads are open by default; pass `reader=<dependency>` to gate them,
-or `dependencies=[...]` (forwarded to `APIRouter`) to gate everything. Needs the
-`fastapi` extra (`pip install "origofs[fastapi]"`). See `examples/fastapi_router.py`.
+or `dependencies=[...]` (forwarded to `APIRouter`) to gate everything. `POST
+/actors`/`POST /sessions` mint new actor/session ids the same way — an
+already-authenticated caller (e.g. a trusted backend onboarding a new user)
+provisions them, not anonymous self-registration. `GET /files/{path}` streams
+(never buffers a whole file in memory) and honors a single-range `Range` header
+(`206`/`416`), so large files and partial fetches behave like a static file
+server. Needs the `fastapi` extra (`pip install "origofs[fastapi]"`). See
+`examples/fastapi_router.py`.
 
 ## fsspec filesystem (pandas / Dask / PyArrow / Zarr)
 

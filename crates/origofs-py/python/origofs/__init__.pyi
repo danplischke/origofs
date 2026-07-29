@@ -5,7 +5,8 @@ Every I/O method is async (returns an awaitable) so it composes with FastAPI's
 directly JSON-serializable.
 """
 from __future__ import annotations
-from typing import Any, Optional
+import sys
+from typing import Any, NoReturn, Optional
 
 class OrigoFSError(Exception):
     """Base origofs error (raised for errors without a more specific mapping)."""
@@ -66,11 +67,14 @@ class GcsConfig:
         prefix: Optional[str] = None,
     ) -> None: ...
 
-class Mount:
-    """A live FUSE mount; unmounts on ``unmount()``, ``with``-exit, or drop."""
-    def unmount(self) -> None: ...
-    def __enter__(self) -> "Mount": ...
-    def __exit__(self, *args: Any) -> None: ...
+if sys.platform != "win32":
+    # Only registered on Unix (`#[cfg(unix)]` in lib.rs) -- FUSE has no Windows
+    # equivalent, so this class doesn't exist there at all.
+    class Mount:
+        """A live FUSE mount; unmounts on ``unmount()``, ``with``-exit, or drop."""
+        def unmount(self) -> None: ...
+        def __enter__(self) -> "Mount": ...
+        def __exit__(self, *args: Any) -> None: ...
 
 class Subscription:
     """A push subscription to the change feed (Postgres LISTEN/NOTIFY)."""
@@ -265,10 +269,16 @@ class Workspace:
     async def reject_suggestion(self, id: int, approver: WriteCtx) -> None: ...
 
     # --- mounting / serving (Unix only) ---
-    # FUSE/NFS are Unix-only; on Windows these raise OSError. Use the HTTP API
-    # (origofs.fastapi) or embed the SDK there instead.
-    def mount(self, mountpoint: str) -> Mount: ...
-    async def serve_nfs(self, addr: str) -> None: ...
+    # FUSE/NFS are Unix-only (`#[cfg(unix)]` in lib.rs); off Unix both always
+    # raise OSError synchronously when called -- note `serve_nfs` is a plain
+    # sync method there too (not `async def`), since there's no awaitable to
+    # produce. Use the HTTP API (origofs.fastapi) or embed the SDK there instead.
+    if sys.platform != "win32":
+        def mount(self, mountpoint: str) -> Mount: ...
+        async def serve_nfs(self, addr: str) -> None: ...
+    else:
+        def mount(self, mountpoint: str) -> NoReturn: ...
+        def serve_nfs(self, addr: str) -> NoReturn: ...
 
 def content_hash(data: bytes) -> str:
     """The origofs content address (BLAKE3, hex) of ``data`` — the same hash a
