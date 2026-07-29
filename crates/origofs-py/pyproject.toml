@@ -16,6 +16,27 @@ dynamic = ["version"]
 [project.optional-dependencies]
 # The `origofs.fastapi` router integration (and the examples under examples/).
 fastapi = ["fastapi", "uvicorn"]
+# The `origofs.fsspec` filesystem (pandas/Dask/PyArrow/Zarr can read origofs paths).
+fsspec = ["fsspec>=2023.9.0"]
+# universal-pathlib: a pathlib-style `UPath("origofs://…")` over the filesystem.
+upath = ["universal_pathlib>=0.2.0", "fsspec>=2023.9.0"]
+# `origofs.db`: SQLAlchemy models of the metadata schema + Alembic migrations
+# for it (`origofs.db.upgrade`). Add a driver for your backend too, e.g.
+# `psycopg[binary]` for Postgres — sqlite3 is stdlib, no extra needed for it.
+db = ["sqlalchemy>=2.0", "alembic>=1.13"]
+
+# Register the "origofs://" protocol so `fsspec.filesystem("origofs", ...)` and
+# `pandas.read_*("origofs://…", storage_options=…)` resolve to our filesystem
+# without an explicit `import origofs.fsspec` first.
+[project.entry-points."fsspec.specs"]
+origofs = "origofs.fsspec:OrigoFileSystem"
+
+# Register an explicit `UPath` subclass for the "origofs://" protocol, so
+# `UPath("origofs://…")` resolves to it (universal-pathlib otherwise falls back to
+# its generic implementation and warns that the filesystem isn't explicitly
+# supported — the fallback works, this just makes it first-class).
+[project.entry-points."universal_pathlib.implementations"]
+origofs = "origofs._upath:OrigofsPath"
 
 [tool.maturin]
 # Build the importable extension module (pyo3 resolves libpython at import).

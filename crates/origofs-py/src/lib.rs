@@ -900,6 +900,25 @@ impl Workspace {
         })
     }
 
+    /// Read the byte range `[off, off+len)` of a file, clamped at EOF (so a `len`
+    /// past the end returns only what's there, and an `off` at/after the end
+    /// returns `b""`). Only the chunks covering the range are fetched from the
+    /// content store, not the whole file — the primitive a range-oriented client
+    /// (fsspec, columnar/Parquet readers, HTTP range requests) reads through.
+    fn read_range<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        off: u64,
+        len: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let bytes = ws.read_range(&path, off, len).await.map_err(to_pyerr)?;
+            Python::attach(|py| Ok(PyBytes::new(py, &bytes).into_any().unbind()))
+        })
+    }
+
     /// Write a file (unattributed). Creates parent directories.
     fn write<'py>(
         &self,
