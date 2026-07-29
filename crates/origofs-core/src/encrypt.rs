@@ -153,4 +153,8 @@ impl ContentStore for EncryptedStore {
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         self.inner.delete(hash).await
     }
+
+    async fn ping(&self) -> Result<()> {
+        self.inner.ping().await
+    }
 }

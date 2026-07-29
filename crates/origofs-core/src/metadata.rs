@@ -23,6 +23,16 @@ pub trait MetadataStore: Send + Sync {
     /// tell whether a `migrate`/`init` would advance the schema.
     async fn schema_version(&self) -> Result<i64>;
 
+    /// A cheap liveness probe of the metadata backend, for the readiness endpoint
+    /// (`/readyz`). The default does a real backend round-trip via
+    /// [`schema_version`](MetadataStore::schema_version) — enough to catch an
+    /// exhausted pool or an unreachable database (surfaced as a classified
+    /// `Backend`/`Unavailable` error). A backend may override it with something
+    /// cheaper.
+    async fn ping(&self) -> Result<()> {
+        self.schema_version().await.map(|_| ())
+    }
+
     /// Begin an atomic write transaction (`docs/DESIGN.md` §4b).
     ///
     /// A logical filesystem write is several statements — create an inode, link
@@ -281,6 +291,9 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn schema_version(&self) -> Result<i64> {
         (**self).schema_version().await
+    }
+    async fn ping(&self) -> Result<()> {
+        (**self).ping().await
     }
     async fn begin(&self) -> Result<Box<dyn MetaTxn>> {
         (**self).begin().await
