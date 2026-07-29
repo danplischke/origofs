@@ -136,7 +136,26 @@ jobs:
           python -m pip install --upgrade pip
           # fastapi + httpx are needed by tests/test_fastapi_router.py — it
           # imports origofs.fastapi (the router integration) and fastapi's TestClient,
-          # which rides on httpx. They are test-only deps, not runtime deps of origofs.
-          pip install maturin pytest fastapi httpx
+          # which rides on httpx. fsspec/universal_pathlib/sqlalchemy/alembic cover
+          # the other optional integrations' own test files. mypy is dev-only (not
+          # a runtime dep of origofs). None of these are needed to build/use origofs
+          # itself -- they're here so every test file (and the type-check below)
+          # can actually import what it needs.
+          pip install maturin pytest fastapi httpx fsspec universal_pathlib \
+            sqlalchemy alembic mypy
           maturin develop
           pytest -q tests
+
+      # Type-check the test suite against python/origofs/__init__.pyi (the hand
+      # -maintained stub for the compiled _origofs extension). This is what
+      # catches the stub drifting from the real pyo3 bindings going forward --
+      # e.g. a Rust-side argument getting renamed without the .pyi following —
+      # PROVIDED the tests call with the keyword arguments the stub promises
+      # (see the `from_=` calls in test_bindings.py). Config lives in
+      # pyproject.toml's [tool.mypy] (also excludes fsspec's own test-support
+      # submodule, which ships no py.typed marker).
+      - name: Type-check (mypy)
+        working-directory: crates/origofs-py
+        run: |
+          . .venv/bin/activate
+          mypy

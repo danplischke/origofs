@@ -38,6 +38,16 @@ origofs = "origofs.fsspec:OrigoFileSystem"
 [project.entry-points."universal_pathlib.implementations"]
 origofs = "origofs._upath:OrigofsPath"
 
+[tool.mypy]
+python_version = "3.11"
+files = ["tests"]
+
+# fsspec's own test-support submodule ships no py.typed marker; that's a gap in
+# fsspec, not origofs, so don't let it show up as noise in our check.
+[[tool.mypy.overrides]]
+module = "fsspec.tests.*"
+ignore_missing_imports = true
+
 [tool.maturin]
 # Build the importable extension module (pyo3 resolves libpython at import).
 features = ["extension-module"]

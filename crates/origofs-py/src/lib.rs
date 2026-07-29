@@ -1050,15 +1050,21 @@ impl Workspace {
     }
 
     /// Move/rename a path.
+    ///
+    /// The Rust-side parameter is `from_`, not `from`: `from` is a Python
+    /// keyword and pyo3 exposes argument names verbatim, so a parameter
+    /// literally named `from` could never be passed by keyword from Python
+    /// (`from=...` is a `SyntaxError`) — `from_` is the usual Python idiom for
+    /// a name that collides with a keyword, and matches the type stub.
     fn rename<'py>(
         &self,
         py: Python<'py>,
-        from: String,
+        from_: String,
         to: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            ws.rename(&from, &to).await.map_err(to_pyerr)?;
+            ws.rename(&from_, &to).await.map_err(to_pyerr)?;
             Ok(())
         })
     }
@@ -1106,11 +1112,12 @@ impl Workspace {
         })
     }
 
-    /// Changed paths between two refs/commits (`from` -> `to`).
-    fn diff<'py>(&self, py: Python<'py>, from: String, to: String) -> PyResult<Bound<'py, PyAny>> {
+    /// Changed paths between two refs/commits (`from_` -> `to`; see `rename`
+    /// for why the parameter is `from_` and not `from`).
+    fn diff<'py>(&self, py: Python<'py>, from_: String, to: String) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            let changes = ws.diff(&from, &to).await.map_err(to_pyerr)?;
+            let changes = ws.diff(&from_, &to).await.map_err(to_pyerr)?;
             Python::attach(|py| {
                 changes
                     .iter()
@@ -1124,13 +1131,13 @@ impl Workspace {
     fn diff_file<'py>(
         &self,
         py: Python<'py>,
-        from: String,
+        from_: String,
         to: String,
         path: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            let patch = ws.diff_file(&from, &to, &path).await.map_err(to_pyerr)?;
+            let patch = ws.diff_file(&from_, &to, &path).await.map_err(to_pyerr)?;
             Ok(patch)
         })
     }
