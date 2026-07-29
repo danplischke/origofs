@@ -111,7 +111,13 @@ async fn subscribe_reconnect_recovers_events_written_during_the_gap() {
         .unwrap();
 
     // Start at the current tail so only our own writes appear past the cursor.
-    let tail = ws.watch(0).await.unwrap().last().map(|e| e.seq).unwrap_or(0);
+    let tail = ws
+        .watch(0)
+        .await
+        .unwrap()
+        .last()
+        .map(|e| e.seq)
+        .unwrap_or(0);
     let mut sub = ws.subscribe(tail, None).await.unwrap();
 
     // One write on the live subscription; remember the cursor we've consumed to.
@@ -168,7 +174,13 @@ async fn subscribe_coalesced_burst_delivers_every_event_in_order() {
         .await
         .unwrap();
 
-    let tail = ws.watch(0).await.unwrap().last().map(|e| e.seq).unwrap_or(0);
+    let tail = ws
+        .watch(0)
+        .await
+        .unwrap()
+        .last()
+        .map(|e| e.seq)
+        .unwrap_or(0);
     let mut sub = ws.subscribe(tail, None).await.unwrap();
 
     // Fire a tight burst — far more than the capacity-1 wakeup buffer — so many

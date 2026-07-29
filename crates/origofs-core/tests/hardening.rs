@@ -407,14 +407,27 @@ async fn names_are_byte_exact_no_unicode_normalization_or_casefold() {
         .unwrap()
         .unwrap()
         .ino;
-    assert_ne!(nfc_ino, nfd_ino, "NFC and NFD names must be separate inodes");
+    assert_ne!(
+        nfc_ino, nfd_ino,
+        "NFC and NFD names must be separate inodes"
+    );
 
     // Case is significant: "README" and "readme" are different files.
     fs.write("/README", b"upper").await.unwrap();
     fs.write("/readme", b"lower").await.unwrap();
     assert_eq!(&fs.read("/README").await.unwrap()[..], b"upper");
     assert_eq!(&fs.read("/readme").await.unwrap()[..], b"lower");
-    let upper = fs.vfs_lookup(INO_ROOT, "README").await.unwrap().unwrap().ino;
-    let lower = fs.vfs_lookup(INO_ROOT, "readme").await.unwrap().unwrap().ino;
+    let upper = fs
+        .vfs_lookup(INO_ROOT, "README")
+        .await
+        .unwrap()
+        .unwrap()
+        .ino;
+    let lower = fs
+        .vfs_lookup(INO_ROOT, "readme")
+        .await
+        .unwrap()
+        .unwrap()
+        .ino;
     assert_ne!(upper, lower, "case variants must be separate inodes");
 }

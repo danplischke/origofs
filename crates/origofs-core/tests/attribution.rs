@@ -711,8 +711,11 @@ async fn revert_session_removes_exactly_that_actors_lines_under_interleaving() {
         fs.revert_session(agent, sa).await.unwrap();
 
         // Oracle: only the human's lines survive, in their original order.
-        let expected: Vec<(String, bool)> =
-            lines.iter().filter(|(_, is_agent)| !*is_agent).cloned().collect();
+        let expected: Vec<(String, bool)> = lines
+            .iter()
+            .filter(|(_, is_agent)| !*is_agent)
+            .cloned()
+            .collect();
         assert_eq!(
             fs.read("/doc").await.unwrap()[..],
             render(&expected)[..],

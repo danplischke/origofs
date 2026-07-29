@@ -577,7 +577,10 @@ mod tests {
     // `tests/postgres.rs`); this guards the list those runners iterate.
     #[test]
     fn migration_list_is_contiguous_sorted_and_nonempty() {
-        assert!(!MIGRATIONS.is_empty(), "there must be at least one migration");
+        assert!(
+            !MIGRATIONS.is_empty(),
+            "there must be at least one migration"
+        );
 
         for (i, m) in MIGRATIONS.iter().enumerate() {
             // Versions are exactly 1, 2, 3, … with no gaps, duplicates, or reordering.

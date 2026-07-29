@@ -211,7 +211,10 @@ fn chunk_bounds_cover_and_bound_all_sizes() {
                 "size {n}: chunk {i} must start where the previous chunk ended"
             );
             assert!(len > 0, "size {n}: chunk {i} is zero-length");
-            assert!(len <= max, "size {n}: chunk {i} len {len} exceeds MAX {max}");
+            assert!(
+                len <= max,
+                "size {n}: chunk {i} len {len} exceeds MAX {max}"
+            );
             let is_last = i + 1 == bounds.len();
             if !is_last {
                 assert!(
@@ -248,7 +251,17 @@ async fn engine_roundtrips_boundary_sizes() {
     let (fs, _store) = mem_fs().await;
     let min = MIN_CHUNK as usize;
     let max = MAX_CHUNK as usize;
-    let sizes = [0usize, 1, min - 1, min, min + 1, max - 1, max, max + 1, 2 * max];
+    let sizes = [
+        0usize,
+        1,
+        min - 1,
+        min,
+        min + 1,
+        max - 1,
+        max,
+        max + 1,
+        2 * max,
+    ];
 
     for &n in &sizes {
         let data = pseudo_random(n, 0x0000_A5A5 ^ n as u64);
@@ -282,7 +295,12 @@ async fn ranged_read_out_of_bounds_is_empty() {
     // offset exactly at EOF
     assert!(fs.read_range("/f", size, 10).await.unwrap().is_empty());
     // offset past EOF
-    assert!(fs.read_range("/f", size + 999, 10).await.unwrap().is_empty());
+    assert!(
+        fs.read_range("/f", size + 999, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     // len saturates to EOF (no overflow), returning just the tail
     let tail = fs.read_range("/f", size - 10, u64::MAX).await.unwrap();
     assert_eq!(&tail[..], &data[data.len() - 10..]);
