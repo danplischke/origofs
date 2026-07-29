@@ -347,3 +347,47 @@ jobs:
           pip install maturin pytest fastapi httpx
           maturin develop
           pytest -q tests
+
+  # B7 (#70): the macOS leg. origofs is developed on macOS as a first-class
+  # platform (its POSIX mount there is NFSv3, not FUSE), so build and test on
+  # macOS to catch platform-specific breakage the Linux jobs miss — path
+  # handling, `cfg(unix)`/`cfg(target_os)` splits, and the NFS surface. macOS
+  # runners have no Docker, so there is no Postgres or MinIO here: the SQLite
+  # metadata path carries the suite and the PG-gated tests self-skip. FUSE is
+  # excluded because `fuser` needs macFUSE (a kernel extension absent on the
+  # runner), which is also why the `full` feature set — and the CLI/Python
+  # builds that pull it — are never used on this leg; the surfaces are enabled
+  # individually minus `fuse`. The NFSv3 adapter stands in for the mount path:
+  # its test drives the NFSFileSystem methods directly plus a bind smoke test,
+  # so it needs no privileged kernel mount and runs on a stock runner.
+  macos:
+    name: macOS (SQLite + NFS surface)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Lint core and the non-fuse surfaces (the NFS module is the
+      # macOS-relevant one) with warnings denied, matching the Linux `rust` job.
+      - name: Clippy (deny warnings, non-fuse surfaces)
+        run: |
+          cargo clippy -p origofs-core --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features api,mcp,sandbox,git,nfs --all-targets -- -D warnings
+
+      # Core on the SQLite path (PG-gated tests self-skip with no
+      # ORIGOFS_PG_TEST_URL) plus the non-fuse SDK surfaces, including the NFSv3
+      # adapter (nfs.rs).
+      - name: Test
+        run: |
+          cargo nextest run --profile ci -p origofs-core
+          cargo nextest run --profile ci -p origofs-sdk --features api,mcp,sandbox,git,nfs
