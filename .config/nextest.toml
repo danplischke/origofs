@@ -3,12 +3,31 @@
 # the randomized concurrency / durability-crash stress suites. The Rust CI job
 # runs `cargo nextest run --profile ci`.
 
+# The Postgres-backed suites share ONE database and several reset it wholesale
+# (DROP SCHEMA public CASCADE) between tests. Under `cargo test` they serialize
+# via a process-global mutex; nextest is process-per-test, so that in-process
+# lock has no effect ("No support for in-process mutexes — emulate them with
+# test groups", per the nextest docs). Serialize every PG-gated binary into one
+# logical mutex (max-threads = 1) so a wholesale schema reset in one never lands
+# mid-test in another. They self-skip when ORIGOFS_PG_TEST_URL is unset, so this
+# is a no-op on a stock runner. Assigned via a default-profile override below,
+# which the `ci` profile inherits.
+[test-groups]
+postgres = { max-threads = 1 }
+
 [profile.default]
 # Report a test as slow once it passes 60s and terminate it after a second such
 # period (~120s), so a genuine hang surfaces as a failure. The slowest real test
 # today is ~11s locally, so this is comfortable headroom.
 slow-timeout = { period = "60s", terminate-after = 2 }
 retries = 0
+
+# Serialize the PG-gated binaries into the `postgres` group (see [test-groups]
+# above). Declared on the default profile so it applies to every profile via
+# inheritance — including `ci`, which is what CI runs.
+[[profile.default.overrides]]
+filter = '(package(origofs-core) & (binary(postgres) | binary(collab) | binary(coedit_relay))) | (package(origofs-sdk) & (binary(api_coedit_cluster) | binary(multi_workspace) | binary(subscribe)))'
+test-group = 'postgres'
 
 # CI: run every test (don't stop at the first failure), tolerate a single
 # transient retry, and loosen the hang guard since coverage/instrumentation and
