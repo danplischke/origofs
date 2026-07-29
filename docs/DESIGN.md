@@ -393,6 +393,33 @@ metadata round-trips are cut by caching dentries with `LISTEN/NOTIFY`-driven inv
 The boundary: **live co-editing is for open, editor-attached files; commit-time merge is for everything else.**
 Both funnel into one attribution store, so blame is uniform regardless of path.
 
+**The live/dirty marker (ruling).** While a path is promoted to a CRDT document, its durable bytes are the last
+**checkpoint** — a real, fully attributed state, but possibly behind the `Y.Doc` people are typing into. A
+workspace-scoped `live_doc` row records that a path is open (plus the file's content address as of the last
+checkpoint, which is how an *out-of-band* write to a live path is detected and reconciled rather than clobbered).
+The rule for every byte reader — `read`, the three-way merge, the git export, a UI — is: **surface the staleness;
+never block, fail, or force a checkpoint.** Three reasons, in order of finality: a read must not write; forcing a
+checkpoint needs an actor to attribute it to, and a reader has none; and the engine could not force one anyway,
+because the live document is in-process room state owned by a co-editing room, quite possibly on another worker —
+the metadata store knows a document is open, it does not *have* the document. The durable bytes are never
+garbage, so `read_live(path) -> (bytes, Option<LiveDoc>)` returning them with a "may lag" flag is the honest
+answer; erroring out because a colleague has an editor open is not. A caller that needs the freshest bytes asks
+the co-editing coordinator to checkpoint first (`Coordinator::checkpoint_all`), then reads. The marker is set on
+`open_coedit` and cleared by the coordinator only *after* the final checkpoint lands; a marker left behind by a
+crashed worker is the safe failure direction (a reader is told the bytes may lag when they do not), whereas a
+live document with no marker would mislead — which is why the marker is written before the document is handed
+out.
+
+**Presence.** Every surface heartbeats `(session, actor, current path)`; `POST /v1/presence` is the HTTP form, so
+a browser client appears in the presence list without an in-process SDK bridge. Like every mutating route the
+body names no actor — identity is the credential's. Presence is keyed by *session*, and a credential not bound to
+one is refused rather than having a session minted for it: minting per heartbeat would let a polling loop create
+unbounded session rows and turn presence into a directory of connections rather than of working sessions.
+
+**Agents propose into live documents too.** The MCP surface exposes the live flag (`origofs_live`) and, with the
+`coedit` feature, a CRDT-shaped proposal (`origofs_suggest_coedit`) — so an agent editing a file a human has open
+proposes a *merge* rather than a whole body. Identity stays server-side, as for every other tool call.
+
 **Change notifications.** `watch(path|branch)` subscribes via Postgres `LISTEN/NOTIFY` (or the in-proc bus in
 SQLite mode); FUSE uses these to invalidate its attr/dentry cache and to push inotify-style events.
 
@@ -433,6 +460,14 @@ reflog(id BIGINT PK, workspace_id, ref_name TEXT, old_hash BYTEA, new_hash BYTEA
 lock(workspace_id, path TEXT, actor_id BIGINT, acquired_at BIGINT, expires_at BIGINT,
      PRIMARY KEY(workspace_id, path));   -- LFS-style binary locks
 conflict(id BIGINT PK, workspace_id, merge_ref TEXT, path TEXT, state TEXT, detail JSONB);
+live_doc(workspace_id, path TEXT, session_id BIGINT, actor_id BIGINT, content_hash TEXT,
+         since BIGINT, PRIMARY KEY(workspace_id, path));  -- an open CRDT doc; bytes may lag (§4e)
+
+-- propose-and-review (bytes live in the content store; only addresses here)
+suggestion(id BIGINT PK, workspace_id, actor_id BIGINT, session_id BIGINT, branch TEXT, path TEXT,
+           base_hash TEXT, proposed_hash TEXT, summary TEXT, kind TEXT,   -- 'bytes' | 'crdt'
+           status TEXT,                                                   -- pending|accepted|rejected|superseded
+           created_ts BIGINT, resolved_ts BIGINT, resolved_by BIGINT);
 
 -- attribution + audit ----------------------------------------------------
 edit_op(id BIGINT PK, session_id BIGINT, actor_id BIGINT, tool_call_id BIGINT NULL,
@@ -495,7 +530,27 @@ human-or-agent + which session + which tool call + which commit introduced it.
 **Human + agent co-edit the same file, live:** file promoted to a CRDT doc; Alice types in her editor, the agent
 inserts via the editor API; the CRDT merges character ops with per-span authorship; every ~N ops it checkpoints
 → new manifest + `edit_op`s split by author span → blame index shows interleaved `human:alice` / `agent:claude`
-ranges with zero manual bookkeeping.
+ranges with zero manual bookkeeping. The path carries a `live_doc` marker for the duration, so a byte reader
+elsewhere can tell "these bytes are the whole truth" from "these bytes are the last checkpoint" (§4e).
+
+**Propose and review an edit (the two kinds):** a proposal stores its bytes in the content store immediately and
+leaves the working tree alone; the review row (`suggestion`) holds only addresses. Its `kind` decides what the
+addresses *mean* and what accepting does:
+
+- `bytes` — `base_hash` is the file's content address when the proposal was computed and `proposed_hash` a whole
+  file body. Accept is a **conditional write**: a null-safe compare-and-set on the current content
+  (`set_content_if`). If the file moved on, applying it would silently discard the intervening change, so it is
+  refused (`Conflict`) *and* the row is retired as `Superseded` — a proposal that can never be applied does not
+  belong in the pending queue. A successful accept likewise sweeps the other pending `bytes` proposals on that
+  path whose base it just moved.
+- `crdt` — `base_hash` addresses the document's Yjs **state vector** and `proposed_hash` an opaque
+  `encodeStateAsUpdate` blob. Accept is `applyUpdate` + checkpoint, not a whole-file write. A CRDT merge is
+  defined for *any* pair of states, so a disjoint concurrent edit is not a conflict; the byte staleness guard
+  does not apply and `crdt` rows are never swept as superseded. The update is applied through `apply_update_as`,
+  so text it introduces is re-stamped server-side with the suggestion's real author, whatever the blob claims.
+
+Either kind lands **attributed to the original author** with the approver recorded, and the review gate
+(author ≠ approver) is the same for both.
 
 ---
 
@@ -544,8 +599,10 @@ each write is, and a storage engine that agents point at untrusted code and untr
 - **Torn multi-step mutations:** operations that touch several rows run inside a single `MetaTxn` that rolls back
   on drop, so a crash or mid-way error can't leave a half-applied state. Working-tree replacement
   (checkout/merge/recover) swaps the tree atomically (`truncate_tree` + `replace_working_tree`); `accept` lands a
-  suggestion only if the author's base still matches (null-safe compare-and-set, `set_content_if`, so a stale
-  proposal is rejected rather than silently clobbering a concurrent edit); ref-mirror generations advance with an
+  **byte** suggestion only if the author's base still matches (null-safe compare-and-set, `set_content_if`, so a
+  stale proposal is rejected rather than silently clobbering a concurrent edit — and is then retired as
+  `Superseded` instead of lingering pending forever, as are the other pending byte proposals a successful accept
+  strands; a `crdt` suggestion merges and so is never stale, §6); ref-mirror generations advance with an
   atomic `bump_counter` instead of a read-modify-write.
 - **Encryption key & nonce discipline:** convergent encryption keeps dedup (identical plaintext → identical
   ciphertext, which the shared content address already revealed — a documented, accepted trade-off), but the AEAD

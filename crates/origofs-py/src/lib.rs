@@ -19,7 +19,7 @@
 use origofs_core::LocalCasStore;
 use origofs_sdk::{
     Actor, BlameRange, CommitInfo, DiffEntry, DiffStatus, DirEntry, Event, EventSubscription,
-    GcsConfig as CoreGcsConfig, Inode, Passage, PassageOptions, Presence, RebuildReport,
+    GcsConfig as CoreGcsConfig, Inode, LiveDoc, Passage, PassageOptions, Presence, RebuildReport,
     S3Config as CoreS3Config, Segmentation, Suggestion, SuggestionStatus,
     Workspace as CoreWorkspace, WriteCtx as CoreWriteCtx, WriteOutcome as CoreWriteOutcome,
     WritePolicy as CoreWritePolicy,
@@ -224,6 +224,20 @@ fn presence_dict(py: Python<'_>, p: &Presence) -> PyResult<Py<PyAny>> {
     Ok(d.into_any().unbind())
 }
 
+/// A live-document marker: `path` has an open CRDT document, so its durable bytes
+/// are a *checkpoint* that may lag what people are typing.
+fn live_doc_dict(py: Python<'_>, l: &LiveDoc) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("path", &l.path)?;
+    d.set_item("session_id", l.session_id)?;
+    d.set_item("actor_id", l.actor_id)?;
+    // The file's content address as of the last checkpoint — an out-of-band write
+    // is exactly "the file's current address differs from this".
+    d.set_item("content_hash", l.content_hash.clone())?;
+    d.set_item("since", l.since)?;
+    Ok(d.into_any().unbind())
+}
+
 fn suggestion_dict(py: Python<'_>, s: &Suggestion) -> PyResult<Py<PyAny>> {
     let d = PyDict::new(py);
     d.set_item("id", s.id)?;
@@ -234,6 +248,10 @@ fn suggestion_dict(py: Python<'_>, s: &Suggestion) -> PyResult<Py<PyAny>> {
     d.set_item("base_hash", s.base_hash.clone())?;
     d.set_item("proposed_hash", s.proposed_hash.clone())?;
     d.set_item("summary", s.summary.clone())?;
+    // `bytes` (a whole file body) or `crdt` (a Yjs update to merge). It decides
+    // what `base_hash`/`proposed_hash` address and how `accept` applies them, so a
+    // reviewer UI needs it to know what it is looking at.
+    d.set_item("kind", s.kind.as_str())?;
     d.set_item("status", s.status.as_str())?;
     d.set_item("created_ts", s.created_ts)?;
     d.set_item("resolved_ts", s.resolved_ts)?;
@@ -704,6 +722,26 @@ impl CoeditDoc {
         let inner = self.inner.clone();
         future_into_py(py, async move {
             let bytes = inner.lock().await.sync_start();
+            Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
+        })
+    }
+
+    /// This document's Yjs state vector (`encodeStateVector`) — "how much of the
+    /// document I already have". The base half of a CRDT suggestion.
+    fn state_vector<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let bytes = inner.lock().await.state_vector();
+            Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
+        })
+    }
+
+    /// This document's full state as a Yjs update (`encodeStateAsUpdate`) — the
+    /// opaque, always-mergeable blob a CRDT suggestion proposes.
+    fn state_update<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let bytes = inner.lock().await.state_update();
             Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
         })
     }
@@ -1615,6 +1653,117 @@ impl Workspace {
                 .await
                 .map_err(to_pyerr)?;
             Ok(())
+        })
+    }
+
+    /// Propose a change to a co-edited `path` as a **CRDT merge** rather than a
+    /// whole file body: the review row records the workspace document's Yjs state
+    /// vector as its base and `doc`'s ``encodeStateAsUpdate`` blob as the proposal.
+    /// Accepting it merges (``applyUpdate``) instead of overwriting, so a
+    /// concurrent disjoint edit is neither clobbered nor false-rejected as stale.
+    /// Returns the suggestion id.
+    #[pyo3(signature = (ctx, path, doc, summary=None))]
+    fn suggest_coedit<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        doc: Py<CoeditDoc>,
+        summary: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        let inner = doc.borrow(py).inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let id = ws
+                .suggest_coedit(c, &path, &guard, summary.as_deref())
+                .await
+                .map_err(to_pyerr)?;
+            Ok(id)
+        })
+    }
+
+    /// The primitive behind `suggest_coedit`, for a client that already holds the
+    /// two Yjs blobs — a browser editor proposes with ``encodeStateVector(doc)`` as
+    /// `base_sv` and ``encodeStateAsUpdate(doc)`` as `update`.
+    #[pyo3(signature = (ctx, path, base_sv, update, summary=None))]
+    fn suggest_coedit_update<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        base_sv: Vec<u8>,
+        update: Vec<u8>,
+        summary: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let id = ws
+                .suggest_coedit_update(c, &path, &base_sv, &update, summary.as_deref())
+                .await
+                .map_err(to_pyerr)?;
+            Ok(id)
+        })
+    }
+
+    /// End a live co-editing session for `path`: clear its live marker so byte
+    /// readers stop being told the durable blob may lag. Checkpoint *first* — this
+    /// only drops the flag. Idempotent.
+    fn end_coedit<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.end_coedit(&path).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// The live-document marker for `path`, or ``None`` when nothing has it open.
+    /// A byte reader consults this to tell "these bytes are the whole truth" from
+    /// "these bytes may lag an open ``Y.Doc``".
+    fn live_doc<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let live = ws.live_doc(&path).await.map_err(to_pyerr)?;
+            Python::attach(|py| match live {
+                Some(l) => live_doc_dict(py, &l).map(Some),
+                None => Ok(None),
+            })
+        })
+    }
+
+    /// Every path currently open in a live co-editing session.
+    fn live_paths<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let list = ws.live_paths().await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                list.iter()
+                    .map(|l| live_doc_dict(py, l))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// Read `path` **and** report whether it is live: ``(bytes, live | None)``. The
+    /// bytes are exactly what `read` returns; the second element is the live marker
+    /// when an open CRDT document may be ahead of them. Reading never blocks,
+    /// fails, or forces a checkpoint on account of a live path — it *surfaces* the
+    /// staleness, and a caller that needs the freshest bytes checkpoints the room
+    /// first, then reads.
+    fn read_live<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let (data, live) = ws.read_live(&path).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                let bytes = PyBytes::new(py, &data).into_any().unbind();
+                let marker = match live {
+                    Some(l) => live_doc_dict(py, &l)?,
+                    None => py.None(),
+                };
+                Ok((bytes, marker))
+            })
         })
     }
 

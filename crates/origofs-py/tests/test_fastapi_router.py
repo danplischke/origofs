@@ -275,6 +275,49 @@ def test_presence_touch_requires_a_session():
     assert r.status_code == 400, r.text
 
 
+def test_presence_heartbeat_route_matches_the_rust_api():
+    # POST /presence is the parity route for the Rust HTTP API's POST
+    # /v1/presence: an optional body carrying only a path, and a response
+    # echoing the *server-resolved* session/actor.
+    c, _ws, dan, sess, hdr = _real_client_with_actor()
+
+    r = c.post("/presence", json={"path": "notes.txt"}, headers=hdr)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"session_id": sess, "actor_id": dan, "path": "/notes.txt"}
+
+    present = c.get("/presence").json()
+    assert any(p["session_id"] == sess and p["path"] == "/notes.txt" for p in present), present
+
+    # The body is optional entirely, and an empty path means "no current path".
+    assert c.post("/presence", headers=hdr).json()["path"] is None
+    assert c.post("/presence", json={"path": "  "}, headers=hdr).json()["path"] is None
+
+
+def test_presence_heartbeat_ignores_an_actor_named_in_the_body():
+    # Identity is resolved server-side from the credential; a body that tries to
+    # name someone else changes nothing (the field simply isn't part of the
+    # request model), so a client can only ever heartbeat itself.
+    c, _ws, dan, sess, hdr = _real_client_with_actor()
+    r = c.post("/presence", json={"actor": 999, "session": 999, "path": "/x"}, headers=hdr)
+    assert r.status_code == 200, r.text
+    assert r.json()["actor_id"] == dan and r.json()["session_id"] == sess
+    assert all(p["actor_id"] != 999 for p in c.get("/presence").json())
+
+
+def test_presence_heartbeat_requires_a_session():
+    # A credential bound to an actor but no session gets a 400 telling it to
+    # create one -- the Rust handler refuses to mint a session per heartbeat.
+    c = _client(FakeWs())
+    r = c.post("/presence", json={"path": "/x"}, headers={"X-Actor-Id": "1"})
+    assert r.status_code == 400, r.text
+    assert "session" in r.json()["detail"]
+
+
+def test_presence_heartbeat_requires_auth():
+    c = _client(FakeWs())
+    assert c.post("/presence", json={"path": "/x"}).status_code == 401
+
+
 def test_read_file_streams_large_content_correctly():
     # A file spanning several internal read_range() chunks (_STREAM_CHUNK is
     # 1 MiB) -- regression coverage for the chunked reassembly loop that

@@ -184,6 +184,92 @@ impl McpServer {
                     "proposed suggestion #{id} for {p} (pending review)"
                 ))
             }
+            // Proposing against a *live* document is a CRDT merge, not a file
+            // body: the base is a state vector rather than a content hash, so a
+            // colleague's keystroke elsewhere in the file can neither stale the
+            // proposal nor be clobbered by accepting it. Only with `coedit`.
+            #[cfg(feature = "coedit")]
+            "origofs_suggest_coedit" => {
+                let p = path();
+                let old = args.get("old").and_then(Value::as_str).unwrap_or("");
+                let new = args.get("new").and_then(Value::as_str).unwrap_or("");
+                let summary = args.get("summary").and_then(Value::as_str);
+                if old.is_empty() {
+                    return Err(OrigoFSError::InvalidArgument(
+                        "suggest_coedit: `old` must be non-empty (a CRDT proposal is an edit to \
+                         an existing document, not a whole new body — use origofs_suggest for that)"
+                            .into(),
+                    ));
+                }
+                if old == new {
+                    return Err(OrigoFSError::InvalidArgument(
+                        "suggest_coedit: `old` and `new` are identical — nothing to propose".into(),
+                    ));
+                }
+                // Was somebody already editing this? If not, we must not leave a
+                // live marker behind for the throwaway replica we open below.
+                let was_live = self.ws.live_doc(p).await?.is_some();
+                let doc = self.ws.open_coedit(self.ctx(), p).await?;
+                let text = doc.text();
+                let count = text.matches(old).count();
+                if count == 0 {
+                    return Err(OrigoFSError::InvalidArgument(format!(
+                        "suggest_coedit: `old` not found in {p}"
+                    )));
+                }
+                if count > 1 {
+                    return Err(OrigoFSError::InvalidArgument(format!(
+                        "suggest_coedit: `old` matches {count} times in {p}; include more \
+                         surrounding context to make it unique"
+                    )));
+                }
+                // Yjs indexes in UTF-16 code units, not bytes.
+                let byte_idx = text.find(old).unwrap_or(0);
+                let index = text[..byte_idx].encode_utf16().count() as u32;
+                doc.remove(index, old.encode_utf16().count() as u32);
+                doc.insert(self.ctx(), index, new);
+                let id = self.ws.suggest_coedit(self.ctx(), p, &doc, summary).await?;
+                // Restore the marker to what we found. Only if it is still *ours*:
+                // if a real room claimed the path meanwhile, leaving the marker set
+                // is the safe direction (a reader is told the bytes may lag when
+                // they may not), clearing a live room's marker is not.
+                if !was_live
+                    && let Some(l) = self.ws.live_doc(p).await?
+                    && l.session_id == Some(self.session)
+                {
+                    self.ws.end_coedit(p).await?;
+                }
+                Ok(format!(
+                    "proposed co-edit suggestion #{id} for {p} (a CRDT merge, pending review)"
+                ))
+            }
+            "origofs_live" => match args.get("path").and_then(Value::as_str) {
+                Some(p) if !p.is_empty() => match self.ws.live_doc(p).await? {
+                    Some(l) => Ok(format!(
+                        "{p} is LIVE (open since {} by actor {}): its durable bytes are a \
+                             checkpoint and may lag the open document — origofs_read still \
+                             answers, it just may be behind. Propose with \
+                             origofs_suggest_coedit rather than origofs_write.",
+                        l.since, l.actor_id
+                    )),
+                    None => Ok(format!(
+                        "{p} is not live: its stored bytes are the whole truth"
+                    )),
+                },
+                _ => {
+                    let live = self.ws.live_paths().await?;
+                    if live.is_empty() {
+                        return Ok("no live documents".to_string());
+                    }
+                    Ok(live
+                        .iter()
+                        .map(|l| {
+                            format!("{}\tlive since {}\tactor {}", l.path, l.since, l.actor_id)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"))
+                }
+            },
             "origofs_suggestions" => {
                 let path_filter = args.get("path").and_then(Value::as_str);
                 let list = self
@@ -331,7 +417,8 @@ fn tool(name: &str, description: &str, props: Value, required: &[&str]) -> Value
 
 fn tool_defs() -> Vec<Value> {
     let path_prop = json!({ "path": { "type": "string", "description": "absolute origofs path" } });
-    vec![
+    #[cfg_attr(not(feature = "coedit"), allow(unused_mut))]
+    let mut defs = vec![
         tool(
             "origofs_read",
             "Read a file's contents.",
@@ -425,11 +512,42 @@ fn tool_defs() -> Vec<Value> {
             &["path"],
         ),
         tool(
+            "origofs_live",
+            "Whether a path has a live co-editing document open — i.e. whether its \
+             stored bytes are the whole truth or a checkpoint that may lag what \
+             people are typing right now. Omit `path` to list every live document. \
+             Reading a live path always works; this only tells you how fresh the \
+             answer is, and that a proposal there belongs in origofs_suggest_coedit.",
+            json!({ "path": { "type": "string", "description": "optional: a single path to check" } }),
+            &[],
+        ),
+        tool(
             "origofs_commit",
             "Snapshot the working tree into a commit.",
             json!({ "message": { "type": "string" } }),
             &["message"],
         ),
         tool("origofs_log", "Show commit history.", json!({}), &[]),
-    ]
+    ];
+    // Only offered when the server was built with `coedit` — advertising a tool
+    // whose dispatch arm isn't compiled in would be a promise the server can't keep.
+    #[cfg(feature = "coedit")]
+    defs.push(tool(
+        "origofs_suggest_coedit",
+        "Propose a change to a live co-edited document as a CRDT merge instead of a \
+         file body: replace `old` with `new` (exact text, must be unique). Prefer this \
+         over origofs_suggest whenever origofs_live says the path is live — a byte \
+         proposal there goes stale on somebody else's keystroke, and accepting it \
+         replaces the whole body; this one merges, so a concurrent disjoint edit \
+         survives. The document changes only when a different actor accepts, and the \
+         merged text is credited to this agent.",
+        json!({
+            "path": { "type": "string" },
+            "old": { "type": "string", "description": "exact text to replace; must be unique in the document" },
+            "new": { "type": "string", "description": "replacement text" },
+            "summary": { "type": "string", "description": "optional note for the reviewer" },
+        }),
+        &["path", "old", "new"],
+    ));
+    defs
 }

@@ -110,6 +110,14 @@ class CoeditDoc:
     async def sync_start(self) -> bytes:
         """The y-sync ``SyncStep1`` frame to greet a new client with."""
         ...
+    async def state_vector(self) -> bytes:
+        """This document's Yjs state vector (``encodeStateVector``) — the base half
+        of a CRDT suggestion."""
+        ...
+    async def state_update(self) -> bytes:
+        """This document's full state as a Yjs update (``encodeStateAsUpdate``) —
+        the opaque, always-mergeable blob a CRDT suggestion proposes."""
+        ...
     async def handle_sync(self, ctx: WriteCtx, data: bytes) -> CoeditSyncReply:
         """Handle one inbound y-sync payload from a connection authenticated as
         ``ctx``; its content is attributed to ``ctx`` server-side."""
@@ -243,8 +251,35 @@ class Workspace:
     ) -> list[dict[str, Any]]: ...
 
     # --- live co-editing (M8) ---
+    # `open_coedit` also marks the path *live* (see `live_doc`); `end_coedit`
+    # clears that marker once the session's final checkpoint has landed.
     async def open_coedit(self, ctx: WriteCtx, path: str) -> CoeditDoc: ...
     async def checkpoint_coedit(self, ctx: WriteCtx, path: str, doc: CoeditDoc) -> None: ...
+    async def end_coedit(self, path: str) -> None: ...
+    # Propose against a co-edited path as a CRDT merge rather than a whole file
+    # body: base = the document's Yjs state vector, proposal = an
+    # `encodeStateAsUpdate` blob, so `accept_suggestion` merges instead of
+    # overwriting. The resulting suggestion's `kind` is `"crdt"`.
+    async def suggest_coedit(
+        self, ctx: WriteCtx, path: str, doc: CoeditDoc, summary: Optional[str] = None
+    ) -> int: ...
+    async def suggest_coedit_update(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        base_sv: bytes,
+        update: bytes,
+        summary: Optional[str] = None,
+    ) -> int: ...
+    # --- live/dirty markers ---
+    # A live path's durable bytes are a *checkpoint* that may lag the open Y.Doc.
+    # These surface that; they never block, fail, or force a checkpoint. Each
+    # marker is a dict with `path`, `session_id`, `actor_id`, `content_hash`
+    # (the file's address as of the last checkpoint) and `since`.
+    async def live_doc(self, path: str) -> Optional[dict[str, Any]]: ...
+    async def live_paths(self) -> list[dict[str, Any]]: ...
+    # `read` plus that marker: (bytes, live | None).
+    async def read_live(self, path: str) -> tuple[bytes, Optional[dict[str, Any]]]: ...
     # Cross-worker relay (Postgres-backed workspaces). `is_postgres` gates it.
     def is_postgres(self) -> bool: ...
     async def coedit_relay_init(self) -> None: ...
@@ -259,6 +294,9 @@ class Workspace:
     async def touch(self, actor_id: int, session_id: int, path: Optional[str] = None) -> None: ...
 
     # --- agent-suggestion review queue ---
+    # Each suggestion dict carries a `kind`: `"bytes"` (a whole file body, whose
+    # `base_hash` gates the accept) or `"crdt"` (a Yjs update, which merges). A
+    # stale byte proposal is retired as `"superseded"` rather than left pending.
     async def suggest(self, ctx: WriteCtx, path: str, data: bytes, summary: Optional[str] = None) -> int: ...
     async def suggest_delete(self, ctx: WriteCtx, path: str, summary: Optional[str] = None) -> int: ...
     async def list_suggestions(self, status: Optional[str] = None, path: Optional[str] = None) -> list[dict[str, Any]]: ...
