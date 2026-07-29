@@ -14,12 +14,14 @@ and every byte knows who wrote it.**
 [![CI](https://github.com/danplischke/origofs/actions/workflows/ci.yml/badge.svg)](https://github.com/danplischke/origofs/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.88%2B-dea584)](#install)
+[![coverage](https://codecov.io/gh/danplischke/origofs/branch/main/graph/badge.svg)](https://codecov.io/gh/danplischke/origofs)
 [![design](https://img.shields.io/badge/docs-DESIGN.md-informational)](docs/DESIGN.md)
 
 [**Quickstart**](#quickstart) · [**Agents**](#working-with-agents) ·
-[**Attribution**](#know-who-did-what) · [**Versioning**](#versioning) ·
-[**Teams**](#running-for-a-team) · [**Backends**](#storage-backends) ·
-[**Design**](docs/DESIGN.md)
+[**Attribution**](#know-who-did-what) · [**Retrieval**](#retrieval-that-carries-provenance) ·
+[**Versioning**](#versioning) · [**Teams**](#running-for-a-team) ·
+[**Mounts**](#mount-it-as-a-real-filesystem) · [**Python**](#python) ·
+[**CLI**](#cli-reference) · [**Design**](docs/DESIGN.md)
 
 </div>
 
@@ -71,14 +73,63 @@ Six questions a directory of files can't answer:
 | **Will it hold up for a team?** | The Postgres backend is built for many concurrent writers — humans and agents — sharing one workspace, with a live change feed and presence so every client sees edits as they happen. |
 | **Can I trust what I read back?** | Content is BLAKE3-addressed and verified on every read: silent bit-rot or tampering in object storage surfaces as an error instead of being served as if it were real. |
 
+## How it fits together
+
+One idea holds the whole system up: **the names and the bytes are stored
+separately, and never mixed.** The metadata store holds inodes, dentries, refs,
+blame, and the change feed — content only ever by hash. The content store holds
+the bytes, as content-defined chunks and immutable git-style objects. Every
+surface funnels down to the same engine, so behaviour is identical whichever one
+you drive:
+
+```mermaid
+flowchart TD
+    CLI["origofs CLI"] --> WS
+    PY["Python bindings"] --> WS
+    HTTP["HTTP / JSON API"] --> WS
+    MCP["MCP server"] --> WS
+    MNT["FUSE · NFS · overlay"] --> WS
+    WS["origofs-sdk :: Workspace"] --> FS
+    FS["origofs-core :: Fs<br/>POSIX ops · chunking · commit · merge · blame · gc"]
+    FS --> META[("MetadataStore<br/>Postgres | SQLite")]
+    FS --> CAS[("ContentStore<br/>local · S3/R2/GCS · packed · encrypted")]
+```
+
+The mutable working tree is an **overlay whose base is a commit tree** — git's
+index idea, made the storage model. Reads fall through the working tree to the
+base tree to chunks; writes copy up; committing crystallizes the working tree into
+new immutable objects. [`docs/DESIGN.md`](docs/DESIGN.md) §3 is the long version.
+
 ## Install
 
-origofs is a Rust workspace. Build the `origofs` CLI with a recent stable toolchain:
+Not published to crates.io or PyPI yet, so build from source. **Rust 1.88+** —
+edition 2024 sets a 1.85 language floor, but let-chains and the dependency graph
+raise the real minimum, and CI pins it.
 
 ```bash
-cargo install --path crates/origofs-cli     # installs the `origofs` binary
+cargo install --path crates/origofs-cli   # installs `origofs` AND `git-remote-origofs`
 # or, without installing:
-cargo build --release                    # ./target/release/origofs
+cargo build --release                     # ./target/release/origofs
+```
+
+Both binaries come from that one install — `git` finds `git-remote-origofs` off your
+`PATH` to make `git clone origofs://…` work.
+
+In a container instead — see [Deployment](#deployment) for the full
+Postgres + object-storage stack:
+
+```bash
+docker build -t origofs .
+docker run --rm -p 8080:8080 -v "$PWD/ws:/var/lib/origofs/ws" origofs \
+    serve --addr 0.0.0.0:8080 --auth-token "$TOKEN=$ACTOR"
+```
+
+The Python bindings build with maturin, not cargo:
+
+```bash
+cd crates/origofs-py
+python -m venv .venv && . .venv/bin/activate
+pip install maturin && maturin develop
 ```
 
 A workspace is just a directory origofs manages (metadata DB + content store). For a
@@ -94,7 +145,16 @@ echo 'hello from origofs' | origofs --workspace "$WS" write /notes/a.txt
 origofs --workspace "$WS" ls   /notes
 origofs --workspace "$WS" read /notes/a.txt
 origofs --workspace "$WS" stat /notes/a.txt
+
+# the same write, attributed — this is the one blame can read back
+DAN=$(origofs --workspace "$WS" actor dan)
+echo 'hello from dan' | origofs --workspace "$WS" write /notes/a.txt --actor "$DAN"
+origofs --workspace "$WS" blame /notes/a.txt
 ```
+
+Writes without `--actor` are *unattributed*: they store content but record no
+authorship, and they invalidate any blame the file had. Attribution is opt-in per
+write on the CLI, and automatic on the agent-facing surfaces below.
 
 From Rust:
 
@@ -127,6 +187,31 @@ it against `--actor`. When it finishes, `origofs blame` and the change feed alre
 reflect everything it did. This is how agents are meant to interact with origofs day
 to day.
 
+> [!CAUTION]
+> **`overlay` and `sandbox` are edit capture, not a security boundary — by
+> default.** The command runs with *your* privileges over a plain copy-on-write
+> overlay: the whole host filesystem stays reachable, including this workspace's
+> own `meta.db`/`cas` and your credentials. There is no network namespace and no
+> seccomp; origofs only strips `ORIGOFS_ENCRYPTION_KEY` from the child's environment.
+> Run only code you trust.
+>
+> Pass **`--isolate`** to run the command under bubblewrap in a fresh tmpfs root
+> that hides the host filesystem — a real boundary for untrusted code (needs
+> `bwrap` ≥ 0.8.0). It is deliberately *filesystem-only*: the network namespace is
+> left shared on purpose, because agents need egress, so it does not by itself
+> contain network-reachable resources. Either way the delta is captured and
+> imported identically.
+
+### Capture on exit instead of live
+
+`origofs sandbox` is the batch counterpart: run a command over a copy-on-write view
+of the workspace and import the whole delta when it exits — or throw it away.
+
+```bash
+origofs --workspace "$WS" sandbox --actor "$AGENT" --isolate -- ./refactor.sh
+origofs --workspace "$WS" sandbox --actor "$AGENT" --discard -- ./try-something.sh
+```
+
 Prefer a protocol integration? origofs also speaks **MCP** (Model Context Protocol)
 over stdio, so an agent can call filesystem tools directly — and every write is
 attributed to the agent:
@@ -134,6 +219,22 @@ attributed to the agent:
 ```bash
 origofs --workspace "$WS" mcp --agent-name claude --model claude-opus-4-8
 ```
+
+Wire it into a client the usual way:
+
+```json
+{
+  "mcpServers": {
+    "origofs": {
+      "command": "origofs",
+      "args": ["--workspace", "/path/to/ws", "mcp",
+               "--agent-name", "claude", "--model", "claude-opus-4-8"]
+    }
+  }
+}
+```
+
+Logs go to stderr, so stdout stays clean for the JSON-RPC transport.
 
 ### Propose-and-review, not just apply
 
@@ -198,6 +299,39 @@ authored, leaving surrounding human edits in place:
 let files_changed = ws.revert_session(agent_id, session_id).await?;
 ```
 
+## Retrieval that carries provenance
+
+Indexing an origofs workspace isn't "object storage plus embeddings". `passages`
+extracts retrieval units from the working tree, and every one carries **who wrote
+it** and a content hash — so an answer can cite its authors, and re-indexing only
+touches the passages whose bytes actually changed:
+
+```rust
+use origofs_core::{PassageOptions, Segmentation};
+
+let passages = ws.passages(&PassageOptions {
+    root: "/docs".into(),
+    exts: Some(vec!["md".into()]),
+    ..Default::default()          // content-defined segmentation, text + blame on
+}).await?;
+
+for p in &passages {
+    // p.path · p.byte_start..p.byte_end · p.hash · p.text · p.blame
+}
+```
+
+The default `Segmentation::ContentDefined` is the one that pays off over time:
+boundaries are chosen by the local bytes (FastCDC), so an edit only disturbs the
+passage it lands in and every other passage keeps its hash — and therefore its
+embedding. Fixed-size windows re-hash the whole tail of a file on any insert.
+`with_text: false` gives a cheap manifest pass (paths + hashes only) for diffing
+two revisions before you spend anything on embeddings.
+
+There are no embeddings, vector store, or framework in here — that half is
+deliberately yours. From Python, `origofs.rag` returns the same records and
+`origofs.llamaindex.SimpleWorkspaceReader` hands them to LlamaIndex as one
+`Document` per passage with the provenance in metadata.
+
 ## Versioning
 
 Versioning is opt-in and Git-shaped — a real commit DAG, branches, checkout, log,
@@ -255,6 +389,24 @@ crash can never leave a half-recorded edit.
 ```rust
 let ws = Workspace::open_pg("host=db port=5432 user=origofs dbname=origofs", content).await?;
 ```
+
+### Many workspaces in one store
+
+A single store can hold many workspaces. Each gets its own root, refs, and working
+tree; they share the content store and the identity tables (actors, blame, audit),
+and are separated by a `workspace_id`:
+
+```rust
+let team = ws.workspace("team-alpha").await?;   // created on first use
+let all  = ws.workspaces().await?;              // ["default", "team-alpha", …]
+```
+
+The metadata pool, content store, and Postgres push-feed handle are all shared
+with the parent, so opening one is cheap — and `subscribe` on it tails only that
+workspace's slice of the change feed. This is the first step of the tenancy model;
+the full picture (control plane vs. data plane, isolation levels, the
+`TenantRouter`) is written up in
+[`docs/MULTI_TENANCY.md`](docs/MULTI_TENANCY.md).
 
 ### Live collaboration
 
@@ -334,6 +486,80 @@ mapping; `serve` refuses to bind a non-loopback address without one. Errors come
 back as a machine-readable envelope (`{"error":{"code","message","retryable"}}`)
 and every response carries an `x-request-id`.
 
+### Deployment
+
+`docker-compose.yml` brings up the production-shaped stack — the HTTP API over a
+Postgres metadata store and a MinIO (S3) content store:
+
+```bash
+docker compose up --build
+curl localhost:8080/readyz
+curl -H 'Authorization: Bearer demo-token' \
+     -X PUT --data-binary 'hello' localhost:8080/v1/files/notes/a.txt
+```
+
+For your own deployment, a config file selects the backends for the shipped
+daemons (`serve`, `nfs`, `mcp`, `mount`) with no custom host program — full
+options in [`deploy/config.example.toml`](deploy/config.example.toml):
+
+```toml
+[metadata]
+backend = "postgres"                 # or "sqlite"
+dsn = "host=postgres user=origofs dbname=origofs"
+
+[content]
+backend = "s3"                       # or "gcs" / "local"
+bucket  = "origofs-content"
+region  = "us-east-1"
+packed  = true                       # batch chunks into pack objects
+```
+
+```bash
+origofs --config ./origofs.toml --workspace /var/lib/origofs/ws \
+    serve --addr 0.0.0.0:8080 --auth-token "$TOKEN=$ACTOR"
+```
+
+One caveat worth planning around: the **packed** layout keeps a local per-chunk
+index, so a multi-container deployment needs that index on a shared volume (or a
+single writer). The unpacked S3 layout keeps every writer's state in the bucket
+plus the database, which is why the compose file uses it.
+
+### Observability
+
+The libraries are **emit-only**: `origofs-core` and `origofs-sdk` emit `tracing` spans
+and events but install no subscriber, so embedding origofs in your own binary costs
+nothing and you install your own. The CLI installs one:
+
+```bash
+ORIGOFS_LOG=debug origofs --log-format json --workspace "$WS" serve --addr 127.0.0.1:8080
+```
+
+Level filter comes from `ORIGOFS_LOG` (falling back to `RUST_LOG`, default `info`),
+and output always goes to **stderr** so `origofs mcp` keeps stdout for JSON-RPC.
+Backend errors carry a stable machine `code()` plus `retryable()`/`class()` instead
+of a flat string, which is what the HTTP error envelope surfaces. `/health` is
+liveness; `/readyz` is a real readiness probe that pings both stores.
+
+## Mount it as a real filesystem
+
+Any program that can open a file can use an origofs workspace — no client library:
+
+```bash
+# FUSE (Linux; needs root and /dev/fuse). Blocks until unmounted.
+sudo origofs --workspace "$WS" mount /mnt/origofs
+
+# NFSv3 — the portable path, and how macOS mounts a workspace. Blocks until stopped.
+origofs --workspace "$WS" nfs --addr 127.0.0.1:11111
+sudo mount -o vers=3,tcp,port=11111 127.0.0.1:/ /mnt/origofs
+```
+
+Both go through the same engine as every other surface, so a write through the
+mount lands on the change feed and in the audit log like any other. But plain
+POSIX writes carry no identity — they are **unattributed**, and they invalidate
+the file's existing blame rather than inventing an author for it. When you want
+authorship, drive an attributed surface: the overlay mount, MCP, the HTTP API, or
+the SDK.
+
 ## Built to not lose or corrupt data
 
 Because agents can generate a lot of churn against shared storage, correctness
@@ -396,31 +622,165 @@ origofs --workspace "$WS" gc     # run when idle — not safe alongside active w
 | **HTTP API** (`origofs-sdk` `api` feature) | Any language / any client over JSON |
 | **MCP** (`origofs-sdk` `mcp` feature) | Agents calling filesystem tools directly, attributed |
 | **Overlay mount** | Running an agent live in a fast native mount |
-| **FUSE / NFS** | Mounting the workspace as a POSIX filesystem |
+| **Sandbox** (`sandbox` feature) | Running a command over a copy-on-write view and importing its delta |
+| **FUSE / NFS** (`fuse`/`nfs`) | Mounting the workspace as a POSIX filesystem |
+| **`git-remote-origofs`** (`git` feature) | Driving a workspace with the real `git` over `origofs://` |
+| **Co-editing WebSocket** (`coedit`) | Yjs clients typing into a shared document, attributed |
 
-Python, for example, keeps every I/O method awaitable so it composes with
-FastAPI, and lets you inject the user/agent behind each write:
+The six access surfaces after the CLI and SDK are **feature-gated modules of
+`origofs-sdk`**, all default-off; `full` turns them on (`coedit` stays separate), and
+that is what `origofs-cli` builds with. A plain `origofs-sdk` dependency stays lean.
+
+### Python
+
+Every I/O method is awaitable, so the bindings drop straight into `async def`
+handlers, and you inject the identity behind each write:
 
 ```python
 import origofs
 ws  = await origofs.Workspace.open_local("meta.db", "cas")   # or open_pg(dsn, cas)
-ctx = origofs.WriteCtx.session(actor_id, session_id)          # your resolved identity
-await ws.write_as(ctx, "/notes.txt", b"hello")            # attributed → blame + audit
+actor = await ws.find_or_create_human("user_42", "Dan")      # your id -> an origofs actor
+ctx = origofs.WriteCtx.session(actor, session_id)            # your resolved identity
+await ws.write_as(ctx, "/notes.txt", b"hello")               # attributed -> blame + audit
 ```
+
+That's the base. Four integrations sit on top, each behind its own extra:
+
+- **FastAPI router** — `origofs.fastapi.build_router(ws, authn=...)` gives you every
+  workspace endpoint with attribution driven by an auth dependency *you* provide.
+  origofs ships no authentication on purpose: a blame trail is only as trustworthy as
+  the identity behind each write, so resolving it is yours to own. Mutating routes
+  depend on `authn` and the request body never names an actor.
+- **fsspec** — `origofs.fsspec.OrigoFileSystem` registers the `origofs://` protocol, so
+  pandas, Dask, PyArrow, and Zarr read and write workspace paths directly. It is a
+  genuine `AsyncFileSystem` (usable sync *or* awaited), passes fsspec's own
+  conformance suite, and carries attribution: pass `actor=`/`session=` and
+  `fs.blame(path)` credits the write.
+- **universal-pathlib** — `UPath("origofs:///notes.txt", db_path=..., cas_dir=...)`
+  works as a first-class registered protocol, so `read_text`/`iterdir`/`stat`
+  behave like `pathlib`.
+- **`origofs.db`** — SQLAlchemy models plus Alembic migrations for the metadata
+  schema, for when you want to query actors, edit-ops, and blame with the rest of
+  your app's SQL.
+
+Full detail, including the RAG/LlamaIndex reader and overlay orchestration, is in
+[`crates/origofs-py/README.md`](crates/origofs-py/README.md).
+
+## CLI reference
+
+`origofs --help` is authoritative; this is the map. Global flags: `--workspace <dir>`
+(required), `--config <file>` to select backends, `--log-format text|json`.
+
+| Area | Commands |
+|---|---|
+| **Files** | `init` · `ls` · `read` · `write` · `stat` · `mkdir` · `rm` · `mv` |
+| **Attribution** | `actor` · `blame` · `write-policy` |
+| **Review queue** | `suggest` · `suggestions` · `suggestion-diff` · `accept` · `reject` |
+| **Versioning** | `commit` · `log` · `status` · `diff` · `branch` · `checkout` · `merge` · `conflicts` |
+| **Locks** | `lock` · `unlock` · `locks` |
+| **Git interop** | `git export` · `git import` (plus the `git-remote-origofs` helper) |
+| **Agents** | `overlay` · `sandbox` · `mcp` |
+| **Serving & mounts** | `serve` · `nfs` · `mount` |
+| **Live** | `watch` · `presence` |
+| **Maintenance** | `gc` · `fsck [--rebuild]` |
+
+## Configuration
+
+| Variable | Used by | What it does |
+|---|---|---|
+| `ORIGOFS_ENCRYPTION_KEY` | any surface | Opts the workspace into encryption at rest, kept out of argv and shell history. The **same** value must be used on every open or reads fail loudly. |
+| `ORIGOFS_LOG` | CLI | Tracing filter (falls back to `RUST_LOG`; default `info`). |
+| `RUST_LOG` | CLI | Fallback tracing filter. |
+| `ORIGOFS_DATABASE_URL` | `origofs.db` (Python) | Target for the Alembic migration runner. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | GCS backend | Application Default Credentials for the native GCS store. |
+| `ORIGOFS_PG_TEST_URL` | tests | Postgres-backed tests self-skip unless this points at a reachable database. |
+| `ORIGOFS_S3_TEST_*` / `ORIGOFS_GCS_TEST_*` | tests | Credentials for the real object-store suites. |
+
+Backend selection itself lives in the `--config` TOML — see
+[Deployment](#deployment).
+
+## Platform support
+
+| | Linux | macOS | Windows |
+|---|:---:|:---:|:---:|
+| Engine, CLI, SDK, HTTP API, MCP, Python | ✅ | ✅ | untested |
+| FUSE mount | ✅ | — | — |
+| NFSv3 | ✅ | ✅ | — |
+| `overlay` / `sandbox` | ✅ | — | — |
+| `--isolate` (bubblewrap) | ✅ | — | — |
+
+FUSE and NFS are `cfg(unix)`. NFSv3 is how a workspace gets mounted on macOS.
+`overlay`/`sandbox` need unprivileged overlayfs in a user namespace, which is
+Linux-only. CI runs Linux and macOS; nothing is claimed for Windows because
+nothing tests it.
+
+## If you're coming from…
+
+| | Where origofs differs |
+|---|---|
+| **`git` (+ git-LFS)** | The working tree is live and shared, not something you stage and commit; authorship is recorded *at write time* per byte range, by actor and session, rather than inferred per commit by author line. Content lives in object storage rather than a local pack — and origofs still exports to and imports from real git objects. |
+| **[agentfs](https://github.com/tursodatabase/agentfs)** | The direct inspiration. agentfs keeps file bytes as fixed BLOBs inside one SQLite file and logs *tool calls*; origofs content-addresses the bytes into a pluggable store (so large and remote files work), swaps SQLite for Postgres when you need real multi-writer concurrency, adds a commit DAG with three-way merge, and attributes *byte ranges* rather than calls. |
+| **A vector store over object storage** | Passages come out of the same store the files live in, keyed by content hash and carrying blame — so re-indexing is incremental and retrieved text can name its authors. |
+| **Rolling your own S3 + Postgres** | That split is the whole design here, done with the sharp edges handled: content flushed before the metadata referencing it commits, integrity re-verified on read, GC that won't sweep live refs, and a DB you can rebuild from the bucket. |
+
+## Status & roadmap
+
+Pre-1.0, and vibe-coded (see the top of this file). The M0–M9 milestones from
+[`docs/DESIGN.md`](docs/DESIGN.md) §9 are delivered — skeleton, content addressing,
+Postgres, versioning, merge, git interop, attribution, access surfaces, live
+collaboration, and the hardening pass. The remaining tail is tracked in a single
+consolidated issue: [#75](https://github.com/danplischke/origofs/issues/75).
+
+Nothing is published to crates.io or PyPI yet, and the HTTP surface is versioned
+(`/v1`) but the Rust and Python APIs may still change.
+
+## Examples
+
+| | |
+|---|---|
+| [`examples/web/`](examples/web) | A full-stack **React + PlateJS** editor over the FastAPI router: per-line and per-block attribution, commit lineage with diffs, the agent-suggestion review queue reviewed inline, presence, and a live SSE feed. The best look at what origofs is *for*. |
+| [`examples/fs-consumer/`](examples/fs-consumer) | Turning the change feed into a reliable stream of file changes — with a BigQuery sink and exactly-once cursor handling. A workspace is already a change-data-capture source; you tail it, you don't crawl it. |
+| [`crates/origofs-py/examples/collab_app.py`](crates/origofs-py/examples/collab_app.py) | A complete little service that also **runs itself** — `python collab_app.py` plays the whole story end to end: a human writes, an agent suggests, a reviewer accepts, blame credits both. No server, no curl. |
 
 ## Development
 
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets
+cargo fmt                                  # no rustfmt.toml — default style
 ```
 
 The Postgres backend tests self-skip unless `ORIGOFS_PG_TEST_URL` points at a
-reachable database:
+reachable database, so a plain `cargo test --workspace` silently exercises only
+the SQLite path:
 
 ```bash
 ORIGOFS_PG_TEST_URL="host=127.0.0.1 port=5432 user=postgres dbname=origofs" cargo test --workspace
 ```
+
+The integration tests in each crate's `tests/` are the clearest executable spec of
+behaviour — `merge`, `attribution`, `recover`, `durability`, `integrity`,
+`hardening` especially. Mirror their style when adding coverage.
+
+### What CI checks
+
+Beyond fmt, clippy, and the test suite on **both** engines (SQLite and Postgres),
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs:
+
+- **Coverage** — `cargo-llvm-cov` uploaded to Codecov, gating patch coverage.
+- **MSRV** — a 1.88 leg, so an accidental newer-stdlib use or a dependency MSRV
+  bump is caught rather than discovered by a user.
+- **Fuzzing** — a bounded `cargo-fuzz` smoke run over the object decoders. Every
+  blob/tree/commit is parsed from untrusted bytes on read, so each decoder is a
+  hostile-input boundary.
+- **Supply chain** — `cargo-deny` for advisories, licenses, and banned deps.
+- **Object storage** — the S3 suite against a real MinIO, covering multipart and
+  ranged reads the in-memory adapter can't model.
+- **macOS** — the NFS surface is the macOS path, so it runs on its target OS.
+- **Benchmarks** — Criterion, tracked run-over-run to flag hot-path regressions.
+
+A separate [`mutants.yml`](.github/workflows/mutants.yml) workflow runs
+`cargo-mutants` periodically to check the suite actually *catches* regressions.
 
 ### Performance
 
@@ -434,7 +794,19 @@ cargo bench -p origofs-core
 
 Indicative single-threaded numbers (release, in-memory store): writes chunk + hash
 at ~1.3 GiB/s and reads reassemble at ~10 GiB/s; encryption at rest costs roughly
-2× on write and is decrypt-bound on read.
+2× on write and is decrypt-bound on read. These came off one developer machine and
+are here for order-of-magnitude only — run the benches on your own hardware before
+planning around them, and remember they exclude disk and network entirely.
+
+### Contributing
+
+Bug reports and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+workflow and what CI expects, and [SECURITY.md](SECURITY.md) for how to report a
+vulnerability. Notable changes are recorded in [CHANGELOG.md](CHANGELOG.md), and
+participation is covered by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+AI-assisted PRs are welcome here rather than frowned on — this project is
+vibe-coded, after all — on one condition: read what you're submitting.
 
 ## Design
 
