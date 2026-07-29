@@ -376,6 +376,7 @@ impl Workspace {
             .await;
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path, bytes = data.len()))]
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
         self.fs.write(path, data).await?;
         self.emit("write", path, None, None, None).await;
@@ -432,12 +433,14 @@ impl Workspace {
         self.fs.stat(path).await
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path))]
     pub async fn remove(&self, path: &str) -> Result<()> {
         self.fs.remove(path).await?;
         self.emit("remove", path, None, None, None).await;
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(from = %from, to = %to))]
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.fs.rename(from, to).await?;
         self.emit("rename", from, Some(to.to_string()), None, None)
@@ -459,6 +462,7 @@ impl Workspace {
     // --- versioning ------------------------------------------------------
 
     /// Snapshot the working tree into a commit on the current branch.
+    #[tracing::instrument(skip_all, fields(author = %author))]
     pub async fn commit(&self, author: &str, message: &str) -> Result<Hash> {
         let hash = self.fs.commit(author, message).await?;
         self.emit("commit", "/", Some(message.to_string()), None, None)
@@ -520,6 +524,7 @@ impl Workspace {
 
     /// Reclaim content-store objects unreachable from any ref or the live
     /// working tree. Run when the workspace is idle.
+    #[tracing::instrument(skip_all)]
     pub async fn gc(&self) -> Result<GcStats> {
         self.fs.gc().await
     }
@@ -565,6 +570,7 @@ impl Workspace {
     }
 
     /// Merge branch `name` into the current branch.
+    #[tracing::instrument(skip_all)]
     pub async fn merge_branch(
         &self,
         name: &str,
@@ -694,6 +700,7 @@ impl Workspace {
     }
 
     /// Attributed write: records the actor and updates per-line authorship.
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path, bytes = data.len()))]
     pub async fn write_as(&self, ctx: WriteCtx, path: &str, data: &[u8]) -> Result<()> {
         self.fs.write_as(ctx, path, data).await?;
         self.emit("write", path, None, Some(ctx.actor), ctx.session)
@@ -821,6 +828,7 @@ impl Workspace {
     }
 
     /// Revert every line an actor wrote in a session. Returns files changed.
+    #[tracing::instrument(skip_all, fields(actor = actor_id, session = session_id))]
     pub async fn revert_session(&self, actor_id: i64, session_id: i64) -> Result<usize> {
         self.fs.revert_session(actor_id, session_id).await
     }

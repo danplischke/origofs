@@ -10,7 +10,7 @@
 //! ```
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use origofs_sdk::{MergeOutcome, SuggestionStatus, Workspace, WriteCtx};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -26,8 +26,23 @@ struct Cli {
     #[arg(long, default_value = ".origofs")]
     workspace: PathBuf,
 
+    /// Format for the library's tracing output (written to stderr). The level
+    /// filter comes from `ORIGOFS_LOG` (or `RUST_LOG`), defaulting to `info`.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
+
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// How the CLI renders the library's tracing output.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum LogFormat {
+    /// Human-readable single-line records.
+    #[default]
+    Text,
+    /// Structured JSON records (one object per line), for log pipelines.
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -298,9 +313,33 @@ enum GitCmd {
     },
 }
 
+/// Install the tracing subscriber for the CLI. The level filter is read from
+/// `ORIGOFS_LOG` (then `RUST_LOG`, then `info`); records go to **stderr** so they
+/// never corrupt a data channel on stdout — notably the `origofs mcp` JSON-RPC
+/// transport. origofs-core/-sdk only *emit* spans and events; this is the one
+/// place they are shown (a Rust embedder installs its own subscriber instead).
+fn init_tracing(format: LogFormat) {
+    use tracing_subscriber::fmt::format::FmtSpan;
+    use tracing_subscriber::{EnvFilter, fmt};
+    let filter = EnvFilter::try_from_env("ORIGOFS_LOG")
+        .or_else(|_| EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    // Log each instrumented operation once when its span closes, with the elapsed
+    // time — so the spans double as per-operation latency records.
+    let builder = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_span_events(FmtSpan::CLOSE);
+    match format {
+        LogFormat::Json => builder.json().init(),
+        LogFormat::Text => builder.init(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_tracing(cli.log_format);
     std::fs::create_dir_all(&cli.workspace)?;
     let db = cli.workspace.join("meta.db");
     let cas = cli.workspace.join("cas");
@@ -808,6 +847,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Serve { addr, auth_tokens } => {
             let auth = build_api_auth(&ws, &addr, &auth_tokens).await?;
+            tracing::info!(%addr, "starting origofs HTTP API");
             println!("serving origofs at http://{addr} (Ctrl-C to stop)");
             origofs_sdk::api::serve(std::sync::Arc::new(ws), addr, auth).await?;
         }
