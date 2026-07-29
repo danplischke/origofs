@@ -173,6 +173,40 @@ def test_fsspec_backend_validation():
         OrigoFileSystem(backend="nonsense", db_path="x")
 
 
+def test_fsspec_error_edges():
+    """Error paths the fsspec compliance suite doesn't pin down for origofs."""
+    fs = _fs()
+
+    # empty file round-trips
+    fs.pipe_file("/empty", b"")
+    assert fs.cat_file("/empty") == b"" and fs.info("/empty")["size"] == 0
+
+    fs.makedirs("/dir")
+    with pytest.raises(FileExistsError):
+        fs.mkdir("/dir")  # already exists
+    with pytest.raises(FileNotFoundError):
+        fs.mkdir("/missing/leaf", create_parents=False)  # parent absent
+
+    fs.pipe_file("/dir/f", b"x")
+    with pytest.raises(OSError):
+        fs.rmdir("/dir")  # not empty
+    with pytest.raises(FileNotFoundError):
+        fs.rm("/does-not-exist")  # missing target -> raise (POSIX-like)
+
+
+def test_fsspec_path_traversal_rejected():
+    """origofs refuses to store a poisoned path component (`..`, NUL) at the
+    metadata boundary — the invariant that stops a name escaping the tree. The
+    filesystem must surface that, not paper over it."""
+    fs = _fs()
+    fs.makedirs("/dir")
+    for bad in ("/dir/../escape", "/dir/a\x00b"):
+        with pytest.raises(ValueError):
+            fs.pipe_file(bad, b"x")
+        with pytest.raises(ValueError):
+            fs.info(bad)
+
+
 if __name__ == "__main__":
     test_fsspec_sync()
     test_fsspec_text_and_append()
@@ -181,4 +215,6 @@ if __name__ == "__main__":
     test_fsspec_registry_and_url()
     test_fsspec_memory_backend()
     test_fsspec_backend_validation()
+    test_fsspec_error_edges()
+    test_fsspec_path_traversal_rejected()
     print("OK  origofs.fsspec")

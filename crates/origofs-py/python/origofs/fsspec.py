@@ -429,19 +429,13 @@ class OrigoFileSystem(AsyncFileSystem):
     ) -> None:
         # origofs removes only files and *empty* directories, so we can't hand the
         # default reverse-order rm a tree. Expand, delete files, then delete the
-        # now-empty directories deepest-first.
+        # now-empty directories deepest-first. A missing target surfaces as
+        # FileNotFoundError (from _expand_path or _info), matching fsspec/POSIX rm.
         paths = await self._expand_path(path, recursive=recursive, maxdepth=maxdepth)
         ws = await self._get_ws()
-        infos = await asyncio.gather(
-            *(self._info(p) for p in paths), return_exceptions=True
-        )
-        files, dirs = [], []
-        for info in infos:
-            if isinstance(info, FileNotFoundError):
-                continue  # already gone (a concurrent delete); fine
-            if isinstance(info, BaseException):
-                raise info
-            (dirs if info["type"] == "directory" else files).append(info["name"])
+        infos = await asyncio.gather(*(self._info(p) for p in paths))
+        files = [i["name"] for i in infos if i["type"] != "directory"]
+        dirs = [i["name"] for i in infos if i["type"] == "directory"]
         await asyncio.gather(*(self._rm_file(f) for f in files))
         for d in sorted(set(dirs), key=lambda x: x.count("/"), reverse=True):
             if d == "/":
@@ -450,6 +444,12 @@ class OrigoFileSystem(AsyncFileSystem):
             self.invalidate_cache(self._parent(d))
 
     async def _cp_file(self, path1: str, path2: str, **kwargs: Any) -> None:
+        # A recursive copy expands to files *and* directories and calls _cp_file on
+        # each; a directory source is reproduced as a directory (so empty dirs
+        # survive the copy), not read as bytes.
+        if await self._isdir(path1):
+            await self._makedirs(path2, exist_ok=True)
+            return
         data = await self._cat_file(path1)
         await self._pipe_file(path2, data, **kwargs)
 

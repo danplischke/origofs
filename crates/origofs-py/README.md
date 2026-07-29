@@ -110,6 +110,10 @@ and server-owns-identity discipline as the rest of origofs. Ranged reads go thro
 default (an origofs working tree is live and multi-writer). Needs the `fsspec` extra
 (`pip install "origofs[fsspec]"`).
 
+It passes fsspec's own conformance suite (`fsspec.tests.abstract` — copy/get/put/
+pipe/open, including the recursive, trailing-slash, and glob edge cases); see
+`tests/test_fsspec_compliance.py`.
+
 **Pathlib API** — because it's a well-behaved filesystem, it also works with
 [universal-pathlib](https://github.com/fsspec/universal_pathlib) as a first-class,
 explicitly-registered protocol (`pip install "origofs[upath]"`):
