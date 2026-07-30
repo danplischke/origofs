@@ -31,6 +31,29 @@ pub trait ContentStore: Send + Sync {
     /// [`EncryptedStore`]: crate::encrypt::EncryptedStore
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()>;
 
+    /// **Replace** the value stored under `key`, atomically where the backend can.
+    ///
+    /// [`put_keyed`](Self::put_keyed) is insert-if-absent in every backend — right
+    /// for a content-addressed key, where the value is a function of the key and a
+    /// second write would be redundant. But `put_keyed` also serves genuinely
+    /// *mutable* keyed stores: a [`PackStore`](crate::PackStore)'s chunk→location
+    /// index changes whenever a repack moves a chunk to a different pack. There,
+    /// insert-if-absent silently drops the update.
+    ///
+    /// The workaround — delete, then put — leaves a window in which the key
+    /// resolves to nothing at all. For the pack index that window is unrecoverable:
+    /// a chunk with no index entry is invisible to `repack`, which then reads the
+    /// pack holding it as fully dead and deletes it. Hence an explicit atomic
+    /// replace.
+    ///
+    /// The default is that unsafe delete-then-put, for a custom backend that can do
+    /// no better; every backend here overrides it with a genuinely atomic write
+    /// (a rename, a map insert, an object PUT).
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        self.delete(key).await?;
+        self.put_keyed(key, bytes).await
+    }
+
     /// Fetch the full blob for `hash`.
     async fn get(&self, hash: &Hash) -> Result<Bytes>;
 
@@ -200,6 +223,12 @@ impl ContentStore for LocalCasStore {
         self.write_at(&path, bytes).await
     }
 
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        // `write_at` is temp-file + rename, so the key never resolves to a
+        // half-written value and never to nothing.
+        self.write_at(&self.path_for(key), bytes).await
+    }
+
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         let path = self.path_for(hash);
         match tokio::fs::read(&path).await {
@@ -340,6 +369,14 @@ impl ContentStore for MemStore {
         Ok(hash)
     }
 
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        self.map
+            .lock()
+            .expect("mem store poisoned")
+            .insert(*key, Bytes::copy_from_slice(bytes));
+        Ok(())
+    }
+
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         self.map
             .lock()
@@ -437,6 +474,16 @@ impl ContentStore for TieredStore {
         Ok(())
     }
 
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        self.backend.replace_keyed(key, bytes).await?;
+        // The cache holds the *old* value, which is now wrong — replace it too, and
+        // drop it on failure rather than leave a stale read in front of the backend.
+        if self.cache.replace_keyed(key, bytes).await.is_err() {
+            let _ = self.cache.delete(key).await;
+        }
+        Ok(())
+    }
+
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         if let Ok(bytes) = self.cache.get(hash).await {
             return Ok(bytes);
@@ -522,6 +569,10 @@ impl ContentStore for VerifyingStore {
 
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         self.inner.put_keyed(key, bytes).await
+    }
+
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        self.inner.replace_keyed(key, bytes).await
     }
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {

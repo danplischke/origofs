@@ -49,6 +49,9 @@ coedit = ["dep:yrs"]
 metrics = ["dep:metrics"]
 
 [dev-dependencies]
+# pack.rs wraps a backend to inject a mid-repack failure, which needs the same
+# `#[async_trait]` the ContentStore trait is declared with.
+async-trait = "0.1.91"
 criterion = "0.5.1"
 proptest = "1"
 tempfile = "3.27.0"

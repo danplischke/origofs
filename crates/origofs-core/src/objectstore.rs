@@ -166,6 +166,16 @@ impl ContentStore for ObjectContentStore {
         Ok(())
     }
 
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        // An object PUT replaces atomically: readers see the old object or the
+        // new one, never neither.
+        self.store
+            .put(&self.path_for(key), PutPayload::from(bytes.to_vec()))
+            .await
+            .map_err(OrigoFSError::from)?;
+        Ok(())
+    }
+
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         let path = self.path_for(hash);
         match self.store.get(&path).await {

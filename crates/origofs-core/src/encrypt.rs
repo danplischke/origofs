@@ -128,6 +128,21 @@ impl ContentStore for EncryptedStore {
         self.inner.put_keyed(key, &ciphertext).await
     }
 
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        // Same nonce-reuse rule as `put_keyed`, and doubly so: *replacing* a value
+        // is by definition storing a second plaintext under one key, which is
+        // exactly the (key, nonce) reuse the derivation cannot survive. A mutable
+        // keyed store (a `PackStore` index) must not be wrapped in encryption.
+        if key != &Hash::of(bytes) {
+            return Err(OrigoFSError::Content(
+                "EncryptedStore::replace_keyed requires a content-addressed key \
+                 (key must equal the hash of the plaintext)"
+                    .into(),
+            ));
+        }
+        self.put_keyed(key, bytes).await
+    }
+
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         let ciphertext = self.inner.get(hash).await?;
         Ok(Bytes::from(self.decrypt(hash, &ciphertext)?))

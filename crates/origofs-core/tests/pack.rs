@@ -191,3 +191,141 @@ async fn engine_writes_land_in_packs() {
         data.len()
     );
 }
+
+/// A data backend that starts failing `put` on demand — enough to stop a repack
+/// exactly where a crash would, in the middle of moving survivors.
+struct FailAfter {
+    inner: Arc<MemStore>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl FailAfter {
+    fn new(inner: Arc<MemStore>) -> Self {
+        Self {
+            inner,
+            fail: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn arm(&self) {
+        self.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn armed(&self) -> bool {
+        self.fail.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ContentStore for FailAfter {
+    async fn put(&self, bytes: &[u8]) -> origofs_core::Result<Hash> {
+        if self.armed() {
+            return Err(origofs_core::OrigoFSError::Content("injected".into()));
+        }
+        self.inner.put(bytes).await
+    }
+    async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> origofs_core::Result<()> {
+        self.inner.put_keyed(key, bytes).await
+    }
+    async fn get(&self, hash: &Hash) -> origofs_core::Result<bytes::Bytes> {
+        self.inner.get(hash).await
+    }
+    async fn get_range(
+        &self,
+        hash: &Hash,
+        off: u64,
+        len: u64,
+    ) -> origofs_core::Result<bytes::Bytes> {
+        self.inner.get_range(hash, off, len).await
+    }
+    async fn has(&self, hash: &Hash) -> origofs_core::Result<bool> {
+        self.inner.has(hash).await
+    }
+    async fn list(&self) -> origofs_core::Result<Vec<Hash>> {
+        self.inner.list().await
+    }
+    async fn delete(&self, hash: &Hash) -> origofs_core::Result<u64> {
+        self.inner.delete(hash).await
+    }
+}
+
+/// A repack that fails partway must leave every live chunk readable.
+///
+/// `repack` moves the survivors of a partially-dead pack into a fresh one. It used
+/// to clear a survivor's index pointer *before* staging it — and staging only
+/// buffers in memory. So if the seal then failed (a crash, a full disk, an S3
+/// error), the chunk had no index entry while its bytes still sat in the old pack.
+/// A chunk with no index entry is invisible to the *next* repack, which reads that
+/// pack as fully dead and deletes it: permanent loss, from the one operation whose
+/// job is to reclaim space safely.
+///
+/// Here the data backend is rigged to fail the new pack's write, which is exactly
+/// that window. The survivor must still be readable afterwards, and a later
+/// successful repack must still find it.
+#[tokio::test]
+async fn a_failed_repack_leaves_live_chunks_readable() {
+    let raw = Arc::new(MemStore::new());
+    let data = Arc::new(FailAfter::new(raw.clone()));
+    let index = Arc::new(MemStore::new());
+    let store = PackStore::with_target(
+        data.clone() as Arc<dyn ContentStore>,
+        index.clone() as Arc<dyn ContentStore>,
+        1 << 20,
+    );
+
+    let survivor = blob(4096, 1);
+    let doomed = blob(4096, 2);
+    let sh = store.put(&survivor).await.unwrap();
+    let dh = store.put(&doomed).await.unwrap();
+    store.flush().await.unwrap();
+    // One pack, two members, one now dead -> the partially-dead case.
+    store.delete(&dh).await.unwrap();
+
+    // Fail the new pack's write, mid-repack.
+    data.arm();
+    assert!(
+        store.repack().await.is_err(),
+        "the injected failure should surface"
+    );
+
+    // Restart. This is what makes the window matter: the failed repack left
+    // survivors in the *in-memory* staging buffer, so the same process can still
+    // read them and the damage is invisible. A fresh store over the same durable
+    // backends is what an operator actually has after a crash.
+    drop(store);
+    data.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let after_crash = PackStore::with_target(
+        data.clone() as Arc<dyn ContentStore>,
+        index.clone() as Arc<dyn ContentStore>,
+        1 << 20,
+    );
+
+    // The decisive assertion: the old pack is still there and the index still
+    // points at it, so the chunk is reachable from durable state alone.
+    let got = after_crash
+        .get(&sh)
+        .await
+        .expect("a live chunk must survive a failed repack plus a restart");
+    assert_eq!(&got[..], &survivor[..]);
+    assert_eq!(Hash::of(&got), sh);
+
+    // And a re-run — what an operator does next — completes and keeps it.
+    after_crash.repack().await.unwrap();
+    assert_eq!(&after_crash.get(&sh).await.unwrap()[..], &survivor[..]);
+}
+
+/// The index is a *mutable* keyed store: a chunk's entry changes when a repack
+/// moves it. `put_keyed` is insert-if-absent in every backend, so it silently
+/// dropped that update — which is why repack had to delete the old pointer first.
+#[tokio::test]
+async fn index_entries_can_be_updated_in_place() {
+    let index = Arc::new(MemStore::new());
+    let key = Hash::of(b"chunk");
+
+    index.put_keyed(&key, b"first").await.unwrap();
+    // Insert-if-absent: the update is dropped.
+    index.put_keyed(&key, b"second").await.unwrap();
+    assert_eq!(&index.get(&key).await.unwrap()[..], b"first");
+
+    // Replace actually replaces, without the key ever resolving to nothing.
+    index.replace_keyed(&key, b"second").await.unwrap();
+    assert_eq!(&index.get(&key).await.unwrap()[..], b"second");
+}
