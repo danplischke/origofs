@@ -136,6 +136,14 @@ impl ObjectContentStore {
         let hex = hash.to_hex();
         OsPath::from(format!("{}/{}/{}", self.prefix, &hex[0..2], &hex[2..]))
     }
+
+    /// Named slots live under a **sibling** prefix, `<prefix>.meta/`. `list` pages
+    /// `<prefix>/`, and object-store prefixes match whole path components, so
+    /// `objects.meta/format` is never returned by a listing of `objects` — slots
+    /// stay invisible to GC and to a recovery scan.
+    fn slot_path(&self, name: &str) -> OsPath {
+        OsPath::from(format!("{}.meta/{}", self.prefix, name))
+    }
 }
 
 #[async_trait]
@@ -164,6 +172,25 @@ impl ContentStore for ObjectContentStore {
             .await
             .map_err(OrigoFSError::from)?;
         Ok(())
+    }
+
+    async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        crate::content::validate_slot_name(name)?;
+        // Overwrites: a slot is mutable, unlike a content-addressed object.
+        self.store
+            .put(&self.slot_path(name), PutPayload::from(bytes.to_vec()))
+            .await
+            .map_err(OrigoFSError::from)?;
+        Ok(())
+    }
+
+    async fn get_meta(&self, name: &str) -> Result<Option<Bytes>> {
+        crate::content::validate_slot_name(name)?;
+        match self.store.get(&self.slot_path(name)).await {
+            Ok(result) => result.bytes().await.map(Some).map_err(OrigoFSError::from),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(OrigoFSError::from(e)),
+        }
     }
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {

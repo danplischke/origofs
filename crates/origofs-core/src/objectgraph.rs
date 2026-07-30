@@ -8,12 +8,9 @@
 //!
 //! [`ContentStore`]: crate::ContentStore
 
-use crate::error::{OrigoFSError, Result};
+use crate::error::Result;
+use crate::format;
 use crate::types::Hash;
-
-const TREE_MAGIC: &[u8; 5] = b"ORGT\x01";
-const COMMIT_MAGIC: &[u8; 5] = b"ORGC\x01";
-const REFS_MAGIC: &[u8; 5] = b"ORGR\x01";
 
 /// The kind of a tree entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,10 +55,13 @@ pub struct Tree {
 }
 
 impl Tree {
-    /// `magic | count(u32) | [ kind(u8) | mode(u32) | name_len(u16) | name | hash(32) ]*`
+    /// `ORGT | version | count(u32) | [ kind(u8) | mode(u32) | name_len(u16) | name | hash(32) ]*`
+    ///
+    /// The bytes are the object's address, so this encoding is frozen for v1 —
+    /// see the format-evolution rules in [`crate::format`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(TREE_MAGIC);
+        out.extend_from_slice(&format::TREE.header());
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for e in &self.entries {
             out.push(e.kind.code());
@@ -73,9 +73,23 @@ impl Tree {
         out
     }
 
+    /// Decode a tree, dispatching on its header's format version. An object
+    /// written by a newer origofs yields [`OrigoFSError::UnsupportedVersion`]
+    /// rather than a "malformed" error that reads like corruption.
+    ///
+    /// [`OrigoFSError::UnsupportedVersion`]: crate::error::OrigoFSError::UnsupportedVersion
     pub fn decode(bytes: &[u8]) -> Result<Tree> {
-        let bad = || OrigoFSError::Content("malformed tree object".to_string());
-        if bytes.len() < 9 || &bytes[0..5] != TREE_MAGIC {
+        match format::TREE.version_of(bytes)? {
+            1 => Tree::decode_v1(bytes),
+            // Unreachable while `version_of` caps at `max_read_version`; this is
+            // the arm a future version is added beside (never *instead of* v1).
+            v => Err(format::TREE.unsupported(v)),
+        }
+    }
+
+    fn decode_v1(bytes: &[u8]) -> Result<Tree> {
+        let bad = || format::TREE.malformed();
+        if bytes.len() < 9 {
             return Err(bad());
         }
         let count = u32::from_le_bytes(bytes[5..9].try_into().map_err(|_| bad())?) as usize;
@@ -123,11 +137,14 @@ pub struct Commit {
 }
 
 impl Commit {
-    /// `magic | tree(32) | parent_count(u32) | parents(32)* | ts(i64) |
+    /// `ORGC | version | tree(32) | parent_count(u32) | parents(32)* | ts(i64) |
     ///  author_len(u16) | author | msg_len(u32) | msg`
+    ///
+    /// The bytes are the object's address, so this encoding is frozen for v1 —
+    /// see the format-evolution rules in [`crate::format`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(COMMIT_MAGIC);
+        out.extend_from_slice(&format::COMMIT.header());
         out.extend_from_slice(self.tree.as_bytes());
         out.extend_from_slice(&(self.parents.len() as u32).to_le_bytes());
         for p in &self.parents {
@@ -141,9 +158,23 @@ impl Commit {
         out
     }
 
+    /// Decode a commit, dispatching on its header's format version. An object
+    /// written by a newer origofs yields [`OrigoFSError::UnsupportedVersion`]
+    /// rather than a "malformed" error that reads like corruption.
+    ///
+    /// [`OrigoFSError::UnsupportedVersion`]: crate::error::OrigoFSError::UnsupportedVersion
     pub fn decode(bytes: &[u8]) -> Result<Commit> {
-        let bad = || OrigoFSError::Content("malformed commit object".to_string());
-        if bytes.len() < 5 + 32 + 4 || &bytes[0..5] != COMMIT_MAGIC {
+        match format::COMMIT.version_of(bytes)? {
+            1 => Commit::decode_v1(bytes),
+            // Unreachable while `version_of` caps at `max_read_version`; this is
+            // the arm a future version is added beside (never *instead of* v1).
+            v => Err(format::COMMIT.unsupported(v)),
+        }
+    }
+
+    fn decode_v1(bytes: &[u8]) -> Result<Commit> {
+        let bad = || format::COMMIT.malformed();
+        if bytes.len() < 5 + 32 + 4 {
             return Err(bad());
         }
         let mut off = 5;
@@ -219,10 +250,13 @@ pub struct RefSnapshot {
 }
 
 impl RefSnapshot {
-    /// `magic | generation(u64) | count(u32) | [ name_len(u16) | name | val_len(u32) | val ]*`
+    /// `ORGR | version | generation(u64) | count(u32) | [ name_len(u16) | name | val_len(u32) | val ]*`
+    ///
+    /// The bytes are the object's address, so this encoding is frozen for v1 —
+    /// see the format-evolution rules in [`crate::format`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(REFS_MAGIC);
+        out.extend_from_slice(&format::REFS.header());
         out.extend_from_slice(&self.generation.to_le_bytes());
         out.extend_from_slice(&(self.refs.len() as u32).to_le_bytes());
         for (name, value) in &self.refs {
@@ -234,9 +268,25 @@ impl RefSnapshot {
         out
     }
 
+    /// Decode a ref snapshot, dispatching on its header's format version. An
+    /// object written by a newer origofs yields
+    /// [`OrigoFSError::UnsupportedVersion`] rather than a "malformed" error that
+    /// reads like corruption — which matters most here, since recovery picks the
+    /// newest snapshot it can read and must not quietly settle for an older one.
+    ///
+    /// [`OrigoFSError::UnsupportedVersion`]: crate::error::OrigoFSError::UnsupportedVersion
     pub fn decode(bytes: &[u8]) -> Result<RefSnapshot> {
-        let bad = || OrigoFSError::Content("malformed ref snapshot".to_string());
-        if bytes.len() < 17 || &bytes[0..5] != REFS_MAGIC {
+        match format::REFS.version_of(bytes)? {
+            1 => RefSnapshot::decode_v1(bytes),
+            // Unreachable while `version_of` caps at `max_read_version`; this is
+            // the arm a future version is added beside (never *instead of* v1).
+            v => Err(format::REFS.unsupported(v)),
+        }
+    }
+
+    fn decode_v1(bytes: &[u8]) -> Result<RefSnapshot> {
+        let bad = || format::REFS.malformed();
+        if bytes.len() < 17 {
             return Err(bad());
         }
         let generation = u64::from_le_bytes(bytes[5..13].try_into().map_err(|_| bad())?);

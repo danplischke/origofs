@@ -125,10 +125,52 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// Initialize the metadata schema, the root directory, and versioning state
-    /// (HEAD → `main`, default `versioning = native`).
+    /// (HEAD → `main`, default `versioning = native`), after checking that this
+    /// build can read the content store's object format.
     pub async fn init(&self) -> Result<()> {
+        self.check_store_format().await?;
         self.meta.init().await?;
         self.init_versioning().await?;
+        Ok(())
+    }
+
+    /// Verify — and on a fresh store, stamp — the content store's format
+    /// descriptor (`crate::format`).
+    ///
+    /// Every `Workspace::open_*` funnels through [`init`](Self::init), so this is
+    /// the one place a store written by a **newer** origofs is caught: once, at
+    /// open, with a single actionable error. Without it the same condition
+    /// surfaces object-by-object, deep in whatever operation happened to touch a
+    /// v2 object first — and some of those paths (recovery's classification, the
+    /// co-edit sidecar's "rebuild if unparseable" fallback) are designed to treat
+    /// bytes they can't parse as *absent*, which turns "upgrade origofs" into
+    /// silent data loss.
+    ///
+    /// A store with no descriptor is a fresh one — stamp it. A backend that doesn't
+    /// implement named slots reports "never written" forever and is simply never
+    /// checked — see [`ContentStore::put_meta`].
+    async fn check_store_format(&self) -> Result<()> {
+        use crate::format::{STORE_DESCRIPTOR_SLOT, StoreDescriptor};
+        let current = StoreDescriptor::current();
+        match self.content.get_meta(STORE_DESCRIPTOR_SLOT).await? {
+            Some(bytes) => {
+                let found = StoreDescriptor::decode(&bytes)?;
+                found.check_readable()?;
+                // We are about to write objects newer than the store advertises;
+                // record that before any of them lands, so a reader that arrives
+                // between the bump and the first v2 object is still warned.
+                if current.format_version > found.format_version {
+                    self.content
+                        .put_meta(STORE_DESCRIPTOR_SLOT, &current.encode())
+                        .await?;
+                }
+            }
+            None => {
+                self.content
+                    .put_meta(STORE_DESCRIPTOR_SLOT, &current.encode())
+                    .await?;
+            }
+        }
         Ok(())
     }
 
