@@ -555,3 +555,73 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose down -v
+
+  # Postgres over TLS. The `rust` job's service container serves plaintext, so the
+  # handshake path — the one that decides whether origofs can reach a managed
+  # Postgres at all — would otherwise never execute. Run one with `ssl = on` and a
+  # certificate from a private CA, which is also the shape a self-hosted deployment
+  # has.
+  pg-tls:
+    name: Postgres over TLS
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Issue a CA and a server certificate
+        run: |
+          mkdir -p /tmp/pgtls
+          cd /tmp/pgtls
+          openssl req -new -x509 -days 1 -nodes -out ca.crt -keyout ca.key \
+            -subj "/CN=origofs-ci-ca"
+          openssl req -new -nodes -out server.csr -keyout server.key \
+            -subj "/CN=localhost"
+          # CA:FALSE matters: rustls refuses to accept a CA certificate as an
+          # end-entity server certificate (`CaUsedAsEndEntity`).
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+            -days 1 -out server.crt -extfile <(printf \
+              "basicConstraints=CA:FALSE\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
+          # The server reads these as uid 999 inside the container.
+          sudo chown 999:999 server.key server.crt
+          sudo chmod 600 server.key
+
+      - name: Start Postgres with TLS
+        run: |
+          docker run -d --name pgtls \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=origofs \
+            -p 5433:5432 \
+            -v /tmp/pgtls:/certs \
+            postgres:16 \
+            -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
+          for i in $(seq 1 30); do
+            docker exec pgtls pg_isready -U postgres && break
+            sleep 2
+          done
+          # Prove the server really negotiated TLS before trusting the test result.
+          docker exec pgtls psql -U postgres -d origofs -tAc \
+            "SELECT current_setting('ssl')"
+
+      - name: Test the TLS path
+        env:
+          ORIGOFS_PG_TLS_TEST_URL: "host=localhost port=5433 user=postgres password=postgres dbname=origofs"
+          ORIGOFS_PG_TLS_TEST_CA: /tmp/pgtls/ca.crt
+        run: cargo test -p origofs-core --test pg_tls
+
+      # The rest of the Postgres suite, with origofs's connections encrypted.
+      #
+      # No explicit `sslmode`, so it defaults to `prefer`: origofs has a connector
+      # and negotiates TLS, while the suite's own schema-reset helper (which opens
+      # a raw `NoTls` connection) degrades to plaintext instead of failing. The
+      # encryption of origofs's connections is asserted directly in `pg_tls.rs`
+      # via `pg_stat_ssl`, not inferred from this job passing.
+      - name: Full Postgres suite with TLS negotiated
+        env:
+          ORIGOFS_PG_TEST_URL: "host=localhost port=5433 user=postgres password=postgres dbname=origofs"
+          ORIGOFS_PG_CA_FILE: /tmp/pgtls/ca.crt
+        run: cargo test -p origofs-core --test postgres
+
+      - name: Server logs
+        if: failure()
+        run: docker logs pgtls

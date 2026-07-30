@@ -12,9 +12,14 @@
 # backend = "sqlite"   # solo/offline (the default)
 #   path = "/data/meta.db"        # optional; default <workspace>/meta.db
 # backend = "postgres" # multi-writer/production
+# TLS is negotiated per the DSN's `sslmode` (libpq's own keyword; default
+# `prefer`). `require` refuses to connect unless the certificate verifies —
+# deliberately stricter than libpq, where `require` encrypts but verifies nothing.
+# Certificates are checked against the platform root store; for a private CA or a
+# self-signed server, point ORIGOFS_PG_CA_FILE at its PEM bundle.
 [metadata]
 backend = "postgres"
-dsn = "host=postgres user=origofs password=origofs dbname=origofs"
+dsn = "host=postgres user=origofs password=origofs dbname=origofs sslmode=prefer"
 
 # --- content store ----------------------------------------------------------
 # backend = "local"    # a sharded directory (default <workspace>/cas)

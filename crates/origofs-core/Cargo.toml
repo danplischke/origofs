@@ -22,7 +22,18 @@ object_store = { version = "0.12", features = ["aws", "gcp"] }
 # future stays `Send`. Both are needed for the SQLite `MetaTxn` (C1).
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# TLS for Postgres. `tokio-postgres` ships only `NoTls`, so a connector has to be
+# supplied to reach any managed Postgres (RDS, Cloud SQL, Neon, Supabase all
+# require it) — and without one, metadata crosses the network in cleartext.
+# rustls and the native root store are already in the tree via `object_store`, so
+# this adds a connector and no new TLS stack. `ring` is named explicitly so the
+# client config picks its provider rather than depending on a process-wide
+# default a *library* has no business installing.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 similar = "3.1.1"
+tokio-postgres-rustls = "0.13"
 thiserror = "2.0.19"
 # Metrics facade — the numeric counterpart to `tracing`. Same emit-only deal: the
 # library only *records*; it installs no exporter and starts no server, so with no

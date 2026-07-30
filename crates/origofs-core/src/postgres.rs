@@ -24,7 +24,7 @@ use futures::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{AsyncMessage, NoTls, Row};
+use tokio_postgres::{AsyncMessage, Row};
 
 const DIR_MODE: i64 = 0o040755;
 
@@ -56,12 +56,81 @@ pub struct PostgresMetadataStore {
     workspace_id: i64,
 }
 
+/// Environment variable naming a PEM bundle of extra CA certificates to trust,
+/// for a Postgres presenting a certificate from a private CA.
+pub const PG_CA_FILE_ENV: &str = "ORIGOFS_PG_CA_FILE";
+
+/// Build the TLS connector every Postgres connection uses.
+///
+/// `tokio-postgres` ships only `NoTls`, and that is what origofs used — so it could
+/// not connect to any managed Postgres at all (RDS, Cloud SQL, Neon, and Supabase
+/// all require TLS), and where it could connect, every path, actor name, and hash
+/// crossed the network in cleartext.
+///
+/// Whether TLS is actually *used* stays the DSN's decision: `tokio-postgres`
+/// honours `sslmode`, so `disable` still connects in the clear (a unix socket or a
+/// loopback test), while `prefer` — the default — and `require` negotiate it.
+/// Handing over a connector only makes the option exist.
+///
+/// Certificates are verified against the platform root store, plus any bundle
+/// named by [`PG_CA_FILE_ENV`]. Note this is deliberately stricter than libpq,
+/// where `sslmode=require` encrypts but verifies *nothing*: a connection that
+/// can't be verified is refused rather than silently downgraded to an encrypted
+/// channel with an unauthenticated peer. Point [`PG_CA_FILE_ENV`] at your CA for a
+/// self-signed or private-CA server.
+fn tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        // A root the platform store offers but rustls rejects is skipped rather
+        // than fatal — one malformed system certificate must not make the database
+        // unreachable.
+        let _ = roots.add(cert);
+    }
+    if let Ok(path) = std::env::var(PG_CA_FILE_ENV) {
+        let pem = std::fs::read(&path).map_err(|e| {
+            OrigoFSError::Metadata(format!("{PG_CA_FILE_ENV}: cannot read {path}: {e}"))
+        })?;
+        let mut added = 0usize;
+        for cert in rustls_pemfile::certs(&mut pem.as_slice()).flatten() {
+            roots
+                .add(cert)
+                .map_err(|e| OrigoFSError::Metadata(format!("{PG_CA_FILE_ENV} ({path}): {e}")))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(OrigoFSError::Metadata(format!(
+                "{PG_CA_FILE_ENV} ({path}) contains no certificates"
+            )));
+        }
+    }
+    if roots.is_empty() {
+        return Err(OrigoFSError::Metadata(format!(
+            "no trusted CA certificates: the platform root store is empty and \
+             {PG_CA_FILE_ENV} is unset, so no Postgres TLS certificate could be verified"
+        )));
+    }
+    // Name the provider rather than relying on a process-wide default: installing
+    // one is the binary's call, not a library's.
+    let cfg = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| OrigoFSError::Metadata(format!("rustls: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(cfg))
+}
+
 impl PostgresMetadataStore {
     /// Connect to Postgres. `dsn` is a libpq DSN or URL, e.g.
     /// `postgres://user:pass@host/db` or `host=/var/run/postgresql dbname=origofs`.
+    ///
+    /// TLS is negotiated per the DSN's `sslmode` (default `prefer`); see
+    /// [`tls_connector`] for the verification policy.
     pub async fn connect(dsn: &str) -> Result<Self> {
         let cfg: tokio_postgres::Config = dsn.parse()?;
-        let mgr = Manager::new(cfg, NoTls);
+        let mgr = Manager::new(cfg, tls_connector()?);
         // Bound acquisition: without a wait timeout, exhausting the pool makes
         // `client()` hang forever instead of surfacing a retriable error. A
         // runtime must be set for the timeouts to be enforced.
@@ -132,7 +201,9 @@ impl PostgresMetadataStore {
         after_seq: i64,
         branch: Option<String>,
     ) -> Result<EventSubscription> {
-        let (client, mut connection) = tokio_postgres::connect(&self.dsn, NoTls)
+        // A dedicated connection (pooled ones can't surface async notifications),
+        // over the same TLS policy as the pool.
+        let (client, mut connection) = tokio_postgres::connect(&self.dsn, tls_connector()?)
             .await
             .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
 
@@ -395,7 +466,9 @@ impl PostgresMetadataStore {
     /// its own (`origin`) and any path it isn't hosting.
     pub async fn coedit_subscribe(&self) -> Result<CoeditRelaySub> {
         self.coedit_relay_init().await?;
-        let (client, mut connection) = tokio_postgres::connect(&self.dsn, NoTls)
+        // A dedicated connection (pooled ones can't surface async notifications),
+        // over the same TLS policy as the pool.
+        let (client, mut connection) = tokio_postgres::connect(&self.dsn, tls_connector()?)
             .await
             .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
 
@@ -1942,5 +2015,21 @@ fn row_to_suggestion(r: &Row) -> Suggestion {
         created_ts: r.get(9),
         resolved_ts: r.get(10),
         resolved_by: r.get(11),
+    }
+}
+
+impl PostgresMetadataStore {
+    /// Whether the server reports *this* pooled connection as TLS-encrypted.
+    /// Test-only introspection; not part of the `MetadataStore` contract.
+    #[doc(hidden)]
+    pub async fn server_ssl_self(&self) -> Result<bool> {
+        let c = self.client().await?;
+        let row = c
+            .query_one(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await?;
+        Ok(row.get(0))
     }
 }

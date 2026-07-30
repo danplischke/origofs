@@ -64,7 +64,7 @@ pub use objectstore::{GcsConfig, ObjectContentStore, S3Config};
 pub use pack::{DEFAULT_PACK_SIZE, PackStore};
 #[cfg(feature = "coedit")]
 pub use postgres::{CoeditRelayNote, CoeditRelaySub};
-pub use postgres::{EventSubscription, PostgresMetadataStore};
+pub use postgres::{EventSubscription, PG_CA_FILE_ENV, PostgresMetadataStore};
 pub use recover::RebuildReport;
 pub use resync::{
     IdentityMap, ResyncOutcome, ResyncReport, TransferStats, carry_blame, resync, transfer,
