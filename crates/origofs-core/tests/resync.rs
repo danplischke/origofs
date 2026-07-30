@@ -553,3 +553,175 @@ async fn reset_pg(dsn: &str) {
     drop(client);
     let _ = handle.await;
 }
+
+// ── write ordering ──────────────────────────────────────────────────────────
+
+/// A destination content store that fails the test if an object is stored before
+/// something it points at. That is the invariant `transfer`'s cut depends on: it
+/// stops descending at any object the destination already has, which is only
+/// sound if a present object implies its whole closure is present.
+struct ChildrenFirst {
+    inner: Arc<MemStore>,
+    violations: std::sync::Mutex<Vec<String>>,
+}
+
+impl ChildrenFirst {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(MemStore::new()),
+            violations: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The objects `bytes` points at. Each decoder checks its own magic, so only
+    /// the matching one succeeds; a chunk or symlink target matches none.
+    fn referenced(bytes: &[u8]) -> Vec<Hash> {
+        use origofs_core::{Commit, Manifest, Tree};
+        if let Ok(c) = Commit::decode(bytes) {
+            let mut v = vec![c.tree];
+            v.extend(c.parents);
+            return v;
+        }
+        if let Ok(t) = Tree::decode(bytes) {
+            return t.entries.iter().map(|e| e.hash).collect();
+        }
+        if let Ok(m) = Manifest::decode(bytes) {
+            return m.chunks.iter().map(|c| c.hash).collect();
+        }
+        Vec::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl ContentStore for ChildrenFirst {
+    async fn put(&self, b: &[u8]) -> origofs_core::Result<Hash> {
+        for child in Self::referenced(b) {
+            if !self.inner.has(&child).await? {
+                self.violations.lock().unwrap().push(format!(
+                    "stored an object before {} that it points at",
+                    child.to_hex()
+                ));
+            }
+        }
+        self.inner.put(b).await
+    }
+    async fn put_keyed(&self, k: &Hash, b: &[u8]) -> origofs_core::Result<()> {
+        self.inner.put_keyed(k, b).await
+    }
+    async fn get(&self, h: &Hash) -> origofs_core::Result<bytes::Bytes> {
+        self.inner.get(h).await
+    }
+    async fn get_range(&self, h: &Hash, o: u64, l: u64) -> origofs_core::Result<bytes::Bytes> {
+        self.inner.get_range(h, o, l).await
+    }
+    async fn has(&self, h: &Hash) -> origofs_core::Result<bool> {
+        self.inner.has(h).await
+    }
+    async fn list(&self) -> origofs_core::Result<Vec<Hash>> {
+        self.inner.list().await
+    }
+    async fn list_with_age(&self) -> origofs_core::Result<Vec<(Hash, Option<u64>)>> {
+        self.inner.list_with_age().await
+    }
+    async fn delete(&self, h: &Hash) -> origofs_core::Result<u64> {
+        self.inner.delete(h).await
+    }
+}
+
+/// An interrupted transfer must leave a *prefix* of the closure, never a hole
+/// under an object that is already present — otherwise the next run's `has()` cut
+/// prunes the subtree containing the hole and reports success over a store that
+/// can never serve those bytes.
+///
+/// Recording nodes in DFS *pop* order and writing that list reversed does not
+/// give this. A second commit that leaves a file untouched reuses the first
+/// commit's manifest, so the manifest is discovered while walking the older
+/// commit — i.e. *before* the newer tree that points at it — and reversing puts
+/// the tree first. That is an ordinary two-commit history, not a corner case.
+#[tokio::test]
+async fn transfer_writes_children_before_parents() {
+    let a = solo().await;
+    a.write("/a.txt", b"first file\n").await.unwrap();
+    a.commit("dan", "one").await.unwrap();
+    // `/a.txt` is untouched, so commit two's tree points at commit one's manifest.
+    a.write("/b.txt", b"second file\n").await.unwrap();
+    let head = a.commit("dan", "two").await.unwrap();
+
+    let checked = ChildrenFirst::new();
+    let b: Fs<Arc<SqliteMetadataStore>, Arc<ChildrenFirst>> = Fs::new(
+        Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+        checked.clone(),
+    );
+    b.init().await.unwrap();
+    transfer(&a, &b, head).await.unwrap();
+
+    let violations = checked.violations.lock().unwrap();
+    assert!(
+        violations.is_empty(),
+        "transfer must store children before parents, got {} violation(s):\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+}
+
+/// The same invariant over a shape where an object is genuinely reachable by more
+/// than one path: a merge DAG with nested directories, where both sides share a
+/// subtree. A node must still be written exactly once, after every one of its
+/// children, whichever path reached it first.
+#[tokio::test]
+async fn transfer_writes_children_before_parents_across_a_merge() {
+    let a = solo().await;
+    a.mkdir_p("/shared").await.unwrap();
+    a.mkdir_p("/shared/deep").await.unwrap();
+    a.write("/shared/deep/common.txt", b"shared by both sides\n")
+        .await
+        .unwrap();
+    a.commit("dan", "base").await.unwrap();
+
+    a.create_branch("side").await.unwrap();
+    a.write("/ours.txt", b"ours\n").await.unwrap();
+    a.commit("dan", "ours").await.unwrap();
+
+    a.checkout("side").await.unwrap();
+    a.write("/theirs.txt", b"theirs\n").await.unwrap();
+    let theirs = a.commit("dan", "theirs").await.unwrap();
+
+    a.checkout("main").await.unwrap();
+    match a.merge(theirs, "dan", "merge").await.unwrap() {
+        MergeOutcome::Merged(_) => {}
+        other => panic!("expected a clean merge, got {other:?}"),
+    }
+    let head = a.head_commit().await.unwrap().unwrap();
+
+    let checked = ChildrenFirst::new();
+    let b: Fs<Arc<SqliteMetadataStore>, Arc<ChildrenFirst>> = Fs::new(
+        Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+        checked.clone(),
+    );
+    b.init().await.unwrap();
+    transfer(&a, &b, head).await.unwrap();
+    // And the destination really holds the whole closure, not merely a valid
+    // order over whatever subset happened to be copied.
+    let mut stack = vec![head];
+    let mut walked = 0usize;
+    while let Some(h) = stack.pop() {
+        let bytes = b
+            .get_object(&h)
+            .await
+            .unwrap_or_else(|e| panic!("closure is incomplete at {}: {e}", h.to_hex()));
+        walked += 1;
+        stack.extend(ChildrenFirst::referenced(&bytes));
+    }
+    assert!(
+        walked > 10,
+        "expected a non-trivial closure, walked {walked}"
+    );
+
+    let violations = checked.violations.lock().unwrap();
+    assert!(
+        violations.is_empty(),
+        "transfer must store children before parents, got {} violation(s):\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+}

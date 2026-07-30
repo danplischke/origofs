@@ -210,12 +210,19 @@ enum ObjKind {
 /// and symlink blobs), but writing instead of marking, and cut short at objects
 /// the destination already holds.
 ///
-/// **The cut is only sound because objects are written children-first.** Discovery
-/// visits parents before children, and the write pass runs that list in reverse —
-/// so a commit is stored only after its trees, chunks, and parent commits are. The
-/// presence of an object therefore implies the presence of its whole closure, and
-/// a walk may stop at it. An interrupted transfer leaves a prefix of the closure
-/// behind, never a hole under a present parent, so re-running it resumes correctly.
+/// **The cut is only sound because objects are written children-first.** The
+/// presence of an object implies the presence of its whole closure, so a walk may
+/// stop at it: an interrupted transfer leaves a *prefix* of the closure behind,
+/// never a hole under a present parent, and re-running it resumes correctly.
+///
+/// That ordering needs a real reverse topological sort, which is why discovery
+/// and ordering are separate passes. Recording nodes in DFS *pop* order and
+/// writing that list reversed is not equivalent, and fails on ordinary input: a
+/// commit that leaves a file untouched reuses the previous commit's manifest, so
+/// the manifest is discovered while walking the *older* commit — before the newer
+/// tree that points at it — and reversing then puts the tree first. A crash in
+/// between leaves that tree present with its manifest missing, and every later
+/// transfer cuts at the tree and reports success over a hole.
 ///
 /// Content writes are content-addressed and idempotent, so a retry — or two
 /// concurrent transfers of overlapping history — costs bytes, never correctness.
@@ -230,10 +237,10 @@ where
     M2: MetadataStore,
     C2: ContentStore,
 {
-    // Phase 1 — discover the closure, parents before children, cutting at
-    // anything the destination already has.
+    // Phase 1 — discover the closure, cutting at anything the destination
+    // already has, and record each object's outgoing edges for phase 2.
     let mut seen: HashSet<Hash> = HashSet::new();
-    let mut discovered: Vec<Hash> = Vec::new();
+    let mut edges: HashMap<Hash, Vec<Hash>> = HashMap::new();
     let mut stats = TransferStats::default();
     let mut stack = vec![(head, ObjKind::Commit)];
 
@@ -245,38 +252,79 @@ where
             stats.skipped += 1;
             continue;
         }
-        discovered.push(hash);
-        match kind {
+        let children: Vec<(Hash, ObjKind)> = match kind {
             ObjKind::Commit => {
                 let commit = Commit::decode(&from.get_object(&hash).await?)?;
-                stack.push((commit.tree, ObjKind::Tree));
-                for parent in commit.parents {
-                    stack.push((parent, ObjKind::Commit));
-                }
+                std::iter::once((commit.tree, ObjKind::Tree))
+                    .chain(commit.parents.into_iter().map(|p| (p, ObjKind::Commit)))
+                    .collect()
             }
             ObjKind::Tree => {
                 let tree = Tree::decode(&from.get_object(&hash).await?)?;
-                for e in tree.entries {
-                    let child = match e.kind {
-                        TreeKind::Dir => ObjKind::Tree,
-                        TreeKind::File => ObjKind::Manifest,
-                        TreeKind::Symlink => ObjKind::Leaf,
-                    };
-                    stack.push((e.hash, child));
-                }
+                tree.entries
+                    .into_iter()
+                    .map(|e| {
+                        let k = match e.kind {
+                            TreeKind::Dir => ObjKind::Tree,
+                            TreeKind::File => ObjKind::Manifest,
+                            TreeKind::Symlink => ObjKind::Leaf,
+                        };
+                        (e.hash, k)
+                    })
+                    .collect()
             }
-            ObjKind::Manifest => {
-                let manifest = Manifest::decode(&from.get_object(&hash).await?)?;
-                for c in manifest.chunks {
-                    stack.push((c.hash, ObjKind::Leaf));
-                }
-            }
-            ObjKind::Leaf => {}
-        }
+            ObjKind::Manifest => Manifest::decode(&from.get_object(&hash).await?)?
+                .chunks
+                .into_iter()
+                .map(|c| (c.hash, ObjKind::Leaf))
+                .collect(),
+            ObjKind::Leaf => Vec::new(),
+        };
+        edges.insert(hash, children.iter().map(|(h, _)| *h).collect());
+        stack.extend(children);
     }
 
-    // Phase 2 — write children before parents (reverse discovery order).
-    for hash in discovered.iter().rev() {
+    // Phase 2 — order the discovered objects children-first: an iterative
+    // post-order over the edges recorded above. Iterative because history depth
+    // and tree depth are both unbounded, and the objects are a DAG rather than a
+    // tree, so a node reachable by several paths must be emitted exactly once —
+    // after all of its children, whichever path got there first.
+    //
+    // Edges pointing outside `edges` are objects the destination already has (the
+    // cut) and are simply not traversed. There are no cycles to break: an object's
+    // address is a hash of its bytes, so it cannot name itself or an ancestor.
+    let mut order: Vec<Hash> = Vec::with_capacity(edges.len());
+    let mut emitted: HashSet<Hash> = HashSet::new();
+    let mut walk: Vec<(Hash, bool)> = Vec::new();
+    if edges.contains_key(&head) {
+        walk.push((head, false));
+    }
+    while let Some((hash, expanded)) = walk.pop() {
+        if emitted.contains(&hash) {
+            continue;
+        }
+        if expanded {
+            emitted.insert(hash);
+            order.push(hash);
+            continue;
+        }
+        // Re-push as expanded *under* the children, so it is popped again — and
+        // emitted — only once every child has been.
+        walk.push((hash, true));
+        for child in edges.get(&hash).into_iter().flatten() {
+            if edges.contains_key(child) && !emitted.contains(child) {
+                walk.push((*child, false));
+            }
+        }
+    }
+    debug_assert_eq!(
+        order.len(),
+        edges.len(),
+        "every discovered object is reachable from head, so all must be ordered"
+    );
+
+    // Phase 3 — write, children before parents.
+    for hash in &order {
         let bytes = from.get_object(hash).await?;
         let written = to.put_object(&bytes).await?;
         // Both stores address by BLAKE3 of the same plaintext, so a mismatch means
