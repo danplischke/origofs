@@ -271,6 +271,10 @@ fn rebuild_report_dict(py: Python<'_>, r: &RebuildReport) -> PyResult<Py<PyAny>>
     d.set_item("dirs", r.dirs)?;
     d.set_item("files", r.files)?;
     d.set_item("symlinks", r.symlinks)?;
+    // Objects written by a newer origofs than this build can decode. `scan` only
+    // reports them; `rebuild` raises instead of restoring a truncated history.
+    d.set_item("unsupported", r.unsupported)?;
+    d.set_item("unsupported_kinds", r.unsupported_kinds.clone())?;
     Ok(d.into_any().unbind())
 }
 

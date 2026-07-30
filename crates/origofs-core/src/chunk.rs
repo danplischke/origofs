@@ -9,6 +9,7 @@
 //! covering chunks.
 
 use crate::error::{OrigoFSError, Result};
+use crate::format;
 use crate::types::Hash;
 
 /// Minimum chunk size (bytes). Files at or below this are a single chunk.
@@ -18,8 +19,7 @@ pub const AVG_CHUNK: u32 = 64 * 1024;
 /// Maximum chunk size (bytes).
 pub const MAX_CHUNK: u32 = 256 * 1024;
 
-const MANIFEST_MAGIC: &[u8; 5] = b"ORGM\x01";
-const HEADER_LEN: usize = 17; // magic(5) + size(8) + count(4)
+const HEADER_LEN: usize = 17; // tag+version(5) + size(8) + count(4)
 const ENTRY_LEN: usize = 36; // hash(32) + len(4)
 
 /// A reference to one content chunk within a file.
@@ -42,10 +42,13 @@ impl Manifest {
     }
 
     /// Canonical serialization so identical content yields an identical manifest
-    /// hash: `magic | size(LE u64) | count(LE u32) | (hash[32] | len(LE u32))*`.
+    /// hash: `ORGM | version | size(LE u64) | count(LE u32) | (hash[32] | len(LE u32))*`.
+    ///
+    /// The bytes are the object's address, so this encoding is frozen for v1 —
+    /// see the format-evolution rules in [`crate::format`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + self.chunks.len() * ENTRY_LEN);
-        out.extend_from_slice(MANIFEST_MAGIC);
+        out.extend_from_slice(&format::MANIFEST.header());
         out.extend_from_slice(&self.size.to_le_bytes());
         out.extend_from_slice(&(self.chunks.len() as u32).to_le_bytes());
         for c in &self.chunks {
@@ -55,9 +58,21 @@ impl Manifest {
         out
     }
 
+    /// Decode a manifest, dispatching on its header's format version. An object
+    /// written by a newer origofs yields [`OrigoFSError::UnsupportedVersion`]
+    /// rather than a "malformed" error that reads like corruption.
     pub fn decode(bytes: &[u8]) -> Result<Manifest> {
-        let bad = || OrigoFSError::Content("malformed manifest".to_string());
-        if bytes.len() < HEADER_LEN || &bytes[0..5] != MANIFEST_MAGIC {
+        match format::MANIFEST.version_of(bytes)? {
+            1 => Manifest::decode_v1(bytes),
+            // Unreachable while `version_of` caps at `max_read_version`; this is
+            // the arm a future version is added beside (never *instead of* v1).
+            v => Err(format::MANIFEST.unsupported(v)),
+        }
+    }
+
+    fn decode_v1(bytes: &[u8]) -> Result<Manifest> {
+        let bad = || format::MANIFEST.malformed();
+        if bytes.len() < HEADER_LEN {
             return Err(bad());
         }
         let size = u64::from_le_bytes(bytes[5..13].try_into().map_err(|_| bad())?);

@@ -19,6 +19,7 @@ pub mod corpus;
 pub mod encrypt;
 pub mod engine;
 pub mod error;
+mod format;
 pub mod gc;
 pub mod interop;
 pub mod merge;

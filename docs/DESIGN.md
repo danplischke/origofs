@@ -148,6 +148,23 @@ file on any insertion. We use **FastCDC** content-defined chunking so an edit on
   `std::fs::read`); the VFS partial-write path bounds itself by what it can actually allocate (`try_reserve`),
   not an arbitrary limit, so a hostile size fails cleanly instead of aborting the process.
 
+**Object header & format evolution.** Every structured object (`blob` manifest, `tree`, `commit`, and the §7
+ref-mirror snapshot) begins with a 4-byte **type tag** plus a 1-byte **format version** — `ORGM 01`, `ORGT 01`,
+`ORGC 01`, `ORGR 01` (`origofs-core/src/format.rs`). Unlike the metadata DB, content cannot be migrated in place;
+it does not need to be, because objects are immutable and addressed by the hash of their own bytes, so a format
+change mints *new* objects at *new* addresses and leaves every existing one valid. That only holds if readers
+stay backwards-compatible, so three rules apply:
+
+1. **Never change an existing version's encoding.** The bytes *are* the address — a re-encode that round-trips
+   perfectly still re-addresses every object, forking the DAG and destroying dedup against the whole store.
+   Golden fixtures (`origofs-core/tests/format.rs`) pin the v1 bytes and their hashes so CI catches it.
+2. **Add a version, keep the old decoder.** `decode` dispatches on the version byte; `decode_v1` stays untouched.
+3. **Ship the reader before the writer** — raise `max_read_version` in one release and `write_version` in a
+   later one, so a mixed-version fleet already reads v2 by the time anything writes it.
+
+A version above what a build can read surfaces as `UnsupportedVersion` (machine code `unsupported_version`),
+deliberately **not** `Corrupt`: the bytes are fine and the fix is to upgrade origofs, not to restore a backup.
+
 **Pluggable backends** behind one trait:
 
 ```rust
@@ -596,7 +613,12 @@ Either kind lands **attributed to the original author** with the approver record
   `origofs fsck [--rebuild]` (SDK `Workspace::rebuild`/`scan`) scans the store, recovers branch names + tips from the
   mirror — or by inferring heads if none exists — and materializes the working tree onto a fresh DB. Attribution
   (blame/audit/actors) and uncommitted edits are **not** recoverable: they live only in the DB, so it remains the
-  component to back up (Postgres PITR/replica; SQLite continuous replication).
+  component to back up (Postgres PITR/replica; SQLite continuous replication). The scan classifies objects by
+  their §4a **type tag** before decoding, so an object written by a *newer* origofs is reported rather than
+  quietly skipped as "not a commit" — and `--rebuild` **refuses** when such an object is load-bearing (any
+  unreadable ref mirror, an unreadable branch tip, or any unreadable commit when head inference is the only
+  option). Restoring a silently truncated history is the one failure mode a recovery tool must not have; the
+  read-only scan still runs on the old binary and reports what it cannot read.
 
 The remaining hazards came out of the **security review** — attribution is only trustworthy if the identity behind
 each write is, and a storage engine that agents point at untrusted code and untrusted objects has to fail closed:
