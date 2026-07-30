@@ -251,6 +251,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             // A fast-forward doesn't merge bytes, it materializes theirs wholesale
             // — which still overwrites a live path. Report the ones it changes.
             let stale = self.live_changed_between(ours, theirs, &live).await?;
+            // Resolved before `begin`: the transaction must not await content I/O
+            // while it holds the metadata connection (see `plan_materialize`).
+            let plan = self.plan_materialize(theirs_commit.tree).await?;
             // The checked ref advance and the tree it describes commit together.
             // The CAS still comes first *within* the transaction, so a branch that
             // moved concurrently aborts before any of the tree work is staged;
@@ -267,8 +270,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                     "branch {branch} moved concurrently; retry the merge"
                 )));
             }
-            self.replace_working_tree_in(&mut *txn, theirs_commit.tree)
-                .await?;
+            self.replace_working_tree_in(&mut *txn, &plan).await?;
             txn.commit().await?;
             self.mirror_refs().await?;
             return Ok((MergeOutcome::FastForward(theirs), stale));
@@ -305,6 +307,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 timestamp: self.now_secs(),
             };
             let commit_hash = self.content.put(&commit.encode()).await?;
+            let plan = self.plan_materialize(merged_tree).await?;
             // Ref advance + working tree in one transaction. The CAS is still
             // first, so a concurrent branch move aborts before anything is
             // staged; and because they now commit together, a crash can no longer
@@ -318,7 +321,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                     "branch {branch} moved concurrently; retry the merge"
                 )));
             }
-            self.replace_working_tree_in(&mut *txn, merged_tree).await?;
+            self.replace_working_tree_in(&mut *txn, &plan).await?;
             txn.commit().await?;
             self.mirror_refs().await?;
             Ok((MergeOutcome::Merged(commit_hash), stale))
@@ -334,8 +337,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             // entirely. A concurrent reader could also catch the window between
             // `clear_conflicts` and the re-inserts and see zero conflicts over a
             // marker-laden tree.
+            let plan = self.plan_materialize(merged_tree).await?;
             let mut txn = self.meta.begin().await?;
-            self.replace_working_tree_in(&mut *txn, merged_tree).await?;
+            self.replace_working_tree_in(&mut *txn, &plan).await?;
             txn.clear_conflicts().await?;
             for c in &conflicts {
                 txn.set_conflict(&c.path, &c.kind).await?;

@@ -20,6 +20,26 @@ use crate::types::{FileKind, Hash, Ino, InodeInit};
 use async_recursion::async_recursion;
 use std::collections::BTreeMap;
 
+/// A tree swap resolved down to the rows it will write: every content object it
+/// needs, already fetched, decoded and name-validated. Built by
+/// [`Fs::plan_materialize`] *before* a transaction opens, then replayed inside
+/// one — see that method for why the two halves must not be interleaved.
+pub(crate) struct MaterializePlan {
+    entries: Vec<PlanEntry>,
+}
+
+struct PlanEntry {
+    name: String,
+    mode: u32,
+    node: PlanNode,
+}
+
+enum PlanNode {
+    Dir(MaterializePlan),
+    File { hash: Hash, size: u64 },
+    Symlink(String),
+}
+
 const HEAD: &str = "HEAD";
 const DEFAULT_BRANCH: &str = "main";
 /// Config key: hex address of the live ref-mirror snapshot (a GC root).
@@ -291,6 +311,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let commit_hash =
             Hash::from_hex(&value).ok_or_else(|| OrigoFSError::Metadata("bad ref value".into()))?;
         let commit = Commit::decode(&self.content.get(&commit_hash).await?)?;
+        let plan = self.plan_materialize(commit.tree).await?;
 
         // The tree swap and the HEAD move commit together. Separately, a crash
         // between them left branch B's tree in the working tree while HEAD still
@@ -298,7 +319,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // A's tip, whose CAS succeeds because A's parent hasn't moved. A checkout
         // silently force-overwriting the branch you came from.
         let mut txn = self.meta.begin().await?;
-        self.replace_working_tree_in(&mut *txn, commit.tree).await?;
+        self.replace_working_tree_in(&mut *txn, &plan).await?;
         txn.set_ref(HEAD, &format!("ref:{branch}")).await?;
         txn.commit().await?;
         self.mirror_refs().await?;
@@ -315,53 +336,96 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// that commits *separately* from the ref describing it is exactly the torn
     /// state `docs/DESIGN.md` §7 claims not to exist.
     pub(crate) async fn replace_working_tree(&self, tree_hash: Hash) -> Result<()> {
+        let plan = self.plan_materialize(tree_hash).await?;
         let mut txn = self.meta.begin().await?;
-        self.replace_working_tree_in(&mut *txn, tree_hash).await?;
+        self.replace_working_tree_in(&mut *txn, &plan).await?;
         txn.commit().await?;
         Ok(())
     }
 
     /// Stage a whole-tree replacement into an existing transaction, so the caller
     /// can commit it together with the refs and conflict rows that describe it.
+    ///
+    /// Takes an already-resolved [`MaterializePlan`] rather than a tree hash, so
+    /// that every content read happens *before* the transaction opens — see
+    /// [`plan_materialize`](Self::plan_materialize) for why that matters.
     pub(crate) async fn replace_working_tree_in(
         &self,
         txn: &mut dyn MetaTxn,
-        tree_hash: Hash,
+        plan: &MaterializePlan,
     ) -> Result<()> {
         txn.truncate_tree().await?;
-        self.materialize_into_txn(txn, tree_hash, self.root_ino)
+        self.apply_plan_into_txn(txn, &plan.entries, self.root_ino)
             .await
     }
 
-    /// Materialize a tree's entries as children of `parent_ino`, staging every
-    /// inode/dentry in `txn` so the whole subtree commits atomically.
+    /// Read and decode everything a tree swap will need from the content store,
+    /// producing a plan the transaction can replay without touching content.
     ///
-    /// This is the door where a *stored* name comes from the content store rather
-    /// than from a caller, so every entry name is re-validated here. Objects are
-    /// integrity-checked against their address, but an address only proves the
-    /// bytes are the ones that were written — not that whoever wrote them was
+    /// **This split is a liveness requirement, not a tidiness one.** The SQLite
+    /// backend's `MetaTxn` holds an owned, *blocking* `parking_lot` guard on the
+    /// single connection from `begin` to `commit`. Materializing a tree directly
+    /// into the transaction awaited `content.get()` once per node while holding
+    /// that guard — an S3 round trip per node — so any other task that touched
+    /// metadata in the meantime blocked a runtime worker on the guard. On a
+    /// `current_thread` runtime that is a hard deadlock: the blocked thread is
+    /// the only one that could have polled the transaction to completion, and it
+    /// takes the timer driver down with it, so even a `tokio::time::timeout`
+    /// wrapped around the operation never fires. On a multi-thread runtime it
+    /// parks one worker per waiting caller. See `tests/materialize.rs`.
+    ///
+    /// This is also the door where a *stored* name comes from the content store
+    /// rather than from a caller, so every entry name is validated here. Objects
+    /// are integrity-checked against their address, but an address only proves
+    /// the bytes are the ones that were written — not that whoever wrote them was
     /// honest. A tree reached from a shared bucket, a `git import`, or a `resync`
     /// peer can name an entry `..`, and without this check it would land in the
     /// dentry table, breaking the invariant that a poisoned name can never be
     /// stored (and so can never escape a later host materialization).
     ///
-    /// Rejecting fails the whole materialization: the caller's transaction rolls
-    /// back, so a hostile tree yields a clean error and an untouched working tree
-    /// rather than a half-applied one. Deliberately *not* enforced in
-    /// `Tree::decode` — GC and diff must still be able to walk such a tree in
-    /// order to reclaim or describe it.
+    /// Rejecting here fails the whole plan *before* any transaction opens, so a
+    /// hostile tree yields a clean error and an untouched working tree rather
+    /// than a half-applied one. Deliberately *not* enforced in `Tree::decode` —
+    /// GC and diff must still be able to walk such a tree in order to reclaim or
+    /// describe it.
     #[async_recursion]
-    async fn materialize_into_txn(
-        &self,
-        txn: &mut dyn MetaTxn,
-        tree_hash: Hash,
-        parent_ino: Ino,
-    ) -> Result<()> {
+    pub(crate) async fn plan_materialize(&self, tree_hash: Hash) -> Result<MaterializePlan> {
         let tree = Tree::decode(&self.content.get(&tree_hash).await?)?;
+        let mut entries = Vec::with_capacity(tree.entries.len());
         for e in &tree.entries {
             crate::engine::validate_component(&e.name)?;
-            match e.kind {
-                TreeKind::Dir => {
+            let node = match e.kind {
+                TreeKind::Dir => PlanNode::Dir(self.plan_materialize(e.hash).await?),
+                TreeKind::File => PlanNode::File {
+                    hash: e.hash,
+                    size: Manifest::decode(&self.content.get(&e.hash).await?)?.size,
+                },
+                TreeKind::Symlink => PlanNode::Symlink(
+                    String::from_utf8_lossy(&self.content.get(&e.hash).await?).into_owned(),
+                ),
+            };
+            entries.push(PlanEntry {
+                name: e.name.clone(),
+                mode: e.mode,
+                node,
+            });
+        }
+        Ok(MaterializePlan { entries })
+    }
+
+    /// Replay a plan as inode/dentry rows under `parent_ino`. Pure metadata: no
+    /// content store call happens here, which is what keeps the transaction from
+    /// parking on I/O while it holds the connection.
+    #[async_recursion]
+    async fn apply_plan_into_txn(
+        &self,
+        txn: &mut dyn MetaTxn,
+        entries: &[PlanEntry],
+        parent_ino: Ino,
+    ) -> Result<()> {
+        for e in entries {
+            match &e.node {
+                PlanNode::Dir(children) => {
                     let ino = txn
                         .create_inode(InodeInit {
                             kind: FileKind::Dir,
@@ -369,29 +433,27 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                         })
                         .await?;
                     txn.add_dentry(parent_ino, &e.name, ino).await?;
-                    self.materialize_into_txn(&mut *txn, e.hash, ino).await?;
+                    self.apply_plan_into_txn(&mut *txn, &children.entries, ino)
+                        .await?;
                 }
-                TreeKind::File => {
+                PlanNode::File { hash, size } => {
                     let ino = txn
                         .create_inode(InodeInit {
                             kind: FileKind::File,
                             mode: e.mode,
                         })
                         .await?;
-                    let size = Manifest::decode(&self.content.get(&e.hash).await?)?.size;
-                    txn.set_content(ino, Some(e.hash), size).await?;
+                    txn.set_content(ino, Some(*hash), *size).await?;
                     txn.add_dentry(parent_ino, &e.name, ino).await?;
                 }
-                TreeKind::Symlink => {
+                PlanNode::Symlink(target) => {
                     let ino = txn
                         .create_inode(InodeInit {
                             kind: FileKind::Symlink,
                             mode: e.mode,
                         })
                         .await?;
-                    let target =
-                        String::from_utf8_lossy(&self.content.get(&e.hash).await?).into_owned();
-                    txn.set_symlink(ino, &target).await?;
+                    txn.set_symlink(ino, target).await?;
                     txn.add_dentry(parent_ino, &e.name, ino).await?;
                 }
             }
