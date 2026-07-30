@@ -37,6 +37,11 @@ pub struct Conflict {
 }
 
 /// The result of a merge.
+// Deliberately NOT `#[non_exhaustive]`. This is an *outcome* enum: its whole
+// purpose is to make the caller handle each case, so a new variant should be a
+// compile error at every call site. `non_exhaustive` would force a wildcard arm
+// that silently swallows it instead — the opposite of the intent. Adding a
+// variant here is a breaking change on purpose.
 #[derive(Clone, Debug)]
 pub enum MergeOutcome {
     /// `theirs` is already reachable from HEAD; nothing to do.

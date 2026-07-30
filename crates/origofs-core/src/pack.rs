@@ -14,6 +14,29 @@
 //! storage: small index local, big packed data remote — the layout restic, borg,
 //! and git packfiles use.
 //!
+//! # What batching actually buys, and where it stops
+//!
+//! Batching is **within a write, not across writes**, and it is worth being precise
+//! about that because the difference is large.
+//!
+//! Every write ends with a durability barrier: content must be durable before the
+//! metadata that references it commits, so `Fs::store_body` and `Fs::write_reader`
+//! call [`ContentStore::flush`] — which here means [`PackStore::seal`] — before
+//! their transaction. So:
+//!
+//! * **One large file is the good case.** A 40 MiB body chunks into hundreds of
+//!   pieces and seals into a handful of packs: hundreds of PUTs become a few. This
+//!   is the case the layout is for, and it works.
+//! * **Many small files is the floor.** Ten thousand 2 KiB files are ten thousand
+//!   writes, each with its own barrier, so each seals its own pack — roughly one
+//!   PUT per file, not one per 4 MiB. Packing is not helping there.
+//!
+//! Nothing can be batched across that boundary without weakening the barrier,
+//! which is what makes a crash recoverable. If a bulk-import workload needs
+//! cross-write batching, the way to get it is fewer, larger writes (stream one
+//! archive through `write_reader` rather than writing each member), not a laxer
+//! barrier.
+//!
 //! A pack is `chunk₀ ‖ chunk₁ ‖ … ‖ trailer ‖ trailer_len(u32) ‖ ORGP ‖ version`,
 //! where the trailer lists `(chunk_hash, len)` in order so [`PackStore::repack`]
 //! can see a pack's full membership and reclaim dead space (deleted chunks) by

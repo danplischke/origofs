@@ -103,6 +103,11 @@ type Content = Arc<dyn ContentStore>;
 /// The outcome of a [`Workspace::ready`] readiness probe: whether each backend
 /// answered. `None` for a store means it is reachable; `Some(msg)` carries why
 /// the probe failed. Backs the HTTP `/readyz` endpoint.
+/// `#[non_exhaustive]`: callers read this, they never construct it, so adding a
+/// counter should not be a breaking change. (Config structs like `S3Config` are
+/// deliberately left constructible — a caller has to be able to build those, and
+/// `..Default::default()` already absorbs new fields there.)
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ReadyReport {
     /// `None` if the metadata store answered its probe; the error otherwise.
@@ -214,7 +219,8 @@ impl Workspace {
     }
 
     /// SQLite metadata + an S3-compatible object store whose chunks are batched
-    /// into **pack objects** (few large PUTs instead of many tiny ones), with the
+    /// into **pack objects** (few large PUTs instead of many tiny ones — batched *within* a write; see
+    /// [`PackStore`] for where that stops), with the
     /// per-chunk index kept in a local directory. This is the recommended layout
     /// for object storage; call [`Workspace::flush`] (or `commit`) to seal the
     /// open pack and [`Workspace::repack`] to reclaim deleted space.
@@ -263,9 +269,18 @@ impl Workspace {
     }
 
     /// Postgres metadata + a **packed** S3 object store (few large PUTs instead of
-    /// many tiny ones), with the per-chunk index in a local directory. The
+    /// many tiny ones — batched *within* a write; see [`PackStore`] for where that
+    /// stops), with the per-chunk index in a local directory. The
     /// recommended object-storage layout; seal the open pack with [`Workspace::flush`]
     /// (or `commit`) and reclaim deleted space with [`Workspace::repack`].
+    ///
+    /// **`index_dir` is node-local, so this is single-writer-per-index.** The
+    /// per-chunk index lives in a `LocalCasStore`, not in the object store — two
+    /// processes with separate index directories cannot see each other's chunks,
+    /// even though they share one database and one bucket. For a multi-container
+    /// deployment either put `index_dir` on a shared volume or keep one writer.
+    /// (This constraint was only recorded in `docker-compose.yml`, where nobody
+    /// reading the API would find it.)
     pub async fn open_pg_s3_packed(
         dsn: &str,
         cfg: S3Config,
@@ -292,7 +307,8 @@ impl Workspace {
     }
 
     /// SQLite metadata + a **packed** native GCS object store (few large PUTs
-    /// instead of many tiny ones), with the per-chunk index under `index_dir`. The
+    /// instead of many tiny ones — batched *within* a write; see [`PackStore`] for
+    /// where that stops), with the per-chunk index under `index_dir`. The
     /// recommended object-storage layout; seal the open pack with [`Workspace::flush`]
     /// (or `commit`) and reclaim deleted space with [`Workspace::repack`].
     pub async fn open_gcs_packed(
@@ -324,6 +340,14 @@ impl Workspace {
     /// index in a local directory. The recommended object-storage layout for a team
     /// on Google Cloud; seal the open pack with [`Workspace::flush`] (or `commit`)
     /// and reclaim deleted space with [`Workspace::repack`].
+    ///
+    /// **`index_dir` is node-local, so this is single-writer-per-index.** The
+    /// per-chunk index lives in a `LocalCasStore`, not in the object store — two
+    /// processes with separate index directories cannot see each other's chunks,
+    /// even though they share one database and one bucket. For a multi-container
+    /// deployment either put `index_dir` on a shared volume or keep one writer.
+    /// (This constraint was only recorded in `docker-compose.yml`, where nobody
+    /// reading the API would find it.)
     pub async fn open_pg_gcs_packed(
         dsn: &str,
         cfg: GcsConfig,
@@ -643,15 +667,32 @@ impl Workspace {
     // --- maintenance -----------------------------------------------------
 
     /// Reclaim content-store objects unreachable from any ref or the live
-    /// working tree. Run when the workspace is idle.
+    /// working tree.
+    ///
+    /// **Safe to run alongside active writers**, which is the only option in a
+    /// workspace agents are always writing to. Reachability alone would not be:
+    /// content is written *before* the metadata that references it, so every write
+    /// has a window where its bytes are stored and nothing points at them. Two
+    /// things close that — the sweep skips anything younger than
+    /// [`DEFAULT_GC_GRACE_SECS`], and a deduplicating write refreshes content that
+    /// has gone stale (`ContentStore::touch`), which is what covers a write that
+    /// dedups onto old unreferenced bytes rather than storing new ones.
+    ///
+    /// Still cheapest on a quiet workspace, and a packed content store needs
+    /// [`repack`](Self::repack) afterwards to actually give the space back.
     #[tracing::instrument(skip_all)]
     pub async fn gc(&self) -> Result<GcStats> {
         self.fs.gc().await
     }
 
     /// [`gc`](Self::gc) with an explicit grace period, in seconds. Only content
-    /// unreferenced *and* untouched for at least that long is reclaimed. `0`
-    /// disables the age gate and is only safe on a store with no active writers.
+    /// unreferenced *and* untouched for at least that long is reclaimed.
+    ///
+    /// `0` disables the age gate entirely and is only safe on a quiesced store.
+    /// Any other value below `DEDUP_REFRESH_AFTER_SECS` is **refused**: the
+    /// dedup-side refresh only fires past that threshold, so a shorter grace
+    /// leaves a band where content is sweepable but was never refreshed — the
+    /// exact race the gate exists to close.
     pub async fn gc_with_grace(&self, grace_secs: u64) -> Result<GcStats> {
         self.fs.gc_with_grace(grace_secs).await
     }

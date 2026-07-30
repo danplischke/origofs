@@ -42,6 +42,11 @@ pub(crate) const WORKSPACE_MIRROR_KEY: &str = "\0origofs.workspace";
 const DEFAULT_WS_NAME: &str = "default";
 
 /// What a recovery scan found and (for [`Fs::rebuild_from_content`]) restored.
+/// `#[non_exhaustive]`: callers read this, they never construct it, so adding a
+/// counter should not be a breaking change. (Config structs like `S3Config` are
+/// deliberately left constructible — a caller has to be able to build those, and
+/// `..Default::default()` already absorbs new fields there.)
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RebuildReport {
     /// Objects read from the content store.

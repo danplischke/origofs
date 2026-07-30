@@ -324,6 +324,7 @@ impl RefSnapshot {
 
 /// Versioning mode for a workspace (`docs/DESIGN.md` §4c).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VersioningMode {
     /// No commits — a plain shared filesystem.
     Off,

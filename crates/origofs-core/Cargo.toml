@@ -1,8 +1,24 @@
 [package]
 name = "origofs-core"
-version = "0.1.0"
-edition = "2024"
+# Inherited from the workspace so the four crates cannot drift apart again.
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+# `description` is not optional for publishing: crates.io rejects a crate without
+# one, so `cargo publish` failed before it got as far as uploading.
+description = "The origofs engine: content-addressed storage, a pluggable metadata store, opt-in Git-style versioning, and per-actor edit attribution"
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+# docs.rs renders with default features, and this crate's optional ones (coedit,
+# metrics) are off by default — so the co-editing and metrics surfaces would be
+# missing from the published docs entirely.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 argon2 = "0.5.3"

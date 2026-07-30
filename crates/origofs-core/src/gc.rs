@@ -72,6 +72,11 @@ const GC_LEASE_KEY: &str = "\0gc-lease";
 const GC_LEASE_SECS: i64 = 3600;
 
 /// What a GC pass reclaimed.
+/// `#[non_exhaustive]`: callers read this, they never construct it, so adding a
+/// counter should not be a breaking change. (Config structs like `S3Config` are
+/// deliberately left constructible — a caller has to be able to build those, and
+/// `..Default::default()` already absorbs new fields there.)
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GcStats {
     /// Distinct objects kept because they were reachable.

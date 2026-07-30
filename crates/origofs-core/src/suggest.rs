@@ -26,6 +26,11 @@ use crate::metadata::MetadataStore;
 use crate::types::Hash;
 
 /// The outcome of a policy-governed write (see [`Fs::write_or_propose`]).
+// Deliberately NOT `#[non_exhaustive]`. This is an *outcome* enum: its whole
+// purpose is to make the caller handle each case, so a new variant should be a
+// compile error at every call site. `non_exhaustive` would force a wildcard arm
+// that silently swallows it instead — the opposite of the intent. Adding a
+// variant here is a breaking change on purpose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteOutcome {
     /// The actor writes directly; the edit landed in the working tree.
@@ -50,6 +55,7 @@ pub enum WriteOutcome {
 ///   conflict and must not be rejected — the byte-suggestion staleness guard would
 ///   false-reject it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SuggestionKind {
     /// A whole-file body (the classic path).
     #[default]
@@ -77,6 +83,7 @@ impl SuggestionKind {
 
 /// The lifecycle state of a suggestion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SuggestionStatus {
     /// Awaiting review.
     Pending,

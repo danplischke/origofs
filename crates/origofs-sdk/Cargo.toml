@@ -1,8 +1,21 @@
 [package]
 name = "origofs-sdk"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Ergonomic Workspace facade over origofs-core, plus every access surface (HTTP API, MCP, FUSE, NFS, git interop, sandbox) as an opt-in feature"
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+# This matters most here. Every surface this crate exists to provide — api, mcp,
+# sandbox, git, fuse, nfs, coedit, metrics — is behind a default-off feature, so
+# docs.rs would render the `Workspace` facade and nothing else.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 origofs-core = { version = "0.1.0", path = "../origofs-core" }

@@ -774,7 +774,7 @@ Content is addressed and never overwritten, so churn leaves orphaned chunks
 behind; mark-and-sweep garbage collection reclaims them:
 
 ```bash
-origofs --workspace "$WS" gc     # run when idle — not safe alongside active writers
+origofs --workspace "$WS" gc     # safe alongside writers (age-gated); cheapest when idle
 ```
 
 ## Interfaces

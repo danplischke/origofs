@@ -40,6 +40,7 @@ use bytes::Bytes;
 /// on each variant. All sizes are in **bytes** (or lines) and describe the passage
 /// units, independent of the storage chunker.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Segmentation {
     /// One passage per file. Best for short documents you retrieve whole.
     WholeFile,

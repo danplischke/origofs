@@ -1958,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "origofs-py"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "fuser",
  "origofs-core",

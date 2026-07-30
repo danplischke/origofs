@@ -25,6 +25,7 @@ use std::collections::{HashMap, VecDeque};
 
 /// Whether an actor is a person, an autonomous agent, or the system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ActorKind {
     Human,
     Agent,
@@ -54,6 +55,7 @@ impl ActorKind {
 /// trusted agent can be [`Direct`](WritePolicy::Direct) while an untrusted human
 /// contributor is [`Propose`](WritePolicy::Propose).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WritePolicy {
     /// May write straight to the working tree (the default).
     #[default]

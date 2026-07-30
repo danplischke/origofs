@@ -3,7 +3,17 @@
 use thiserror::Error;
 
 /// Errors surfaced by the metadata store, content store, and engine.
+///
+/// `#[non_exhaustive]`: hardening this crate has meant adding variants (`Denied`
+/// for the write policy, `UnsupportedVersion` for a newer on-disk format) and will
+/// mean adding more. Without the attribute each one is a semver-major break for
+/// every downstream `match`, which is a bad trade for a library whose whole
+/// business is surfacing precise failures. Match the variants you handle and end
+/// with a wildcard; [`code`](Self::code), [`retryable`](Self::retryable), and
+/// [`class`](Self::class) give a stable, growth-safe way to branch without
+/// enumerating variants at all.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum OrigoFSError {
     #[error("not found: {0}")]
     NotFound(String),
@@ -98,6 +108,7 @@ pub enum OrigoFSError {
 /// retry. This is the classification the flattened `String` payloads used to
 /// lose (`docs/DESIGN.md` M9 — production readiness).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorClass {
     /// A transient failure very likely to succeed on retry — a Postgres
     /// serialization failure (`40001`) or deadlock (`40P01`), or a SQLite
@@ -136,6 +147,7 @@ impl std::fmt::Display for ErrorClass {
 
 /// Which store an [`OrigoFSError::Backend`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BackendOrigin {
     Metadata,
     Content,
