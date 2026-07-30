@@ -93,27 +93,71 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// The best common ancestor (merge base) of `a` and `b`, if any.
+    ///
+    /// A merge base is a common ancestor that is **not** itself an ancestor of any
+    /// *other* common ancestor — i.e. maximal in the ancestry order, which is the
+    /// fork point. Ranking common ancestors by hop distance alone is not enough:
+    /// the root commit is a common ancestor of every pair, so on any history with
+    /// more than one commit of shared trunk a distance-only rule can base the merge
+    /// on the root and diff3 against pre-fork content — producing spurious conflicts
+    /// and "clean" merges that resurrect lines deleted before the fork.
+    ///
+    /// A criss-cross history can leave several maximal candidates. We do not build a
+    /// virtual recursive base (git's `recursive`/`ort` strategy); we take the
+    /// candidate nearest `a`, breaking ties by hash so that the same pair of commits
+    /// always merges the same way.
     pub async fn merge_base(&self, a: Hash, b: Hash) -> Result<Option<Hash>> {
-        // Min distance from `a` to each of its ancestors.
+        // Min hop distance from `a`, plus the parent edges — recorded here so the
+        // candidate walk below needs no further object loads.
         let mut depth: HashMap<Hash, u32> = HashMap::new();
+        let mut parents_of: HashMap<Hash, Vec<Hash>> = HashMap::new();
         let mut frontier = vec![(a, 0u32)];
         while let Some((h, d)) = frontier.pop() {
             if depth.get(&h).is_some_and(|&e| e <= d) {
                 continue;
             }
             depth.insert(h, d);
-            for p in self.commit_at(&h).await?.parents {
+            let parents = match parents_of.get(&h) {
+                Some(p) => p.clone(),
+                None => {
+                    let p = self.commit_at(&h).await?.parents;
+                    parents_of.insert(h, p.clone());
+                    p
+                }
+            };
+            for p in parents {
                 frontier.push((p, d + 1));
             }
         }
-        // Among common ancestors, the one closest to `a` (greatest depth) is the base.
-        Ok(self
+
+        // Common ancestors: reachable from `b` and from `a` (hence in `depth`).
+        let common: HashSet<Hash> = self
             .ancestors(b)
             .await?
             .into_iter()
-            .filter_map(|h| depth.get(&h).map(|&d| (d, h)))
-            .max_by_key(|(d, _)| *d)
-            .map(|(_, h)| h))
+            .filter(|h| depth.contains_key(h))
+            .collect();
+
+        // Every *proper* ancestor of a common ancestor is itself common, and is
+        // superseded by it — so the merge bases are the common ancestors that no
+        // other common ancestor reaches. Each edge here is already in `parents_of`,
+        // because every common ancestor is an ancestor of `a`.
+        let mut superseded: HashSet<Hash> = HashSet::new();
+        let mut stack: Vec<Hash> = common
+            .iter()
+            .flat_map(|h| parents_of.get(h).cloned().unwrap_or_default())
+            .collect();
+        while let Some(h) = stack.pop() {
+            if !superseded.insert(h) {
+                continue;
+            }
+            stack.extend(parents_of.get(&h).cloned().unwrap_or_default());
+        }
+
+        Ok(common
+            .into_iter()
+            .filter(|h| !superseded.contains(h))
+            .min_by_key(|h| (depth[h], *h.as_bytes())))
     }
 
     // --- file bodies ------------------------------------------------------
