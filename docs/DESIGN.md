@@ -399,10 +399,14 @@ metadata round-trips are cut by caching dentries with `LISTEN/NOTIFY`-driven inv
 **Live shared workspace — the boundary (ruling):** two regimes, chosen per file:
 
 - **Default (agents + ordinary tools):** the working tree of a `(workspace, branch)` is shared; concurrent
-  writers coordinate via Postgres MVCC + **advisory locks per inode** for the brief critical section of a
-  flush; non-overlapping writes never conflict (content-addressed), overlapping writes are last-writer-wins at
-  the byte level with both recorded in the op-log, and *semantic* reconciliation happens at **commit-time
-  three-way merge**. This covers agents that `pwrite` via FUSE/MCP and never open an "editor."
+  writers coordinate via Postgres MVCC; non-overlapping writes never conflict (content-addressed). An
+  attributed whole-file write (`write_as`) is **optimistic, not last-writer-wins**: authorship is derived by
+  diffing against the file's current content, so the write lands only if that content is still current and
+  otherwise returns `Conflict` — read, merge, and write again. (It *was* last-writer-wins; the loser lost
+  their bytes with no error, and the winner's blame was derived from a version that no longer existed, so the
+  op-log recorded a `pre_hash` that was never overwritten.) Mount writes (`vfs_write`) remain byte-level
+  last-writer-wins. *Semantic* reconciliation happens at **commit-time three-way merge**. This covers agents
+  that `pwrite` via FUSE/MCP and never open an "editor." *(Per-inode advisory locks are not implemented.)*
 - **Opt-in live co-editing (human in an editor + agent via an editor-like API):** a file can be promoted to a
   **CRDT document** (Yjs/Automerge) for real-time character-level co-editing; the CRDT periodically checkpoints
   into the working tree (→ new manifest, op-log entries per actor's spans). This is where humans and agents
