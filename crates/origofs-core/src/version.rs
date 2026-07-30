@@ -360,6 +360,31 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         crate::retry::retrying("checkout", || self.checkout_attempt(branch)).await
     }
 
+    /// [`checkout`](Self::checkout), attributed to `ctx` and subject to its write
+    /// policy (§6).
+    ///
+    /// Checkout is the most destructive operation on the working tree: it
+    /// truncates and rematerializes the whole thing, discarding every uncommitted
+    /// edit in the workspace. A propose-only actor — one deliberately barred from
+    /// overwriting a *single file* — must not be able to do that, so this is
+    /// policy-gated like `commit_as`. There is no propose-shaped equivalent: the
+    /// reviewable unit is an edit, and switching branches authors none.
+    ///
+    /// [`checkout`](Self::checkout) remains the unattributed form for the CLI,
+    /// tests, and internal machinery (merge materialization, recovery).
+    pub async fn checkout_as(&self, ctx: crate::WriteCtx, branch: &str) -> Result<()> {
+        self.ensure_may_write(ctx, "check out a branch").await?;
+        self.checkout(branch).await
+    }
+
+    /// [`create_branch`](Self::create_branch), attributed to `ctx` and subject to
+    /// its write policy (§6). Creating a ref mutates shared workspace state, so it
+    /// is gated for the same reason `commit_as` is.
+    pub async fn create_branch_as(&self, ctx: crate::WriteCtx, name: &str) -> Result<()> {
+        self.ensure_may_write(ctx, "create a branch").await?;
+        self.create_branch(name).await
+    }
+
     /// One attempt at [`checkout`](Self::checkout); see [`crate::retry`] for why the
     /// retry wrapper sits outside the whole operation rather than inside it.
     async fn checkout_attempt(&self, branch: &str) -> Result<()> {

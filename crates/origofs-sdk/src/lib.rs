@@ -581,13 +581,50 @@ impl Workspace {
     }
 
     /// Create a branch at the current HEAD commit.
+    ///
+    /// Unattributed. A surface that has resolved an actor must call
+    /// [`create_branch_as`](Self::create_branch_as) instead — see it for why.
     pub async fn create_branch(&self, name: &str) -> Result<()> {
         self.fs.create_branch(name).await
     }
 
+    /// [`create_branch`](Self::create_branch), attributed and policy-gated.
+    pub async fn create_branch_as(&self, ctx: WriteCtx, name: &str) -> Result<()> {
+        self.fs.create_branch_as(ctx, name).await?;
+        self.emit(
+            "branch",
+            "/",
+            Some(name.to_string()),
+            Some(ctx.actor),
+            ctx.session,
+        )
+        .await;
+        Ok(())
+    }
+
     /// Switch the working tree to `branch`.
+    ///
+    /// Unattributed, and **destructive**: it truncates and rematerializes the
+    /// whole working tree, discarding every uncommitted edit. A surface that has
+    /// resolved an actor must call [`checkout_as`](Self::checkout_as) instead —
+    /// otherwise a propose-only actor, barred from overwriting a single file, can
+    /// discard the entire workspace.
     pub async fn checkout(&self, branch: &str) -> Result<()> {
         self.fs.checkout(branch).await
+    }
+
+    /// [`checkout`](Self::checkout), attributed and policy-gated.
+    pub async fn checkout_as(&self, ctx: WriteCtx, branch: &str) -> Result<()> {
+        self.fs.checkout_as(ctx, branch).await?;
+        self.emit(
+            "checkout",
+            "/",
+            Some(branch.to_string()),
+            Some(ctx.actor),
+            ctx.session,
+        )
+        .await;
+        Ok(())
     }
 
     /// All branches with their commit hashes.
@@ -786,9 +823,6 @@ impl Workspace {
 
     // --- schema / migrations -------------------------------------------------
 
-    /// The migration version currently applied to this workspace's metadata DB.
-    /// A normal open already brings this to [`latest_schema_version`](Self::latest_schema_version);
-    /// this is here for operators who want to introspect or gate on it.
     /// Write a consistent snapshot of the **metadata** store to `dest`.
     ///
     /// This is the half of a workspace that cannot be reconstructed: `fsck
@@ -806,6 +840,10 @@ impl Workspace {
         self.fs.meta.backup_to(dest.as_ref()).await
     }
 
+    /// The migration version currently applied to this workspace's metadata DB.
+    /// A normal open already brings this to
+    /// [`latest_schema_version`](Self::latest_schema_version); this is here for
+    /// operators who want to introspect or gate on it.
     pub async fn schema_version(&self) -> Result<i64> {
         self.fs.meta.schema_version().await
     }
@@ -920,6 +958,19 @@ impl Workspace {
     /// actor-agnostic trust gate; the default is `Direct`.
     pub async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()> {
         self.fs.set_write_policy(actor_id, policy).await
+    }
+
+    /// Refuse `op` with [`OrigoFSError::Denied`] if `ctx`'s actor is
+    /// [`WritePolicy::Propose`] (§6).
+    ///
+    /// Every attributed engine method applies this itself, so an ordinary mutation
+    /// needs no explicit call. It is exposed for the *administrative* operations
+    /// that have no attributed variant — registering an actor, setting a policy —
+    /// which mutate the identity registry rather than the working tree. There is
+    /// nothing to attribute there, but they must still not be open to an actor the
+    /// operator has deliberately restricted, and a surface has no other way to ask.
+    pub async fn ensure_may_write(&self, ctx: WriteCtx, op: &str) -> Result<()> {
+        self.fs.ensure_may_write(ctx, op).await
     }
 
     /// Submit an edit to `path` governed by the actor's write policy: a `Direct`

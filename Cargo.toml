@@ -12,3 +12,13 @@ description = "origofs — an agent-and-human filesystem: content-addressed stor
 # Milestone M0: skeleton + core traits (MetadataStore, ContentStore),
 # a SQLite metadata backend, a local content-addressed store, and the
 # working-tree engine. See docs/DESIGN.md and issue #1.
+
+# Debug info dominates target/ size (tens of GiB across the test binaries) and is
+# not what these profiles are for: `cargo test` needs symbol names for a backtrace,
+# not full DWARF. `line-tables-only` keeps file/line in panics and backtraces while
+# cutting the artifacts by roughly an order of magnitude.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

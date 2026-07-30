@@ -22,20 +22,28 @@
 //! `unshare -U -r -m` overlay: fast, and fine for code you already trust, but the
 //! command runs with your privileges with no `pivot_root`/`chroot` (the whole
 //! host filesystem stays reachable by absolute path, including this workspace's
-//! `meta.db`/`cas`), no network namespace, and no seccomp. We only strip origofs's
-//! own `ORIGOFS_ENCRYPTION_KEY` from the child; everything else your process can
-//! reach, the command can too.
+//! `meta.db`/`cas`), no network namespace, and no seccomp. The child inherits your
+//! environment except origofs's own `ORIGOFS_ENCRYPTION_KEY`; everything else your
+//! process can reach, the command can too.
 //!
 //! **Isolated (`isolate: true`, `origofs sandbox --isolate`) — a real filesystem
 //! boundary.** Runs the command under [bubblewrap](https://github.com/containers/bubblewrap)
 //! ([`bwrap_available`]): a fresh namespace whose root is a tmpfs with only the
 //! host toolchain bind-mounted **read-only** and the copy-on-write overlay as the
 //! working dir. The rest of the host filesystem — `meta.db`/`cas`, the home dir,
-//! cloud/DB credentials — is simply absent, so untrusted code can't read or
-//! tamper with any of it. The delta is still captured in `upper/` and imported
-//! exactly as before. This is a *filesystem* boundary; the network namespace is
-//! left shared on purpose because agents typically need egress, so it does not by
-//! itself contain network-reachable resources.
+//! credential files — is simply absent, so untrusted code can't read or tamper
+//! with any of it. The **environment is cleared** too, down to `PATH`/`HOME`/
+//! `TMPDIR`: otherwise `AWS_SECRET_ACCESS_KEY`, `DATABASE_URL`, and every API
+//! token in the parent's `environ` would be inherited verbatim, which — with
+//! egress deliberately left open — hands untrusted code both the secrets and the
+//! means to exfiltrate them. `--new-session` detaches the controlling terminal, so
+//! the child cannot `TIOCSTI`-inject keystrokes into the launching shell. The delta
+//! is still captured in `upper/` and imported exactly as before.
+//!
+//! This is a *filesystem* boundary; the network namespace is left shared on purpose
+//! because agents typically need egress, so it does not by itself contain
+//! network-reachable resources. A caller passing secrets to a sandboxed command
+//! must do so explicitly.
 
 use crate::{FileKind, Workspace, WriteCtx};
 use anyhow::{Context, Result, bail};
@@ -283,11 +291,49 @@ fn sandbox_command(
 /// additionally needs bwrap >= 0.8.0; an older bwrap fails the run loudly rather
 /// than silently dropping the boundary.
 pub fn bwrap_available() -> bool {
-    std::process::Command::new("bwrap")
+    let Ok(out) = std::process::Command::new("bwrap")
         .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    // The version really is checked, not just the exit status. This function's own
+    // doc, the `sandbox_command` error text, the CLI's messages and CLAUDE.md all
+    // said `>= 0.8.0` was "gated by `bwrap_available()`" — and it wasn't. An older
+    // bwrap passed the gate and then died on `--overlay: unknown option`, which
+    // fails closed but tells the operator nothing about why. Checking here turns
+    // that into "your bwrap is too old" at the point the decision is made.
+    let text = String::from_utf8_lossy(&out.stdout);
+    match parse_bwrap_version(&text) {
+        Some(v) => v >= MIN_BWRAP_VERSION,
+        // Unparseable output from something calling itself bwrap: treat as
+        // unusable rather than assume it is new enough.
+        None => false,
+    }
+}
+
+/// The oldest bubblewrap whose `--overlay` this uses. Overlay mounts landed in
+/// 0.8.0; without them there is no copy-on-write layer to capture a delta from.
+const MIN_BWRAP_VERSION: (u32, u32, u32) = (0, 8, 0);
+
+/// Parse `bwrap --version` output ("bubblewrap 0.11.0") into a comparable triple.
+/// A missing patch component reads as 0, so "bubblewrap 0.8" is 0.8.0.
+fn parse_bwrap_version(out: &str) -> Option<(u32, u32, u32)> {
+    let token = out.split_whitespace().find(|t| {
+        t.split('.')
+            .next()
+            .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_digit()))
+    })?;
+    let mut parts = token
+        .split('.')
+        .map(|p| p.trim_end_matches(|c: char| !c.is_ascii_digit()));
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
 }
 
 /// Destination mountpoint for the overlay inside the bubblewrap sandbox.
@@ -313,7 +359,22 @@ fn bwrap_command(
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("bwrap");
     command
-        .env_remove("ORIGOFS_ENCRYPTION_KEY")
+        // **Clear the environment, don't just remove one key.** The module doc
+        // above promises that "cloud/DB credentials" are absent, and that is true
+        // of the *filesystem* — `~/.aws/credentials` really is gone. It was not
+        // true of the environment: `AWS_SECRET_ACCESS_KEY`, `DATABASE_URL`, and
+        // every API token in the parent's `environ` were inherited verbatim, and
+        // the network namespace is deliberately shared, so the child had both the
+        // secrets and the egress to use them. Removing `ORIGOFS_ENCRYPTION_KEY`
+        // alone protected origofs's own key and nothing else.
+        //
+        // What is put back is the minimum a command needs to run at all. Add to
+        // this list deliberately; anything else the sandboxed process needs should
+        // be passed explicitly by the caller.
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("HOME", BWRAP_WORKDIR)
+        .env("TMPDIR", "/tmp")
         .args([
             "--unshare-user",
             "--unshare-pid",
@@ -321,6 +382,12 @@ fn bwrap_command(
             "--unshare-uts",
             "--unshare-cgroup",
             "--die-with-parent",
+            // A new session detaches the child from the controlling terminal.
+            // Without it the child shares our tty and can `TIOCSTI`-inject
+            // keystrokes into the shell that launched it — bubblewrap's own
+            // documentation calls this out as a sandbox escape, and it would let
+            // untrusted code run commands as the user outside the sandbox.
+            "--new-session",
             "--proc",
             "/proc",
             "--dev",
@@ -505,6 +572,7 @@ async fn apply_opaque(
     ws: &Workspace,
     origofs_dir: &str,
     present: &HashSet<String>,
+    ctx: Option<WriteCtx>,
 ) -> Result<Vec<String>> {
     let Ok(existing) = ws.ls(origofs_dir).await else {
         return Ok(Vec::new()); // nothing on the origofs side to replace
@@ -520,7 +588,7 @@ async fn apply_opaque(
             bail!("refusing to delete unsafe path component {:?}", e.name);
         }
         let victim = join_origofs(origofs_dir, &e.name);
-        origofs_rm_rf(ws, &victim).await?;
+        origofs_rm_rf(ws, &victim, ctx).await?;
         removed.push(victim);
     }
     Ok(removed)
@@ -573,10 +641,14 @@ async fn import_delta(
     actor: Option<i64>,
     session: Option<i64>,
 ) -> Result<usize> {
+    // One context for every mutation this import performs, so a deletion, a
+    // directory, and a symlink are attributed exactly like the file writes
+    // alongside them.
+    let ctx = write_ctx(actor, session);
     let mut count = 0;
     let (names, hosts) = read_dir_snapshot(dir).await?;
     if is_opaque_dir(dir) {
-        count += apply_opaque(ws, &origofs_path_for(root, dir), &names)
+        count += apply_opaque(ws, &origofs_path_for(root, dir), &names, ctx)
             .await?
             .len();
     }
@@ -595,15 +667,14 @@ async fn import_delta(
 
         if ft.is_char_device() && md.rdev() == 0 {
             // overlayfs whiteout => the path was deleted in the sandbox
-            let _ = origofs_rm_rf(ws, &origofs_path).await;
+            let _ = origofs_rm_rf(ws, &origofs_path, ctx).await;
             count += 1;
         } else if ft.is_dir() {
-            ws.mkdir_p(&origofs_path).await?;
+            mkdir_attributed(ws, &origofs_path, ctx).await?;
             count += Box::pin(import_delta(ws, root, &host, actor, session)).await?;
         } else if ft.is_symlink() {
             let target = tokio::fs::read_link(&host).await?;
-            let _ = ws.remove(&origofs_path).await;
-            ws.symlink(&target.to_string_lossy(), &origofs_path).await?;
+            symlink_attributed(ws, &target.to_string_lossy(), &origofs_path, ctx).await?;
             count += 1;
         } else if ft.is_file() {
             let bytes = tokio::fs::read(&host).await?;
@@ -665,6 +736,7 @@ impl LiveSync {
     }
 
     async fn sync_dir(&mut self, ws: &Workspace, root: &Path, dir: &Path) -> Result<usize> {
+        let ctx = write_ctx(self.actor, self.session);
         let mut count = 0;
         let (names, hosts) = match read_dir_snapshot(dir).await {
             Ok(snapshot) => snapshot,
@@ -675,7 +747,7 @@ impl LiveSync {
         // the agent's write layer no longer lists (once — see `opaque`).
         let dir_path = origofs_path_for(root, dir);
         if is_opaque_dir(dir) && self.opaque.insert(dir_path.clone()) {
-            for victim in apply_opaque(ws, &dir_path, &names).await? {
+            for victim in apply_opaque(ws, &dir_path, &names, ctx).await? {
                 let sub = format!("{victim}/");
                 self.seen
                     .retain(|p, _| p != &victim && !p.starts_with(&sub));
@@ -690,19 +762,18 @@ impl LiveSync {
             if ft.is_char_device() && md.rdev() == 0 {
                 // overlayfs whiteout => the path was deleted in the overlay.
                 if self.deleted.insert(origofs_path.clone()) {
-                    let _ = origofs_rm_rf(ws, &origofs_path).await;
+                    let _ = origofs_rm_rf(ws, &origofs_path, ctx).await;
                     self.seen.remove(&origofs_path);
                     count += 1;
                 }
             } else if ft.is_dir() {
-                ws.mkdir_p(&origofs_path).await?;
+                mkdir_attributed(ws, &origofs_path, ctx).await?;
                 count += Box::pin(self.sync_dir(ws, root, &host)).await?;
             } else if ft.is_symlink() {
                 let key = (mtime_ns(&md), md.len());
                 if self.seen.get(&origofs_path) != Some(&key) {
                     let target = tokio::fs::read_link(&host).await?;
-                    let _ = ws.remove(&origofs_path).await;
-                    ws.symlink(&target.to_string_lossy(), &origofs_path).await?;
+                    symlink_attributed(ws, &target.to_string_lossy(), &origofs_path, ctx).await?;
                     self.seen.insert(origofs_path.clone(), key);
                     self.deleted.remove(&origofs_path);
                     count += 1;
@@ -733,19 +804,81 @@ fn mtime_ns(md: &std::fs::Metadata) -> i64 {
     md.mtime() * 1_000_000_000 + md.mtime_nsec()
 }
 
-/// Recursively remove an origofs path (file or directory).
-async fn origofs_rm_rf(ws: &Workspace, path: &str) -> Result<()> {
+/// The [`WriteCtx`] an import attributes through, when it has both halves.
+///
+/// An import needs an actor *and* a session to be attributable; with either
+/// missing there is nothing meaningful to record, and the unattributed engine
+/// methods are the honest fallback rather than a fabricated identity.
+fn write_ctx(actor: Option<i64>, session: Option<i64>) -> Option<WriteCtx> {
+    match (actor, session) {
+        (Some(a), Some(s)) => Some(WriteCtx::session(a, s)),
+        _ => None,
+    }
+}
+
+/// Recursively remove an origofs path (file or directory), attributed to the
+/// importing actor when there is one.
+///
+/// Deletions used to import through the unattributed `remove`, so
+/// `origofs sandbox --actor 7 -- rm -rf src/` recorded *nothing* about who
+/// removed the tree: no blame, no `edit_op`, no audit row. In a system whose
+/// premise is that every change is attributable, an unattributed delete is the
+/// worst gap to have, because a deletion is the change you most want to trace.
+async fn origofs_rm_rf(ws: &Workspace, path: &str, ctx: Option<WriteCtx>) -> Result<()> {
     match ws.stat(path).await {
         Ok(inode) if inode.kind == FileKind::Dir => {
             for e in ws.ls(path).await? {
-                Box::pin(origofs_rm_rf(ws, &join_origofs(path, &e.name))).await?;
+                Box::pin(origofs_rm_rf(ws, &join_origofs(path, &e.name), ctx)).await?;
             }
-            ws.remove(path).await?;
+            remove_attributed(ws, path, ctx).await?;
         }
         Ok(_) => {
-            ws.remove(path).await?;
+            remove_attributed(ws, path, ctx).await?;
         }
         Err(_) => {} // already gone
+    }
+    Ok(())
+}
+
+/// `remove`, attributed when the import has an actor.
+///
+/// Uses `remove_or_propose` rather than `remove_as`: it is the variant that
+/// honours the §6 write policy, so a propose-only actor's deletion is queued for
+/// review instead of applied. An import is the actor's own work arriving by a
+/// different route, not privileged machinery, so it gets the same gate the
+/// front door has.
+async fn remove_attributed(ws: &Workspace, path: &str, ctx: Option<WriteCtx>) -> Result<()> {
+    match ctx {
+        Some(ctx) => {
+            ws.remove_or_propose(ctx, path, Some("removed in sandbox"))
+                .await?;
+        }
+        None => ws.remove(path).await?,
+    }
+    Ok(())
+}
+
+/// `mkdir_p`, attributed when the import has an actor.
+async fn mkdir_attributed(ws: &Workspace, path: &str, ctx: Option<WriteCtx>) -> Result<()> {
+    match ctx {
+        Some(ctx) => ws.mkdir_as(ctx, path).await?,
+        None => ws.mkdir_p(path).await?,
+    }
+    Ok(())
+}
+
+/// `symlink`, attributed when the import has an actor. The existing entry is
+/// removed first because `symlink` refuses to overwrite.
+async fn symlink_attributed(
+    ws: &Workspace,
+    target: &str,
+    path: &str,
+    ctx: Option<WriteCtx>,
+) -> Result<()> {
+    let _ = remove_attributed(ws, path, ctx).await;
+    match ctx {
+        Some(ctx) => ws.symlink_as(ctx, target, path).await?,
+        None => ws.symlink(target, path).await?,
     }
     Ok(())
 }

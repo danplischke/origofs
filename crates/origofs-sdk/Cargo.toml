@@ -35,8 +35,11 @@ flate2          = { version = "1.0.35",  optional = true }  # git
 sha1            = { version = "0.10.6",  optional = true }  # git
 sha2            = { version = "0.10.9",  optional = true }  # git
 hex             = { version = "0.4.3",   optional = true }  # git
-tower           = { version = "0.5.2",   optional = true }  # api (middleware stack)
-tower-http      = { version = "0.6.2",   optional = true, features = ["cors", "request-id", "trace", "limit"] } # api
+# `limit` for the concurrency cap that provides backpressure; `timeout` (on
+# tower-http) for the per-request deadline. Without both, one wedged query or a
+# slow client holds a connection and its task indefinitely.
+tower           = { version = "0.5.2",   optional = true, features = ["limit"] }  # api (middleware stack)
+tower-http      = { version = "0.6.2",   optional = true, features = ["cors", "request-id", "trace", "limit", "timeout"] } # api
 
 [target.'cfg(unix)'.dependencies]
 fuser    = { version = "0.17",    optional = true }         # fuse

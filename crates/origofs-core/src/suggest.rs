@@ -206,7 +206,13 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     /// route through here. Checkout, merge materialization and
     /// [`accept_suggestion`](Self::accept_suggestion) applying an approved edit are
     /// all system actions with no requesting actor to police.
-    pub(crate) async fn ensure_may_write(&self, ctx: WriteCtx, op: &str) -> Result<()> {
+    /// Refuse `op` for an actor whose [`WritePolicy`](crate::WritePolicy) is
+    /// `Propose` (§6). `pub` so a *surface* can gate an administrative operation
+    /// that has no attributed engine variant of its own — registering an actor,
+    /// for instance, mutates the identity registry rather than the working tree,
+    /// so there is nothing to attribute, but it still must not be open to an
+    /// actor the operator has restricted.
+    pub async fn ensure_may_write(&self, ctx: WriteCtx, op: &str) -> Result<()> {
         match self.write_policy_of(ctx.actor).await? {
             WritePolicy::Direct => Ok(()),
             WritePolicy::Propose => Err(OrigoFSError::Denied(format!(

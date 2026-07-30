@@ -123,10 +123,17 @@ impl McpServer {
             "origofs_write" => {
                 let p = path();
                 let data = args.get("content").and_then(Value::as_str).unwrap_or("");
+                // `mkdir_as`, not the unattributed `mkdir_p`. Creating the
+                // parent is a working-tree mutation like any other, so it has to
+                // carry the agent and pass the write policy — otherwise a
+                // propose-only agent whose *edit* is correctly queued for review
+                // still silently creates directories on its way there. The engine
+                // fixed this class internally (`suggest.rs`); the surface was
+                // still doing it by hand.
                 if let Some((parent, _)) = p.rsplit_once('/')
                     && !parent.is_empty()
                 {
-                    self.ws.mkdir_p(parent).await?;
+                    self.ws.mkdir_as(self.ctx(), parent).await?;
                 }
                 // Governed by this agent's write policy: a direct agent writes
                 // straight to the tree; a propose-only agent's edit is queued for
@@ -212,10 +219,17 @@ impl McpServer {
                 let p = path();
                 let data = args.get("content").and_then(Value::as_str).unwrap_or("");
                 let summary = args.get("summary").and_then(Value::as_str);
+                // `mkdir_as`, not the unattributed `mkdir_p`. Creating the
+                // parent is a working-tree mutation like any other, so it has to
+                // carry the agent and pass the write policy — otherwise a
+                // propose-only agent whose *edit* is correctly queued for review
+                // still silently creates directories on its way there. The engine
+                // fixed this class internally (`suggest.rs`); the surface was
+                // still doing it by hand.
                 if let Some((parent, _)) = p.rsplit_once('/')
                     && !parent.is_empty()
                 {
-                    self.ws.mkdir_p(parent).await?;
+                    self.ws.mkdir_as(self.ctx(), parent).await?;
                 }
                 let id = self
                     .ws
@@ -398,7 +412,17 @@ impl McpServer {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("commit via mcp");
-                let hash = self.ws.commit_as(self.ctx(), "mcp-agent", message).await?;
+                // Resolve the agent's real display name, as the HTTP surface
+                // does. Hardcoding "mcp-agent" made every commit from every agent
+                // anonymous and identical in `origofs log` — the one place a
+                // reader looks to see who did what.
+                let author = self
+                    .ws
+                    .get_actor(self.agent)
+                    .await?
+                    .map(|a| a.display_name)
+                    .unwrap_or_else(|| format!("actor:{}", self.agent));
+                let hash = self.ws.commit_as(self.ctx(), &author, message).await?;
                 Ok(format!("committed {}", &hash.to_hex()[..12]))
             }
             "origofs_log" => {
@@ -409,7 +433,12 @@ impl McpServer {
                     .collect::<Vec<_>>()
                     .join("\n"))
             }
-            other => Ok(format!("unknown tool: {other}")),
+            // An error, not an `Ok` string. Returning `Ok` set `isError: false`,
+            // so a typo'd tool name looked to the agent exactly like a call that
+            // had worked — and agents act on that.
+            other => Err(crate::OrigoFSError::InvalidArgument(format!(
+                "unknown tool: {other}"
+            ))),
         }
     }
 

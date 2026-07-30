@@ -502,8 +502,21 @@ async fn main() -> Result<()> {
                         }
                     };
                     let session = ws.create_session(actor, Some("cli")).await?;
-                    ws.write_as(WriteCtx::session(actor, session), &path, &data)
-                        .await?;
+                    // `write_or_propose`, not `write_as`: the raw attributed write
+                    // is exempt from the §6 policy by construction, so `origofs
+                    // policy <actor> propose` had no effect on `origofs write` —
+                    // the CLI ignored the gate its own subcommand sets.
+                    match ws
+                        .write_or_propose(WriteCtx::session(actor, session), &path, &data, None)
+                        .await?
+                    {
+                        origofs_sdk::WriteOutcome::Wrote => {}
+                        origofs_sdk::WriteOutcome::Proposed(suggestion_id) => {
+                            println!(
+                                "actor {actor} is propose-only: queued suggestion #{suggestion_id} for {path} (pending review)"
+                            );
+                        }
+                    }
                 }
                 (None, None) => {
                     let mut buf = Vec::new();
@@ -864,6 +877,21 @@ async fn main() -> Result<()> {
                 anyhow::bail!(
                     "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
                 );
+            } else {
+                // Say it at the moment it matters. Without `--isolate` the child
+                // runs with the invoker's privileges over a plain copy-on-write
+                // overlay: the whole host filesystem stays reachable, including
+                // this workspace's meta.db and cas, with no network namespace and
+                // no seccomp. That caveat lived only in `--help` and doc comments,
+                // while strictly less dangerous things (a non-loopback NFS or
+                // metrics bind) both warned at runtime.
+                eprintln!(
+                    "warning: running without --isolate: this captures edits but is NOT a \
+                     security boundary. The command runs with your privileges and can read \
+                     and modify anything you can, including this workspace's meta.db and \
+                     cas. Run only code you trust, or pass --isolate for a real filesystem \
+                     boundary (needs bwrap >= 0.8.0)."
+                );
             }
             let tmp = cli
                 .workspace
@@ -901,6 +929,21 @@ async fn main() -> Result<()> {
             } else if !origofs_sdk::sandbox::overlay_supported() {
                 anyhow::bail!(
                     "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
+                );
+            } else {
+                // Say it at the moment it matters. Without `--isolate` the child
+                // runs with the invoker's privileges over a plain copy-on-write
+                // overlay: the whole host filesystem stays reachable, including
+                // this workspace's meta.db and cas, with no network namespace and
+                // no seccomp. That caveat lived only in `--help` and doc comments,
+                // while strictly less dangerous things (a non-loopback NFS or
+                // metrics bind) both warned at runtime.
+                eprintln!(
+                    "warning: running without --isolate: this captures edits but is NOT a \
+                     security boundary. The command runs with your privileges and can read \
+                     and modify anything you can, including this workspace's meta.db and \
+                     cas. Run only code you trust, or pass --isolate for a real filesystem \
+                     boundary (needs bwrap >= 0.8.0)."
                 );
             }
             let tmp = cli
@@ -1143,7 +1186,16 @@ async fn main() -> Result<()> {
             println!(
                 "serving origofs at http://{addr} (SIGTERM/Ctrl-C to stop; in-flight requests drain)"
             );
-            origofs_sdk::api::serve(std::sync::Arc::new(ws), addr, auth).await?;
+            let ws = std::sync::Arc::new(ws);
+            // Housekeeping. `reap_presence` and `supersede_stale_suggestions`
+            // existed with no caller anywhere, so a long-running `origofs serve`
+            // grew its presence table forever and left suggestions pending against
+            // bases that had already moved. A server is exactly the process that
+            // should be running them; nothing else is long-lived enough to.
+            let janitor = tokio::spawn(spawn_janitor(ws.clone()));
+            let result = origofs_sdk::api::serve(ws, addr, auth).await;
+            janitor.abort();
+            result?;
         }
         Cmd::Nfs { addr } => {
             // NFSv3 is unauthenticated; warn loudly if this isn't a loopback bind.
@@ -1168,6 +1220,42 @@ async fn main() -> Result<()> {
 /// Build the HTTP API authenticator from `--auth-token` specs. origofs never trusts a
 /// client-named actor, so the server must resolve identity itself. With no specs:
 /// refuse to expose a non-loopback address, and on loopback attribute all writes
+/// Periodic housekeeping for a long-running server.
+///
+/// Two maintenance operations shipped with no caller anywhere in the tree:
+///
+///   * `reap_presence` drops presence rows for sessions that stopped
+///     heartbeating. Without it the table only ever grows, and `presence()` —
+///     which every collaborative UI polls — gets slower forever.
+///   * `supersede_stale_suggestions` retires proposals whose base content has
+///     already moved on. Left pending, they sit in the review queue looking
+///     actionable, and accepting one just fails as superseded.
+///
+/// A server is the right place for both: it is the only process that lives long
+/// enough for either to matter. Every call is best-effort — housekeeping must never
+/// take the server down — and the interval is deliberately coarse, because neither
+/// operation is urgent and both touch shared tables.
+async fn spawn_janitor(ws: std::sync::Arc<origofs_sdk::Workspace>) {
+    /// How long a session may go without a heartbeat before its presence row is
+    /// reaped. Comfortably longer than any sane heartbeat interval, so a brief
+    /// network hiccup does not make a working collaborator vanish from the UI.
+    const PRESENCE_GRACE_SECS: i64 = 300;
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let mut ticker = tokio::time::interval(EVERY);
+    // The first tick fires immediately; skip straight to the cadence so startup
+    // isn't competing with a maintenance sweep.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        match ws.reap_presence(PRESENCE_GRACE_SECS).await {
+            Ok(n) if n > 0 => tracing::debug!(reaped = n, "reaped stale presence rows"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "presence reap failed"),
+        }
+    }
+}
+
 /// to an auto-created local actor (dev convenience only).
 async fn build_api_auth(
     ws: &Workspace,

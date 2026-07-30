@@ -44,9 +44,11 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 #[cfg(feature = "coedit")]
@@ -210,8 +212,28 @@ pub struct ApiOptions {
     /// browser client on another origin needs its origin listed here.
     pub cors_origins: Vec<String>,
     /// Maximum request-body size in bytes for uploads (`PUT /v1/files/…`).
-    /// Defaults to 1 GiB.
+    ///
+    /// Defaults to 64 MiB. `PUT` buffers the whole body in memory before writing
+    /// (reads stream, writes do not), so this is a direct bound on per-request
+    /// allocation — with the old 1 GiB default, a handful of concurrent maximum
+    /// uploads was enough to exhaust the process. Raise it deliberately if large
+    /// single-request uploads are part of the workload.
     pub max_body_bytes: usize,
+    /// How long a single request may run before it is abandoned with `408`.
+    ///
+    /// Defaults to 60 seconds. Without a timeout, one wedged metadata query or a
+    /// slow-loris client pins a connection and its task indefinitely, and enough
+    /// of them stall the server without anything looking like an error. `None`
+    /// disables it, for a deployment that genuinely has unbounded operations and
+    /// its own upstream deadline.
+    pub request_timeout: Option<Duration>,
+    /// Maximum number of requests processed concurrently; the rest queue.
+    ///
+    /// Defaults to 512. This is the backpressure valve: every accepted request
+    /// costs memory (up to `max_body_bytes` for an upload) and a metadata
+    /// connection, so an unbounded accept loop converts a traffic spike into an
+    /// out-of-memory kill rather than into latency. `None` disables the limit.
+    pub max_concurrent_requests: Option<usize>,
 }
 
 impl Default for ApiOptions {
@@ -219,7 +241,9 @@ impl Default for ApiOptions {
         Self {
             gate_reads: false,
             cors_origins: Vec::new(),
-            max_body_bytes: 1 << 30,
+            max_body_bytes: 64 << 20,
+            request_timeout: Some(Duration::from_secs(60)),
+            max_concurrent_requests: Some(512),
         }
     }
 }
@@ -302,14 +326,32 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
     let app = app.with_state(state);
     // Cross-cutting middleware (outermost first): an `x-request-id` set on the
     // request and echoed on the response, a tracing span per request, a
-    // request-body size cap, and CORS for browser clients. CORS sits innermost so
-    // it wraps the router's plain body (it requires a `Default` response body,
-    // which the trace layer's wrapped body is not).
+    // concurrency cap, a per-request deadline, a request-body size cap, and CORS
+    // for browser clients. CORS sits innermost so it wraps the router's plain body
+    // (it requires a `Default` response body, which the trace layer's wrapped body
+    // is not).
+    //
+    // The concurrency limit is outside the timeout on purpose: queued requests
+    // should have their deadline start when they begin *executing*, not while they
+    // are waiting for a slot, or a burst would time out everything behind it.
     app.layer(
         ServiceBuilder::new()
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(TraceLayer::new_for_http())
+            .option_layer(
+                options
+                    .max_concurrent_requests
+                    .map(tower::limit::ConcurrencyLimitLayer::new),
+            )
+            // `408 Request Timeout` rather than tower-http's legacy `500`: this is
+            // a deadline the server imposed, not an internal failure, and the
+            // distinction is what tells a client the request may be safe to retry.
+            .option_layer(
+                options
+                    .request_timeout
+                    .map(|d| TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, d)),
+            )
             .layer(DefaultBodyLimit::max(options.max_body_bytes))
             .layer(cors_layer(&options)),
     )
@@ -359,6 +401,23 @@ pub async fn serve(
     serve_until(ws, addr, auth, crate::shutdown_signal()).await
 }
 
+/// [`serve`] with explicit [`ApiOptions`].
+///
+/// `serve`/`serve_until` build the router with defaults, which left `ApiOptions`
+/// public but unreachable from the only entry point that also provides the
+/// graceful drain: configuring anything meant calling [`router_with`] and running
+/// your own `axum::serve`, throwing the drain away. Read gating, CORS origins,
+/// body size, timeout, and the concurrency cap are all things a deployment needs
+/// to set without giving up shutdown behaviour.
+pub async fn serve_with(
+    ws: Shared,
+    addr: SocketAddr,
+    auth: Arc<dyn Authenticator>,
+    options: ApiOptions,
+) -> std::io::Result<()> {
+    serve_until_with(ws, addr, auth, options, crate::shutdown_signal()).await
+}
+
 /// [`serve`], stopping when `shutdown` resolves and then **draining**: the
 /// listener closes to new connections while requests already in flight run to
 /// completion.
@@ -379,8 +438,19 @@ pub async fn serve_until(
     auth: Arc<dyn Authenticator>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    serve_until_with(ws, addr, auth, ApiOptions::default(), shutdown).await
+}
+
+/// [`serve_until`] with explicit [`ApiOptions`]. See [`serve_with`].
+pub async fn serve_until_with(
+    ws: Shared,
+    addr: SocketAddr,
+    auth: Arc<dyn Authenticator>,
+    options: ApiOptions,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(ws, auth))
+    axum::serve(listener, router_with(ws, auth, options))
         .with_graceful_shutdown(async move {
             shutdown.await;
             tracing::info!("shutdown signal received; draining in-flight requests");
@@ -398,6 +468,31 @@ fn abspath(p: &str) -> String {
 }
 
 // --- error mapping ----------------------------------------------------------
+
+/// The message an error is allowed to show a client.
+///
+/// Most `OrigoFSError` variants are *about the request* — a path that isn't
+/// there, a name that isn't valid, a policy that refused — and their `Display` is
+/// exactly what the caller needs. [`Backend`](crate::OrigoFSError::Backend) is
+/// not: its `Display` interpolates the driver error verbatim, which for
+/// tokio-postgres or rusqlite means SQL text, table and column names, constraint
+/// names, and connection or file paths. Returning that over HTTP hands an
+/// unauthenticated caller (reads are open by default) a description of the
+/// schema and the deployment.
+///
+/// So a backend failure gets a fixed message plus the stable machine `code` and
+/// `class` the envelope already carries — enough for a client to decide whether
+/// to retry — while the real cause goes to the log, where the operator can
+/// correlate it by request id.
+fn client_message(e: &crate::OrigoFSError) -> String {
+    match e {
+        crate::OrigoFSError::Backend { origin, class, .. } => {
+            tracing::error!(error = %e, %origin, %class, "backend error");
+            format!("{origin} backend error ({class}); see server logs")
+        }
+        other => other.to_string(),
+    }
+}
 
 /// An HTTP error: either a mapped [`crate::OrigoFSError`] or an explicit status
 /// (e.g. `401` from the [`Auth`] extractor).
@@ -447,7 +542,7 @@ impl IntoResponse for ApiError {
                     e if e.retryable() => StatusCode::SERVICE_UNAVAILABLE,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
-                (status, e.code(), e.to_string(), e.retryable())
+                (status, e.code(), client_message(&e), e.retryable())
             }
         };
         // Machine-readable envelope: a stable `code` a client can branch on, the
@@ -479,14 +574,28 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// Readiness: probe the backing stores. `200` when both answer, `503` (with the
-/// per-store detail) when either is unreachable — so a load balancer or a k8s
-/// readiness probe pulls this instance out of rotation until its database and
-/// content store recover, instead of routing requests it cannot serve.
+/// Readiness: probe the backing stores. `200` when both answer, `503` when either
+/// is unreachable — so a load balancer or a k8s readiness probe pulls this
+/// instance out of rotation until its database and content store recover, instead
+/// of routing requests it cannot serve.
+///
+/// **The response says only which store is unhealthy, never why.** This endpoint
+/// sits at the root, outside `/v1`, so it is not covered by `gate_reads` and is
+/// unauthenticated by design — a probe should not need a credential. It used to
+/// echo the raw probe error, which for a metadata failure is a driver message
+/// carrying the DSN host, database name, and connection details. A prober needs
+/// `ready: false` and which half is down; the operator needs the cause, and gets
+/// it from the log.
 async fn readyz(State(ws): State<Shared>) -> Response {
     let report = ws.ready().await;
+    if let Some(err) = &report.metadata {
+        tracing::error!(error = %err, store = "metadata", "readiness probe failed");
+    }
+    if let Some(err) = &report.content {
+        tracing::error!(error = %err, store = "content", "readiness probe failed");
+    }
     let store = |probe: &Option<String>| match probe {
-        Some(err) => json!({ "ok": false, "error": err }),
+        Some(_) => json!({ "ok": false }),
         None => json!({ "ok": true }),
     };
     let body = json!({
@@ -713,8 +822,14 @@ async fn list_dir(
     list_path(&ws, &abspath(&path)).await
 }
 
+/// `POST /v1/dirs` — the root directory.
+///
+/// The root always exists, so there is nothing to create and nothing to
+/// attribute; this exists only so the collection URL is not a 405 next to
+/// `POST /v1/dirs/{path}`. Says so rather than claiming it created something.
+/// Listed in `NO_ACTOR_NEEDED` in `tests/api_write_policy.rs`.
 async fn make_root(State(_ws): State<Shared>, _auth: Auth) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(json!({ "created": "/" })))
+    Ok(Json(json!({ "path": "/", "created": false })))
 }
 
 async fn make_dir(
@@ -1059,19 +1174,24 @@ struct BranchReq {
 
 async fn create_branch(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Json(req): Json<BranchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    ws.create_branch(&req.name).await?;
+    ws.create_branch_as(principal.write_ctx(), &req.name)
+        .await?;
     Ok(Json(json!({ "created": req.name })))
 }
 
+/// Switching branches rematerializes the whole working tree, discarding every
+/// uncommitted edit — so it goes through the attributed, policy-gated variant.
+/// Taking only `_auth` here meant a propose-only token, held by an actor
+/// deliberately barred from overwriting one file, could destroy the workspace.
 async fn checkout(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Json(req): Json<BranchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    ws.checkout(&req.name).await?;
+    ws.checkout_as(principal.write_ctx(), &req.name).await?;
     Ok(Json(json!({ "branch": req.name })))
 }
 
@@ -1262,11 +1382,20 @@ struct ActorReq {
     controller: Option<i64>,
 }
 
+/// Register a new actor.
+///
+/// Gated, not merely authenticated. This mutates the identity registry rather
+/// than the working tree, so there is no attributed variant to call — but leaving
+/// it open to any valid credential let a propose-only actor, one the operator had
+/// deliberately restricted, mint unbounded rows in the very table attribution is
+/// resolved against.
 async fn create_actor(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Json(req): Json<ActorReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    ws.ensure_may_write(principal.write_ctx(), "register actors")
+        .await?;
     let id = if req.agent {
         ws.create_agent(
             &req.name,
@@ -1280,18 +1409,29 @@ async fn create_actor(
     Ok(Json(json!({ "id": id })))
 }
 
+/// The body of `POST /v1/sessions`. It carries **no** actor: the session belongs
+/// to whoever the credential resolves to, server-side.
 #[derive(Deserialize)]
 struct SessionReq {
-    actor: i64,
     #[serde(default)]
     client: Option<String>,
 }
 
+/// Open a session for the *authenticated* actor.
+///
+/// This used to read `actor` out of the request body, which is the one place the
+/// surface broke origofs's central rule that the server never trusts a
+/// client-named actor. Writes were never forgeable through it — they attribute
+/// from the token's principal, not from a client-supplied session — but any valid
+/// credential could mint unbounded session rows belonging to *other* actors,
+/// polluting the very audit trail sessions exist to provide.
 async fn create_session(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Json(req): Json<SessionReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let id = ws.create_session(req.actor, req.client.as_deref()).await?;
-    Ok(Json(json!({ "id": id })))
+    let id = ws
+        .create_session(principal.actor, req.client.as_deref())
+        .await?;
+    Ok(Json(json!({ "id": id, "actor": principal.actor })))
 }
