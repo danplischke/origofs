@@ -274,6 +274,34 @@ enum Cmd {
     },
     /// Reclaim content unreachable from any branch or the working tree.
     Gc,
+    /// Compact the content store, reclaiming space held by deleted objects.
+    ///
+    /// Meaningful for a **packed** store (the recommended object-storage layout,
+    /// and what `deploy/config.example.toml` sets): deleting a chunk only clears
+    /// its index entry, so the bytes stay in their pack until a repack rewrites
+    /// the survivors. Run it after `gc`.
+    Repack,
+    /// Seal any buffered writes to durable storage.
+    ///
+    /// A no-op for stores that write through; a packed store seals its open pack.
+    Flush,
+    /// Apply any pending schema migrations and report the versions.
+    ///
+    /// Opening a workspace already migrates, so this is for running the upgrade
+    /// deliberately — as a deploy step, before starting the new binaries.
+    Migrate,
+    /// Show the workspace's schema version and the newest this binary knows.
+    SchemaVersion,
+    /// Back up the **metadata** store — the half that cannot be rebuilt.
+    ///
+    /// `fsck --rebuild` recovers committed files, directories, symlinks, and
+    /// branches from the content store alone, but blame, the audit log, the actor
+    /// registry, and every uncommitted edit exist only in the database. SQLite is
+    /// snapshotted with the online backup API, so writers need not stop.
+    Backup {
+        /// Where to write the snapshot. Must not already exist.
+        dest: PathBuf,
+    },
     /// Recover a workspace from the content store after a metadata-DB loss.
     /// Scans the object graph (commits, trees, chunks, the ref mirror) and, with
     /// `--rebuild`, restores refs + the working tree onto a fresh DB. Read-only
@@ -949,6 +977,57 @@ async fn main() -> Result<()> {
             println!(
                 "gc: kept {} object(s), deleted {} ({} bytes freed)",
                 stats.reachable, stats.deleted, stats.bytes_freed
+            );
+            if stats.skipped_young > 0 {
+                println!(
+                    "  {} unreferenced object(s) left for now: younger than the {}s grace \n  period, which is what keeps a collection safe alongside live writers",
+                    stats.skipped_young,
+                    origofs_sdk::DEFAULT_GC_GRACE_SECS
+                );
+            }
+            if stats.skipped_undated > 0 {
+                println!(
+                    "  warning: {} unreferenced object(s) could not be dated by this content \n  backend, so they were left alone — this store cannot be collected safely",
+                    stats.skipped_undated
+                );
+            }
+        }
+        Cmd::Repack => {
+            let freed = ws.repack().await?;
+            println!("repack: {freed} bytes reclaimed");
+        }
+        Cmd::Flush => {
+            ws.flush().await?;
+            println!("flushed buffered writes to durable storage");
+        }
+        Cmd::Migrate => {
+            let (before, after) = ws.migrate().await?;
+            if before == after {
+                println!("schema already at v{after}; nothing to apply");
+            } else {
+                println!("migrated schema v{before} -> v{after}");
+            }
+        }
+        Cmd::SchemaVersion => {
+            let current = ws.schema_version().await?;
+            let latest = ws.latest_schema_version();
+            println!("schema version: v{current} (this binary knows up to v{latest})");
+            if current < latest {
+                println!(
+                    "  run `origofs migrate` to apply {} step(s)",
+                    latest - current
+                );
+            } else if current > latest {
+                println!(
+                    "  warning: the store is NEWER than this binary; a newer origofs wrote it \n  and this one may not understand every column. Upgrade before writing."
+                );
+            }
+        }
+        Cmd::Backup { dest } => {
+            let what = ws.backup_metadata(&dest).await?;
+            println!("{what}");
+            println!(
+                "note: this is the metadata store only — content lives in the content store \n  and is already durable there. Blame, the audit log, actors, and uncommitted \n  edits exist ONLY in this file."
             );
         }
         Cmd::Fsck { rebuild } => {

@@ -195,6 +195,54 @@ impl MetadataStore for SqliteMetadataStore {
         }
     }
 
+    /// SQLite's **online backup API**, not a file copy.
+    ///
+    /// Copying `meta.db` while the workspace is live gives you a file that may
+    /// be mid-transaction and whose `-wal` sidecar you probably didn't copy — it
+    /// often restores, which is what makes it dangerous. The backup API walks the
+    /// pages under the same locking the engine uses, so the result is a coherent
+    /// database even with writers active.
+    ///
+    /// Runs to completion in one step: the alternative, stepping a few pages at a
+    /// time, lets a concurrent writer restart the copy and can starve it
+    /// indefinitely on a busy store. Holding the connection for the duration is
+    /// the price of a snapshot that terminates.
+    async fn backup_to(&self, dest: &std::path::Path) -> Result<String> {
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Refuse to clobber: a backup command that silently overwrites the
+        // previous backup can destroy the only good copy.
+        if dest.exists() {
+            return Err(OrigoFSError::AlreadyExists(format!(
+                "{} already exists; choose another destination",
+                dest.display()
+            )));
+        }
+        let conn = self.lock();
+        let mut out = Connection::open(dest)?;
+        let backup = rusqlite::backup::Backup::new(&conn, &mut out)?;
+        // `-1` is SQLite's "copy every remaining page in this step". Passing a
+        // huge positive count instead is a trap: `run_to_completion` asserts the
+        // count is positive, and `usize::MAX as i32` wraps to -1, so it panics.
+        match backup.step(-1)? {
+            rusqlite::backup::StepResult::Done => {}
+            other => {
+                return Err(OrigoFSError::Metadata(format!(
+                    "sqlite backup did not complete: {other:?}"
+                )));
+            }
+        }
+        drop(backup);
+        let bytes = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        Ok(format!(
+            "sqlite online backup -> {} ({bytes} bytes)",
+            dest.display()
+        ))
+    }
+
     async fn begin(&self) -> Result<Box<dyn MetaTxn>> {
         // Hold the connection lock for the whole transaction — SQLite is
         // single-writer, so this both serializes writers and lets the txn issue

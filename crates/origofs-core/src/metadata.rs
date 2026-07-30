@@ -33,6 +33,30 @@ pub trait MetadataStore: Send + Sync {
         self.schema_version().await.map(|_| ())
     }
 
+    /// Write a consistent snapshot of this store to `dest`, returning a
+    /// human-readable description of what was produced.
+    ///
+    /// The metadata store is the one part of a workspace the content store cannot
+    /// rebuild. `fsck --rebuild` recovers committed files, directories, symlinks,
+    /// and branches from the bucket alone — but blame, the audit log, the actor
+    /// registry, and every uncommitted edit exist *only* here. Three documents
+    /// (`CLAUDE.md`, `DESIGN.md` §7, `README.md`) all say to back this up, and
+    /// there was no way to.
+    ///
+    /// "Consistent" means concurrent writers are allowed: a snapshot must not
+    /// require the workspace to be stopped, or it will not be taken. The default
+    /// refuses rather than producing something that only looks like a backup —
+    /// a backup you cannot restore is worse than an absent one, because it is
+    /// discovered at the moment you need it.
+    async fn backup_to(&self, dest: &std::path::Path) -> Result<String> {
+        let _ = dest;
+        Err(crate::error::OrigoFSError::InvalidArgument(
+            "this metadata backend has no built-in backup; use the backend's own \
+             tooling (for Postgres: pg_dump, or continuous archiving/PITR)"
+                .into(),
+        ))
+    }
+
     /// Begin an atomic write transaction (`docs/DESIGN.md` §4b).
     ///
     /// A logical filesystem write is several statements — create an inode, link
@@ -419,6 +443,9 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn ping(&self) -> Result<()> {
         (**self).ping().await
+    }
+    async fn backup_to(&self, dest: &std::path::Path) -> Result<String> {
+        (**self).backup_to(dest).await
     }
     async fn begin(&self) -> Result<Box<dyn MetaTxn>> {
         (**self).begin().await

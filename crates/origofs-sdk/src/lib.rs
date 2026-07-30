@@ -767,6 +767,23 @@ impl Workspace {
     /// The migration version currently applied to this workspace's metadata DB.
     /// A normal open already brings this to [`latest_schema_version`](Self::latest_schema_version);
     /// this is here for operators who want to introspect or gate on it.
+    /// Write a consistent snapshot of the **metadata** store to `dest`.
+    ///
+    /// This is the half of a workspace that cannot be reconstructed: `fsck
+    /// --rebuild` recovers committed files, directories, symlinks, and branches
+    /// from the content store alone, but blame, the audit log, the actor
+    /// registry, and every uncommitted edit live only in the database. Content is
+    /// already durable and replicated wherever the object store puts it; this is
+    /// what actually needs backing up.
+    ///
+    /// SQLite uses the online backup API, so a live workspace can be snapshotted
+    /// without stopping writers. Postgres has no built-in equivalent here and
+    /// refuses with a pointer to `pg_dump`/PITR rather than producing something
+    /// that only resembles a backup.
+    pub async fn backup_metadata(&self, dest: impl AsRef<Path>) -> Result<String> {
+        self.fs.meta.backup_to(dest.as_ref()).await
+    }
+
     pub async fn schema_version(&self) -> Result<i64> {
         self.fs.meta.schema_version().await
     }
