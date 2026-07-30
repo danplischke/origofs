@@ -129,16 +129,45 @@ impl PostgresMetadataStore {
     /// TLS is negotiated per the DSN's `sslmode` (default `prefer`); see
     /// [`tls_connector`] for the verification policy.
     pub async fn connect(dsn: &str) -> Result<Self> {
-        let cfg: tokio_postgres::Config = dsn.parse()?;
+        let mut cfg: tokio_postgres::Config = dsn.parse()?;
+        // An optional per-statement ceiling, so one pathological query can't pin a
+        // pooled connection for its whole lifetime. Off by default and deliberately
+        // so: origofs's statements are small, but a few (`truncate_tree` on a large
+        // working tree, a wide `list_dir`) legitimately run long, and a timeout
+        // that aborts a checkout is worse than one that never fires. Operators who
+        // want the ceiling set it; those who don't keep the old behaviour.
+        if let Ok(ms) = std::env::var("ORIGOFS_PG_STATEMENT_TIMEOUT_MS")
+            && ms.parse::<u64>().is_ok_and(|v| v > 0)
+        {
+            let existing = cfg.get_options().unwrap_or_default().to_string();
+            cfg.options(format!("{existing} -c statement_timeout={ms}").trim());
+        }
         let mgr = Manager::new(cfg, tls_connector()?);
-        // Bound acquisition: without a wait timeout, exhausting the pool makes
-        // `client()` hang forever instead of surfacing a retriable error. A
-        // runtime must be set for the timeouts to be enforced.
+        // Pool sizing is a deployment property, not a library constant: 16 is far
+        // too many for a dozen sidecars sharing one small database and far too few
+        // for a busy single writer. It was hardcoded with no way to change it.
+        fn env_usize(var: &str, default: usize) -> usize {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+        fn env_secs(var: &str, default: u64) -> std::time::Duration {
+            std::time::Duration::from_secs(
+                std::env::var(var)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(default),
+            )
+        }
         let pool = Pool::builder(mgr)
-            .max_size(16)
+            .max_size(env_usize("ORIGOFS_PG_POOL_SIZE", 16))
             .runtime(deadpool_postgres::Runtime::Tokio1)
-            .wait_timeout(Some(std::time::Duration::from_secs(10)))
-            .create_timeout(Some(std::time::Duration::from_secs(10)))
+            // Bound acquisition: without a wait timeout, exhausting the pool makes
+            // `client()` hang forever instead of surfacing a retriable error.
+            .wait_timeout(Some(env_secs("ORIGOFS_PG_WAIT_TIMEOUT_SECS", 10)))
+            .create_timeout(Some(env_secs("ORIGOFS_PG_CONNECT_TIMEOUT_SECS", 10)))
+            .recycle_timeout(Some(env_secs("ORIGOFS_PG_RECYCLE_TIMEOUT_SECS", 10)))
             .build()
             .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
         Ok(Self {
@@ -206,6 +235,7 @@ impl PostgresMetadataStore {
         let (client, mut connection) = tokio_postgres::connect(&self.dsn, tls_connector()?)
             .await
             .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
+        crate::metrics::record_feed_connect();
 
         // The connection future both drives the socket and surfaces async
         // NOTIFYs; forward each notification to the receiver as a bare wakeup.
@@ -315,6 +345,17 @@ impl EventSubscription {
         .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
 
         let events: Vec<Event> = rows.iter().map(row_to_event).collect();
+        // The feed's own health was invisible: a subscriber falling behind looked
+        // exactly like a quiet workspace. A full batch means there is more waiting,
+        // which is the signal that matters.
+        crate::metrics::record_feed_drain(
+            events.len() as u64,
+            if events.len() as i64 >= DRAIN_BATCH {
+                DRAIN_BATCH as u64
+            } else {
+                0
+            },
+        );
         // Advance past the max seq we *saw*, so a branch filter still moves the
         // cursor forward and we don't re-scan skipped rows on the next wake.
         if let Some(last) = events.last() {
@@ -471,6 +512,7 @@ impl PostgresMetadataStore {
         let (client, mut connection) = tokio_postgres::connect(&self.dsn, tls_connector()?)
             .await
             .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
+        crate::metrics::record_feed_connect();
 
         // Coalescing capacity-1 wakeups: a wake only means "re-drain", so a burst
         // collapses into one and the drained query stays the source of truth.

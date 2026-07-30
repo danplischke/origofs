@@ -19,7 +19,12 @@ use object_store::{ObjectStore, PutPayload};
 use std::sync::Arc;
 
 /// Connection settings for an S3-compatible backend.
-#[derive(Clone, Debug, Default)]
+///
+/// `Debug` is hand-written so the secret access key cannot reach a log. A derived
+/// one would print it, and this struct is exactly the sort of thing that ends up
+/// inside a `tracing` field or an `anyhow` context during a connection failure —
+/// the moment someone is most likely to paste the output somewhere.
+#[derive(Clone, Default)]
 pub struct S3Config {
     pub bucket: String,
     pub region: String,
@@ -36,6 +41,26 @@ pub struct S3Config {
     pub prefix: Option<String>,
 }
 
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("allow_http", &self.allow_http)
+            .field(
+                "access_key_id",
+                &self.access_key_id.as_ref().map(|_| "<set>"),
+            )
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+
 /// Connection settings for a **native** Google Cloud Storage backend.
 ///
 /// Unlike [`S3Config`] — which reaches GCS only through its S3-interop XML API and
@@ -47,7 +72,7 @@ pub struct S3Config {
 /// 2. Application Default Credentials — [`Self::application_credentials`], else the
 ///    `GOOGLE_APPLICATION_CREDENTIALS` env var or the well-known `gcloud` location;
 /// 3. the GCE/GKE metadata server (workload identity) when nothing else is set.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct GcsConfig {
     pub bucket: String,
     /// Path to a service-account JSON key file.
@@ -62,10 +87,72 @@ pub struct GcsConfig {
     pub prefix: Option<String>,
 }
 
+impl std::fmt::Debug for GcsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `service_account_key` is the *contents* of a private key file.
+        f.debug_struct("GcsConfig")
+            .field("bucket", &self.bucket)
+            .field("service_account_path", &self.service_account_path)
+            .field(
+                "service_account_key",
+                &self.service_account_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("application_credentials", &self.application_credentials)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+
 /// A content-addressed store over any `object_store` backend.
 pub struct ObjectContentStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+}
+
+/// Retry and timeout policy for every object-store backend.
+///
+/// `object_store` has defaults, but taking them meant origofs had no *stated*
+/// behaviour against a flaky bucket — the operator could not know how long a stuck
+/// request would hang, and a request with no timeout at all is the one that turns
+/// a slow S3 into a wedged server. These are explicit, tunable, and documented:
+///
+/// * a request that has produced no response in `ORIGOFS_S3_TIMEOUT_SECS` is
+///   abandoned, so a black-holed connection surfaces as a retryable error instead
+///   of pinning a task forever;
+/// * a connect that doesn't complete in `ORIGOFS_S3_CONNECT_TIMEOUT_SECS` fails
+///   fast, which is the common shape of a mis-set endpoint;
+/// * retries are bounded by both count and total elapsed time, so a persistent
+///   outage produces an error the caller can classify rather than an unbounded
+///   stall. `OrigoFSError` already marks these retryable, so callers can back off.
+fn client_options() -> object_store::ClientOptions {
+    fn secs(var: &str, default: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default),
+        )
+    }
+    object_store::ClientOptions::new()
+        .with_timeout(secs("ORIGOFS_S3_TIMEOUT_SECS", 60))
+        .with_connect_timeout(secs("ORIGOFS_S3_CONNECT_TIMEOUT_SECS", 10))
+}
+
+/// See [`client_options`].
+fn retry_config() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        max_retries: std::env::var("ORIGOFS_S3_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5),
+        retry_timeout: std::time::Duration::from_secs(
+            std::env::var("ORIGOFS_S3_RETRY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(180),
+        ),
+        ..Default::default()
+    }
 }
 
 impl ObjectContentStore {
@@ -85,7 +172,9 @@ impl ObjectContentStore {
     pub fn s3(cfg: S3Config) -> Result<Self> {
         let mut builder = object_store::aws::AmazonS3Builder::new()
             .with_bucket_name(&cfg.bucket)
-            .with_region(&cfg.region);
+            .with_region(&cfg.region)
+            .with_client_options(client_options())
+            .with_retry(retry_config());
         if let Some(endpoint) = &cfg.endpoint {
             builder = builder
                 .with_endpoint(endpoint)
@@ -118,7 +207,9 @@ impl ObjectContentStore {
         } else {
             GoogleCloudStorageBuilder::from_env()
         }
-        .with_bucket_name(&cfg.bucket);
+        .with_bucket_name(&cfg.bucket)
+        .with_client_options(client_options())
+        .with_retry(retry_config());
         if let Some(key) = &cfg.service_account_key {
             builder = builder.with_service_account_key(key);
         } else if let Some(path) = &cfg.service_account_path {
