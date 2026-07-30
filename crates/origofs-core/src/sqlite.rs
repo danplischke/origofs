@@ -436,6 +436,17 @@ impl MetadataStore for SqliteMetadataStore {
         .map_err(Into::into)
     }
 
+    async fn parent_of(&self, ino: Ino) -> Result<Option<Ino>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT parent_ino FROM dentry WHERE ino = ?1 LIMIT 1",
+            params![ino],
+            |r| r.get::<_, Ino>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     async fn child_count(&self, parent: Ino) -> Result<usize> {
         let conn = self.lock();
         let n: i64 = conn.query_row(

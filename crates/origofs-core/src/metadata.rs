@@ -128,6 +128,17 @@ pub trait MetadataStore: Send + Sync {
     /// first is returned so the mapping is deterministic.
     async fn dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>>;
 
+    /// The directory `ino` is linked into, or `None` for the root (or an inode
+    /// with no dentry).
+    ///
+    /// Lets an *inode-oriented* op walk **up** the tree — which the path API gets
+    /// for free from the path itself, but FUSE/NFS handlers do not. `rename`'s
+    /// "is the destination inside the thing I'm moving?" check needs it: without
+    /// an upward walk the only alternative is scanning the source's whole subtree
+    /// downward on every rename. Backed by `idx_dentry_ino`, so it is one indexed
+    /// lookup per level.
+    async fn parent_of(&self, ino: Ino) -> Result<Option<Ino>>;
+
     /// Number of entries directly under `parent`.
     async fn child_count(&self, parent: Ino) -> Result<usize>;
 
@@ -412,6 +423,9 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
         (**self).dentry_name(parent, ino).await
+    }
+    async fn parent_of(&self, ino: Ino) -> Result<Option<Ino>> {
+        (**self).parent_of(ino).await
     }
     async fn child_count(&self, parent: Ino) -> Result<usize> {
         (**self).child_count(parent).await

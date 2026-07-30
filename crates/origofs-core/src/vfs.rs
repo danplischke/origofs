@@ -292,6 +292,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .lookup(parent, name)
             .await?
             .ok_or_else(|| OrigoFSError::NotFound(name.to_string()))?;
+        // `mv /mnt/a /mnt/a/b/a2` through a mount is the same self-into-descendant
+        // cycle the path API guards, and the inode surface can reach it too.
+        self.ensure_not_own_descendant(sino, newparent).await?;
         // Resolve the destination's state before the txn; the mutations below
         // commit together so a crash can't leave the source unlinked with the
         // destination half-replaced (C1).

@@ -566,3 +566,52 @@ async fn names_are_byte_exact_no_unicode_normalization_or_casefold() {
         .ino;
     assert_ne!(upper, lower, "case variants must be separate inodes");
 }
+
+// SEC/L: renaming a directory *into itself* must be refused (POSIX `EINVAL`).
+//
+// `rename("/a", "/a/b/a2")` makes `a` a child of its own child. The subtree is
+// then unreachable from the root, so it disappears from `ls` and from
+// `build_tree` — and, decisively, from `mark_working`, which is what GC uses to
+// decide what is live. So an ordinary `mv` silently destroyed data: the rows
+// stayed in the database while GC reclaimed all of the content they pointed at.
+#[tokio::test]
+async fn rename_into_own_descendant_is_refused() {
+    let fs = fixture().await;
+    fs.mkdir_p("/a/b/deep").await.unwrap();
+    fs.write("/a/payload.txt", b"precious").await.unwrap();
+
+    for (from, to) in [("/a", "/a/b/a2"), ("/a", "/a/a2"), ("/a/b", "/a/b/deep/x")] {
+        let err = fs.rename(from, to).await;
+        assert!(
+            matches!(err, Err(OrigoFSError::InvalidArgument(_))),
+            "rename({from:?}, {to:?}) must be refused, got {err:?}"
+        );
+    }
+
+    // Still reachable and intact, and — the part that mattered — still live as
+    // far as GC is concerned.
+    assert_eq!(&fs.read("/a/payload.txt").await.unwrap()[..], b"precious");
+    fs.gc().await.unwrap();
+    assert_eq!(
+        &fs.read("/a/payload.txt").await.unwrap()[..],
+        b"precious",
+        "content of a subtree that a refused rename would have orphaned"
+    );
+
+    // The inode surface (FUSE/NFS `mv`) reaches the same cycle.
+    let a = fs.vfs_lookup(INO_ROOT, "a").await.unwrap().unwrap().ino;
+    let b = fs.vfs_lookup(a, "b").await.unwrap().unwrap().ino;
+    let err = fs.vfs_rename(INO_ROOT, "a", b, "a2").await;
+    assert!(
+        matches!(err, Err(OrigoFSError::InvalidArgument(_))),
+        "vfs_rename into a descendant must be refused, got {err:?}"
+    );
+
+    // Ordinary moves — including into a sibling and back out of a subtree — still
+    // work, so the guard isn't over-broad.
+    fs.mkdir_p("/elsewhere").await.unwrap();
+    fs.rename("/a/b", "/elsewhere/b").await.unwrap();
+    fs.rename("/elsewhere", "/moved").await.unwrap();
+    assert!(fs.stat("/moved/b").await.is_ok());
+    assert_eq!(&fs.read("/a/payload.txt").await.unwrap()[..], b"precious");
+}

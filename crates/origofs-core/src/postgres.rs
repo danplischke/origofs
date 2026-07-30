@@ -854,6 +854,17 @@ impl MetadataStore for PostgresMetadataStore {
         Ok(row.map(|r| r.get(0)))
     }
 
+    async fn parent_of(&self, ino: Ino) -> Result<Option<Ino>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT parent_ino FROM dentry WHERE ino = $1 LIMIT 1",
+                &[&ino],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
     async fn child_count(&self, parent: Ino) -> Result<usize> {
         let c = self.client().await?;
         let row = c

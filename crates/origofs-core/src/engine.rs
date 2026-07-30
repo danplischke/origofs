@@ -786,6 +786,43 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
     }
 
+    /// Refuse to move `sino` inside itself.
+    ///
+    /// `rename("/a", "/a/b/a2")` would make `a` a child of its own child. The
+    /// subtree is then unreachable from the root, so it vanishes from `ls`, from
+    /// `build_tree` — and from `mark_working`, which is what makes GC reclaim all
+    /// of its content while the inode and dentry rows stay behind forever. An
+    /// ordinary `mv` silently destroying data. POSIX `rename(2)` returns `EINVAL`.
+    ///
+    /// Walks up from the destination parent rather than scanning the source's
+    /// subtree downward, so the cost is the destination's depth and not the size
+    /// of what is being moved. The walk is bounded by `MAX_ANCESTOR_WALK` so a
+    /// cycle already present in the store (from a build without this check)
+    /// surfaces as an error instead of hanging.
+    pub(crate) async fn ensure_not_own_descendant(&self, sino: Ino, dst_parent: Ino) -> Result<()> {
+        /// Deeper than any real tree; only a pre-existing cycle reaches it.
+        const MAX_ANCESTOR_WALK: usize = 4096;
+
+        let mut cur = dst_parent;
+        for _ in 0..MAX_ANCESTOR_WALK {
+            if cur == sino {
+                return Err(OrigoFSError::InvalidArgument(
+                    "cannot move a directory inside itself".to_string(),
+                ));
+            }
+            if cur == self.root_ino {
+                return Ok(());
+            }
+            match self.meta.parent_of(cur).await? {
+                Some(p) => cur = p,
+                None => return Ok(()), // unlinked or the root: no cycle above it
+            }
+        }
+        Err(OrigoFSError::Corrupt(format!(
+            "directory ancestry from inode {dst_parent} exceeds {MAX_ANCESTOR_WALK} levels (cycle?)"
+        )))
+    }
+
     /// Rename/move `from` to `to`. Overwrites an existing regular file or an
     /// existing empty directory at `to`.
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
@@ -797,6 +834,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .ok_or_else(|| OrigoFSError::NotFound(from.to_string()))?;
         let (dp, dn) = self.resolve_parent(to).await?;
         self.ensure_dir(dp).await?;
+        self.ensure_not_own_descendant(sino, dp).await?;
 
         // Read the destination's state before the txn; the mutations below all
         // commit together so a crash mid-rename can't leave the source unlinked
