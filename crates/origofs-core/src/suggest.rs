@@ -271,6 +271,16 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             .unwrap_or(WritePolicy::Direct);
         match policy {
             WritePolicy::Direct => {
+                // Missing parents are created here, *after* the policy decision.
+                // Surfaces used to do it before calling in, so an edit that was
+                // merely queued for review had already mutated the working tree —
+                // the one thing a propose-only actor must not be able to do.
+                // `accept_suggestion` creates them on the way in instead.
+                if let Some((parent, _)) = path.rsplit_once('/')
+                    && !parent.is_empty()
+                {
+                    self.mkdir_p(parent).await?;
+                }
                 self.write_as(ctx, path, data).await?;
                 Ok(WriteOutcome::Wrote)
             }

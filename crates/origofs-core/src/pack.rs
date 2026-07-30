@@ -32,8 +32,9 @@ use crate::format;
 use crate::types::Hash;
 use async_trait::async_trait;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Default target size for a sealed pack (4 MiB).
 pub const DEFAULT_PACK_SIZE: usize = 4 * 1024 * 1024;
@@ -119,7 +120,7 @@ impl PackStore {
 
     async fn stage(&self, key: Hash, bytes: &[u8], dedup: bool) -> Result<()> {
         {
-            let p = self.pending.lock().unwrap();
+            let p = self.pending.lock();
             if p.resident.contains_key(&key) {
                 return Ok(());
             }
@@ -128,7 +129,7 @@ impl PackStore {
             return Ok(());
         }
         let full = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.pending.lock();
             if p.resident.contains_key(&key) {
                 return Ok(());
             }
@@ -148,7 +149,7 @@ impl PackStore {
         let _guard = self.flush_lock.lock().await;
 
         let (order, chunks) = {
-            let p = self.pending.lock().unwrap();
+            let p = self.pending.lock();
             if p.order.is_empty() {
                 return Ok(());
             }
@@ -181,14 +182,19 @@ impl PackStore {
                 offset: *offset,
                 len: *len,
             };
-            self.index.put_keyed(h, &loc.encode()).await?;
+            // `replace_keyed`, not `put_keyed`: on a repack this chunk already has
+            // an index entry pointing into the *old* pack, and insert-if-absent
+            // would silently leave it there.
+            self.index.replace_keyed(h, &loc.encode()).await?;
         }
 
         // Drop the sealed chunks; keep anything appended during the seal.
-        let mut p = self.pending.lock().unwrap();
+        let mut p = self.pending.lock();
         for h in &order {
             if let Some(b) = p.resident.remove(h) {
-                p.size -= b.len();
+                // Saturating: a bookkeeping slip must not panic while holding
+                // the buffer lock.
+                p.size = p.size.saturating_sub(b.len());
             }
         }
         let Pending {
@@ -226,7 +232,25 @@ impl PackStore {
             if live.is_empty() {
                 reclaimed += self.data.delete(&pack).await?; // fully dead
             } else if live.len() < members.len() {
-                // Partially dead: move survivors into fresh packs, drop the old.
+                // Partially dead: move survivors into a fresh pack, then drop the
+                // old one.
+                //
+                // The order is the whole safety argument, and it used to be
+                // backwards: the old index pointer was cleared *before* the
+                // survivor was staged, and staging only buffers in memory. A crash
+                // (or any error from `stage`/`seal`) in that window left the chunk
+                // with no index entry while its bytes still lived in the old pack —
+                // and a chunk with no index entry is invisible to the *next*
+                // repack, which then reads that pack as fully dead and deletes it.
+                // Permanent loss, from the one operation whose job is to reclaim
+                // space safely.
+                //
+                // Now: stage everything, seal (which writes the new pack and
+                // atomically repoints each index entry at it), and only then delete
+                // the old pack. A crash before the seal leaves the old pack and its
+                // pointers untouched; a crash after it leaves the old pack
+                // unreferenced, which the next repack reclaims. Every intermediate
+                // state keeps each live chunk reachable.
                 for (h, offset, len) in &members {
                     if live.contains(h) {
                         let slice = bytes.slice(*offset as usize..(*offset + *len) as usize);
@@ -243,7 +267,6 @@ impl PackStore {
                                 actual.to_hex()
                             )));
                         }
-                        self.index.delete(h).await?; // clear the old pointer
                         self.stage(*h, &slice, false).await?;
                     }
                 }
@@ -308,6 +331,10 @@ impl ContentStore for PackStore {
         self.stage(*key, bytes, true).await
     }
 
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        self.stage(*key, bytes, true).await
+    }
+
     /// Slots go to the **data** backend — that's the one that travels with the
     /// store and survives a lost index (which is rebuildable from pack trailers).
     async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
@@ -320,7 +347,7 @@ impl ContentStore for PackStore {
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         {
-            let p = self.pending.lock().unwrap();
+            let p = self.pending.lock();
             if let Some(b) = p.resident.get(hash) {
                 return Ok(b.clone());
             }
@@ -337,7 +364,7 @@ impl ContentStore for PackStore {
 
     async fn get_range(&self, hash: &Hash, off: u64, len: u64) -> Result<Bytes> {
         {
-            let p = self.pending.lock().unwrap();
+            let p = self.pending.lock();
             if let Some(b) = p.resident.get(hash) {
                 let start = (off as usize).min(b.len());
                 let end = start.saturating_add(len as usize).min(b.len());
@@ -358,7 +385,7 @@ impl ContentStore for PackStore {
 
     async fn has(&self, hash: &Hash) -> Result<bool> {
         {
-            let p = self.pending.lock().unwrap();
+            let p = self.pending.lock();
             if p.resident.contains_key(hash) {
                 return Ok(true);
             }
@@ -368,9 +395,30 @@ impl ContentStore for PackStore {
 
     async fn list(&self) -> Result<Vec<Hash>> {
         let mut out = self.index.list().await?;
-        let p = self.pending.lock().unwrap();
+        let p = self.pending.lock();
         for h in p.resident.keys() {
             out.push(*h);
+        }
+        Ok(out)
+    }
+
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.data.get_sidecar(name).await
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.data.put_sidecar_if_absent(name, bytes).await
+    }
+
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        // A chunk's age is its *index entry's* age: the index is what makes it
+        // reachable, and a repack rewrites the entry when the chunk moves packs.
+        let mut out = self.index.list_with_age().await?;
+        // Still buffered, so written moments ago by definition — age 0 keeps them
+        // inside any grace period.
+        let p = self.pending.lock();
+        for h in p.resident.keys() {
+            out.push((*h, Some(0)));
         }
         Ok(out)
     }
@@ -383,10 +431,12 @@ impl ContentStore for PackStore {
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         let staged = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.pending.lock();
             if let Some(b) = p.resident.remove(hash) {
                 p.order.retain(|h| h != hash);
-                p.size -= b.len();
+                // Saturating: a bookkeeping slip must not panic while holding
+                // the buffer lock.
+                p.size = p.size.saturating_sub(b.len());
                 Some(b.len() as u64)
             } else {
                 None

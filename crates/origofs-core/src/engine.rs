@@ -41,6 +41,67 @@ pub(crate) fn validate_component(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a ref (branch) name that could escape a directory when a surface turns
+/// it back into a host path, or that `git` itself would refuse.
+///
+/// Ref names are not just database keys: the git-interop layer writes
+/// `refs/heads/<name>` and interpolates the name into `HEAD`, so an absolute or
+/// `..`-bearing name would place a file outside the exported repository, and an
+/// embedded newline would inject a second line into `HEAD`. This is the ref-level
+/// counterpart of [`validate_component`] — enforced where a name enters the ref
+/// table, so a hostile name can never be *stored*.
+///
+/// The rules follow `git check-ref-format`, which also keeps every name we accept
+/// round-trippable through a real git repository. The internal refs (`HEAD`,
+/// `MERGE_HEAD`) satisfy them, so nothing needs a carve-out.
+pub fn validate_ref_name(name: &str) -> Result<()> {
+    // Long enough for any real branch name; short enough that a name can't be used
+    // to blow past a filesystem's path limit during export.
+    const MAX_REF_NAME: usize = 255;
+
+    let bad = |why: &str| {
+        Err(OrigoFSError::InvalidArgument(format!(
+            "invalid ref name {name:?}: {why}"
+        )))
+    };
+
+    if name.is_empty() {
+        return bad("empty");
+    }
+    if name.len() > MAX_REF_NAME {
+        return bad("longer than 255 bytes");
+    }
+    // Control characters (incl. NUL and newline — the `HEAD` injection vector),
+    // DEL, space, and the characters git reserves for refspecs and globbing.
+    if let Some(c) = name
+        .chars()
+        .find(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(*c))
+    {
+        return bad(&format!("contains {c:?}"));
+    }
+    // A leading `/` makes `Path::join` discard the directory it is joined onto; a
+    // trailing or doubled `/` yields an empty component.
+    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        return bad("leading, trailing, or repeated '/'");
+    }
+    // `..` anywhere is a traversal; `.` as a component is at best meaningless.
+    // Checked per component so a legitimate name like `fix.2` still passes.
+    if name.split('/').any(|c| c == "." || c == "..") {
+        return bad("'.' or '..' path component");
+    }
+    if name.contains("..") || name.contains("@{") || name == "@" {
+        return bad("contains '..' or '@{', or is '@'");
+    }
+    // `-` leading would be read as a flag by any CLI that forwards the name.
+    if name.starts_with('-') {
+        return bad("starts with '-'");
+    }
+    if name.ends_with('.') || name.ends_with(".lock") {
+        return bad("ends with '.' or '.lock'");
+    }
+    Ok(())
+}
+
 /// An owned [`Stream`] over a manifest's chunks, one `store.get` at a time. The
 /// store handle is moved into the stream state, so the stream is self-contained
 /// (`'static` when `S` is) and can outlive the [`Fs`] it came from — unlike
@@ -246,6 +307,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Create a single directory; its parent must already exist.
     pub async fn mkdir(&self, path: &str) -> Result<Ino> {
+        crate::retry::retrying("mkdir", || self.mkdir_attempt(path)).await
+    }
+
+    /// One attempt at [`mkdir`](Self::mkdir); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn mkdir_attempt(&self, path: &str) -> Result<Ino> {
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
         if self.meta.lookup(parent, name).await?.is_some() {
@@ -341,13 +408,18 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if inode.kind != FileKind::Dir {
             return Err(OrigoFSError::NotADirectory(path.to_string()));
         }
+        // A cheap early answer for the common case; the binding check is the
+        // conditional delete below, which evaluates emptiness as part of the
+        // statement rather than trusting this read from before the transaction.
         if self.meta.child_count(ino).await? > 0 {
             return Err(OrigoFSError::DirectoryNotEmpty(path.to_string()));
         }
         // Unlink + free the inode atomically (C1/L3).
         let mut tx = self.meta.begin().await?;
         tx.remove_dentry(parent, name).await?;
-        tx.delete_inode(ino).await?;
+        if !tx.delete_inode_if_childless(ino).await? {
+            return Err(OrigoFSError::DirectoryNotEmpty(path.to_string()));
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -443,6 +515,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Write `data` as the entire contents of `path`, creating the file if needed.
     /// The body is content-defined-chunked; unchanged chunks are deduplicated.
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+        crate::retry::retrying("write", || self.write_attempt(path, data)).await
+    }
+
+    /// One attempt at [`write`](Self::write); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn write_attempt(&self, path: &str, data: &[u8]) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
         // Content is made durable first (store_body flushes), then the metadata
@@ -747,11 +825,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // crash can't drop the name yet leave the inode dangling (C1/L3).
         let mut tx = self.meta.begin().await?;
         tx.remove_dentry(parent, name).await?;
-        let nlink = inode.nlink - 1;
-        if nlink <= 0 {
+        // Decremented by the database, not by us: the `nlink` we read above
+        // happened before the transaction, so computing the new value here would
+        // let two concurrent unlinks both write the same one (see
+        // `MetaTxn::adjust_nlink`).
+        if tx.adjust_nlink(ino, -1).await? <= 0 {
             tx.delete_inode(ino).await?;
-        } else {
-            tx.set_nlink(ino, nlink).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -759,6 +838,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Remove a file or an empty directory.
     pub async fn remove(&self, path: &str) -> Result<()> {
+        crate::retry::retrying("remove", || self.remove_attempt(path)).await
+    }
+
+    /// One attempt at [`remove`](Self::remove); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn remove_attempt(&self, path: &str) -> Result<()> {
         let inode = self.stat(path).await?;
         if inode.kind == FileKind::Dir {
             self.rmdir(path).await
@@ -767,9 +852,52 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
     }
 
+    /// Refuse to move `sino` inside itself.
+    ///
+    /// `rename("/a", "/a/b/a2")` would make `a` a child of its own child. The
+    /// subtree is then unreachable from the root, so it vanishes from `ls`, from
+    /// `build_tree` — and from `mark_working`, which is what makes GC reclaim all
+    /// of its content while the inode and dentry rows stay behind forever. An
+    /// ordinary `mv` silently destroying data. POSIX `rename(2)` returns `EINVAL`.
+    ///
+    /// Walks up from the destination parent rather than scanning the source's
+    /// subtree downward, so the cost is the destination's depth and not the size
+    /// of what is being moved. The walk is bounded by `MAX_ANCESTOR_WALK` so a
+    /// cycle already present in the store (from a build without this check)
+    /// surfaces as an error instead of hanging.
+    pub(crate) async fn ensure_not_own_descendant(&self, sino: Ino, dst_parent: Ino) -> Result<()> {
+        /// Deeper than any real tree; only a pre-existing cycle reaches it.
+        const MAX_ANCESTOR_WALK: usize = 4096;
+
+        let mut cur = dst_parent;
+        for _ in 0..MAX_ANCESTOR_WALK {
+            if cur == sino {
+                return Err(OrigoFSError::InvalidArgument(
+                    "cannot move a directory inside itself".to_string(),
+                ));
+            }
+            if cur == self.root_ino {
+                return Ok(());
+            }
+            match self.meta.parent_of(cur).await? {
+                Some(p) => cur = p,
+                None => return Ok(()), // unlinked or the root: no cycle above it
+            }
+        }
+        Err(OrigoFSError::Corrupt(format!(
+            "directory ancestry from inode {dst_parent} exceeds {MAX_ANCESTOR_WALK} levels (cycle?)"
+        )))
+    }
+
     /// Rename/move `from` to `to`. Overwrites an existing regular file or an
     /// existing empty directory at `to`.
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        crate::retry::retrying("rename", || self.rename_attempt(from, to)).await
+    }
+
+    /// One attempt at [`rename`](Self::rename); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn rename_attempt(&self, from: &str, to: &str) -> Result<()> {
         let (sp, sn) = self.resolve_parent(from).await?;
         let sino = self
             .meta
@@ -778,6 +906,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .ok_or_else(|| OrigoFSError::NotFound(from.to_string()))?;
         let (dp, dn) = self.resolve_parent(to).await?;
         self.ensure_dir(dp).await?;
+        self.ensure_not_own_descendant(sino, dp).await?;
 
         // Read the destination's state before the txn; the mutations below all
         // commit together so a crash mid-rename can't leave the source unlinked
@@ -802,13 +931,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if let Some((dino, dinode)) = overwrite {
             tx.remove_dentry(dp, dn).await?;
             match dinode.kind {
-                FileKind::Dir => tx.delete_inode(dino).await?,
+                // Conditional, for the same reason `rmdir` is: the emptiness
+                // check above ran before this transaction opened.
+                FileKind::Dir => {
+                    if !tx.delete_inode_if_childless(dino).await? {
+                        return Err(OrigoFSError::DirectoryNotEmpty(to.to_string()));
+                    }
+                }
                 _ => {
-                    let nlink = dinode.nlink - 1;
-                    if nlink <= 0 {
+                    if tx.adjust_nlink(dino, -1).await? <= 0 {
                         tx.delete_inode(dino).await?;
-                    } else {
-                        tx.set_nlink(dino, nlink).await?;
                     }
                 }
             }
@@ -823,6 +955,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Create a symbolic link at `linkpath` pointing at `target`.
     pub async fn symlink(&self, target: &str, linkpath: &str) -> Result<Ino> {
+        crate::retry::retrying("symlink", || self.symlink_attempt(target, linkpath)).await
+    }
+
+    /// One attempt at [`symlink`](Self::symlink); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn symlink_attempt(&self, target: &str, linkpath: &str) -> Result<Ino> {
         let (parent, name) = self.resolve_parent(linkpath).await?;
         self.ensure_dir(parent).await?;
         if self.meta.lookup(parent, name).await?.is_some() {

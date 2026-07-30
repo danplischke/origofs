@@ -5,16 +5,25 @@
 # so the shipped `origofs serve` / `nfs` / `mcp` / `mount` daemons can front a
 # production (Postgres + object-store) backend with no custom host program.
 #
-# Encryption at rest (ORIGOFS_ENCRYPTION_KEY) is currently supported only with
-# the sqlite + local backend; it is rejected with any other backend here.
+# Encryption at rest: set ORIGOFS_ENCRYPTION_KEY (a passphrase) and it applies to
+# whichever backends you configure below, this one included. The key is derived
+# with Argon2id over a per-store random salt kept beside the content — in the
+# bucket for an object store — so it survives losing the metadata database and
+# garbage collection never touches it. The same passphrase must be used on every
+# open; a wrong one fails loudly rather than returning garbage.
 
 # --- metadata store ---------------------------------------------------------
 # backend = "sqlite"   # solo/offline (the default)
 #   path = "/data/meta.db"        # optional; default <workspace>/meta.db
 # backend = "postgres" # multi-writer/production
+# TLS is negotiated per the DSN's `sslmode` (libpq's own keyword; default
+# `prefer`). `require` refuses to connect unless the certificate verifies —
+# deliberately stricter than libpq, where `require` encrypts but verifies nothing.
+# Certificates are checked against the platform root store; for a private CA or a
+# self-signed server, point ORIGOFS_PG_CA_FILE at its PEM bundle.
 [metadata]
 backend = "postgres"
-dsn = "host=postgres user=origofs password=origofs dbname=origofs"
+dsn = "host=postgres user=origofs password=origofs dbname=origofs sslmode=prefer"
 
 # --- content store ----------------------------------------------------------
 # backend = "local"    # a sharded directory (default <workspace>/cas)
@@ -32,3 +41,26 @@ region = "us-east-1"
 # prefix = "objects"              # key prefix (default "objects")
 packed = true                     # batch chunks into pack objects (recommended for object stores)
 # index_dir = "/data/index"       # per-chunk pack index (default <workspace>/index)
+
+# --- tuning (environment variables) -----------------------------------------
+# Postgres pool. Sizing is a deployment property: 16 is far too many for a dozen
+# sidecars sharing one small database and far too few for a busy single writer.
+#   ORIGOFS_PG_POOL_SIZE=16
+#   ORIGOFS_PG_WAIT_TIMEOUT_SECS=10       # bound waiting for a free connection
+#   ORIGOFS_PG_CONNECT_TIMEOUT_SECS=10
+#   ORIGOFS_PG_RECYCLE_TIMEOUT_SECS=10
+#   ORIGOFS_PG_STATEMENT_TIMEOUT_MS=0     # 0 = off; see below
+#   ORIGOFS_PG_CA_FILE=/etc/ssl/pg-ca.pem # trust a private CA for TLS
+#
+# A statement timeout is off by default on purpose. origofs's statements are
+# small, but a few (`truncate_tree` on a large working tree, a wide `list_dir`)
+# legitimately run long, and a timeout that aborts a checkout is worse than one
+# that never fires. Set it if you want the ceiling.
+#
+# Object store. Explicit so a flaky bucket has stated behaviour rather than
+# whatever the client library defaults to; a request with no timeout is the one
+# that turns a slow S3 into a wedged server.
+#   ORIGOFS_S3_TIMEOUT_SECS=60            # abandon a request with no response
+#   ORIGOFS_S3_CONNECT_TIMEOUT_SECS=10    # fail fast on a mis-set endpoint
+#   ORIGOFS_S3_MAX_RETRIES=5
+#   ORIGOFS_S3_RETRY_TIMEOUT_SECS=180     # total elapsed retry budget

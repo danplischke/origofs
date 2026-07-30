@@ -12,19 +12,51 @@
 //! reconstruct from current content + the blame map, so a superseded body's
 //! blobs are exactly what GC should reclaim.
 //!
-//! GC assumes a quiescent store — it is not safe to run concurrently with
-//! writers, since a freshly `put` chunk is briefly unreferenced. Run it when the
-//! workspace is idle (a generational grace period is future work).
+//! **Reachability alone is not a safe sweep criterion.** Content is written
+//! *before* the metadata that references it — that ordering is the durability
+//! barrier — so every write has a window in which its chunks are stored and
+//! nothing points at them yet. A sweep that trusts reachability deletes exactly
+//! that: the write in flight. Measured on the unfixed code, a writer racing GC
+//! failed with `ContentMissing` on content it had itself just stored, and files
+//! that had already been committed became permanently unreadable.
+//!
+//! So the sweep is also **age-gated**: an object is reclaimed only once it has
+//! been unreferenced *and* untouched for longer than [`DEFAULT_GC_GRACE_SECS`],
+//! which must exceed the longest write-to-commit window. Ages come from the
+//! backend itself ([`ContentStore::list_with_age`]); an object the backend cannot
+//! date is never swept. A GC **lease** additionally keeps two collections from
+//! overlapping, since a sweep is destructive and running it twice at once doubles
+//! the exposure for no benefit.
+//!
+//! This is not a substitute for running GC when the workspace is calm — it is what
+//! makes doing so on a *live, shared* workspace safe, which is the only option in
+//! a workspace agents are always writing to.
 
 use crate::content::ContentStore;
 use crate::engine::Fs;
-use crate::error::Result;
+use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
 use crate::objectgraph::TreeKind;
 use crate::suggest::SuggestionStatus;
 use crate::types::{FileKind, Hash, Ino};
 use async_recursion::async_recursion;
 use std::collections::HashSet;
+
+/// How long an object must have been unreferenced before GC will sweep it.
+///
+/// Must exceed the longest window between a write storing its content and the
+/// transaction referencing it committing. Ten minutes is far beyond any single
+/// write and still lets a periodic collection reclaim churn promptly; the cost of
+/// being generous is only that garbage lingers one extra cycle.
+pub const DEFAULT_GC_GRACE_SECS: u64 = 600;
+
+/// Key of the advisory lease that serializes collections. Not a valid path — no
+/// user `lock` can collide with it, because `validate_component` rejects the NUL.
+const GC_LEASE_KEY: &str = "\0gc-lease";
+
+/// How long a GC lease is honored before another collection may take it. Bounds
+/// how long a crashed collector blocks the next one.
+const GC_LEASE_SECS: i64 = 3600;
 
 /// What a GC pass reclaimed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -35,11 +67,68 @@ pub struct GcStats {
     pub deleted: usize,
     /// Bytes freed by the deletions.
     pub bytes_freed: u64,
+    /// Unreferenced objects left alone because they were younger than the grace
+    /// period — a write in flight, or recent churn that the next pass will take.
+    pub skipped_young: usize,
+    /// Unreferenced objects left alone because the backend could not date them.
+    /// Non-zero means the store cannot be collected safely.
+    pub skipped_undated: usize,
 }
 
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
-    /// Run a mark-and-sweep collection over the content store.
+    /// Run a mark-and-sweep collection over the content store, using the default
+    /// grace period ([`DEFAULT_GC_GRACE_SECS`]).
     pub async fn gc(&self) -> Result<GcStats> {
+        self.gc_with_grace(DEFAULT_GC_GRACE_SECS).await
+    }
+
+    /// [`gc`](Self::gc) with an explicit grace period, in seconds.
+    ///
+    /// Only content that has been unreferenced *and* untouched for at least
+    /// `grace_secs` is swept. The grace must exceed the longest window between a
+    /// write storing its content and the transaction that references it
+    /// committing — see the sweep below for why. `0` restores the old
+    /// reachability-only behaviour and is unsafe with any concurrent writer; it
+    /// exists for tests and for a genuinely quiesced store.
+    pub async fn gc_with_grace(&self, grace_secs: u64) -> Result<GcStats> {
+        // One collection at a time. Nothing guarded this before: two `gc()` calls
+        // would interleave a mark against the other's sweep. The lease is the
+        // existing advisory-lock table under a key no path can be, and it expires
+        // so a collector that died mid-run doesn't block the next one forever.
+        let now = self.now_secs();
+        let owner = format!("gc-{}", std::process::id());
+        if !self.meta.acquire_lock(GC_LEASE_KEY, &owner, now).await? {
+            let held = self
+                .meta
+                .list_locks()
+                .await?
+                .into_iter()
+                .find(|(p, _, _)| p == GC_LEASE_KEY);
+            match held {
+                // Stale: the previous collector is gone. Take it over.
+                Some((_, holder, at)) if now - at > GC_LEASE_SECS => {
+                    self.meta.release_lock(GC_LEASE_KEY, &holder).await?;
+                    if !self.meta.acquire_lock(GC_LEASE_KEY, &owner, now).await? {
+                        return Err(OrigoFSError::Conflict(
+                            "another garbage collection is already running".into(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(OrigoFSError::Conflict(
+                        "another garbage collection is already running".into(),
+                    ));
+                }
+            }
+        }
+        let out = self.gc_locked(grace_secs).await;
+        // Release even on failure — the lease outliving a failed run would block
+        // every retry until it expired.
+        let _ = self.meta.release_lock(GC_LEASE_KEY, &owner).await;
+        out
+    }
+
+    async fn gc_locked(&self, grace_secs: u64) -> Result<GcStats> {
         let mut marked: HashSet<Hash> = HashSet::new();
 
         // Content is shared across every workspace in the store, so GC marks from
@@ -89,15 +178,35 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
         }
 
-        // Sweep: delete everything not marked.
+        // Sweep: delete what is unmarked *and* old enough to be safe.
+        //
+        // Reachability alone is not a safe criterion. Content is written before
+        // the metadata that references it — that ordering is the durability
+        // barrier — so every write has a window in which its chunks are stored
+        // and nothing points at them yet. Sweeping on reachability deletes
+        // exactly that: the write in flight. Measured on the unfixed code, a
+        // writer racing GC failed with `ContentMissing` on content it had just
+        // stored, and files that had been committed became permanently
+        // unreadable.
+        //
+        // So an object is only swept once it has been unreferenced for longer
+        // than any single write could plausibly take. An object whose age the
+        // backend cannot report is never swept.
         let mut stats = GcStats {
             reachable: marked.len(),
             ..Default::default()
         };
-        for hash in self.content.list().await? {
-            if !marked.contains(&hash) {
-                stats.bytes_freed += self.content.delete(&hash).await?;
-                stats.deleted += 1;
+        for (hash, age) in self.content.list_with_age().await? {
+            if marked.contains(&hash) {
+                continue;
+            }
+            match age {
+                Some(secs) if secs >= grace_secs => {
+                    stats.bytes_freed += self.content.delete(&hash).await?;
+                    stats.deleted += 1;
+                }
+                Some(_) => stats.skipped_young += 1,
+                None => stats.skipped_undated += 1,
             }
         }
         Ok(stats)

@@ -16,6 +16,9 @@ tracing = "0.1"
 # `fs`/`io-util`/`rt-multi-thread`/`macros`/`time`.
 tokio = { version = "1.53.1", features = [
     "rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "process", "io-std", "time",
+    # `signal` for graceful shutdown: SIGTERM is what an orchestrator sends, and
+    # without a handler every in-flight request was severed mid-flight.
+    "signal",
 ] }
 
 # ── Access-surface dependencies ─────────────────────────────────────────────
@@ -89,6 +92,13 @@ tokio-postgres = "0.7"
 # stock y-sync `DefaultProtocol`, exactly what PlateJS / y-websocket run.
 yrs = "0.23"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+
+# git_hostile.rs hand-crafts loose git objects (a self-parenting commit, a
+# tampered object, a deep history) that the real `git` binary would refuse to
+# produce — so the importer's own bounds can be tested against them.
+flate2 = "1.0.35"
+sha1 = "0.10.6"
+hex = "0.4.3"
 
 # The NFS surface test (nfs.rs) drives nfsserve types directly; Unix-only.
 [target.'cfg(unix)'.dev-dependencies]

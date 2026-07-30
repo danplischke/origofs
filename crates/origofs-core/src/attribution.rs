@@ -84,12 +84,18 @@ impl WritePolicy {
             WritePolicy::Propose => 1,
         }
     }
-    /// Decode the stored integer; anything unrecognized is the safe default
-    /// (`Direct`) so an unknown value never silently blocks writes.
+    /// Decode the stored integer. An unrecognized value decodes to the
+    /// *restrictive* policy, not the permissive one.
+    ///
+    /// This is an authorization control, so it fails closed: a value this binary
+    /// doesn't know is one a newer binary wrote (say a future `ReadOnly`), and
+    /// resolving that to `Direct` would silently *grant* direct writes to an actor
+    /// an operator had deliberately restricted. Routing an edit through review is
+    /// recoverable; letting an unreviewed one land is not.
     pub fn from_i64(v: i64) -> Self {
         match v {
-            1 => WritePolicy::Propose,
-            _ => WritePolicy::Direct,
+            0 => WritePolicy::Direct,
+            _ => WritePolicy::Propose,
         }
     }
 }
@@ -190,6 +196,25 @@ pub struct EditOp {
     pub pre_hash: Option<String>,
     pub post_hash: Option<String>,
     pub ts: i64,
+}
+
+/// Which prior content version an attributed write is allowed to land on.
+///
+/// The engine derives authorship by diffing against a version it read *before*
+/// the transaction, so the version it lands on has to be pinned — otherwise the
+/// blame describes a predecessor that was already replaced, and the `edit_op`
+/// log records a `pre_hash` that was never the thing overwritten.
+#[derive(Clone, Copy, Debug)]
+enum WriteBase {
+    /// The content read at the start of this attempt. A concurrent write is a
+    /// [`OrigoFSError::Conflict`] — the default for [`Fs::write_as`].
+    AsRead,
+    /// A caller-supplied expectation (`None` = "expected absent/empty"), for
+    /// [`Fs::write_as_expecting`] and the suggestion-accept path.
+    Expected(Option<Hash>),
+    /// Unconditional. Only the CRDT checkpoint path, which owns the document and
+    /// reconciles out-of-band writes itself — see [`Fs::write_as_blamed`].
+    Clobber,
 }
 
 /// The actor context for an attributed write.
@@ -442,8 +467,40 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Write `data` to `path`, attributing the change to `ctx`'s actor and
     /// updating per-line authorship. Creates the file if needed.
+    ///
+    /// # Concurrency
+    ///
+    /// **Optimistic, not last-writer-wins.** Authorship is derived by diffing
+    /// `data` against the file's current content, so the write is applied only if
+    /// that content is *still* current when the transaction commits; if another
+    /// writer landed in between, this returns [`OrigoFSError::Conflict`] and
+    /// nothing is written.
+    ///
+    /// It was previously unconditional, and the loser of a race lost their bytes
+    /// with no error and no signal to anyone — while the winner's blame was
+    /// derived from a version that no longer existed, so the `edit_op` log
+    /// recorded a `pre_hash` that was never the thing overwritten. A human and an
+    /// agent editing one file at the same moment is the scenario this system
+    /// exists for; silently dropping one of them is the wrong answer, and the
+    /// op-log is supposed to be attribution's ground truth.
+    ///
+    /// A `Conflict` is deliberately *not* retried by [`crate::retry`] — it is a
+    /// real answer about the caller's request, and re-running the write would
+    /// re-derive it against the new content and clobber the change the caller
+    /// needs to see. Read, merge, and write again.
+    ///
+    /// [`write_as_expecting`](Self::write_as_expecting) is the same guarantee
+    /// against a caller-chosen base; [`write_as_blamed`](Self::write_as_blamed)
+    /// deliberately keeps the unconditional behaviour — see there.
     pub async fn write_as(&self, ctx: WriteCtx, path: &str, data: &[u8]) -> Result<()> {
-        self.write_as_inner(ctx, path, data, None, None).await
+        crate::retry::retrying("write_as", || self.write_as_attempt(ctx, path, data)).await
+    }
+
+    /// One attempt at [`write_as`](Self::write_as); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn write_as_attempt(&self, ctx: WriteCtx, path: &str, data: &[u8]) -> Result<()> {
+        self.write_as_inner(ctx, path, data, WriteBase::AsRead, None)
+            .await
     }
 
     /// Write `data`, attributing byte spans to explicit `(actor_id, session_id,
@@ -458,6 +515,15 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// checkpoint author); `spans` drives the blame index and its `byte_len`s must
     /// sum to `data.len()` (contiguous, in order). The explicit map replaces prior
     /// authorship wholesale. Requires UTF-8 text.
+    ///
+    /// # Concurrency
+    ///
+    /// Unlike [`write_as`](Self::write_as), this write is unconditional. The
+    /// caller here is a CRDT coordinator checkpointing a document it owns: the
+    /// `Y.Doc` is the live truth and the durable blob is a snapshot of it, so a
+    /// checkpoint that refused because the blob moved would strand the document
+    /// rather than protect it. Out-of-band writes are reconciled by the coedit
+    /// layer, which re-seeds the doc from the file — see [`crate::coedit`].
     pub async fn write_as_blamed(
         &self,
         ctx: WriteCtx,
@@ -477,8 +543,14 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 data.len()
             )));
         }
-        self.write_as_inner(ctx, path, data, None, Some(BlameMap::from_spans(spans)))
-            .await
+        self.write_as_inner(
+            ctx,
+            path,
+            data,
+            WriteBase::Clobber,
+            Some(BlameMap::from_spans(spans)),
+        )
+        .await
     }
 
     /// Like [`write_as`](Self::write_as), but applies the write only if `path`'s
@@ -493,7 +565,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         data: &[u8],
         expected: Option<Hash>,
     ) -> Result<()> {
-        self.write_as_inner(ctx, path, data, Some(expected), None)
+        self.write_as_inner(ctx, path, data, WriteBase::Expected(expected), None)
             .await
     }
 
@@ -502,7 +574,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         ctx: WriteCtx,
         path: &str,
         data: &[u8],
-        expect: Option<Option<Hash>>,
+        base: WriteBase,
         blame_override: Option<BlameMap>,
     ) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
@@ -575,7 +647,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                         drop(tx);
                         // A conditional write that required absence can't proceed
                         // once the file exists.
-                        if matches!(expect, Some(None)) {
+                        if matches!(base, WriteBase::Expected(None)) {
                             return Err(OrigoFSError::Conflict(format!(
                                 "{path} was created concurrently"
                             )));
@@ -590,12 +662,22 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             if let Some(h) = mhash {
                 tx.set_blob_blame(&h, &blame.encode()).await?;
             }
-            match &expect {
-                None => tx.set_content(ino, mhash, size).await?,
-                // Conditional apply: only write if the content is still what the
-                // caller based this write on. On mismatch the whole transaction
-                // rolls back (undoing the blame staged just above).
-                Some(expected) => {
+            // Conditional apply: the write lands only on the content its blame
+            // was derived from. On mismatch the whole transaction rolls back,
+            // undoing the blame staged just above, and the caller is told rather
+            // than having their bytes silently replaced.
+            match &base {
+                WriteBase::AsRead => {
+                    if !tx
+                        .set_content_if(ino, pre_hash.as_ref(), mhash, size)
+                        .await?
+                    {
+                        return Err(OrigoFSError::Conflict(format!(
+                            "{path} was written concurrently; re-read it and write again"
+                        )));
+                    }
+                }
+                WriteBase::Expected(expected) => {
                     if !tx
                         .set_content_if(ino, expected.as_ref(), mhash, size)
                         .await?
@@ -605,6 +687,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                         )));
                     }
                 }
+                // The CRDT checkpoint path — see `write_as_blamed`.
+                WriteBase::Clobber => tx.set_content(ino, mhash, size).await?,
             }
             tx.append_edit_op(EditOpInit {
                 session_id: ctx.session,

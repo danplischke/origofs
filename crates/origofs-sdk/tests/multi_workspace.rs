@@ -714,7 +714,7 @@ async fn gc_preserves_other_workspaces_pending_suggestions() {
         .unwrap();
 
     // GC driven from a *different* workspace must not touch alpha's proposal.
-    beta.gc().await.unwrap();
+    beta.gc_with_grace(0).await.unwrap();
 
     // alpha can still accept it (the proposed content survived the sweep).
     alpha
@@ -749,7 +749,7 @@ async fn gc_preserves_other_workspaces_recovery_mirror() {
         beta.commit("t", "beta").await.unwrap();
 
         // GC from the default workspace: must keep alpha's & beta's mirrors alive.
-        ws.gc().await.unwrap();
+        ws.gc_with_grace(0).await.unwrap();
     }
 
     // Catastrophe after the GC: rebuild a fresh DB from the swept content store.
@@ -798,7 +798,7 @@ async fn gc_keeps_content_shared_across_workspaces() {
     // alpha also stops referencing the shared bytes; only beta still holds them.
     alpha.remove("/a.txt").await.unwrap();
 
-    let stats = alpha.gc().await.unwrap();
+    let stats = alpha.gc_with_grace(0).await.unwrap();
     assert!(
         stats.deleted >= 1,
         "gc should have swept alpha's orphaned object, else the test proves nothing"

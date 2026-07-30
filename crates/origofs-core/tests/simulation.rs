@@ -36,6 +36,11 @@
 //! sim can't drive. Concurrent-interleaving coverage therefore lives in the
 //! real-runtime stress tiers (`concurrency.rs`, `postgres.rs`) instead.
 
+//! GC assertions here use `gc_with_grace(0)`: the simulation quiesces the store
+//! before collecting, and disabling the age gate keeps these checks about
+//! *reachability* — which is what they are testing — rather than about how
+//! recently an object happened to be written.
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use origofs_core::{
@@ -232,6 +237,21 @@ impl ContentStore for FaultyContentStore {
         let mut seen: HashSet<Hash> = self.durable.lock().unwrap().keys().copied().collect();
         seen.extend(self.buffered.lock().unwrap().keys().copied());
         Ok(seen.into_iter().collect())
+    }
+
+    // Ages drive GC's grace period. The trait's default reports "unknown", which
+    // GC treats as not-safe-to-sweep — correct as a fail-safe for a backend that
+    // genuinely cannot date its objects, but here it would silently turn every
+    // collection into a no-op and make the reclamation assertions meaningless.
+    // This store is a fault injector over an in-memory map, and the simulation
+    // quiesces before collecting, so every object is reportable and old enough.
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .map(|h| (h, Some(u64::MAX)))
+            .collect())
     }
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {
@@ -432,7 +452,7 @@ async fn check_barrier(fs: &SimFs) -> Result<()> {
             Err(e) => return Err(e), // ContentMissing => a dangling reference
         }
     }
-    fs.gc().await?;
+    fs.gc_with_grace(0).await?;
     Ok(())
 }
 
@@ -706,7 +726,7 @@ async fn gc_is_safe_complete_and_idempotent() {
             }
         }
 
-        let first = fs.gc().await.unwrap();
+        let first = fs.gc_with_grace(0).await.unwrap();
 
         // Complete: everything still stored is reachable (nothing unreachable
         // survived, nothing reachable was double-counted).
@@ -723,7 +743,7 @@ async fn gc_is_safe_complete_and_idempotent() {
         }
 
         // Idempotent: a second pass has nothing left to delete.
-        let second = fs.gc().await.unwrap();
+        let second = fs.gc_with_grace(0).await.unwrap();
         assert_eq!(
             second.deleted, 0,
             "seed {seed}: a second gc deleted {} objects (non-idempotent)",
@@ -1008,7 +1028,7 @@ async fn gc_and_isolation_hold_across_workspaces() {
         // GC safety: it may not change any workspace's full observable state, and
         // every file that still stats must still read (its content wasn't swept).
         let pre = all_full_states(&wss).await;
-        let stats = wss[0].gc().await.unwrap();
+        let stats = wss[0].gc_with_grace(0).await.unwrap();
         let post = all_full_states(&wss).await;
         assert_eq!(pre, post, "seed {seed}: gc changed a workspace's state");
         for (w, fs) in wss.iter().enumerate() {
@@ -1028,7 +1048,7 @@ async fn gc_and_isolation_hold_across_workspaces() {
             "seed {seed}: post-gc object count != reachable set"
         );
         assert_eq!(
-            wss[0].gc().await.unwrap().deleted,
+            wss[0].gc_with_grace(0).await.unwrap().deleted,
             0,
             "seed {seed}: a second gc pass was not idempotent"
         );

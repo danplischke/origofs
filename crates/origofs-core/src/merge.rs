@@ -93,27 +93,71 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// The best common ancestor (merge base) of `a` and `b`, if any.
+    ///
+    /// A merge base is a common ancestor that is **not** itself an ancestor of any
+    /// *other* common ancestor — i.e. maximal in the ancestry order, which is the
+    /// fork point. Ranking common ancestors by hop distance alone is not enough:
+    /// the root commit is a common ancestor of every pair, so on any history with
+    /// more than one commit of shared trunk a distance-only rule can base the merge
+    /// on the root and diff3 against pre-fork content — producing spurious conflicts
+    /// and "clean" merges that resurrect lines deleted before the fork.
+    ///
+    /// A criss-cross history can leave several maximal candidates. We do not build a
+    /// virtual recursive base (git's `recursive`/`ort` strategy); we take the
+    /// candidate nearest `a`, breaking ties by hash so that the same pair of commits
+    /// always merges the same way.
     pub async fn merge_base(&self, a: Hash, b: Hash) -> Result<Option<Hash>> {
-        // Min distance from `a` to each of its ancestors.
+        // Min hop distance from `a`, plus the parent edges — recorded here so the
+        // candidate walk below needs no further object loads.
         let mut depth: HashMap<Hash, u32> = HashMap::new();
+        let mut parents_of: HashMap<Hash, Vec<Hash>> = HashMap::new();
         let mut frontier = vec![(a, 0u32)];
         while let Some((h, d)) = frontier.pop() {
             if depth.get(&h).is_some_and(|&e| e <= d) {
                 continue;
             }
             depth.insert(h, d);
-            for p in self.commit_at(&h).await?.parents {
+            let parents = match parents_of.get(&h) {
+                Some(p) => p.clone(),
+                None => {
+                    let p = self.commit_at(&h).await?.parents;
+                    parents_of.insert(h, p.clone());
+                    p
+                }
+            };
+            for p in parents {
                 frontier.push((p, d + 1));
             }
         }
-        // Among common ancestors, the one closest to `a` (greatest depth) is the base.
-        Ok(self
+
+        // Common ancestors: reachable from `b` and from `a` (hence in `depth`).
+        let common: HashSet<Hash> = self
             .ancestors(b)
             .await?
             .into_iter()
-            .filter_map(|h| depth.get(&h).map(|&d| (d, h)))
-            .max_by_key(|(d, _)| *d)
-            .map(|(_, h)| h))
+            .filter(|h| depth.contains_key(h))
+            .collect();
+
+        // Every *proper* ancestor of a common ancestor is itself common, and is
+        // superseded by it — so the merge bases are the common ancestors that no
+        // other common ancestor reaches. Each edge here is already in `parents_of`,
+        // because every common ancestor is an ancestor of `a`.
+        let mut superseded: HashSet<Hash> = HashSet::new();
+        let mut stack: Vec<Hash> = common
+            .iter()
+            .flat_map(|h| parents_of.get(h).cloned().unwrap_or_default())
+            .collect();
+        while let Some(h) = stack.pop() {
+            if !superseded.insert(h) {
+                continue;
+            }
+            stack.extend(parents_of.get(&h).cloned().unwrap_or_default());
+        }
+
+        Ok(common
+            .into_iter()
+            .filter(|h| !superseded.contains(h))
+            .min_by_key(|h| (depth[h], *h.as_bytes())))
     }
 
     // --- file bodies ------------------------------------------------------
@@ -180,6 +224,20 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         author: &str,
         message: &str,
     ) -> Result<(MergeOutcome, Vec<LiveDoc>)> {
+        crate::retry::retrying("merge_live", || {
+            self.merge_live_attempt(theirs, author, message)
+        })
+        .await
+    }
+
+    /// One attempt at [`merge_live`](Self::merge_live); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn merge_live_attempt(
+        &self,
+        theirs: Hash,
+        author: &str,
+        message: &str,
+    ) -> Result<(MergeOutcome, Vec<LiveDoc>)> {
         self.ensure_commits_enabled().await?;
         let branch = self.current_branch().await?.ok_or_else(|| {
             OrigoFSError::InvalidArgument("cannot merge with a detached HEAD".into())
@@ -204,22 +262,30 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
         if self.is_ancestor(ours, theirs).await? {
             let theirs_commit = self.commit_at(&theirs).await?;
-            // Advance the ref FIRST (checked): if the branch moved concurrently
-            // the CAS fails and we abort *before* clobbering the working tree,
-            // rather than silently overwriting it and reporting success.
-            let swapped = self
-                .meta
+            // A fast-forward doesn't merge bytes, it materializes theirs wholesale
+            // — which still overwrites a live path. Report the ones it changes.
+            let stale = self.live_changed_between(ours, theirs, &live).await?;
+            // Resolved before `begin`: the transaction must not await content I/O
+            // while it holds the metadata connection (see `plan_materialize`).
+            let plan = self.plan_materialize(theirs_commit.tree).await?;
+            // The checked ref advance and the tree it describes commit together.
+            // The CAS still comes first *within* the transaction, so a branch that
+            // moved concurrently aborts before any of the tree work is staged;
+            // committing them separately meant a crash in between advanced the
+            // branch while the working tree still held the old content, and the
+            // next commit would snapshot that stale tree on top — silently
+            // reverting the merge.
+            let mut txn = self.meta.begin().await?;
+            if !txn
                 .cas_ref(&branch, Some(&ours.to_hex()), &theirs.to_hex())
-                .await?;
-            if !swapped {
+                .await?
+            {
                 return Err(OrigoFSError::Conflict(format!(
                     "branch {branch} moved concurrently; retry the merge"
                 )));
             }
-            // A fast-forward doesn't merge bytes, it materializes theirs wholesale
-            // — which still overwrites a live path. Report the ones it changes.
-            let stale = self.live_changed_between(ours, theirs, &live).await?;
-            self.replace_working_tree(theirs_commit.tree).await?;
+            self.replace_working_tree_in(&mut *txn, &plan).await?;
+            txn.commit().await?;
             self.mirror_refs().await?;
             return Ok((MergeOutcome::FastForward(theirs), stale));
         }
@@ -255,30 +321,45 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 timestamp: self.now_secs(),
             };
             let commit_hash = self.content.put(&commit.encode()).await?;
-            // Advance the ref FIRST (checked), then reflect it in the working
-            // tree — so a concurrent branch move aborts the merge before we
-            // overwrite the working tree or drop `theirs` from history.
-            let swapped = self
-                .meta
+            let plan = self.plan_materialize(merged_tree).await?;
+            // Ref advance + working tree in one transaction. The CAS is still
+            // first, so a concurrent branch move aborts before anything is
+            // staged; and because they now commit together, a crash can no longer
+            // leave the branch advanced onto a tree that was never materialized.
+            let mut txn = self.meta.begin().await?;
+            if !txn
                 .cas_ref(&branch, Some(&ours.to_hex()), &commit_hash.to_hex())
-                .await?;
-            if !swapped {
+                .await?
+            {
                 return Err(OrigoFSError::Conflict(format!(
                     "branch {branch} moved concurrently; retry the merge"
                 )));
             }
-            self.replace_working_tree(merged_tree).await?;
+            self.replace_working_tree_in(&mut *txn, &plan).await?;
+            txn.commit().await?;
             self.mirror_refs().await?;
             Ok((MergeOutcome::Merged(commit_hash), stale))
         } else {
             // Conflicts: reflect the merge (with markers) and record MERGE_HEAD;
             // the ref intentionally does NOT advance until the user commits.
-            self.replace_working_tree(merged_tree).await?;
-            self.meta.clear_conflicts().await?;
+            //
+            // All of it in one transaction. This was the worst of the torn states:
+            // five separate writes, so a crash before `MERGE_HEAD` landed left a
+            // working tree full of conflict markers with *no record that a merge
+            // was in progress* — and the next commit then produced a single-parent
+            // commit containing the markers, dropping `theirs` from history
+            // entirely. A concurrent reader could also catch the window between
+            // `clear_conflicts` and the re-inserts and see zero conflicts over a
+            // marker-laden tree.
+            let plan = self.plan_materialize(merged_tree).await?;
+            let mut txn = self.meta.begin().await?;
+            self.replace_working_tree_in(&mut *txn, &plan).await?;
+            txn.clear_conflicts().await?;
             for c in &conflicts {
-                self.meta.set_conflict(&c.path, &c.kind).await?;
+                txn.set_conflict(&c.path, &c.kind).await?;
             }
-            self.meta.set_ref(MERGE_HEAD, &theirs.to_hex()).await?;
+            txn.set_ref(MERGE_HEAD, &theirs.to_hex()).await?;
+            txn.commit().await?;
             self.mirror_refs().await?;
             Ok((MergeOutcome::Conflicts(conflicts), stale))
         }

@@ -462,7 +462,48 @@ under failure is a first-class concern:
   is mirrored alongside it, so if the metadata DB is lost you can point a fresh one
   at the surviving object store and `origofs fsck --rebuild` to recover every committed
   file, directory, and branch — chunking and all. (Blame and the audit log live
-  only in the DB, so back that up — Postgres PITR or SQLite replication.)
+  only in the DB — see [Backing up](#backing-up).)
+
+## Backing up
+
+Two stores, two very different jobs.
+
+**The content store needs no backup from origofs.** It is immutable and
+content-addressed, so whatever durability your bucket or filesystem already
+provides is the whole story.
+
+**The metadata database is the irreplaceable half.** `origofs fsck --rebuild`
+reconstructs every committed file, directory, symlink, and branch from the
+content store alone — but **blame, the audit log, the actor registry, and every
+uncommitted edit exist only in the database**. Losing it loses the thing origofs
+is for.
+
+```bash
+origofs --workspace ./ws backup ./backups/meta-$(date +%F).db
+```
+
+SQLite is snapshotted with SQLite's own online backup API, so writers keep
+running while it is taken. Do not substitute `cp meta.db`: a live database has a
+`-wal` sidecar and may be mid-transaction, and the copy often restores — which is
+what makes it dangerous. The command refuses to overwrite an existing file, so a
+scheduled backup cannot quietly destroy the previous one.
+
+To restore, put the snapshot back where the workspace expects it, alongside the
+**same content store** (the snapshot is metadata only):
+
+```bash
+origofs --workspace ./ws serve ...   # stop first
+rm -f ./ws/meta.db ./ws/meta.db-wal ./ws/meta.db-shm
+cp ./backups/meta-2026-01-31.db ./ws/meta.db
+origofs --workspace ./ws schema-version   # sanity-check, then restart
+```
+
+**Postgres**: `origofs backup` deliberately refuses rather than producing
+something that merely resembles a backup. Use `pg_dump` or continuous archiving
+(PITR) — both give a consistent snapshot of a live database, and PITR additionally
+bounds how much you can lose. The restore procedure is the same shape: restore the
+database, keep the content store as it is, then check `origofs schema-version`
+before starting the new binaries.
 
 ## Storage backends
 

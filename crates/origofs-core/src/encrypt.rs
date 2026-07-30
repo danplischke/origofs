@@ -128,6 +128,21 @@ impl ContentStore for EncryptedStore {
         self.inner.put_keyed(key, &ciphertext).await
     }
 
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        // Same nonce-reuse rule as `put_keyed`, and doubly so: *replacing* a value
+        // is by definition storing a second plaintext under one key, which is
+        // exactly the (key, nonce) reuse the derivation cannot survive. A mutable
+        // keyed store (a `PackStore` index) must not be wrapped in encryption.
+        if key != &Hash::of(bytes) {
+            return Err(OrigoFSError::Content(
+                "EncryptedStore::replace_keyed requires a content-addressed key \
+                 (key must equal the hash of the plaintext)"
+                    .into(),
+            ));
+        }
+        self.put_keyed(key, bytes).await
+    }
+
     /// Slots pass through **in plaintext**, by design.
     ///
     /// The nonce here is derived from a content address, and a slot has none — but
@@ -165,8 +180,40 @@ impl ContentStore for EncryptedStore {
         self.inner.list().await
     }
 
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        self.inner.list_with_age().await
+    }
+
+    /// Forwarded **unencrypted**, and necessarily so: the salt stored here is what
+    /// derives this store's key, so it has to be readable before the key exists.
+    /// It is not secret — Argon2id salts are public by design; they exist to make
+    /// the same passphrase yield a different key in every store.
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get_sidecar(name).await
+    }
+
+    /// See [`get_sidecar`](Self::get_sidecar).
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.inner.put_sidecar_if_absent(name, bytes).await
+    }
+
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         self.inner.delete(hash).await
+    }
+
+    /// Forwarded, and it matters: without this the default no-op silently swallows
+    /// the seal, so wrapping a [`PackStore`](crate::PackStore) in encryption meant
+    /// its buffered chunks never became durable — metadata would reference content
+    /// that only ever existed in one process's memory. The same reasoning applies
+    /// to `repack`, which would otherwise never reclaim anything through an
+    /// encrypted store.
+    async fn flush(&self) -> Result<()> {
+        self.inner.flush().await
+    }
+
+    /// See [`flush`](Self::flush).
+    async fn repack(&self) -> Result<u64> {
+        self.inner.repack().await
     }
 
     async fn ping(&self) -> Result<()> {

@@ -58,12 +58,24 @@ pub const COMMITS_TOTAL: &str = "origofs_commits_total";
 pub const GC_OBJECTS_DELETED_TOTAL: &str = "origofs_gc_objects_deleted_total";
 /// Counter: bytes reclaimed by mark-and-sweep GC.
 pub const GC_BYTES_FREED_TOTAL: &str = "origofs_gc_bytes_freed_total";
+/// Change-feed events delivered to subscribers.
+pub const FEED_EVENTS_DELIVERED_TOTAL: &str = "origofs_feed_events_delivered_total";
+/// Times a subscriber's `LISTEN` connection was (re)established.
+pub const FEED_RECONNECTS_TOTAL: &str = "origofs_feed_reconnects_total";
+/// How far behind the newest event a drain started, in events.
+pub const FEED_LAG_EVENTS: &str = "origofs_feed_lag_events";
 
 /// Counter, labeled `code` (the stable [`crate::OrigoFSError::code`]) and `class`
 /// (`retryable` | `unavailable` | `fatal` | `none` for the non-backend variants):
 /// errors surfaced to a caller. Both labels are closed sets, so cardinality is
 /// bounded.
 pub const ERRORS_TOTAL: &str = "origofs_errors_total";
+
+/// Counter, labeled `op` (a fixed operation name): transactions the backend asked
+/// to retry (`40001`/`40P01`/`SQLITE_BUSY`). A rising rate is contention, not
+/// breakage — but it is what turns into user-visible errors once an operation
+/// exhausts its attempts.
+pub const RETRIES_TOTAL: &str = "origofs_retries_total";
 
 /// Histogram, labeled `op` (a fixed operation name such as `write`, `read`,
 /// `commit`, `gc`): wall-clock duration of an engine operation, **in seconds**.
@@ -152,6 +164,11 @@ pub fn describe() {
             "Chunks the content store already had (dedup hits)."
         );
         describe_counter!(
+            RETRIES_TOTAL,
+            Unit::Count,
+            "Transactions re-run after the backend asked for a retry."
+        );
+        describe_counter!(
             COMMITS_TOTAL,
             Unit::Count,
             "Commits crystallized from the working tree."
@@ -160,6 +177,21 @@ pub fn describe() {
             GC_OBJECTS_DELETED_TOTAL,
             Unit::Count,
             "Unreachable objects swept by garbage collection."
+        );
+        describe_counter!(
+            FEED_EVENTS_DELIVERED_TOTAL,
+            Unit::Count,
+            "Change-feed events delivered to subscribers."
+        );
+        describe_counter!(
+            FEED_RECONNECTS_TOTAL,
+            Unit::Count,
+            "Times a subscriber's feed connection was established."
+        );
+        ::metrics::describe_gauge!(
+            FEED_LAG_EVENTS,
+            Unit::Count,
+            "Events a feed drain was behind the newest event when it started."
         );
         describe_counter!(
             GC_BYTES_FREED_TOTAL,
@@ -240,6 +272,31 @@ pub fn record_commit() {
     ::metrics::counter!(COMMITS_TOTAL).increment(1);
 }
 
+/// Record a change-feed drain: how many events it delivered, and how far behind
+/// the newest event the subscriber was when it started.
+///
+/// The push feed's own health was invisible. `subscribe` reconnects and recovers
+/// gaps correctly, but nothing reported that it *had* — so a subscriber silently
+/// falling behind, or flapping its connection, looked exactly like a quiet
+/// workspace. Both labels-free counters, so no cardinality risk.
+#[inline]
+pub fn record_feed_drain(delivered: u64, lag_events: u64) {
+    #[cfg(feature = "metrics")]
+    {
+        ::metrics::counter!(FEED_EVENTS_DELIVERED_TOTAL).increment(delivered);
+        ::metrics::gauge!(FEED_LAG_EVENTS).set(lag_events as f64);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (delivered, lag_events);
+}
+
+/// Record that a subscriber established (or re-established) its feed connection.
+#[inline]
+pub fn record_feed_connect() {
+    #[cfg(feature = "metrics")]
+    ::metrics::counter!(FEED_RECONNECTS_TOTAL).increment(1);
+}
+
 /// Record the outcome of a garbage-collection sweep.
 #[inline]
 pub fn record_gc(objects_deleted: u64, bytes_freed: u64) {
@@ -270,6 +327,16 @@ pub fn record_error(err: &crate::OrigoFSError) {
     }
     #[cfg(not(feature = "metrics"))]
     let _ = err;
+}
+
+/// Count one retried transaction. `op` is the fixed name of the logical
+/// operation being re-run — a closed set, like [`record_op_duration`]'s.
+#[inline]
+pub fn record_retry(op: &'static str) {
+    #[cfg(feature = "metrics")]
+    ::metrics::counter!(RETRIES_TOTAL, "op" => op).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = op;
 }
 
 /// Record the duration of an engine operation. `op` must be a fixed, small set of

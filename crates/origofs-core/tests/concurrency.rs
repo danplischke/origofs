@@ -12,7 +12,7 @@
 //! the observed state.
 
 use origofs_core::{
-    EventInit, FileKind, Fs, MemStore, OrigoFSError, SqliteMetadataStore, WriteCtx,
+    EventInit, FileKind, Fs, MemStore, MetadataStore, OrigoFSError, SqliteMetadataStore, WriteCtx,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -126,9 +126,19 @@ async fn concurrent_events_are_exactly_once_and_monotonic() {
     }
 }
 
-/// An attributed write is atomic: when writers race the *same* path, the file
-/// ends as **exactly one** writer's content (never interleaved) and its blame
-/// credits that same writer (content and blame commit together — no mismatch).
+/// An attributed write is atomic *and* optimistic: when writers race the same
+/// path, exactly one lands, the rest are told, and nothing is invented.
+///
+/// The write was previously unconditional. Every racer "succeeded", the last one
+/// to commit replaced the others' bytes with no error and no signal to anyone,
+/// and — worse for a system whose thesis is attribution — the winner's blame had
+/// been derived against a version that no longer existed, so the `edit_op` log
+/// claimed a `pre_hash` that was never the thing overwritten. A human and an
+/// agent editing one file at the same moment is what this system is *for*.
+///
+/// Three things are asserted, and the first is the one the old behaviour passed:
+/// content is never interleaved, blame credits the actor whose bytes survived,
+/// and the losers see `Conflict` rather than a lie.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_writes_never_tear_content_or_blame() {
     for round in 0..100u64 {
@@ -151,9 +161,20 @@ async fn concurrent_writes_never_tear_content_or_blame() {
                 fs.write_as(WriteCtx::actor(actor), "/shared", &body).await
             }));
         }
+        let mut landed = 0usize;
         for h in handles {
-            h.await.unwrap().unwrap();
+            match h.await.unwrap() {
+                Ok(()) => landed += 1,
+                // The only failure a racer may see. Anything else — a torn
+                // transaction surfacing as a backend error, say — is a bug.
+                Err(OrigoFSError::Conflict(_)) => {}
+                Err(e) => panic!("round {round}: unexpected error {e:?}"),
+            }
         }
+        assert!(
+            landed >= 1,
+            "round {round}: every writer was refused; at least one must make progress"
+        );
 
         let final_c = fs.read("/shared").await.unwrap().to_vec();
         assert!(
@@ -174,6 +195,21 @@ async fn concurrent_writes_never_tear_content_or_blame() {
                 r.actor.id
             );
         }
+
+        // The op-log records edits that *happened*. A refused write rolls its
+        // whole transaction back, op-log entry included, so a reader of the
+        // ground truth never sees an edit whose bytes were never stored.
+        let mut logged = 0usize;
+        for &actor in &actors {
+            for op in fs.edit_ops(actor, None).await.unwrap() {
+                assert_eq!(op.path, "/shared");
+                logged += 1;
+            }
+        }
+        assert_eq!(
+            logged, landed,
+            "round {round}: the op-log must show exactly the writes that landed"
+        );
     }
 }
 
@@ -285,6 +321,240 @@ async fn concurrent_mkdir_p_is_idempotent_and_orphan_free() {
         assert_eq!(
             leaf_stat.ino, leaf,
             "round {round}: leaf inode unstable after the race"
+        );
+    }
+}
+
+/// Concurrent identical `put`s against a **real on-disk** store must each return
+/// an object whose bytes hash to the address they were given.
+///
+/// Every other test in this file runs over `MemStore`, which is a `HashMap` and
+/// so immune by construction — but `LocalCasStore` writes a temp sibling and
+/// renames. When that temp name was derived from the object's path it was shared
+/// by every writer of the same content, which is precisely what dedup produces:
+/// two agents writing the same chunk, `mirror_refs`, a `store_body` retry.
+/// `File::create` truncates, so one writer could zero another's partially-written
+/// file, and the first would then fsync and rename a zero-filled hole into place —
+/// returning `Ok(hash)` for bytes that don't hash to `hash`. The loser of the
+/// rename race would see a spurious `ENOENT` for a write that had succeeded.
+///
+/// The body is large enough that a write spans several syscalls, which is what
+/// gives the interleaving room to happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_identical_puts_to_a_real_cas_never_corrupt() {
+    use origofs_core::{ContentStore, Hash, LocalCasStore};
+
+    for round in 0..8u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalCasStore::open(dir.path()).await.unwrap());
+
+        // Distinct per round so no round can be satisfied by another's leftovers.
+        let body: Vec<u8> = (0..4 * 1024 * 1024)
+            .map(|i| (i as u64 ^ round).to_le_bytes()[0])
+            .collect();
+        let want = Hash::of(&body);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = Arc::clone(&store);
+            let body = body.clone();
+            handles.push(tokio::spawn(async move { store.put(&body).await }));
+        }
+        for h in handles {
+            let got = h
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("round {round}: a racing put failed: {e}"));
+            assert_eq!(got, want, "round {round}: put returned the wrong address");
+        }
+
+        // The decisive check: what is actually on disk must hash to its address.
+        let stored = store.get(&want).await.unwrap();
+        assert_eq!(
+            Hash::of(&stored),
+            want,
+            "round {round}: stored bytes do not hash to their address ({} bytes)",
+            stored.len()
+        );
+        assert_eq!(&stored[..], &body[..], "round {round}: stored bytes differ");
+
+        // No temp files left behind.
+        let leftovers = walk_tmp(dir.path());
+        assert!(
+            leftovers.is_empty(),
+            "round {round}: temp files left behind: {leftovers:?}"
+        );
+    }
+}
+
+/// Every `*.tmp` under `root`, recursively.
+fn walk_tmp(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "tmp") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// A deterministic version of the race above, because the randomized one cannot
+/// tell the two behaviours apart: with a large enough gap between attempts every
+/// writer lands under *either* rule.
+///
+/// Here the second writer is held inside its prior-content read until the first
+/// writer has committed, so its blame is provably derived from a version that no
+/// longer exists. It must be refused, and it must leave nothing behind.
+struct Gated {
+    inner: Arc<MemStore>,
+    /// Fires on the first `get` after arming, then disarms.
+    reached: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Held until the test lets the read finish.
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait::async_trait]
+impl origofs_core::ContentStore for Gated {
+    async fn put(&self, b: &[u8]) -> origofs_core::Result<origofs_core::Hash> {
+        self.inner.put(b).await
+    }
+    async fn put_keyed(&self, k: &origofs_core::Hash, b: &[u8]) -> origofs_core::Result<()> {
+        self.inner.put_keyed(k, b).await
+    }
+    async fn get(&self, h: &origofs_core::Hash) -> origofs_core::Result<bytes::Bytes> {
+        let armed = self.reached.lock().unwrap().take();
+        if let Some(tx) = armed {
+            let rx = self.release.lock().unwrap().take();
+            let _ = tx.send(());
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+        }
+        self.inner.get(h).await
+    }
+    async fn get_range(
+        &self,
+        h: &origofs_core::Hash,
+        o: u64,
+        l: u64,
+    ) -> origofs_core::Result<bytes::Bytes> {
+        self.inner.get_range(h, o, l).await
+    }
+    async fn has(&self, h: &origofs_core::Hash) -> origofs_core::Result<bool> {
+        self.inner.has(h).await
+    }
+    async fn list(&self) -> origofs_core::Result<Vec<origofs_core::Hash>> {
+        self.inner.list().await
+    }
+    async fn list_with_age(&self) -> origofs_core::Result<Vec<(origofs_core::Hash, Option<u64>)>> {
+        self.inner.list_with_age().await
+    }
+    async fn delete(&self, h: &origofs_core::Hash) -> origofs_core::Result<u64> {
+        self.inner.delete(h).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_derived_from_a_replaced_version_is_refused() {
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let content = Arc::new(Gated {
+        inner: Arc::new(MemStore::new()),
+        reached: std::sync::Mutex::new(None),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let fs = Arc::new(Fs::new(
+        Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+        content.clone(),
+    ));
+    fs.init().await.unwrap();
+    let ann = fs.create_human("ann", None).await.unwrap();
+    let bot = fs.create_agent("bot", "opus", None).await.unwrap();
+    fs.write_as(WriteCtx::actor(ann), "/doc.md", b"base\n")
+        .await
+        .unwrap();
+
+    // Bot starts a write based on "base\n" and is parked reading it.
+    *content.reached.lock().unwrap() = Some(reached_tx);
+    let slow = {
+        let fs = Arc::clone(&fs);
+        tokio::spawn(async move {
+            fs.write_as(WriteCtx::actor(bot), "/doc.md", b"base\nbot\n")
+                .await
+        })
+    };
+    reached_rx.await.unwrap();
+
+    // Ann replaces the file entirely while bot is parked. The gate has disarmed,
+    // so this write runs to completion.
+    fs.write_as(WriteCtx::actor(ann), "/doc.md", b"ann only\n")
+        .await
+        .unwrap();
+
+    release_tx.send(()).unwrap();
+    let err = slow
+        .await
+        .unwrap()
+        .expect_err("a write derived from a replaced version must not land");
+    assert!(
+        matches!(err, OrigoFSError::Conflict(_)),
+        "expected a Conflict, got {err:?}"
+    );
+
+    // Ann's content stands, and bot left nothing behind — no bytes, no blame, and
+    // no op-log entry claiming an edit that never happened.
+    assert_eq!(&fs.read("/doc.md").await.unwrap()[..], b"ann only\n");
+    for r in fs.blame("/doc.md").await.unwrap() {
+        assert_eq!(r.actor.id, ann, "bot's authorship must not appear");
+    }
+    assert!(
+        fs.edit_ops(bot, None).await.unwrap().is_empty(),
+        "a refused write must not appear in the attribution ground truth"
+    );
+}
+
+/// `rmdir` must not leave a dentry parented to an inode it deleted.
+///
+/// Emptiness used to be read *before* the transaction and then trusted, so a
+/// `mkdir` that committed in between produced a directory entry whose parent no
+/// longer exists: a row nothing can reach, invisible to `ls`, to `build_tree`,
+/// and to the GC mark — the same shape of loss as `rename`-into-itself. The
+/// check now runs as part of the delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn rmdir_racing_mkdir_never_orphans_a_dentry() {
+    for round in 0..80u64 {
+        let fs = shared().await;
+        fs.mkdir_p("/dir").await.unwrap();
+        let dir = fs
+            .meta
+            .lookup(1, "dir")
+            .await
+            .unwrap()
+            .expect("/dir exists");
+
+        let (a, b) = (Arc::clone(&fs), Arc::clone(&fs));
+        let remove = tokio::spawn(async move { a.remove("/dir").await });
+        let create = tokio::spawn(async move { b.mkdir_p("/dir/child").await });
+        let removed = remove.await.unwrap();
+        let created = create.await.unwrap();
+
+        // Whatever the interleaving, the two outcomes must agree: a surviving
+        // child implies a surviving parent.
+        let children = fs.meta.child_count(dir).await.unwrap();
+        let parent_gone = fs.meta.get_inode(dir).await.unwrap().is_none();
+        assert!(
+            !(parent_gone && children > 0),
+            "round {round}: /dir deleted with {children} orphaned child dentr(ies) \
+             (remove: {removed:?}, mkdir: {created:?})"
         );
     }
 }

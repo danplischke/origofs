@@ -487,3 +487,141 @@ jobs:
         with:
           path: ./cache
           key: bench-${{ runner.os }}-${{ github.run_id }}
+
+  # The shipped deployment artifact. Nothing else in CI builds the image, which is
+  # how it came to pin a Rust older than the workspace MSRV and stop building at
+  # all. This job compiles it and then exercises the whole production-shaped stack
+  # (Postgres metadata + MinIO content) the compose file describes, so a break in
+  # either the image or the wiring fails here rather than in someone's deploy.
+  docker:
+    name: Docker image + compose stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build once into the local image store, cached across runs, so the compose
+      # services below reuse it instead of each rebuilding from source.
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: origofs:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Binaries run and report a version
+        run: |
+          docker run --rm origofs:latest --help
+          docker run --rm --entrypoint git-remote-origofs origofs:latest --help || true
+
+      # `docker compose` builds the same Dockerfile; point it at the image just
+      # built so this step is a wiring test, not a second compile.
+      - name: Bring the stack up
+        run: |
+          docker compose up -d --wait --wait-timeout 300
+          docker compose ps
+
+      - name: Readiness probe reports both stores healthy
+        run: |
+          curl -fsS localhost:8080/readyz | tee /tmp/readyz.json
+          grep -q '"ready":true' /tmp/readyz.json
+
+      # A real write/read round-trip through the Postgres + S3 backends, and a
+      # check that the surface is actually gated: the API refuses to serve
+      # unauthenticated writes on a non-loopback bind.
+      - name: Write and read a file over the API
+        run: |
+          curl -fsS -H 'Authorization: Bearer demo-token' \
+            -X PUT --data-binary 'hello from ci' \
+            localhost:8080/v1/files/notes/a.txt
+          got=$(curl -fsS -H 'Authorization: Bearer demo-token' \
+            localhost:8080/v1/files/notes/a.txt)
+          test "$got" = "hello from ci" || { echo "read back: $got"; exit 1; }
+
+      - name: Unauthenticated writes are refused
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X PUT --data-binary 'nope' localhost:8080/v1/files/notes/b.txt)
+          test "$code" = "401" || { echo "expected 401, got $code"; exit 1; }
+
+      - name: Stack logs
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # Postgres over TLS. The `rust` job's service container serves plaintext, so the
+  # handshake path — the one that decides whether origofs can reach a managed
+  # Postgres at all — would otherwise never execute. Run one with `ssl = on` and a
+  # certificate from a private CA, which is also the shape a self-hosted deployment
+  # has.
+  pg-tls:
+    name: Postgres over TLS
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Issue a CA and a server certificate
+        run: |
+          mkdir -p /tmp/pgtls
+          cd /tmp/pgtls
+          openssl req -new -x509 -days 1 -nodes -out ca.crt -keyout ca.key \
+            -subj "/CN=origofs-ci-ca"
+          openssl req -new -nodes -out server.csr -keyout server.key \
+            -subj "/CN=localhost"
+          # CA:FALSE matters: rustls refuses to accept a CA certificate as an
+          # end-entity server certificate (`CaUsedAsEndEntity`).
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+            -days 1 -out server.crt -extfile <(printf \
+              "basicConstraints=CA:FALSE\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
+          # The server reads these as uid 999 inside the container.
+          sudo chown 999:999 server.key server.crt
+          sudo chmod 600 server.key
+
+      - name: Start Postgres with TLS
+        run: |
+          docker run -d --name pgtls \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=origofs \
+            -p 5433:5432 \
+            -v /tmp/pgtls:/certs \
+            postgres:16 \
+            -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
+          for i in $(seq 1 30); do
+            docker exec pgtls pg_isready -U postgres && break
+            sleep 2
+          done
+          # Prove the server really negotiated TLS before trusting the test result.
+          docker exec pgtls psql -U postgres -d origofs -tAc \
+            "SELECT current_setting('ssl')"
+
+      - name: Test the TLS path
+        env:
+          ORIGOFS_PG_TLS_TEST_URL: "host=localhost port=5433 user=postgres password=postgres dbname=origofs"
+          ORIGOFS_PG_TLS_TEST_CA: /tmp/pgtls/ca.crt
+        run: cargo test -p origofs-core --test pg_tls
+
+      # The rest of the Postgres suite, with origofs's connections encrypted.
+      #
+      # No explicit `sslmode`, so it defaults to `prefer`: origofs has a connector
+      # and negotiates TLS, while the suite's own schema-reset helper (which opens
+      # a raw `NoTls` connection) degrades to plaintext instead of failing. The
+      # encryption of origofs's connections is asserted directly in `pg_tls.rs`
+      # via `pg_stat_ssl`, not inferred from this job passing.
+      - name: Full Postgres suite with TLS negotiated
+        env:
+          ORIGOFS_PG_TEST_URL: "host=localhost port=5433 user=postgres password=postgres dbname=origofs"
+          ORIGOFS_PG_CA_FILE: /tmp/pgtls/ca.crt
+        run: cargo test -p origofs-core --test postgres
+
+      - name: Server logs
+        if: failure()
+        run: docker logs pgtls

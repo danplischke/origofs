@@ -31,6 +31,29 @@ pub trait ContentStore: Send + Sync {
     /// [`EncryptedStore`]: crate::encrypt::EncryptedStore
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()>;
 
+    /// **Replace** the value stored under `key`, atomically where the backend can.
+    ///
+    /// [`put_keyed`](Self::put_keyed) is insert-if-absent in every backend — right
+    /// for a content-addressed key, where the value is a function of the key and a
+    /// second write would be redundant. But `put_keyed` also serves genuinely
+    /// *mutable* keyed stores: a [`PackStore`](crate::PackStore)'s chunk→location
+    /// index changes whenever a repack moves a chunk to a different pack. There,
+    /// insert-if-absent silently drops the update.
+    ///
+    /// The workaround — delete, then put — leaves a window in which the key
+    /// resolves to nothing at all. For the pack index that window is unrecoverable:
+    /// a chunk with no index entry is invisible to `repack`, which then reads the
+    /// pack holding it as fully dead and deletes it. Hence an explicit atomic
+    /// replace.
+    ///
+    /// The default is that unsafe delete-then-put, for a custom backend that can do
+    /// no better; every backend here overrides it with a genuinely atomic write
+    /// (a rename, a map insert, an object PUT).
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        self.delete(key).await?;
+        self.put_keyed(key, bytes).await
+    }
+
     /// Write a small **named slot** beside the store's objects, overwriting any
     /// previous value.
     ///
@@ -74,6 +97,66 @@ pub trait ContentStore: Send + Sync {
     /// collection to find unreachable objects.
     async fn list(&self) -> Result<Vec<Hash>>;
 
+    /// Every stored object with its **age in seconds**, measured by the backend's
+    /// own clock — `None` when the backend cannot tell.
+    ///
+    /// This is what makes garbage collection safe alongside writers. Content is
+    /// written *before* the metadata that references it (the durability barrier),
+    /// so every object is legitimately unreferenced for the window between its
+    /// `put` and the commit of the transaction that names it. A mark-and-sweep
+    /// that trusts reachability alone deletes exactly those objects — the write in
+    /// flight — and the writer then fails with `ContentMissing` on content it had
+    /// just stored. Skipping anything younger than a grace period longer than that
+    /// window closes it without any per-write bookkeeping.
+    ///
+    /// The age is relative to the backend's own notion of now, not the engine's
+    /// clock, so an injected test clock cannot make a real store look ancient.
+    ///
+    /// The default reports `None` for everything, which
+    /// [`Fs::gc`](crate::Fs::gc) treats as "not safe to sweep" — a custom backend
+    /// that cannot date its objects collects nothing rather than collecting
+    /// something live.
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        Ok(self.list().await?.into_iter().map(|h| (h, None)).collect())
+    }
+
+    /// Read a small named **sidecar** value, or `None` if it was never written.
+    ///
+    /// A sidecar is deliberately *outside* the content-addressed namespace: it is
+    /// keyed by a name rather than a hash, and [`list`](Self::list) never
+    /// enumerates it, so garbage collection cannot see it and therefore cannot
+    /// sweep it. That last property is the whole point — the encryption salt lives
+    /// here, and a GC pass that reclaimed it would make every encrypted object in
+    /// the store permanently undecryptable.
+    ///
+    /// It also has to sit beside the *content*, not in the metadata database:
+    /// losing the database is a survivable event that `fsck --rebuild` recovers
+    /// from, and it must not also cost you the ability to read your bytes.
+    ///
+    /// Sidecars are for small, rarely-changing values only. The default has none.
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Write a sidecar **only if absent**, returning the value that is stored
+    /// afterwards — the caller's bytes, or the existing ones if another writer got
+    /// there first.
+    ///
+    /// Create-if-absent rather than plain write, because the salt is randomly
+    /// generated: two processes opening a fresh store concurrently would otherwise
+    /// each write a different salt, and whichever landed second would silently
+    /// invalidate the key the first had already derived and started writing with.
+    /// Returning the stored value makes both agree.
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        let _ = (name, bytes);
+        Err(OrigoFSError::Content(
+            "this content backend does not support sidecar values (needed for \
+             encryption-at-rest, which stores its key-derivation salt beside the content)"
+                .into(),
+        ))
+    }
+
     /// Delete an object, returning the bytes freed. Idempotent: deleting an
     /// absent hash succeeds and frees `0`.
     async fn delete(&self, hash: &Hash) -> Result<u64>;
@@ -105,6 +188,27 @@ pub trait ContentStore: Send + Sync {
     async fn ping(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Validate a sidecar name so it can be used as a single path/key component.
+///
+/// Same rule as every other name that becomes a path: no traversal, no separator,
+/// no NUL. Sidecar names are internal today, but this is the boundary where a
+/// future caller-supplied one would escape.
+fn sidecar_file(name: &str) -> Result<String> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name == "objects"
+    {
+        return Err(OrigoFSError::InvalidPath(format!(
+            "invalid sidecar name: {name:?}"
+        )));
+    }
+    Ok(name.to_string())
 }
 
 /// Reject a slot name that isn't a single safe path component.
@@ -140,6 +244,8 @@ pub struct LocalCasStore {
     /// lets tests assert the durability barrier actually ran (C3). Not part of
     /// the [`ContentStore`] contract.
     syncs: AtomicU64,
+    /// Counter making each write's temp filename unique — see [`Self::write_at`].
+    tmp_seq: AtomicU64,
 }
 
 impl LocalCasStore {
@@ -150,6 +256,7 @@ impl LocalCasStore {
         Ok(Self {
             root,
             syncs: AtomicU64::new(0),
+            tmp_seq: AtomicU64::new(0),
         })
     }
 
@@ -176,17 +283,46 @@ impl LocalCasStore {
     /// then the parent directory is fsynced so the rename entry itself survives.
     /// This establishes the invariant the metadata layer relies on: content is
     /// on disk before any metadata references it.
+    ///
+    /// The temp name is unique per write, not derived from the object's path.
+    /// Deriving it from the path gives every concurrent writer of the *same*
+    /// content one shared temp file — and that is the common case, because
+    /// identical content is exactly what dedup produces. Since `File::create`
+    /// truncates, one writer could zero another's partially-written file and the
+    /// first would then fsync and rename the hole into place, returning `Ok(hash)`
+    /// for bytes that do not hash to `hash`; the loser of the rename race would
+    /// meanwhile see a spurious `ENOENT` for a write that had in fact succeeded.
+    /// With distinct temps both writers rename their own complete copy, and rename
+    /// is atomic, so the last one simply wins with identical bytes.
     async fn write_at(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = path.with_extension("tmp");
-        let mut f = tokio::fs::File::create(&tmp).await?;
+        // pid + counter is unique among *live* writers: within a process the
+        // counter never repeats, and a recycled pid means the other process is
+        // gone. Kept a sibling of `path` so the rename stays within one directory
+        // (and so atomic).
+        let tmp = path.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            self.tmp_seq.fetch_add(1, Ordering::Relaxed)
+        ));
+        let res = self.write_tmp_then_rename(&tmp, path, bytes).await;
+        if res.is_err() {
+            // Nothing will ever reuse this name, so a partial temp would just
+            // accumulate. Best-effort: the write already failed.
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        res
+    }
+
+    async fn write_tmp_then_rename(&self, tmp: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut f = tokio::fs::File::create(tmp).await?;
         f.write_all(bytes).await?;
         f.sync_all().await?;
         drop(f);
         self.syncs.fetch_add(1, Ordering::Relaxed);
-        tokio::fs::rename(&tmp, path).await?;
+        tokio::fs::rename(tmp, path).await?;
         // Directory fsync makes the rename durable. Unix-only: Windows has no
         // portable directory-fsync, and the temp-file fsync above still bounds
         // the exposure there.
@@ -218,6 +354,12 @@ impl ContentStore for LocalCasStore {
             return Ok(());
         }
         self.write_at(&path, bytes).await
+    }
+
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        // `write_at` is temp-file + rename, so the key never resolves to a
+        // half-written value and never to nothing.
+        self.write_at(&self.path_for(key), bytes).await
     }
 
     /// Slots live in `<root>/meta/`, a sibling of `objects/` — so `list` (which
@@ -261,6 +403,75 @@ impl ContentStore for LocalCasStore {
 
     async fn has(&self, hash: &Hash) -> Result<bool> {
         Ok(Self::exists(&self.path_for(hash)).await)
+    }
+
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        match tokio::fs::read(self.root.join(sidecar_file(name)?)).await {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        let path = self.root.join(sidecar_file(name)?);
+        tokio::fs::create_dir_all(&self.root).await?;
+        // `create_new` is the exclusive-create: exactly one racing writer wins and
+        // the loser re-reads the winner's value.
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(mut f) => {
+                f.write_all(bytes).await?;
+                f.flush().await?;
+                Ok(bytes.to_vec())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(tokio::fs::read(&path).await?)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        let now = std::time::SystemTime::now();
+        let objects = self.root.join("objects");
+        let mut out = Vec::new();
+        let mut shards = match tokio::fs::read_dir(&objects).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(shard) = shards.next_entry().await? {
+            if !shard.file_type().await?.is_dir() {
+                continue;
+            }
+            let prefix = shard.file_name().to_string_lossy().into_owned();
+            let mut entries = tokio::fs::read_dir(shard.path()).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".tmp") {
+                    continue; // an in-flight write; not yet a committed object
+                }
+                let Some(h) = Hash::from_hex(&format!("{prefix}{name}")) else {
+                    continue;
+                };
+                // An unreadable or future-dated mtime reports `None` (unknown),
+                // which the sweep treats as "don't touch".
+                let age = entry
+                    .metadata()
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs());
+                out.push((h, age));
+            }
+        }
+        Ok(out)
     }
 
     async fn list(&self) -> Result<Vec<Hash>> {
@@ -338,6 +549,15 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
     async fn list(&self) -> Result<Vec<Hash>> {
         (**self).list().await
     }
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        (**self).get_sidecar(name).await
+    }
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        (**self).put_sidecar_if_absent(name, bytes).await
+    }
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        (**self).list_with_age().await
+    }
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         (**self).delete(hash).await
     }
@@ -356,6 +576,12 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
 #[derive(Default)]
 pub struct MemStore {
     map: Mutex<HashMap<Hash, Bytes>>,
+    /// When each object was first stored, so the store can report an age the way
+    /// a real backend does (see [`ContentStore::list_with_age`]).
+    born: Mutex<HashMap<Hash, std::time::Instant>>,
+    /// Named sidecars, kept out of `map` so `list()` never enumerates them and GC
+    /// therefore cannot sweep them (see [`ContentStore::get_sidecar`]).
+    sidecars: Mutex<HashMap<String, Vec<u8>>>,
     /// Named slots, kept apart from `map` so they stay invisible to `list`/`gc`
     /// exactly as they are on a real backend.
     slots: Mutex<HashMap<String, Bytes>>,
@@ -364,6 +590,15 @@ pub struct MemStore {
 impl MemStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record `hash` as newly stored, unless it already was.
+    fn touch_born(&self, hash: Hash) {
+        self.born
+            .lock()
+            .expect("mem store poisoned")
+            .entry(hash)
+            .or_insert_with(std::time::Instant::now);
     }
 
     /// Number of distinct blobs stored (useful for dedup assertions in tests).
@@ -385,7 +620,47 @@ impl ContentStore for MemStore {
             .expect("mem store poisoned")
             .entry(hash)
             .or_insert_with(|| Bytes::copy_from_slice(bytes));
+        self.touch_born(hash);
         Ok(hash)
+    }
+
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .sidecars
+            .lock()
+            .expect("mem store poisoned")
+            .get(name)
+            .cloned())
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        Ok(self
+            .sidecars
+            .lock()
+            .expect("mem store poisoned")
+            .entry(name.to_string())
+            .or_insert_with(|| bytes.to_vec())
+            .clone())
+    }
+
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        let born = self.born.lock().expect("mem store poisoned");
+        Ok(self
+            .map
+            .lock()
+            .expect("mem store poisoned")
+            .keys()
+            .map(|h| (*h, born.get(h).map(|t| t.elapsed().as_secs())))
+            .collect())
+    }
+
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        self.map
+            .lock()
+            .expect("mem store poisoned")
+            .insert(*key, Bytes::copy_from_slice(bytes));
+        self.touch_born(*key);
+        Ok(())
     }
 
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
@@ -394,6 +669,7 @@ impl ContentStore for MemStore {
             .expect("mem store poisoned")
             .entry(*key)
             .or_insert_with(|| Bytes::copy_from_slice(bytes));
+        self.touch_born(*key);
         Ok(())
     }
 
@@ -451,6 +727,7 @@ impl ContentStore for MemStore {
     }
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {
+        self.born.lock().expect("mem store poisoned").remove(hash);
         Ok(self
             .map
             .lock()
@@ -504,6 +781,16 @@ impl ContentStore for TieredStore {
         Ok(())
     }
 
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        self.backend.replace_keyed(key, bytes).await?;
+        // The cache holds the *old* value, which is now wrong — replace it too, and
+        // drop it on failure rather than leave a stale read in front of the backend.
+        if self.cache.replace_keyed(key, bytes).await.is_err() {
+            let _ = self.cache.delete(key).await;
+        }
+        Ok(())
+    }
+
     /// Slots go to the backend only. They are mutable, and a stale cached copy of
     /// "which format is this store" is worse than a round-trip on open.
     async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
@@ -538,6 +825,31 @@ impl ContentStore for TieredStore {
         // The backend is authoritative (writes are write-through); the cache
         // holds only a subset.
         self.backend.list().await
+    }
+
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        self.backend.list_with_age().await
+    }
+
+    /// Forwarded to the backend, which is the authoritative store. Without this
+    /// the trait's no-op default silently swallows a batching backend's seal — a
+    /// `PackStore` behind a cache tier would never make its buffered chunks
+    /// durable, while metadata already referenced them.
+    async fn flush(&self) -> Result<()> {
+        self.backend.flush().await
+    }
+
+    /// See [`flush`](Self::flush).
+    async fn repack(&self) -> Result<u64> {
+        self.backend.repack().await
+    }
+
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.backend.get_sidecar(name).await
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.backend.put_sidecar_if_absent(name, bytes).await
     }
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {
@@ -601,6 +913,10 @@ impl ContentStore for VerifyingStore {
         self.inner.put_keyed(key, bytes).await
     }
 
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        self.inner.replace_keyed(key, bytes).await
+    }
+
     /// Pass through unverified: a slot is deliberately not content-addressed, so
     /// there is no address to check it against. Slot payloads carry their own
     /// tag+version header instead.
@@ -640,6 +956,18 @@ impl ContentStore for VerifyingStore {
 
     async fn list(&self) -> Result<Vec<Hash>> {
         self.inner.list().await
+    }
+
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        self.inner.list_with_age().await
+    }
+
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get_sidecar(name).await
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.inner.put_sidecar_if_absent(name, bytes).await
     }
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {

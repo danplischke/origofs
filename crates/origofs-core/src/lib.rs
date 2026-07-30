@@ -32,6 +32,7 @@ pub mod pack;
 pub mod postgres;
 pub mod recover;
 pub mod resync;
+mod retry;
 pub mod sqlite;
 pub mod suggest;
 pub mod types;
@@ -50,9 +51,9 @@ pub use collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, PRESENCE_WINDOW_SECS,
 pub use content::{ContentStore, LocalCasStore, MemStore, TieredStore, VerifyingStore};
 pub use corpus::{Passage, PassageOptions, Segmentation};
 pub use encrypt::EncryptedStore;
-pub use engine::Fs;
+pub use engine::{Fs, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
-pub use gc::GcStats;
+pub use gc::{DEFAULT_GC_GRACE_SECS, GcStats};
 pub use merge::{Conflict, MergeOutcome};
 pub use metadata::{MetaTxn, MetadataStore};
 pub use metrics::OpTimer;
@@ -65,7 +66,7 @@ pub use objectstore::{GcsConfig, ObjectContentStore, S3Config};
 pub use pack::{DEFAULT_PACK_SIZE, PackStore};
 #[cfg(feature = "coedit")]
 pub use postgres::{CoeditRelayNote, CoeditRelaySub};
-pub use postgres::{EventSubscription, PostgresMetadataStore};
+pub use postgres::{EventSubscription, PG_CA_FILE_ENV, PostgresMetadataStore};
 pub use recover::RebuildReport;
 pub use resync::{
     IdentityMap, ResyncOutcome, ResyncReport, TransferStats, carry_blame, resync, transfer,

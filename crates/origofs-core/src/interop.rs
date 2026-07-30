@@ -66,6 +66,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Point a branch ref at `hash` (creating the ref if absent).
     pub async fn set_branch(&self, branch: &str, hash: Hash) -> Result<()> {
+        crate::engine::validate_ref_name(branch)?;
         self.meta.set_ref(branch, &hash.to_hex()).await
     }
 
@@ -79,6 +80,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// writer got there first; re-read [`branch_head`](Self::branch_head) and
     /// retry rather than forcing the write.
     pub async fn cas_branch(&self, branch: &str, expect: Option<Hash>, new: Hash) -> Result<bool> {
+        crate::engine::validate_ref_name(branch)?;
         let expect = expect.map(|h| h.to_hex());
         let swapped = self
             .meta

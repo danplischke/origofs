@@ -356,8 +356,36 @@ pub async fn serve(
     addr: SocketAddr,
     auth: Arc<dyn Authenticator>,
 ) -> std::io::Result<()> {
+    serve_until(ws, addr, auth, crate::shutdown_signal()).await
+}
+
+/// [`serve`], stopping when `shutdown` resolves and then **draining**: the
+/// listener closes to new connections while requests already in flight run to
+/// completion.
+///
+/// Without this the server was a bare `axum::serve`, so a `SIGTERM` — an ordinary
+/// Kubernetes rollout, a `docker stop` — severed every in-flight request at
+/// whatever point it had reached. Content is written before the metadata that
+/// references it, so a write cut in the middle leaves durable orphaned chunks and
+/// a client that never learns whether its write landed. Draining turns a
+/// deployment from a burst of failed requests into a quiet handover.
+///
+/// The drain is unbounded here on purpose: the caller owns the deadline, because
+/// only it knows the orchestrator's grace period. Wrap it in `tokio::time::timeout`
+/// to bound it.
+pub async fn serve_until(
+    ws: Shared,
+    addr: SocketAddr,
+    auth: Arc<dyn Authenticator>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(ws, auth)).await
+    axum::serve(listener, router(ws, auth))
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            tracing::info!("shutdown signal received; draining in-flight requests");
+        })
+        .await
 }
 
 /// Normalize a URL-tail path to an absolute origofs path.
@@ -619,18 +647,13 @@ async fn write_file(
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     let p = abspath(&path);
-    if let Some((parent, _)) = p.rsplit_once('/')
-        && !parent.is_empty()
-    {
-        ws.mkdir_p(parent).await?;
-    }
+    let ctx = principal.write_ctx();
     // Attribution comes only from the authenticated principal — never the request.
     // Governed by the principal's write policy: a propose-only actor's edit is
-    // queued for review rather than landing directly.
-    match ws
-        .write_or_propose(principal.write_ctx(), &p, &body, None)
-        .await?
-    {
+    // queued for review rather than landing directly. Missing parents are created
+    // by the engine *after* that decision, so a queued suggestion leaves the
+    // working tree untouched.
+    match ws.write_or_propose(ctx, &p, &body, None).await? {
         WriteOutcome::Wrote => {
             origofs_core::metrics::record_write(body.len() as u64);
             Ok(Json(json!({ "path": p, "written": body.len() })))

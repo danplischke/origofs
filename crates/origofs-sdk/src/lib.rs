@@ -5,10 +5,7 @@
 //! tier). Both sides are `Arc<dyn …>`, so the backend is chosen at runtime. Later
 //! milestones add commits and attribution behind the same façade.
 
-use origofs_core::{
-    ContentStore, Fs, LocalCasStore, MetadataStore, PostgresMetadataStore, Result,
-    SqliteMetadataStore,
-};
+use origofs_core::{Fs, Result};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,17 +16,23 @@ pub use futures::stream::BoxStream;
 /// [`api::set_metrics_renderer`], exactly as it installs a tracing subscriber.
 #[cfg(feature = "metrics")]
 pub use origofs_core::metrics;
+// The building blocks a caller needs to assemble a backend stack by hand, which
+// `Workspace::open_encrypted` takes. Previously private, so an embedder could not
+// compose one.
 pub use origofs_core::{
-    Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DiffEntry, DiffStatus, DirEntry,
-    DirEntryAttr, DirPage, EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind,
-    GcStats, GcsConfig, Hash, Inode, LiveDoc, MemStore, MergeOutcome, ObjectContentStore,
-    OrigoFSError, PackStore, Passage, PassageOptions, Presence, RebuildReport, ResyncOutcome,
-    ResyncReport, S3Config, Segmentation, Suggestion, SuggestionContent, SuggestionInit,
-    SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats, VerifyingStore,
-    VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DEFAULT_GC_GRACE_SECS,
+    DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, EncryptedStore, Event,
+    EventInit, EventSubscription, FileKind, GcStats, GcsConfig, Hash, Inode, LiveDoc, MemStore,
+    MergeOutcome, ObjectContentStore, OrigoFSError, PackStore, Passage, PassageOptions, Presence,
+    RebuildReport, ResyncOutcome, ResyncReport, S3Config, Segmentation, Suggestion,
+    SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit,
+    TransferStats, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
 #[cfg(feature = "coedit")]
 pub use origofs_core::{COEDIT_SIDECAR_DIR, CoeditDoc, CoeditRelayNote, CoeditRelaySub};
+pub use origofs_core::{
+    ContentStore, LocalCasStore, MetadataStore, PostgresMetadataStore, SqliteMetadataStore,
+};
 
 // ── Access surfaces ─────────────────────────────────────────────────────────
 // Each surface that was formerly its own crate is now an opt-in, feature-gated
@@ -48,6 +51,51 @@ pub mod mcp;
 pub mod nfs;
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
+
+/// Resolves when the process is asked to stop: `SIGTERM` or `SIGINT` on Unix,
+/// Ctrl-C elsewhere.
+///
+/// `SIGTERM` is the one that matters in production — it is what Kubernetes and
+/// `docker stop` send, and what a long-running server previously had no handler
+/// for at all, so every in-flight request was severed at whatever point it had
+/// reached. `SIGINT` is here so an interactive Ctrl-C drains the same way.
+///
+/// Returning a future rather than installing a handler keeps the choice with the
+/// caller: an embedder that already has its own shutdown plumbing passes that to
+/// [`api::serve_until`] instead.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // If a handler can't be installed, wait forever rather than shutting down
+        // immediately — a spurious instant shutdown is far worse than no handler.
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; shutdown will not be graceful");
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGINT");
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => tracing::info!("received SIGTERM"),
+            _ = int.recv() => tracing::info!("received SIGINT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("received Ctrl-C");
+    }
+}
 
 type Meta = Arc<dyn MetadataStore>;
 type Content = Arc<dyn ContentStore>;
@@ -111,11 +159,30 @@ impl Workspace {
         cas_dir: impl AsRef<Path>,
         passphrase: &str,
     ) -> Result<Self> {
-        let cas_dir = cas_dir.as_ref();
         let meta: Meta = Arc::new(SqliteMetadataStore::open(db_path)?);
-        // Open the CAS first so the directory exists, then place the salt in it.
         let backend: Content = Arc::new(LocalCasStore::open(cas_dir).await?);
-        let salt = read_or_create_salt(cas_dir).await?;
+        Self::open_encrypted(meta, backend, passphrase).await
+    }
+
+    /// Any metadata store + any content backend, **encrypted at rest** with a key
+    /// derived from `passphrase` (Argon2id) over a per-store random salt.
+    ///
+    /// Encryption used to be wired only for SQLite + a local directory, and the
+    /// CLI refused outright for anything else — so the deployment
+    /// `deploy/config.example.toml` recommends, Postgres over an object store,
+    /// could not have encryption at rest at all. `EncryptedStore` always composed
+    /// over any `ContentStore`; what was missing was somewhere to keep the salt
+    /// that (a) survives losing the metadata database and (b) garbage collection
+    /// cannot sweep. That is now a content-store *sidecar* — see
+    /// [`ContentStore::get_sidecar`](origofs_core::ContentStore::get_sidecar).
+    ///
+    /// The same passphrase must be used on every open; a wrong one fails loudly
+    /// rather than returning garbage.
+    ///
+    /// `VerifyingStore` belongs *outside* this, as the `open_*` recipes arrange:
+    /// integrity is checked at the chunk-addressed boundary the caller reads by.
+    pub async fn open_encrypted(meta: Meta, backend: Content, passphrase: &str) -> Result<Self> {
+        let salt = read_or_create_salt(&backend).await?;
         let content: Content =
             Arc::new(EncryptedStore::from_passphrase(backend, passphrase, &salt)?);
         Self::open(meta, content).await
@@ -545,6 +612,13 @@ impl Workspace {
         self.fs.gc().await
     }
 
+    /// [`gc`](Self::gc) with an explicit grace period, in seconds. Only content
+    /// unreferenced *and* untouched for at least that long is reclaimed. `0`
+    /// disables the age gate and is only safe on a store with no active writers.
+    pub async fn gc_with_grace(&self, grace_secs: u64) -> Result<GcStats> {
+        self.fs.gc_with_grace(grace_secs).await
+    }
+
     /// Rebuild refs and the working tree from the content store's object graph,
     /// for disaster recovery after the metadata DB is lost. Open a workspace with
     /// a **fresh** metadata DB pointed at the surviving content store, then call
@@ -715,6 +789,23 @@ impl Workspace {
     /// The migration version currently applied to this workspace's metadata DB.
     /// A normal open already brings this to [`latest_schema_version`](Self::latest_schema_version);
     /// this is here for operators who want to introspect or gate on it.
+    /// Write a consistent snapshot of the **metadata** store to `dest`.
+    ///
+    /// This is the half of a workspace that cannot be reconstructed: `fsck
+    /// --rebuild` recovers committed files, directories, symlinks, and branches
+    /// from the content store alone, but blame, the audit log, the actor
+    /// registry, and every uncommitted edit live only in the database. Content is
+    /// already durable and replicated wherever the object store puts it; this is
+    /// what actually needs backing up.
+    ///
+    /// SQLite uses the online backup API, so a live workspace can be snapshotted
+    /// without stopping writers. Postgres has no built-in equivalent here and
+    /// refuses with a pointer to `pg_dump`/PITR rather than producing something
+    /// that only resembles a backup.
+    pub async fn backup_metadata(&self, dest: impl AsRef<Path>) -> Result<String> {
+        self.fs.meta.backup_to(dest.as_ref()).await
+    }
+
     pub async fn schema_version(&self) -> Result<i64> {
         self.fs.meta.schema_version().await
     }
@@ -1208,54 +1299,41 @@ impl Workspace {
     }
 }
 
-/// Read the per-store encryption salt from `cas_dir/keysalt`, creating it with 16
-/// fresh random bytes on first open.
+/// The per-store encryption salt, created with 16 fresh random bytes on first use.
 ///
-/// The salt is not secret, but the Argon2id key is derived from
-/// `passphrase + salt`, so it must stay stable for the life of the store and must
-/// survive a metadata-DB loss — hence it lives beside the content store, not in
-/// the DB. It is written with an exclusive `create_new`, so two processes opening
-/// the same fresh store concurrently can't settle on different salts: exactly one
-/// wins the create and the other re-reads the winner's file.
-async fn read_or_create_salt(cas_dir: &Path) -> Result<Vec<u8>> {
-    use tokio::io::AsyncWriteExt;
-    let path = cas_dir.join("keysalt");
-    match tokio::fs::read(&path).await {
-        Ok(salt) if !salt.is_empty() => return Ok(salt),
-        Ok(_) => {
-            return Err(OrigoFSError::Content(format!(
-                "encryption salt {} is empty (refusing to derive a key from it)",
-                path.display()
-            )));
+/// The salt is not secret — an Argon2id salt exists to make the *same* passphrase
+/// derive a *different* key in every store, which is what stops one cracked
+/// passphrase from unlocking all of them. But it must stay stable for the life of
+/// the store and must survive a metadata-database loss, so it lives beside the
+/// **content**, as a sidecar: outside the content-addressed namespace, so garbage
+/// collection never enumerates it and therefore cannot sweep it. Reclaiming the
+/// salt would render every object in the store permanently undecryptable.
+///
+/// Written create-if-absent, so two processes opening the same fresh store cannot
+/// each generate a salt and have the second silently invalidate the key the first
+/// already started writing with.
+///
+/// For a local store the sidecar is `<cas_dir>/keysalt`, which is exactly where
+/// the salt lived before — existing encrypted workspaces keep working unchanged.
+const KEYSALT: &str = "keysalt";
+
+async fn read_or_create_salt(content: &Content) -> Result<Vec<u8>> {
+    if let Some(salt) = content.get_sidecar(KEYSALT).await? {
+        if salt.is_empty() {
+            return Err(OrigoFSError::Content(
+                "the stored encryption salt is empty (refusing to derive a key from it)".into(),
+            ));
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        return Ok(salt);
     }
-    let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt)
+    let mut fresh = [0u8; 16];
+    getrandom::getrandom(&mut fresh)
         .map_err(|e| OrigoFSError::Content(format!("failed to generate encryption salt: {e}")))?;
-    match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .await
-    {
-        Ok(mut f) => {
-            f.write_all(&salt).await?;
-            f.flush().await?;
-            Ok(salt.to_vec())
-        }
-        // Lost the create race with a concurrent open: adopt the salt they wrote.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let salt = tokio::fs::read(&path).await?;
-            if salt.is_empty() {
-                return Err(OrigoFSError::Content(format!(
-                    "encryption salt {} is empty (refusing to derive a key from it)",
-                    path.display()
-                )));
-            }
-            Ok(salt)
-        }
-        Err(e) => Err(e.into()),
+    let stored = content.put_sidecar_if_absent(KEYSALT, &fresh).await?;
+    if stored.is_empty() {
+        return Err(OrigoFSError::Content(
+            "the stored encryption salt is empty (refusing to derive a key from it)".into(),
+        ));
     }
+    Ok(stored)
 }

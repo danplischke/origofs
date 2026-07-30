@@ -24,7 +24,7 @@ use futures::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{AsyncMessage, NoTls, Row};
+use tokio_postgres::{AsyncMessage, Row};
 
 const DIR_MODE: i64 = 0o040755;
 
@@ -56,20 +56,137 @@ pub struct PostgresMetadataStore {
     workspace_id: i64,
 }
 
+/// Environment variable naming a PEM bundle of extra CA certificates to trust,
+/// for a Postgres presenting a certificate from a private CA.
+pub const PG_CA_FILE_ENV: &str = "ORIGOFS_PG_CA_FILE";
+
+/// Read the PEM bundle at `path` into certificates.
+///
+/// A real CA bundle is rarely one bare certificate: it usually carries several,
+/// with OpenSSL's human-readable preamble between them and whatever trailing text
+/// the tool that concatenated it left behind. Every certificate in the file is
+/// returned and the surrounding noise ignored — stopping at the first non-PEM line
+/// would silently trust only part of the bundle, which surfaces much later as a
+/// server that inexplicably fails to verify.
+///
+/// A bundle that yields *nothing* usable is an error rather than a silent
+/// fall-back to the platform roots, since the operator named this file precisely
+/// because those roots are not enough.
+fn load_ca_bundle(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+
+    let pem = std::fs::read(path).map_err(|e| {
+        OrigoFSError::Metadata(format!("{PG_CA_FILE_ENV}: cannot read {path}: {e}"))
+    })?;
+    // Malformed entries are skipped rather than fatal, matching the tolerance
+    // applied to the platform root store.
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(&pem).flatten().collect();
+    if certs.is_empty() {
+        return Err(OrigoFSError::Metadata(format!(
+            "{PG_CA_FILE_ENV} ({path}) contains no certificates"
+        )));
+    }
+    Ok(certs)
+}
+
+/// Build the TLS connector every Postgres connection uses.
+///
+/// `tokio-postgres` ships only `NoTls`, and that is what origofs used — so it could
+/// not connect to any managed Postgres at all (RDS, Cloud SQL, Neon, and Supabase
+/// all require TLS), and where it could connect, every path, actor name, and hash
+/// crossed the network in cleartext.
+///
+/// Whether TLS is actually *used* stays the DSN's decision: `tokio-postgres`
+/// honours `sslmode`, so `disable` still connects in the clear (a unix socket or a
+/// loopback test), while `prefer` — the default — and `require` negotiate it.
+/// Handing over a connector only makes the option exist.
+///
+/// Certificates are verified against the platform root store, plus any bundle
+/// named by [`PG_CA_FILE_ENV`]. Note this is deliberately stricter than libpq,
+/// where `sslmode=require` encrypts but verifies *nothing*: a connection that
+/// can't be verified is refused rather than silently downgraded to an encrypted
+/// channel with an unauthenticated peer. Point [`PG_CA_FILE_ENV`] at your CA for a
+/// self-signed or private-CA server.
+fn tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        // A root the platform store offers but rustls rejects is skipped rather
+        // than fatal — one malformed system certificate must not make the database
+        // unreachable.
+        let _ = roots.add(cert);
+    }
+    if let Ok(path) = std::env::var(PG_CA_FILE_ENV) {
+        for cert in load_ca_bundle(&path)? {
+            roots
+                .add(cert)
+                .map_err(|e| OrigoFSError::Metadata(format!("{PG_CA_FILE_ENV} ({path}): {e}")))?;
+        }
+    }
+    if roots.is_empty() {
+        return Err(OrigoFSError::Metadata(format!(
+            "no trusted CA certificates: the platform root store is empty and \
+             {PG_CA_FILE_ENV} is unset, so no Postgres TLS certificate could be verified"
+        )));
+    }
+    // Name the provider rather than relying on a process-wide default: installing
+    // one is the binary's call, not a library's.
+    let cfg = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| OrigoFSError::Metadata(format!("rustls: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(cfg))
+}
+
 impl PostgresMetadataStore {
     /// Connect to Postgres. `dsn` is a libpq DSN or URL, e.g.
     /// `postgres://user:pass@host/db` or `host=/var/run/postgresql dbname=origofs`.
+    ///
+    /// TLS is negotiated per the DSN's `sslmode` (default `prefer`); see
+    /// [`tls_connector`] for the verification policy.
     pub async fn connect(dsn: &str) -> Result<Self> {
-        let cfg: tokio_postgres::Config = dsn.parse()?;
-        let mgr = Manager::new(cfg, NoTls);
-        // Bound acquisition: without a wait timeout, exhausting the pool makes
-        // `client()` hang forever instead of surfacing a retriable error. A
-        // runtime must be set for the timeouts to be enforced.
+        let mut cfg: tokio_postgres::Config = dsn.parse()?;
+        // An optional per-statement ceiling, so one pathological query can't pin a
+        // pooled connection for its whole lifetime. Off by default and deliberately
+        // so: origofs's statements are small, but a few (`truncate_tree` on a large
+        // working tree, a wide `list_dir`) legitimately run long, and a timeout
+        // that aborts a checkout is worse than one that never fires. Operators who
+        // want the ceiling set it; those who don't keep the old behaviour.
+        if let Ok(ms) = std::env::var("ORIGOFS_PG_STATEMENT_TIMEOUT_MS")
+            && ms.parse::<u64>().is_ok_and(|v| v > 0)
+        {
+            let existing = cfg.get_options().unwrap_or_default().to_string();
+            cfg.options(format!("{existing} -c statement_timeout={ms}").trim());
+        }
+        let mgr = Manager::new(cfg, tls_connector()?);
+        // Pool sizing is a deployment property, not a library constant: 16 is far
+        // too many for a dozen sidecars sharing one small database and far too few
+        // for a busy single writer. It was hardcoded with no way to change it.
+        fn env_usize(var: &str, default: usize) -> usize {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+        fn env_secs(var: &str, default: u64) -> std::time::Duration {
+            std::time::Duration::from_secs(
+                std::env::var(var)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(default),
+            )
+        }
         let pool = Pool::builder(mgr)
-            .max_size(16)
+            .max_size(env_usize("ORIGOFS_PG_POOL_SIZE", 16))
             .runtime(deadpool_postgres::Runtime::Tokio1)
-            .wait_timeout(Some(std::time::Duration::from_secs(10)))
-            .create_timeout(Some(std::time::Duration::from_secs(10)))
+            // Bound acquisition: without a wait timeout, exhausting the pool makes
+            // `client()` hang forever instead of surfacing a retriable error.
+            .wait_timeout(Some(env_secs("ORIGOFS_PG_WAIT_TIMEOUT_SECS", 10)))
+            .create_timeout(Some(env_secs("ORIGOFS_PG_CONNECT_TIMEOUT_SECS", 10)))
+            .recycle_timeout(Some(env_secs("ORIGOFS_PG_RECYCLE_TIMEOUT_SECS", 10)))
             .build()
             .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
         Ok(Self {
@@ -132,9 +249,12 @@ impl PostgresMetadataStore {
         after_seq: i64,
         branch: Option<String>,
     ) -> Result<EventSubscription> {
-        let (client, mut connection) = tokio_postgres::connect(&self.dsn, NoTls)
+        // A dedicated connection (pooled ones can't surface async notifications),
+        // over the same TLS policy as the pool.
+        let (client, mut connection) = tokio_postgres::connect(&self.dsn, tls_connector()?)
             .await
             .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
+        crate::metrics::record_feed_connect();
 
         // The connection future both drives the socket and surfaces async
         // NOTIFYs; forward each notification to the receiver as a bare wakeup.
@@ -244,6 +364,17 @@ impl EventSubscription {
         .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
 
         let events: Vec<Event> = rows.iter().map(row_to_event).collect();
+        // The feed's own health was invisible: a subscriber falling behind looked
+        // exactly like a quiet workspace. A full batch means there is more waiting,
+        // which is the signal that matters.
+        crate::metrics::record_feed_drain(
+            events.len() as u64,
+            if events.len() as i64 >= DRAIN_BATCH {
+                DRAIN_BATCH as u64
+            } else {
+                0
+            },
+        );
         // Advance past the max seq we *saw*, so a branch filter still moves the
         // cursor forward and we don't re-scan skipped rows on the next wake.
         if let Some(last) = events.last() {
@@ -395,9 +526,12 @@ impl PostgresMetadataStore {
     /// its own (`origin`) and any path it isn't hosting.
     pub async fn coedit_subscribe(&self) -> Result<CoeditRelaySub> {
         self.coedit_relay_init().await?;
-        let (client, mut connection) = tokio_postgres::connect(&self.dsn, NoTls)
+        // A dedicated connection (pooled ones can't surface async notifications),
+        // over the same TLS policy as the pool.
+        let (client, mut connection) = tokio_postgres::connect(&self.dsn, tls_connector()?)
             .await
             .map_err(|e| OrigoFSError::Metadata(e.to_string()))?;
+        crate::metrics::record_feed_connect();
 
         // Coalescing capacity-1 wakeups: a wake only means "re-drain", so a burst
         // collapses into one and the drained query stays the source of truth.
@@ -642,7 +776,29 @@ impl MetadataStore for PostgresMetadataStore {
         // transaction's statements run on this same connection; it returns to
         // the pool only on commit or rollback.
         let obj = self.client().await?;
-        obj.batch_execute("BEGIN").await?;
+        // The isolation level is stated rather than inherited. A bare `BEGIN`
+        // takes whatever `default_transaction_isolation` happens to be, which is
+        // a server/pooler setting an operator can change without ever seeing this
+        // code — so the level every invariant below is argued against would be
+        // silently swappable.
+        //
+        // READ COMMITTED is the right level *because* [`MetaTxn`] exposes no
+        // plain reads. Every method on it is a blind write or a conditional one
+        // (`cas_ref`, `set_content_if`, `resolve_suggestion`), so no flow depends
+        // on two statements seeing the same snapshot — which is the one thing
+        // READ COMMITTED does not give you. Cross-row invariants rest on those
+        // conditional writes, on unique indexes, and on `bump_counter`, none of
+        // which need snapshot isolation.
+        //
+        // Under READ COMMITTED a conditional `UPDATE … WHERE value = $expected`
+        // that collides re-reads the row after the other writer commits and
+        // re-evaluates the predicate, so the CAS decides on the latest committed
+        // value — exactly the semantics `cas_ref` needs. REPEATABLE READ would
+        // instead abort with `40001`, needing a retry to reach the same answer.
+        //
+        // **Keep `MetaTxn` write-only.** The moment a read lands on it, this
+        // argument stops holding and the level has to be revisited.
+        obj.batch_execute(BEGIN_TXN).await?;
         Ok(Box::new(PostgresTxn {
             obj: Some(obj),
             workspace_id: self.workspace_id,
@@ -849,6 +1005,17 @@ impl MetadataStore for PostgresMetadataStore {
                 "SELECT name FROM dentry WHERE parent_ino = $1 AND ino = $2
                  ORDER BY name LIMIT 1",
                 &[&parent, &ino],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    async fn parent_of(&self, ino: Ino) -> Result<Option<Ino>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT parent_ino FROM dentry WHERE ino = $1 LIMIT 1",
+                &[&ino],
             )
             .await?;
         Ok(row.map(|r| r.get(0)))
@@ -1674,6 +1841,17 @@ impl MetaTxn for PostgresTxn {
         Ok(())
     }
 
+    async fn adjust_nlink(&mut self, ino: Ino, delta: i64) -> Result<i64> {
+        let row = self
+            .conn()
+            .query_one(
+                "UPDATE inode SET nlink = nlink + $1 WHERE ino = $2 RETURNING nlink",
+                &[&delta, &ino],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
     async fn delete_inode(&mut self, ino: Ino) -> Result<()> {
         let c = self.conn();
         c.execute("DELETE FROM symlink WHERE ino = $1", &[&ino])
@@ -1683,7 +1861,58 @@ impl MetaTxn for PostgresTxn {
         Ok(())
     }
 
+    async fn delete_inode_if_childless(&mut self, ino: Ino) -> Result<bool> {
+        let c = self.conn();
+        // Claim the row *before* asking whether it has children, with the same
+        // statement `add_dentry` uses. This ordering is load-bearing and was
+        // arrived at empirically (`postgres_rmdir_racing_mkdir_never_orphans_a_dentry`):
+        // relying on the conditional delete alone is not enough, because when it
+        // blocks on a concurrent locker Postgres re-evaluates its qualification
+        // against the *updated row* but keeps the original snapshot for the
+        // `dentry` subquery — so the child that just committed stays invisible
+        // and the delete goes through anyway.
+        //
+        // Blocking on the claim instead moves the wait one statement earlier. In
+        // READ COMMITTED each statement takes a fresh snapshot, so by the time
+        // the delete below runs the inserter has committed and its child *is*
+        // visible. The other order is safe too: a claim that matches no row means
+        // the inode is already gone.
+        if c.execute("UPDATE inode SET nlink = nlink WHERE ino = $1", &[&ino])
+            .await?
+            == 0
+        {
+            return Ok(false);
+        }
+        let n = c
+            .execute(
+                "DELETE FROM inode WHERE ino = $1
+                   AND NOT EXISTS (SELECT 1 FROM dentry WHERE parent_ino = $1)",
+                &[&ino],
+            )
+            .await?;
+        if n == 1 {
+            c.execute("DELETE FROM symlink WHERE ino = $1", &[&ino])
+                .await?;
+        }
+        Ok(n == 1)
+    }
+
     async fn add_dentry(&mut self, parent: Ino, name: &str, ino: Ino) -> Result<()> {
+        // Claim the parent first — a self-update rather than a read, so it both
+        // proves the directory still exists inside this transaction and takes its
+        // row. A concurrent `rmdir` then blocks here and, on re-evaluating its
+        // conditional delete against the updated row, sees this child. See the
+        // trait method's docs.
+        if self
+            .conn()
+            .execute("UPDATE inode SET nlink = nlink WHERE ino = $1", &[&parent])
+            .await?
+            == 0
+        {
+            return Err(OrigoFSError::NotFound(format!(
+                "parent inode {parent} no longer exists"
+            )));
+        }
         match self
             .conn()
             .execute(
@@ -1750,6 +1979,127 @@ impl MetaTxn for PostgresTxn {
         Ok(row.get(0))
     }
 
+    async fn set_ref(&mut self, name: &str, value: &str) -> Result<()> {
+        let ws = self.workspace_id;
+        self.conn()
+            .execute(
+                "INSERT INTO ref(workspace_id, name, value) VALUES ($1, $2, $3)
+                 ON CONFLICT (workspace_id, name) DO UPDATE SET value = excluded.value",
+                &[&ws, &name, &value],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn cas_ref(&mut self, name: &str, expect: Option<&str>, new: &str) -> Result<bool> {
+        let ws = self.workspace_id;
+        let changed = match expect {
+            None => {
+                self.conn()
+                    .execute(
+                        "INSERT INTO ref(workspace_id, name, value) VALUES ($1, $2, $3)
+                         ON CONFLICT (workspace_id, name) DO NOTHING",
+                        &[&ws, &name, &new],
+                    )
+                    .await?
+            }
+            Some(v) => {
+                self.conn()
+                    .execute(
+                        "UPDATE ref SET value = $1
+                         WHERE workspace_id = $2 AND name = $3 AND value = $4",
+                        &[&new, &ws, &name, &v],
+                    )
+                    .await?
+            }
+        };
+        Ok(changed == 1)
+    }
+
+    async fn delete_ref(&mut self, name: &str) -> Result<()> {
+        let ws = self.workspace_id;
+        self.conn()
+            .execute(
+                "DELETE FROM ref WHERE workspace_id = $1 AND name = $2",
+                &[&ws, &name],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn set_conflict(&mut self, path: &str, kind: &str) -> Result<()> {
+        let ws = self.workspace_id;
+        self.conn()
+            .execute(
+                "INSERT INTO conflict(workspace_id, path, kind) VALUES ($1, $2, $3)
+                 ON CONFLICT (workspace_id, path) DO UPDATE SET kind = excluded.kind",
+                &[&ws, &path, &kind],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_conflicts(&mut self) -> Result<()> {
+        let ws = self.workspace_id;
+        self.conn()
+            .execute("DELETE FROM conflict WHERE workspace_id = $1", &[&ws])
+            .await?;
+        Ok(())
+    }
+
+    async fn set_config(&mut self, key: &str, value: &str) -> Result<()> {
+        let ws = self.workspace_id;
+        self.conn()
+            .execute(
+                "INSERT INTO config(workspace_id, key, value) VALUES ($1, $2, $3)
+                 ON CONFLICT (workspace_id, key) DO UPDATE SET value = excluded.value",
+                &[&ws, &key, &value],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn append_event(&mut self, ev: EventInit, ts: i64) -> Result<i64> {
+        let ws = self.workspace_id;
+        let row = self
+            .conn()
+            .query_one(
+                "INSERT INTO fs_event(workspace_id, actor_id, session_id, kind, path, detail, ts, branch)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING seq",
+                &[
+                    &ws,
+                    &ev.actor_id,
+                    &ev.session_id,
+                    &ev.kind,
+                    &ev.path,
+                    &ev.detail,
+                    &ts,
+                    &ev.branch,
+                ],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    async fn resolve_suggestion(
+        &mut self,
+        id: i64,
+        status: SuggestionStatus,
+        resolved_by: Option<i64>,
+        ts: i64,
+    ) -> Result<bool> {
+        let ws = self.workspace_id;
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE suggestion SET status = $1, resolved_by = $2, resolved_ts = $3
+                 WHERE id = $4 AND workspace_id = $5 AND status = 'pending'",
+                &[&status.as_str(), &resolved_by, &ts, &id, &ws],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
     async fn truncate_tree(&mut self) -> Result<()> {
         // Same as MetadataStore::truncate_tree, staged in this transaction.
         let ws = self.workspace_id;
@@ -1810,5 +2160,134 @@ fn row_to_suggestion(r: &Row) -> Suggestion {
         created_ts: r.get(9),
         resolved_ts: r.get(10),
         resolved_by: r.get(11),
+    }
+}
+
+/// The statement every [`MetaTxn`] opens with. Named so the isolation level is a
+/// single, testable fact rather than a string buried in one method — see the
+/// comment at its use site in `begin` for why READ COMMITTED is the level the
+/// design argues for, and `tests/postgres.rs` for the assertion that the server
+/// agrees.
+#[doc(hidden)]
+pub const BEGIN_TXN: &str = "BEGIN ISOLATION LEVEL READ COMMITTED";
+
+impl PostgresMetadataStore {
+    /// The isolation level the server reports for a transaction opened the way
+    /// [`MetadataStore::begin`] opens one. Test-only introspection.
+    #[doc(hidden)]
+    pub async fn begin_isolation_self(&self) -> Result<String> {
+        let c = self.client().await?;
+        c.batch_execute(BEGIN_TXN).await?;
+        let row = c.query_one("SHOW transaction_isolation", &[]).await?;
+        let level: String = row.get(0);
+        c.batch_execute("ROLLBACK").await?;
+        Ok(level)
+    }
+
+    /// Whether the server reports *this* pooled connection as TLS-encrypted.
+    /// Test-only introspection; not part of the `MetadataStore` contract.
+    #[doc(hidden)]
+    pub async fn server_ssl_self(&self) -> Result<bool> {
+        let c = self.client().await?;
+        let row = c
+            .query_one(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two self-signed CAs, long-lived so these tests do not rot. Only their
+    /// *parsing* is under test — nothing verifies a chain against them — so expiry
+    /// is deliberately not part of what is asserted.
+    const CA_ONE: &str = "-----BEGIN CERTIFICATE-----
+MIIBkzCCATmgAwIBAgIUPMPvouh0uiI6Tdl1TgfxVD0/lQkwCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTb3JpZ29mcy10ZXN0LWNhLW9uZTAgFw0yNjA3MzAxMTM4MzJa
+GA8yMTI2MDcwNjExMzgzMlowHjEcMBoGA1UEAwwTb3JpZ29mcy10ZXN0LWNhLW9u
+ZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABCb/5GuGDR/RqARGulE6Xkq472Qo
+ZtON09yucyiE7FNo4UPj1QAd9Sox/LOxNCCjrEeRWOvwBlL5A/McvDiG8WujUzBR
+MB0GA1UdDgQWBBQX6q4LfhrQjc9BZ10fapw3/+Nb6jAfBgNVHSMEGDAWgBQX6q4L
+fhrQjc9BZ10fapw3/+Nb6jAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gA
+MEUCIQDHHuR5h4aRnkw9Jbis3tuIK50Sl1Ddrc1oajCWPV5DXgIgSKKMVQnKufxA
+brgubkkchZOzzrml5MTLkzc216Exz+Y=
+-----END CERTIFICATE-----
+";
+
+    const CA_TWO: &str = "-----BEGIN CERTIFICATE-----
+MIIBlDCCATmgAwIBAgIUEy4wZSsI4c8c1kkdnsPm4U9QxLcwCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTb3JpZ29mcy10ZXN0LWNhLXR3bzAgFw0yNjA3MzAxMTM4MzJa
+GA8yMTI2MDcwNjExMzgzMlowHjEcMBoGA1UEAwwTb3JpZ29mcy10ZXN0LWNhLXR3
+bzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABOD6ti5O1W3/fvhoRWGz+ZtKCTn0
+c71ORnGd2om3M4zcVlJeOgwunK5tb2d/DA/zZ5XIVHmMsWRTqtGR2ofOiJKjUzBR
+MB0GA1UdDgQWBBRozCeGNdnnaZJ7YK0HfH3kmEhYqDAfBgNVHSMEGDAWgBRozCeG
+NdnnaZJ7YK0HfH3kmEhYqDAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kA
+MEYCIQC7A4rQxYlr7zsrAXK80KMBjisVJh+pA0qevSbuvvKERQIhAMLLUq5p6xCY
+yfosoM84rjsOMr7BDRLh0CR+NVw5yuPV
+-----END CERTIFICATE-----
+";
+
+    /// Every certificate in a bundle must be read, not just the first — and the
+    /// human-readable noise real bundles carry (OpenSSL's preamble, blank lines,
+    /// trailing text) must not cut the parse short. A bundle silently truncated to
+    /// its first certificate surfaces much later, as a server that inexplicably
+    /// fails to verify.
+    #[test]
+    fn a_multi_certificate_bundle_is_read_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.pem");
+        std::fs::write(
+            &path,
+            format!(
+                "# origofs test bundle\n\n{CA_ONE}\n\
+                 # a comment between the two certificates\n\n{CA_TWO}\n\
+                 trailing junk that is not a certificate\n"
+            ),
+        )
+        .unwrap();
+
+        let certs = load_ca_bundle(path.to_str().unwrap()).expect("bundle must parse");
+        assert_eq!(certs.len(), 2, "both certificates must be read");
+
+        // And both must be acceptable as roots, which is what they are read for.
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert).expect("a self-signed CA is a valid root");
+        }
+        assert_eq!(roots.len(), 2);
+    }
+
+    /// A bundle with nothing usable in it is an error, not a silent fall-back to
+    /// the platform roots — the operator named the file because those are not
+    /// enough.
+    #[test]
+    fn a_bundle_with_no_certificates_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("junk.pem");
+        std::fs::write(&path, b"not a certificate\n").unwrap();
+
+        let err = load_ca_bundle(path.to_str().unwrap()).expect_err("junk must be refused");
+        assert!(
+            err.to_string().contains("no certificates"),
+            "expected a clear parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_bundle_is_a_clean_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.pem");
+
+        let err =
+            load_ca_bundle(path.to_str().unwrap()).expect_err("a missing file must be refused");
+        assert!(
+            err.to_string().contains("cannot read"),
+            "expected a clear read error, got: {err}"
+        );
     }
 }

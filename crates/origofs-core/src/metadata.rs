@@ -33,6 +33,30 @@ pub trait MetadataStore: Send + Sync {
         self.schema_version().await.map(|_| ())
     }
 
+    /// Write a consistent snapshot of this store to `dest`, returning a
+    /// human-readable description of what was produced.
+    ///
+    /// The metadata store is the one part of a workspace the content store cannot
+    /// rebuild. `fsck --rebuild` recovers committed files, directories, symlinks,
+    /// and branches from the bucket alone — but blame, the audit log, the actor
+    /// registry, and every uncommitted edit exist *only* here. Three documents
+    /// (`CLAUDE.md`, `DESIGN.md` §7, `README.md`) all say to back this up, and
+    /// there was no way to.
+    ///
+    /// "Consistent" means concurrent writers are allowed: a snapshot must not
+    /// require the workspace to be stopped, or it will not be taken. The default
+    /// refuses rather than producing something that only looks like a backup —
+    /// a backup you cannot restore is worse than an absent one, because it is
+    /// discovered at the moment you need it.
+    async fn backup_to(&self, dest: &std::path::Path) -> Result<String> {
+        let _ = dest;
+        Err(crate::error::OrigoFSError::InvalidArgument(
+            "this metadata backend has no built-in backup; use the backend's own \
+             tooling (for Postgres: pg_dump, or continuous archiving/PITR)"
+                .into(),
+        ))
+    }
+
     /// Begin an atomic write transaction (`docs/DESIGN.md` §4b).
     ///
     /// A logical filesystem write is several statements — create an inode, link
@@ -127,6 +151,17 @@ pub trait MetadataStore: Send + Sync {
     /// gives `ino` several names in the same directory, the lexicographically
     /// first is returned so the mapping is deterministic.
     async fn dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>>;
+
+    /// The directory `ino` is linked into, or `None` for the root (or an inode
+    /// with no dentry).
+    ///
+    /// Lets an *inode-oriented* op walk **up** the tree — which the path API gets
+    /// for free from the path itself, but FUSE/NFS handlers do not. `rename`'s
+    /// "is the destination inside the thing I'm moving?" check needs it: without
+    /// an upward walk the only alternative is scanning the source's whole subtree
+    /// downward on every rename. Backed by `idx_dentry_ino`, so it is one indexed
+    /// lookup per level.
+    async fn parent_of(&self, ino: Ino) -> Result<Option<Ino>>;
 
     /// Number of entries directly under `parent`.
     async fn child_count(&self, parent: Ino) -> Result<usize>;
@@ -334,9 +369,59 @@ pub trait MetaTxn: Send {
     ) -> Result<bool>;
     /// Set an inode's link count.
     async fn set_nlink(&mut self, ino: Ino, nlink: i64) -> Result<()>;
+
+    /// Add `delta` to an inode's link count and return the new value.
+    ///
+    /// Prefer this over reading `nlink` and calling [`set_nlink`](Self::set_nlink)
+    /// with an absolute value. The read has to happen before the transaction (the
+    /// trait exposes no reads — see the note above), so two concurrent unlinks of
+    /// two hard links to one inode both read 2 and both write 1: both names go and
+    /// the inode is leaked at `nlink = 1` with nothing pointing at it, forever.
+    /// A delta computed by the database cannot lose an update that way.
+    ///
+    /// Latent today — nothing creates a second link — but it is the kind of thing
+    /// that is a silent leak the day a `link` op is added, and the delta form is
+    /// simpler than the read it replaces.
+    async fn adjust_nlink(&mut self, ino: Ino, delta: i64) -> Result<i64>;
+
+    /// Delete an inode **only if** no dentry names it as a parent, returning
+    /// whether it applied. `false` means the directory is not empty.
+    ///
+    /// `rmdir` cannot ask "is it empty?" and then delete: the answer is read
+    /// before the transaction opens, so a `mkdir` landing in between leaves its
+    /// dentry parented to an inode that no longer exists — a file that is in the
+    /// table and reachable from nothing.
+    ///
+    /// Implementations must claim the inode's row before testing emptiness, with
+    /// the same statement [`add_dentry`](Self::add_dentry) uses, so that the two
+    /// operations contend on one row. The conditional delete on its own is not
+    /// enough on Postgres; the backend implementations explain why, and
+    /// `postgres_rmdir_racing_mkdir_never_orphans_a_dentry` is the check.
+    ///
+    /// This is application-level integrity. A foreign key from
+    /// `dentry.parent_ino` to `inode.ino` would give it for free and in share
+    /// mode (so concurrent creates in one directory would stop serializing); the
+    /// schema declares no foreign keys at all today, which is why
+    /// `PRAGMA foreign_keys=ON` has nothing to enforce.
+    async fn delete_inode_if_childless(&mut self, ino: Ino) -> Result<bool>;
     /// Delete an inode (and any symlink row).
     async fn delete_inode(&mut self, ino: Ino) -> Result<()>;
     /// Link `name` in `parent` to `ino`. Errors if the name already exists.
+    /// Link `ino` into `parent` under `name`.
+    ///
+    /// Fails with [`OrigoFSError::NotFound`] if `parent` no longer exists, and —
+    /// this is the part that matters — takes the parent's row for update so that
+    /// an `rmdir` of it and this insert cannot both succeed. Callers resolve the
+    /// parent *before* the transaction, so without that contention a directory
+    /// removed in between leaves this dentry pointing at nothing: a row invisible
+    /// to `ls`, to `build_tree`, and to the GC mark, exactly like a `rename` into
+    /// its own descendant.
+    ///
+    /// The cost is that concurrent creates in one directory serialize on the
+    /// parent row. A foreign key from `dentry.parent_ino` to `inode.ino` would
+    /// buy the same guarantee in share mode, and is the better long-term answer;
+    /// the schema declares no foreign keys at all today, which is why
+    /// `PRAGMA foreign_keys=ON` has nothing to enforce.
     async fn add_dentry(&mut self, parent: Ino, name: &str, ino: Ino) -> Result<()>;
     /// Unlink `name` from `parent` (no-op if absent).
     async fn remove_dentry(&mut self, parent: Ino, name: &str) -> Result<()>;
@@ -352,6 +437,46 @@ pub trait MetaTxn: Send {
     /// concurrent reader never sees a half-emptied tree. Blame (keyed by content
     /// hash) is deliberately not cleared.
     async fn truncate_tree(&mut self) -> Result<()>;
+    // --- refs, conflicts, config, feed, suggestions -------------------------
+    //
+    // These exist so a *logical* operation can be one transaction. Without them
+    // `commit`, `checkout`, `merge`, and `accept_suggestion` each had to touch the
+    // working tree in a transaction and then make several further writes outside
+    // it, so an interruption between the parts left the workspace in a state no
+    // caller could produce deliberately: a branch advanced onto a tree that was
+    // never materialized, conflict markers with no `MERGE_HEAD`, a suggestion
+    // still `Pending` after its edit had landed. See `docs/DESIGN.md` §7's
+    // "torn multi-step mutations".
+
+    /// Set (or replace) a ref, as part of this transaction.
+    async fn set_ref(&mut self, name: &str, value: &str) -> Result<()>;
+    /// Compare-and-set a ref (`expect` `None` = "must not exist"), returning
+    /// whether it applied. The branch advance every commit/merge is built on.
+    async fn cas_ref(&mut self, name: &str, expect: Option<&str>, new: &str) -> Result<bool>;
+    /// Delete a ref (no-op if absent).
+    async fn delete_ref(&mut self, name: &str) -> Result<()>;
+    /// Record a merge conflict at `path`.
+    async fn set_conflict(&mut self, path: &str, kind: &str) -> Result<()>;
+    /// Drop every recorded conflict.
+    async fn clear_conflicts(&mut self) -> Result<()>;
+    /// Set a config value (the ref-mirror generation pointer, versioning mode…).
+    async fn set_config(&mut self, key: &str, value: &str) -> Result<()>;
+    /// Append a change-feed event, returning its sequence number.
+    ///
+    /// In the transaction so a subscriber cannot observe an event for a mutation
+    /// that rolled back, nor miss one that committed — the feed is a log of
+    /// *applied* state or it is not trustworthy.
+    async fn append_event(&mut self, ev: EventInit, ts: i64) -> Result<i64>;
+    /// Transition a suggestion out of `pending`, returning whether it applied
+    /// (`false` means someone else resolved it first).
+    async fn resolve_suggestion(
+        &mut self,
+        id: i64,
+        status: SuggestionStatus,
+        resolved_by: Option<i64>,
+        ts: i64,
+    ) -> Result<bool>;
+
     /// Commit every staged mutation atomically. Consumes the transaction.
     async fn commit(self: Box<Self>) -> Result<()>;
 }
@@ -368,6 +493,9 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn ping(&self) -> Result<()> {
         (**self).ping().await
+    }
+    async fn backup_to(&self, dest: &std::path::Path) -> Result<String> {
+        (**self).backup_to(dest).await
     }
     async fn begin(&self) -> Result<Box<dyn MetaTxn>> {
         (**self).begin().await
@@ -412,6 +540,9 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
         (**self).dentry_name(parent, ino).await
+    }
+    async fn parent_of(&self, ino: Ino) -> Result<Option<Ino>> {
+        (**self).parent_of(ino).await
     }
     async fn child_count(&self, parent: Ino) -> Result<usize> {
         (**self).child_count(parent).await

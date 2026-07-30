@@ -21,8 +21,25 @@ object_store = { version = "0.12", features = ["aws", "gcp"] }
 # across `.await`s; `send_guard` makes that guard `Send` so the transaction
 # future stays `Send`. Both are needed for the SQLite `MetaTxn` (C1).
 parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+# `backup` is SQLite's online-backup API: a consistent snapshot of a *live*
+# database, which a plain file copy is not. The metadata DB is the one thing the
+# content store cannot rebuild (blame, the audit log, actors, uncommitted edits),
+# so backing it up correctly matters more than anything else here.
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+# TLS for Postgres. `tokio-postgres` ships only `NoTls`, so a connector has to be
+# supplied to reach any managed Postgres (RDS, Cloud SQL, Neon, Supabase all
+# require it) — and without one, metadata crosses the network in cleartext.
+# rustls and the native root store are already in the tree via `object_store`, so
+# this adds a connector and no new TLS stack. `ring` is named explicitly so the
+# client config picks its provider rather than depending on a process-wide
+# default a *library* has no business installing. PEM parsing for the CA bundle
+# comes from `rustls::pki_types::pem` rather than `rustls-pemfile`: the latter is
+# unmaintained (RUSTSEC-2025-0134) and 2.x is only a thin wrapper over this same
+# code, so using it directly drops a dependency instead of adding one.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 similar = "3.1.1"
+tokio-postgres-rustls = "0.13"
 thiserror = "2.0.19"
 # Metrics facade — the numeric counterpart to `tracing`. Same emit-only deal: the
 # library only *records*; it installs no exporter and starts no server, so with no
@@ -49,6 +66,9 @@ coedit = ["dep:yrs"]
 metrics = ["dep:metrics"]
 
 [dev-dependencies]
+# pack.rs wraps a backend to inject a mid-repack failure, which needs the same
+# `#[async_trait]` the ContentStore trait is declared with.
+async-trait = "0.1.91"
 criterion = "0.5.1"
 proptest = "1"
 tempfile = "3.27.0"

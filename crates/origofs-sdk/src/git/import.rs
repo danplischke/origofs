@@ -8,18 +8,22 @@
 //! lossless. Packed objects are out of scope for this milestone — freshly
 //! committed and freshly exported repos keep their objects loose.
 
-use super::object::{ObjectFormat, parse_commit, parse_tree, read_loose};
+use super::object::{ObjectFormat, ParsedCommit, parse_commit, parse_tree, read_loose};
 use crate::Workspace;
 use async_recursion::async_recursion;
 use origofs_core::error::{OrigoFSError, Result};
 use origofs_core::objectgraph::{Commit, Tree, TreeEntry, TreeKind};
 use origofs_core::types::Hash;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Import `branch` from the git repository at `dir` into the workspace, then
 /// check it out. Returns the origofs commit hash of the imported head.
 pub async fn import_git(ws: &Workspace, dir: &Path, branch: &str) -> Result<Hash> {
+    // `resolve_head` joins this onto `refs/heads/`, so an absolute or `..`-bearing
+    // name would read a file outside the repository — and the first line of
+    // whatever it read comes back in the "unrecognized object id" error.
+    origofs_core::validate_ref_name(branch)?;
     let git_dir = if dir.join(".git").is_dir() {
         dir.join(".git")
     } else {
@@ -36,7 +40,7 @@ pub async fn import_git(ws: &Workspace, dir: &Path, branch: &str) -> Result<Hash
         commits: HashMap::new(),
         trees: HashMap::new(),
     };
-    let head = im.import_commit(&head_hex).await?;
+    let head = im.import_history(&head_hex).await?;
 
     ws.fs().set_branch(branch, head).await?;
     ws.checkout(branch).await?;
@@ -75,40 +79,104 @@ struct Importer<'a> {
     trees: HashMap<String, Hash>,
 }
 
+/// Ceiling on directory nesting during import. Deeper than any real source tree
+/// (git's own index format caps paths well below this), and low enough that the
+/// bounded recursion below cannot exhaust the stack.
+const MAX_TREE_DEPTH: usize = 128;
+
 impl Importer<'_> {
-    #[async_recursion]
-    async fn import_commit(&mut self, oid_hex: &str) -> Result<Hash> {
-        if let Some(h) = self.commits.get(oid_hex) {
-            return Ok(*h);
-        }
+    /// Read and parse a commit object, checking it really is one.
+    fn read_commit(&self, oid_hex: &str) -> Result<ParsedCommit> {
         let (kind, payload) = read_loose(&self.git_dir, oid_hex)?;
         if kind != "commit" {
             return Err(OrigoFSError::Content(format!(
                 "{oid_hex} is a {kind}, not a commit"
             )));
         }
-        let parsed = parse_commit(&payload)?;
-
-        let mut parents = Vec::with_capacity(parsed.parents.len());
-        for p in &parsed.parents {
-            parents.push(self.import_commit(p).await?);
-        }
-        let tree = self.import_tree(&parsed.tree).await?;
-
-        let commit = Commit {
-            tree,
-            parents,
-            author: parsed.author,
-            message: parsed.message.trim_end_matches('\n').to_string(),
-            timestamp: parsed.timestamp,
-        };
-        let hash = self.ws.fs().put_object(&commit.encode()).await?;
-        self.commits.insert(oid_hex.to_string(), hash);
-        Ok(hash)
+        parse_commit(&payload)
     }
 
+    /// Import `head_hex` and every commit it reaches, returning the head's hash.
+    ///
+    /// Iterative rather than recursive. History length is unbounded in ordinary
+    /// use — a linear history of tens of thousands of commits is unremarkable —
+    /// and one nested boxed future per commit is one stack frame chain per commit,
+    /// so recursion overflowed the stack (a `SIGSEGV`, not a catchable error) on
+    /// perfectly benign repositories as well as crafted ones.
+    ///
+    /// Termination does not depend on a visited-set alone: `read_loose` verifies
+    /// each object against its oid, so the graph cannot contain a cycle.
+    async fn import_history(&mut self, head_hex: &str) -> Result<Hash> {
+        // Post-order DFS with an explicit stack: a commit is emitted only after
+        // every parent it reaches, so each import below finds its parents done.
+        let mut stack: Vec<(String, bool)> = vec![(head_hex.to_string(), false)];
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut parsed: HashMap<String, ParsedCommit> = HashMap::new();
+
+        while let Some((oid, expanded)) = stack.pop() {
+            if expanded {
+                order.push(oid);
+                continue;
+            }
+            if self.commits.contains_key(&oid) || !seen.insert(oid.clone()) {
+                continue;
+            }
+            let c = self.read_commit(&oid)?;
+            stack.push((oid.clone(), true));
+            for p in &c.parents {
+                if !self.commits.contains_key(p) && !seen.contains(p) {
+                    stack.push((p.clone(), false));
+                }
+            }
+            parsed.insert(oid, c);
+        }
+
+        let mut head = None;
+        for oid in order {
+            let c = parsed
+                .remove(&oid)
+                .expect("every emitted commit was parsed on the way down");
+            let parents = c
+                .parents
+                .iter()
+                .map(|p| {
+                    self.commits.get(p).copied().ok_or_else(|| {
+                        OrigoFSError::Content(format!("commit {oid} parent {p} not imported"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let tree = self.import_tree(&c.tree, 0).await?;
+            let commit = Commit {
+                tree,
+                parents,
+                author: c.author,
+                message: c.message.trim_end_matches('\n').to_string(),
+                timestamp: c.timestamp,
+            };
+            let hash = self.ws.fs().put_object(&commit.encode()).await?;
+            self.commits.insert(oid, hash);
+            head = Some(hash);
+        }
+        // `head_hex` may already have been imported by an earlier call, in which
+        // case the walk emitted nothing.
+        match head {
+            Some(h) => Ok(h),
+            None => self.commits.get(head_hex).copied().ok_or_else(|| {
+                OrigoFSError::Content(format!("commit {head_hex} was not imported"))
+            }),
+        }
+    }
+
+    /// Trees stay recursive — nesting is directory depth, not history length — but
+    /// bounded, so a crafted repository can't drive the stack down 100k levels.
     #[async_recursion]
-    async fn import_tree(&mut self, oid_hex: &str) -> Result<Hash> {
+    async fn import_tree(&mut self, oid_hex: &str, depth: usize) -> Result<Hash> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(OrigoFSError::Content(format!(
+                "git tree nesting exceeds {MAX_TREE_DEPTH} levels at {oid_hex}"
+            )));
+        }
         if let Some(h) = self.trees.get(oid_hex) {
             return Ok(*h);
         }
@@ -125,7 +193,7 @@ impl Importer<'_> {
                     name: e.name,
                     mode: 0o40755,
                     kind: TreeKind::Dir,
-                    hash: self.import_tree(&e.oid_hex).await?,
+                    hash: self.import_tree(&e.oid_hex, depth + 1).await?,
                 },
                 "120000" => {
                     let target = self.read_blob(&e.oid_hex)?;

@@ -77,7 +77,7 @@ async fn gc_keeps_pending_suggestion_content() {
         .unwrap();
 
     // A GC pass on the (otherwise quiescent) store must keep the proposed blob.
-    fs.gc().await.unwrap();
+    fs.gc_with_grace(0).await.unwrap();
 
     assert!(fs.suggestion_diff(sid).await.unwrap().contains("+two"));
     fs.accept_suggestion(sid, WriteCtx::actor(reviewer))
@@ -179,6 +179,141 @@ async fn traversal_path_components_are_rejected_everywhere() {
     fs.mkdir_p("/real/dir").await.unwrap();
     fs.write("/real/dir/f", b"ok").await.unwrap();
     assert_eq!(&fs.read("/real/dir/f").await.unwrap()[..], b"ok");
+}
+
+// SEC: ref names are the *other* half of the traversal story. A branch name is
+// written to the ref table as a plain key, but the git-interop layer turns it back
+// into a host path (`refs/heads/<name>`) and interpolates it into `HEAD` — so an
+// absolute or `..`-bearing name writes outside the exported repository, and an
+// embedded newline injects a second line into `HEAD`. Reject at the door, so a
+// hostile name can never be stored.
+#[tokio::test]
+async fn hostile_ref_names_are_rejected_everywhere() {
+    let fs = fixture().await;
+    fs.write("/f", b"hi").await.unwrap();
+    fs.commit("a", "c1").await.unwrap();
+
+    let hostile = [
+        "/etc/cron.d/pwn", // absolute: `Path::join` discards the base
+        "../../../../home/u/.ssh/authorized_keys", // climbs out of refs/heads
+        "a/../../b",       // traversal mid-name
+        "main\nref: refs/heads/evil", // newline injects a line into HEAD
+        "main\0evil",      // NUL
+        "-delete",         // reads as a flag to anything forwarding it
+        "feature branch",  // whitespace
+        "refs/heads/",     // trailing slash -> empty component
+        "a//b",            // empty component
+        "x.lock",          // git refuses; would collide with its locks
+        "he^ad",           // refspec metacharacter
+        "v1..v2",          // range syntax
+        "@{now}",          // reflog syntax
+        ".",
+        "..",
+        "",
+    ];
+    for bad in hostile {
+        assert!(
+            fs.create_branch(bad).await.is_err(),
+            "create_branch should reject {bad:?}"
+        );
+        assert!(
+            fs.set_branch(bad, Hash::of(b"x")).await.is_err(),
+            "set_branch should reject {bad:?}"
+        );
+        assert!(
+            fs.cas_branch(bad, None, Hash::of(b"x")).await.is_err(),
+            "cas_branch should reject {bad:?}"
+        );
+        assert!(
+            fs.checkout(bad).await.is_err(),
+            "checkout should reject {bad:?}"
+        );
+        // Nothing hostile reached the ref table by any of those doors.
+        assert!(
+            fs.branch_head(bad).await.unwrap().is_none(),
+            "{bad:?} must not have been stored"
+        );
+    }
+
+    // Ordinary names — including the ones that merely *look* like the rejected
+    // ones — still work, so the rule isn't over-broad.
+    for ok in [
+        "dev",
+        "feature/login",
+        "release-1.2",
+        "fix.2",
+        "user/x/deep/name",
+    ] {
+        fs.create_branch(ok)
+            .await
+            .unwrap_or_else(|e| panic!("create_branch should accept {ok:?}: {e}"));
+        fs.checkout(ok).await.unwrap();
+    }
+    // The internal refs satisfy the same rule, so they need no carve-out.
+    origofs_core::validate_ref_name("HEAD").unwrap();
+    origofs_core::validate_ref_name("MERGE_HEAD").unwrap();
+}
+
+// SEC: the *third* traversal door. Path components are validated on the way in
+// and ref names at the ref table — but a tree entry's name arrives from the
+// content store, and `materialize_into_txn` fed it straight to `add_dentry`. An
+// object's address proves its bytes are what was written, not that the writer was
+// honest: a tree from a shared bucket, a `git import`, or a `resync` peer can name
+// an entry `..`. Checkout/merge/rebuild must refuse it, and leave the working tree
+// alone when they do.
+#[tokio::test]
+async fn hostile_tree_entry_names_are_rejected_on_materialize() {
+    use origofs_core::{Commit, Tree, TreeEntry, TreeKind};
+
+    for bad in ["..", ".", "a/b", "x\0y", ""] {
+        let fs = fixture().await;
+        fs.write("/legit", b"original").await.unwrap();
+        fs.commit("a", "base").await.unwrap();
+
+        // A real manifest for the hostile entry to point at: write a file the
+        // ordinary way and reuse its content address.
+        fs.write("/payload-src", b"payload").await.unwrap();
+        let mhash = fs.stat("/payload-src").await.unwrap().content.unwrap();
+        let tree = Tree {
+            entries: vec![TreeEntry {
+                name: bad.to_string(),
+                mode: 0o100644,
+                kind: TreeKind::File,
+                hash: mhash,
+            }],
+        };
+        let tree_hash = fs.put_object(&tree.encode()).await.unwrap();
+        let commit = Commit {
+            tree: tree_hash,
+            parents: vec![],
+            author: "attacker".into(),
+            message: "poisoned tree".into(),
+            timestamp: 0,
+        };
+        let chash = fs.put_object(&commit.encode()).await.unwrap();
+        fs.set_branch("evil", chash).await.unwrap();
+
+        let err = fs.checkout("evil").await;
+        assert!(
+            matches!(err, Err(OrigoFSError::InvalidPath(_))),
+            "checkout of a tree naming {bad:?} should be rejected, got {err:?}"
+        );
+
+        // The transaction rolled back: the pre-existing tree is intact and the
+        // hostile name was never stored.
+        assert_eq!(&fs.read("/legit").await.unwrap()[..], b"original");
+        let names: Vec<String> = fs
+            .ls("/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.iter().all(|n| n == "legit" || n == "payload-src"),
+            "no entry from the poisoned tree may survive, got {names:?}"
+        );
+    }
 }
 
 // SEC (security audit #4): the object-graph decoders must bound their
@@ -430,4 +565,53 @@ async fn names_are_byte_exact_no_unicode_normalization_or_casefold() {
         .unwrap()
         .ino;
     assert_ne!(upper, lower, "case variants must be separate inodes");
+}
+
+// SEC/L: renaming a directory *into itself* must be refused (POSIX `EINVAL`).
+//
+// `rename("/a", "/a/b/a2")` makes `a` a child of its own child. The subtree is
+// then unreachable from the root, so it disappears from `ls` and from
+// `build_tree` — and, decisively, from `mark_working`, which is what GC uses to
+// decide what is live. So an ordinary `mv` silently destroyed data: the rows
+// stayed in the database while GC reclaimed all of the content they pointed at.
+#[tokio::test]
+async fn rename_into_own_descendant_is_refused() {
+    let fs = fixture().await;
+    fs.mkdir_p("/a/b/deep").await.unwrap();
+    fs.write("/a/payload.txt", b"precious").await.unwrap();
+
+    for (from, to) in [("/a", "/a/b/a2"), ("/a", "/a/a2"), ("/a/b", "/a/b/deep/x")] {
+        let err = fs.rename(from, to).await;
+        assert!(
+            matches!(err, Err(OrigoFSError::InvalidArgument(_))),
+            "rename({from:?}, {to:?}) must be refused, got {err:?}"
+        );
+    }
+
+    // Still reachable and intact, and — the part that mattered — still live as
+    // far as GC is concerned.
+    assert_eq!(&fs.read("/a/payload.txt").await.unwrap()[..], b"precious");
+    fs.gc_with_grace(0).await.unwrap();
+    assert_eq!(
+        &fs.read("/a/payload.txt").await.unwrap()[..],
+        b"precious",
+        "content of a subtree that a refused rename would have orphaned"
+    );
+
+    // The inode surface (FUSE/NFS `mv`) reaches the same cycle.
+    let a = fs.vfs_lookup(INO_ROOT, "a").await.unwrap().unwrap().ino;
+    let b = fs.vfs_lookup(a, "b").await.unwrap().unwrap().ino;
+    let err = fs.vfs_rename(INO_ROOT, "a", b, "a2").await;
+    assert!(
+        matches!(err, Err(OrigoFSError::InvalidArgument(_))),
+        "vfs_rename into a descendant must be refused, got {err:?}"
+    );
+
+    // Ordinary moves — including into a sibling and back out of a subtree — still
+    // work, so the guard isn't over-broad.
+    fs.mkdir_p("/elsewhere").await.unwrap();
+    fs.rename("/a/b", "/elsewhere/b").await.unwrap();
+    fs.rename("/elsewhere", "/moved").await.unwrap();
+    assert!(fs.stat("/moved/b").await.is_ok());
+    assert_eq!(&fs.read("/a/payload.txt").await.unwrap()[..], b"precious");
 }

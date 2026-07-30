@@ -5,7 +5,7 @@
 #   docker compose up --build
 #   curl localhost:8080/readyz          # -> {"ready":true,...}
 #   curl -H 'Authorization: Bearer demo-token' \
-#        -X PUT --data-binary 'hello' localhost:8080/files/notes/a.txt
+#        -X PUT --data-binary 'hello' localhost:8080/v1/files/notes/a.txt
 #
 # Content uses the *unpacked* S3 layout so every writer's state lives entirely in
 # the bucket + database; the packed layout keeps a local per-chunk index, which a
@@ -55,6 +55,7 @@ services:
   # One-shot: create the demo actor. On a fresh database the first human actor is
   # id 1, which the serve command below maps its bearer token to.
   origofs-init:
+    image: origofs:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -72,6 +73,7 @@ services:
        "actor", "demo-human"]
 
   origofs:
+    image: origofs:latest
     build:
       context: .
       dockerfile: Dockerfile

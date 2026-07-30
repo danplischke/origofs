@@ -408,9 +408,20 @@ fn resolve_mirror(
     let mut branches: Vec<(String, Hash)> = Vec::new();
     for (name, value) in &snap.refs {
         if name == HEAD {
-            head_target = value.strip_prefix("ref:").map(str::to_string);
+            // The mirror is bytes from the content store, which a rebuild may be
+            // pointed at without trusting it. A `HEAD` naming `../..` would escape
+            // when the git layer writes `refs/heads/<name>`, so drop it and let
+            // `pick_checkout` fall back to a real branch.
+            head_target = value
+                .strip_prefix("ref:")
+                .filter(|b| crate::engine::validate_ref_name(b).is_ok())
+                .map(str::to_string);
         } else if name == MERGE_HEAD || name == WORKSPACE_MIRROR_KEY {
             continue; // an in-progress merge / the workspace-name tag, not a branch
+        } else if crate::engine::validate_ref_name(name).is_err() {
+            // Skip rather than abort: a rebuild is a recovery tool, and one
+            // poisoned ref must not cost the operator every other branch.
+            continue;
         } else if let Some(h) = Hash::from_hex(value)
             && commits.contains_key(&h)
         {

@@ -265,6 +265,120 @@ async fn modify_delete_conflicts() {
     assert_eq!(&fs.read("/f").await.unwrap()[..], b"hello");
 }
 
+/// `merge_base` must return the **fork point**, not some older shared commit.
+///
+/// Every other three-way test here forks after a single commit, so the only common
+/// ancestor is that commit and any ranking rule looks correct. With more than one
+/// commit of shared trunk, ranking common ancestors by hop distance picks the root
+/// (a common ancestor of every pair) instead of the fork point.
+#[tokio::test]
+async fn merge_base_is_the_fork_point_not_the_root() {
+    let fs = fixture().await;
+
+    fs.write("/f", b"c1").await.unwrap();
+    let c1 = fs.commit("a", "c1").await.unwrap();
+    fs.write("/f", b"c2").await.unwrap();
+    let c2 = fs.commit("a", "c2").await.unwrap();
+    fs.write("/f", b"c3").await.unwrap();
+    let fork = fs.commit("a", "c3 (fork point)").await.unwrap();
+
+    fs.create_branch("dev").await.unwrap();
+    fs.checkout("dev").await.unwrap();
+    fs.write("/dev-only", b"d").await.unwrap();
+    let theirs = fs.commit("a", "on dev").await.unwrap();
+
+    fs.checkout("main").await.unwrap();
+    fs.write("/main-only", b"m").await.unwrap();
+    let ours = fs.commit("a", "on main").await.unwrap();
+
+    assert_eq!(
+        fs.merge_base(ours, theirs).await.unwrap(),
+        Some(fork),
+        "merge base must be the fork point, not an older shared commit"
+    );
+    // Sanity: the older trunk commits really are common ancestors, so this is a
+    // choice among several and not a one-candidate accident.
+    assert!(fs.is_ancestor(c1, ours).await.unwrap());
+    assert!(fs.is_ancestor(c1, theirs).await.unwrap());
+    assert!(fs.is_ancestor(c2, theirs).await.unwrap());
+}
+
+/// The consequence of a stale merge base: a file created on the trunk *before* the
+/// fork and deleted on one side is **resurrected** by the merge.
+///
+/// With the correct base the entry is present in it, so `b == Some(te)` reads as
+/// "theirs never touched it, ours deleted it" and the delete wins. With the root as
+/// the base the entry is absent, so the same state reads as "they added it and we
+/// never had it" and the file comes back.
+#[tokio::test]
+async fn merge_does_not_resurrect_a_file_deleted_after_the_fork() {
+    let fs = fixture().await;
+
+    fs.write("/keep", b"keep").await.unwrap();
+    fs.commit("a", "root").await.unwrap();
+    // Created on the trunk, one commit *after* the root — so it exists at the fork
+    // point but not at the root.
+    fs.write("/doomed", b"doomed").await.unwrap();
+    fs.commit("a", "add doomed").await.unwrap();
+
+    fs.create_branch("dev").await.unwrap();
+    fs.checkout("dev").await.unwrap();
+    fs.write("/dev-only", b"d").await.unwrap();
+    let theirs = fs.commit("a", "on dev (doomed untouched)").await.unwrap();
+
+    fs.checkout("main").await.unwrap();
+    fs.remove("/doomed").await.unwrap();
+    fs.commit("a", "delete doomed").await.unwrap();
+
+    match fs.merge(theirs, "a", "merge dev").await.unwrap() {
+        MergeOutcome::Merged(_) => {}
+        other => panic!("expected a clean merge, got {other:?}"),
+    }
+    assert!(
+        fs.stat("/doomed").await.is_err(),
+        "a file deleted on our side and untouched on theirs must stay deleted"
+    );
+    assert_eq!(&fs.read("/dev-only").await.unwrap()[..], b"d");
+    assert_eq!(&fs.read("/keep").await.unwrap()[..], b"keep");
+}
+
+/// A criss-cross history has several maximal common ancestors. We don't build a
+/// virtual recursive base, but the choice must be **deterministic** — the same pair
+/// of commits must always produce the same base, or a merge isn't reproducible.
+#[tokio::test]
+async fn merge_base_is_deterministic_on_a_criss_cross() {
+    let fs = fixture().await;
+
+    fs.write("/f", b"root").await.unwrap();
+    fs.commit("a", "root").await.unwrap();
+    fs.create_branch("dev").await.unwrap();
+
+    fs.checkout("dev").await.unwrap();
+    fs.write("/d", b"1").await.unwrap();
+    let d1 = fs.commit("a", "d1").await.unwrap();
+
+    fs.checkout("main").await.unwrap();
+    fs.write("/m", b"1").await.unwrap();
+    fs.commit("a", "m1").await.unwrap();
+    // Cross-merge both ways, so each side has the other as an ancestor.
+    fs.merge(d1, "a", "main <- dev").await.unwrap();
+    let m2 = fs.head_commit().await.unwrap().unwrap();
+
+    fs.checkout("dev").await.unwrap();
+    fs.write("/d", b"2").await.unwrap();
+    let d2 = fs.commit("a", "d2").await.unwrap();
+
+    let first = fs.merge_base(m2, d2).await.unwrap();
+    assert!(first.is_some(), "a criss-cross still has a common ancestor");
+    for _ in 0..8 {
+        assert_eq!(
+            fs.merge_base(m2, d2).await.unwrap(),
+            first,
+            "merge base must not depend on hash-set iteration order"
+        );
+    }
+}
+
 #[tokio::test]
 async fn locks_are_exclusive() {
     let fs = fixture().await;

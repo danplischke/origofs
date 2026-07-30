@@ -2,6 +2,13 @@
 //! is reclaimed, while everything reachable from a ref or the live working tree
 //! survives — verified against both the in-memory and on-disk content stores.
 
+//! These call `gc_with_grace(0)`, which disables the age gate. That is the right
+//! model here — each test quiesces the store before collecting — and it also makes
+//! the *preservation* assertions stronger: content survives because it is
+//! reachable, not merely because it is young. The one test that races GC against a
+//! live writer deliberately keeps the production default, since the grace is
+//! exactly what makes that safe.
+
 use origofs_core::{ContentStore, Fs, LocalCasStore, MemStore, SqliteMetadataStore};
 use std::sync::Arc;
 
@@ -39,7 +46,7 @@ async fn reclaims_uncommitted_churn_keeps_live_body() {
     let after_v2 = store.len();
     assert!(after_v2 > after_v1, "v2 added distinct objects");
 
-    let stats = fs.gc().await.unwrap();
+    let stats = fs.gc_with_grace(0).await.unwrap();
 
     // Every v1 object was unreachable and reclaimed; only v2's remain.
     assert_eq!(stats.deleted, after_v1, "all of v1 collected");
@@ -51,7 +58,7 @@ async fn reclaims_uncommitted_churn_keeps_live_body() {
     assert_eq!(&fs.read("/a.bin").await.unwrap()[..], &v2[..]);
 
     // GC is idempotent: a second pass finds nothing to reclaim.
-    let again = fs.gc().await.unwrap();
+    let again = fs.gc_with_grace(0).await.unwrap();
     assert_eq!(again.deleted, 0);
 }
 
@@ -68,7 +75,7 @@ async fn committed_content_survives_working_tree_moving_on() {
     fs.write("/a.bin", &y).await.unwrap(); // uncommitted
     fs.write("/a.bin", &z).await.unwrap(); // orphans y; z is the live body
 
-    let stats = fs.gc().await.unwrap();
+    let stats = fs.gc_with_grace(0).await.unwrap();
     assert!(stats.deleted > 0, "the orphaned y body was reclaimed");
 
     // Working tree is untouched.
@@ -88,7 +95,7 @@ async fn gc_never_touches_a_clean_committed_workspace() {
     fs.commit("alice", "snapshot").await.unwrap();
 
     let before = store.len();
-    let stats = fs.gc().await.unwrap();
+    let stats = fs.gc_with_grace(0).await.unwrap();
     assert_eq!(stats.deleted, 0, "nothing reachable was collected");
     assert_eq!(store.len(), before);
     assert_eq!(&fs.read("/dir/a.txt").await.unwrap()[..], b"alpha");
@@ -108,14 +115,14 @@ async fn reclaims_on_the_local_on_disk_store() {
     fs.write("/big.bin", &v2).await.unwrap();
 
     let before = store.list().await.unwrap().len();
-    let stats = fs.gc().await.unwrap();
+    let stats = fs.gc_with_grace(0).await.unwrap();
     assert!(stats.deleted > 0);
     assert!(stats.bytes_freed >= 300 * 1024);
     assert_eq!(store.list().await.unwrap().len(), before - stats.deleted);
 
     // Body still intact, and a re-run is a no-op.
     assert_eq!(&fs.read("/big.bin").await.unwrap()[..], &v2[..]);
-    assert_eq!(fs.gc().await.unwrap().deleted, 0);
+    assert_eq!(fs.gc_with_grace(0).await.unwrap().deleted, 0);
 }
 
 // A3 (issue #70): GC is documented as unsafe alongside active writers — a freshly
@@ -165,4 +172,116 @@ async fn gc_never_reclaims_committed_refs_under_concurrent_writers() {
             "round {round}: GC reclaimed content still reachable from the `main` ref"
         );
     }
+}
+
+/// GC must be safe to run while writers are working.
+///
+/// Content is written *before* the metadata that references it — that ordering is
+/// the durability barrier — so every write has a window in which its chunks are
+/// stored and nothing points at them. A sweep that trusts reachability alone
+/// deletes exactly that. Measured on the unfixed code, this loop produced:
+///
+///     writer result: Some("content missing for hash 0aee3f9d…")
+///     gc errors: 46
+///     unreadable files after the race: 1/5
+///
+/// — the writer failing on content it had itself just stored, and committed files
+/// destroyed. Nothing here is exotic: a periodic collector plus an agent writing
+/// is the ordinary state of a shared workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_is_safe_to_run_while_writers_are_working() {
+    use origofs_core::{LocalCasStore, WriteCtx};
+
+    // Several rounds: the race needs a store with objects already in it, so the
+    // first round on an empty store is often clean. On the unfixed code rounds
+    // after the first reported ~59 writer errors and 1/5 files destroyed.
+    for round in 0..3u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(Fs::new(
+            Arc::new(SqliteMetadataStore::open_in_memory().unwrap()),
+            Arc::new(LocalCasStore::open(dir.path()).await.unwrap()),
+        ));
+        fs.init().await.unwrap();
+        let actor = fs.create_human("dan", None).await.unwrap();
+
+        let writer = {
+            let fs = Arc::clone(&fs);
+            tokio::spawn(async move {
+                for i in 0..300u64 {
+                    let body = format!("body {i} {}", "x".repeat(200));
+                    fs.write_as(
+                        WriteCtx::actor(actor),
+                        &format!("/f{}.txt", i % 5),
+                        body.as_bytes(),
+                    )
+                    .await?;
+                }
+                Ok::<_, origofs_core::OrigoFSError>(())
+            })
+        };
+        let sweeper = {
+            let fs = Arc::clone(&fs);
+            tokio::spawn(async move {
+                // The production default: the grace is what makes this safe.
+                for _ in 0..60 {
+                    fs.gc().await?;
+                }
+                Ok::<_, origofs_core::OrigoFSError>(())
+            })
+        };
+
+        writer.await.unwrap().unwrap_or_else(|e| {
+            panic!("round {round}: a writer lost content to a concurrent collection: {e}")
+        });
+        sweeper.await.unwrap().unwrap_or_else(|e| {
+            panic!("round {round}: a collection failed against a live writer: {e}")
+        });
+
+        // Every file the writer produced is still readable.
+        for i in 0..5 {
+            let path = format!("/f{i}.txt");
+            fs.read(&path).await.unwrap_or_else(|e| {
+                panic!("round {round}: {path} was destroyed by a concurrent collection: {e}")
+            });
+        }
+    }
+}
+
+/// Two collections must not overlap: a sweep is destructive, and a second one
+/// marking against the first one's deletions gains nothing and doubles the
+/// exposure. Nothing guarded this before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_collections_are_serialized() {
+    let (fs, _store) = mem_fixture().await;
+    let fs = Arc::new(fs);
+    fs.write("/a.txt", b"hello").await.unwrap();
+    fs.commit("dan", "base").await.unwrap();
+
+    let a = {
+        let fs = Arc::clone(&fs);
+        tokio::spawn(async move { fs.gc().await })
+    };
+    let b = {
+        let fs = Arc::clone(&fs);
+        tokio::spawn(async move { fs.gc().await })
+    };
+    let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+
+    // Either both ran (serialized by the lease) or the loser was told so — never
+    // two sweeps interleaved.
+    assert!(
+        ra.is_ok() || rb.is_ok(),
+        "at least one collection should succeed"
+    );
+    for r in [&ra, &rb] {
+        if let Err(e) = r {
+            assert!(
+                matches!(e, origofs_core::OrigoFSError::Conflict(_)),
+                "a refused collection must say why, got {e:?}"
+            );
+        }
+    }
+    // The lease is released, so a later collection still works.
+    fs.gc().await.unwrap();
+    assert_eq!(&fs.read("/a.txt").await.unwrap()[..], b"hello");
 }

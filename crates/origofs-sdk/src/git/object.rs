@@ -145,7 +145,22 @@ fn git_name_cmp(a: &str, a_dir: bool, b: &str, b_dir: bool) -> Ordering {
 
 /// Inflate ceiling for a single loose object: bounds a zlib decompression bomb
 /// (a few KB expanding to many GB) so import / the remote helper can't be OOM'd.
-const MAX_GIT_OBJECT: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+///
+/// The whole inflated object is held in memory at once, so this is also the peak
+/// RSS one hostile object can force. 2 GiB was nominally a bound but not a useful
+/// one — a single object could still OOM-kill a modestly-sized container. 256 MiB
+/// is far above any real source blob (git itself warns past 512 MiB, and anything
+/// approaching this belongs in LFS, which this importer resolves separately).
+/// Override for a repository that genuinely needs more.
+const MAX_GIT_OBJECT_DEFAULT: u64 = 256 * 1024 * 1024;
+
+/// `ORIGOFS_GIT_MAX_OBJECT_BYTES` overrides [`MAX_GIT_OBJECT_DEFAULT`].
+fn max_git_object() -> u64 {
+    std::env::var("ORIGOFS_GIT_MAX_OBJECT_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_GIT_OBJECT_DEFAULT)
+}
 
 /// Validate a hex object id before it is used to build a filesystem path or
 /// sliced positionally. Git ids are hex of a fixed width (40 for SHA-1, 64 for
@@ -189,20 +204,38 @@ pub fn write_loose(git_dir: &Path, obj: &GitObject) -> Result<()> {
 }
 
 /// Read and inflate a loose object, returning `(kind, payload)`.
+///
+/// The object is verified against the id it was fetched by. An oid is a *claim*
+/// until it is checked: a hand-crafted `.git` can put arbitrary bytes at any oid
+/// filename, and nothing else in the import path would notice. Checking makes the
+/// imported object graph acyclic by construction — a commit naming itself as its
+/// own parent, or two trees referencing each other, would each require knowing a
+/// hash before computing it — which is what stops a crafted repository from
+/// driving the importer into unbounded recursion.
 pub fn read_loose(git_dir: &Path, oid_hex: &str) -> Result<(String, Vec<u8>)> {
     validate_oid(oid_hex)?;
     let path = loose_path(git_dir, oid_hex);
     let compressed = std::fs::read(&path)
         .map_err(|_| OrigoFSError::NotFound(format!("git object {oid_hex}")))?;
+    let max = max_git_object();
     let mut framed = Vec::new();
     // Bounded inflate: cap the output so a decompression bomb can't OOM us.
     flate2::read::ZlibDecoder::new(&compressed[..])
-        .take(MAX_GIT_OBJECT + 1)
+        .take(max + 1)
         .read_to_end(&mut framed)
         .map_err(|e| OrigoFSError::Content(format!("inflate {oid_hex}: {e}")))?;
-    if framed.len() as u64 > MAX_GIT_OBJECT {
+    if framed.len() as u64 > max {
         return Err(OrigoFSError::Content(format!(
-            "git object {oid_hex} exceeds {MAX_GIT_OBJECT} bytes (possible zip bomb)"
+            "git object {oid_hex} exceeds {max} bytes (possible zip bomb)"
+        )));
+    }
+    // `validate_oid` already fixed the width at 40 (SHA-1) or 64 (SHA-256).
+    let fmt = ObjectFormat::from_hex_len(oid_hex.len())
+        .ok_or_else(|| OrigoFSError::Content(format!("unrecognized object id: {oid_hex}")))?;
+    let actual = hex::encode(fmt.digest(&framed));
+    if !actual.eq_ignore_ascii_case(oid_hex) {
+        return Err(OrigoFSError::Corrupt(format!(
+            "git object {oid_hex} hashes to {actual}"
         )));
     }
     parse_framed(&framed)
