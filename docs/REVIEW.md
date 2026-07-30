@@ -1,7 +1,17 @@
 # origofs — pre-MVP review
 
-> Status: **review snapshot**, taken against `1a0d5dd` (2026-07-30). Nothing here has
-> been applied — this is a findings document, not a changelog.
+> Status: **resolved.** Taken against `1a0d5dd` (2026-07-30); every finding below
+> has since been addressed — see `CHANGELOG.md` for what changed and the commits
+> from `de67b05` onward for the reasoning. Kept as the record of what was found
+> and why it mattered, not as a live to-do list.
+>
+> Four bugs were found *by* the fixes rather than by the review: a Postgres
+> `schema_version` probe that never matched its own error, three `cfg`
+> combinations that had never been compiled, an `--auth-token` split that made
+> base64 tokens unusable, and a `deny_unknown_fields` that covered only the outer
+> config struct. Each surfaced the first time something actually ran the path —
+> which is the argument for closing coverage gaps rather than reasoning about
+> them.
 
 ## Context
 
