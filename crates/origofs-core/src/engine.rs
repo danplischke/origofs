@@ -41,6 +41,67 @@ pub(crate) fn validate_component(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a ref (branch) name that could escape a directory when a surface turns
+/// it back into a host path, or that `git` itself would refuse.
+///
+/// Ref names are not just database keys: the git-interop layer writes
+/// `refs/heads/<name>` and interpolates the name into `HEAD`, so an absolute or
+/// `..`-bearing name would place a file outside the exported repository, and an
+/// embedded newline would inject a second line into `HEAD`. This is the ref-level
+/// counterpart of [`validate_component`] — enforced where a name enters the ref
+/// table, so a hostile name can never be *stored*.
+///
+/// The rules follow `git check-ref-format`, which also keeps every name we accept
+/// round-trippable through a real git repository. The internal refs (`HEAD`,
+/// `MERGE_HEAD`) satisfy them, so nothing needs a carve-out.
+pub fn validate_ref_name(name: &str) -> Result<()> {
+    // Long enough for any real branch name; short enough that a name can't be used
+    // to blow past a filesystem's path limit during export.
+    const MAX_REF_NAME: usize = 255;
+
+    let bad = |why: &str| {
+        Err(OrigoFSError::InvalidArgument(format!(
+            "invalid ref name {name:?}: {why}"
+        )))
+    };
+
+    if name.is_empty() {
+        return bad("empty");
+    }
+    if name.len() > MAX_REF_NAME {
+        return bad("longer than 255 bytes");
+    }
+    // Control characters (incl. NUL and newline — the `HEAD` injection vector),
+    // DEL, space, and the characters git reserves for refspecs and globbing.
+    if let Some(c) = name
+        .chars()
+        .find(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(*c))
+    {
+        return bad(&format!("contains {c:?}"));
+    }
+    // A leading `/` makes `Path::join` discard the directory it is joined onto; a
+    // trailing or doubled `/` yields an empty component.
+    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        return bad("leading, trailing, or repeated '/'");
+    }
+    // `..` anywhere is a traversal; `.` as a component is at best meaningless.
+    // Checked per component so a legitimate name like `fix.2` still passes.
+    if name.split('/').any(|c| c == "." || c == "..") {
+        return bad("'.' or '..' path component");
+    }
+    if name.contains("..") || name.contains("@{") || name == "@" {
+        return bad("contains '..' or '@{', or is '@'");
+    }
+    // `-` leading would be read as a flag by any CLI that forwards the name.
+    if name.starts_with('-') {
+        return bad("starts with '-'");
+    }
+    if name.ends_with('.') || name.ends_with(".lock") {
+        return bad("ends with '.' or '.lock'");
+    }
+    Ok(())
+}
+
 /// An owned [`Stream`] over a manifest's chunks, one `store.get` at a time. The
 /// store handle is moved into the stream state, so the stream is self-contained
 /// (`'static` when `S` is) and can outlive the [`Fs`] it came from — unlike

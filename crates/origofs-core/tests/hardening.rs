@@ -181,6 +181,79 @@ async fn traversal_path_components_are_rejected_everywhere() {
     assert_eq!(&fs.read("/real/dir/f").await.unwrap()[..], b"ok");
 }
 
+// SEC: ref names are the *other* half of the traversal story. A branch name is
+// written to the ref table as a plain key, but the git-interop layer turns it back
+// into a host path (`refs/heads/<name>`) and interpolates it into `HEAD` — so an
+// absolute or `..`-bearing name writes outside the exported repository, and an
+// embedded newline injects a second line into `HEAD`. Reject at the door, so a
+// hostile name can never be stored.
+#[tokio::test]
+async fn hostile_ref_names_are_rejected_everywhere() {
+    let fs = fixture().await;
+    fs.write("/f", b"hi").await.unwrap();
+    fs.commit("a", "c1").await.unwrap();
+
+    let hostile = [
+        "/etc/cron.d/pwn", // absolute: `Path::join` discards the base
+        "../../../../home/u/.ssh/authorized_keys", // climbs out of refs/heads
+        "a/../../b",       // traversal mid-name
+        "main\nref: refs/heads/evil", // newline injects a line into HEAD
+        "main\0evil",      // NUL
+        "-delete",         // reads as a flag to anything forwarding it
+        "feature branch",  // whitespace
+        "refs/heads/",     // trailing slash -> empty component
+        "a//b",            // empty component
+        "x.lock",          // git refuses; would collide with its locks
+        "he^ad",           // refspec metacharacter
+        "v1..v2",          // range syntax
+        "@{now}",          // reflog syntax
+        ".",
+        "..",
+        "",
+    ];
+    for bad in hostile {
+        assert!(
+            fs.create_branch(bad).await.is_err(),
+            "create_branch should reject {bad:?}"
+        );
+        assert!(
+            fs.set_branch(bad, Hash::of(b"x")).await.is_err(),
+            "set_branch should reject {bad:?}"
+        );
+        assert!(
+            fs.cas_branch(bad, None, Hash::of(b"x")).await.is_err(),
+            "cas_branch should reject {bad:?}"
+        );
+        assert!(
+            fs.checkout(bad).await.is_err(),
+            "checkout should reject {bad:?}"
+        );
+        // Nothing hostile reached the ref table by any of those doors.
+        assert!(
+            fs.branch_head(bad).await.unwrap().is_none(),
+            "{bad:?} must not have been stored"
+        );
+    }
+
+    // Ordinary names — including the ones that merely *look* like the rejected
+    // ones — still work, so the rule isn't over-broad.
+    for ok in [
+        "dev",
+        "feature/login",
+        "release-1.2",
+        "fix.2",
+        "user/x/deep/name",
+    ] {
+        fs.create_branch(ok)
+            .await
+            .unwrap_or_else(|e| panic!("create_branch should accept {ok:?}: {e}"));
+        fs.checkout(ok).await.unwrap();
+    }
+    // The internal refs satisfy the same rule, so they need no carve-out.
+    origofs_core::validate_ref_name("HEAD").unwrap();
+    origofs_core::validate_ref_name("MERGE_HEAD").unwrap();
+}
+
 // SEC (security audit #4): the object-graph decoders must bound their
 // pre-allocation, so a tiny crafted object declaring a hostile entry count
 // returns an error instead of aborting the process on a multi-GB

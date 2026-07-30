@@ -78,6 +78,11 @@ pub async fn export_git(ws: &Workspace, dir: &Path, opts: &ExportOptions) -> Res
             OrigoFSError::InvalidArgument("HEAD is detached; pass a branch".into())
         })?,
     };
+    // The name becomes a host path (`refs/heads/<branch>`) and a line in `HEAD`.
+    // The ref table already refuses a name that could escape, but this export can
+    // be pointed at a workspace written by an older binary — so re-check here
+    // rather than trust the store.
+    origofs_core::validate_ref_name(&branch)?;
     let head = ws.fs().branch_head(&branch).await?.ok_or_else(|| {
         OrigoFSError::InvalidArgument(format!("branch {branch} has no commits to export"))
     })?;

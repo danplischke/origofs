@@ -246,6 +246,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Create a branch at the current HEAD commit.
     pub async fn create_branch(&self, name: &str) -> Result<()> {
+        crate::engine::validate_ref_name(name)?;
         self.ensure_commits_enabled().await?;
         let head = self.head_commit().await?.ok_or_else(|| {
             OrigoFSError::InvalidArgument("cannot branch before the first commit".into())
@@ -273,6 +274,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Switch the working tree to `branch`, materializing its commit.
     pub async fn checkout(&self, branch: &str) -> Result<()> {
+        // Validated even though the ref must already exist: `HEAD` is written as
+        // `ref:{branch}`, and the git layer turns that back into a host path.
+        crate::engine::validate_ref_name(branch)?;
         self.ensure_commits_enabled().await?;
         let value = self
             .meta

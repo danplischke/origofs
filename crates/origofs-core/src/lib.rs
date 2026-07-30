@@ -49,7 +49,7 @@ pub use collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, PRESENCE_WINDOW_SECS,
 pub use content::{ContentStore, LocalCasStore, MemStore, TieredStore, VerifyingStore};
 pub use corpus::{Passage, PassageOptions, Segmentation};
 pub use encrypt::EncryptedStore;
-pub use engine::Fs;
+pub use engine::{Fs, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
 pub use gc::GcStats;
 pub use merge::{Conflict, MergeOutcome};

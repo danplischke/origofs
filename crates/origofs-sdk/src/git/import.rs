@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 /// Import `branch` from the git repository at `dir` into the workspace, then
 /// check it out. Returns the origofs commit hash of the imported head.
 pub async fn import_git(ws: &Workspace, dir: &Path, branch: &str) -> Result<Hash> {
+    // `resolve_head` joins this onto `refs/heads/`, so an absolute or `..`-bearing
+    // name would read a file outside the repository — and the first line of
+    // whatever it read comes back in the "unrecognized object id" error.
+    origofs_core::validate_ref_name(branch)?;
     let git_dir = if dir.join(".git").is_dir() {
         dir.join(".git")
     } else {
