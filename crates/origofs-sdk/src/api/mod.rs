@@ -29,7 +29,7 @@
 //! --metrics` does), and until it does `/metrics` answers `503 metrics not
 //! enabled`.
 
-use crate::{Workspace, WriteCtx, WriteOutcome};
+use crate::{Workspace, WriteCtx, WriteOutcome, WritePolicy};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -411,6 +411,9 @@ impl IntoResponse for ApiError {
                 let status = match &e {
                     NotFound(_) | ContentMissing(_) => StatusCode::NOT_FOUND,
                     AlreadyExists(_) | Conflict(_) => StatusCode::CONFLICT,
+                    // Authenticated, but this actor's write policy forbids it —
+                    // 403, not 401: re-authenticating would change nothing.
+                    PermissionDenied(_) => StatusCode::FORBIDDEN,
                     IsADirectory(_) | NotADirectory(_) | DirectoryNotEmpty(_) | InvalidPath(_)
                     | InvalidArgument(_) => StatusCode::BAD_REQUEST,
                     // A transient backend failure: tell the client it may retry.
@@ -617,18 +620,22 @@ async fn write_file(
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     let p = abspath(&path);
-    if let Some((parent, _)) = p.rsplit_once('/')
+    let ctx = principal.write_ctx();
+    // Attribution comes only from the authenticated principal — never the request.
+    // Governed by the principal's write policy: a propose-only actor's edit is
+    // queued for review rather than landing directly.
+    //
+    // Parent directories are created only when the edit actually lands. Creating
+    // them up front meant an edit that was merely "queued for review" had already
+    // mutated the tree — the one thing a propose-only actor must not be able to
+    // do. `accept_suggestion` creates them on the way in instead.
+    if matches!(ws.write_policy_for(ctx).await?, WritePolicy::Direct)
+        && let Some((parent, _)) = p.rsplit_once('/')
         && !parent.is_empty()
     {
         ws.mkdir_p(parent).await?;
     }
-    // Attribution comes only from the authenticated principal — never the request.
-    // Governed by the principal's write policy: a propose-only actor's edit is
-    // queued for review rather than landing directly.
-    match ws
-        .write_or_propose(principal.write_ctx(), &p, &body, None)
-        .await?
-    {
+    match ws.write_or_propose(ctx, &p, &body, None).await? {
         WriteOutcome::Wrote => {
             origofs_core::metrics::record_write(body.len() as u64);
             Ok(Json(json!({ "path": p, "written": body.len() })))
@@ -639,12 +646,20 @@ async fn write_file(
 
 async fn delete_file(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Path(path): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let p = abspath(&path);
-    ws.remove(&p).await?;
-    Ok(Json(json!({ "removed": p })))
+    // Governed by the write policy, like `write_file`. A propose-only actor used
+    // to be able to delete any file outright — more destructive than the edits the
+    // policy exists to gate.
+    match ws
+        .remove_or_propose(principal.write_ctx(), &p, None)
+        .await?
+    {
+        WriteOutcome::Wrote => Ok(Json(json!({ "removed": p }))),
+        WriteOutcome::Proposed(id) => Ok(Json(json!({ "path": p, "proposed": id }))),
+    }
 }
 
 // --- directories ------------------------------------------------------------
@@ -685,11 +700,13 @@ async fn make_root(State(_ws): State<Shared>, _auth: Auth) -> ApiResult<Json<ser
 
 async fn make_dir(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Path(path): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let p = abspath(&path);
-    ws.mkdir_p(&p).await?;
+    // Governed by the write policy. There is no way to queue a directory creation
+    // for review, so a propose-only actor is refused rather than silently allowed.
+    ws.mkdir_p_as(principal.write_ctx(), &p).await?;
     Ok(Json(json!({ "created": p })))
 }
 
@@ -725,10 +742,13 @@ struct RenameReq {
 
 async fn rename(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Json(req): Json<RenameReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    ws.rename(&req.from, &req.to).await?;
+    // Governed by the write policy, like every other content mutation. A rename
+    // has no suggestion form, so a propose-only actor is refused.
+    ws.rename_as(principal.write_ctx(), &req.from, &req.to)
+        .await?;
     Ok(Json(json!({ "from": req.from, "to": req.to })))
 }
 

@@ -84,12 +84,18 @@ impl WritePolicy {
             WritePolicy::Propose => 1,
         }
     }
-    /// Decode the stored integer; anything unrecognized is the safe default
-    /// (`Direct`) so an unknown value never silently blocks writes.
+    /// Decode the stored integer. An unrecognized value decodes to the
+    /// *restrictive* policy, not the permissive one.
+    ///
+    /// This is an authorization control, so it fails closed: a value this binary
+    /// doesn't know is one a newer binary wrote (say a future `ReadOnly`), and
+    /// resolving that to `Direct` would silently *grant* direct writes to an actor
+    /// an operator had deliberately restricted. Routing an edit through review is
+    /// recoverable; letting an unreviewed one land is not.
     pub fn from_i64(v: i64) -> Self {
         match v {
-            1 => WritePolicy::Propose,
-            _ => WritePolicy::Direct,
+            0 => WritePolicy::Direct,
+            _ => WritePolicy::Propose,
         }
     }
 }

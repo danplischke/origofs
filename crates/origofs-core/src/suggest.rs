@@ -23,7 +23,7 @@ use crate::collab::EventInit;
 use crate::content::ContentStore;
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
-use crate::types::Hash;
+use crate::types::{Hash, Ino};
 
 /// The outcome of a policy-governed write (see [`Fs::write_or_propose`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +171,85 @@ fn crdt_needs_feature(id: i64) -> OrigoFSError {
 }
 
 impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
+    /// The effective write policy for `ctx`'s actor.
+    ///
+    /// An actor with no row has no policy on record and defaults to `Direct`,
+    /// matching the column default. Identity is resolved server-side before any
+    /// of this, so in practice the actor always exists.
+    pub async fn write_policy_for(&self, ctx: WriteCtx) -> Result<WritePolicy> {
+        Ok(self
+            .meta
+            .get_actor(ctx.actor)
+            .await?
+            .map(|a| a.write_policy)
+            .unwrap_or(WritePolicy::Direct))
+    }
+
+    /// Refuse `op` when the actor is propose-only.
+    ///
+    /// For mutations that have **no suggestion form** — there is no way to queue a
+    /// rename or an mkdir for review — the only way to honor `Propose` is to
+    /// refuse. Silently allowing them was the hole: the policy was consulted in
+    /// exactly one function, so a propose-only agent could still delete, rename,
+    /// and create paths at will while an operator believed its edits were gated.
+    ///
+    /// Note the deliberate boundary. `WritePolicy` governs *content* mutations.
+    /// `commit`, `checkout`, and branch operations stay ungated: they introduce no
+    /// unreviewed content (a propose-only actor's edits never reach the working
+    /// tree to be committed in the first place), and gating them belongs to a
+    /// per-path/per-operation authorization model, which origofs does not yet have —
+    /// any valid credential can still perform them.
+    pub async fn ensure_may_mutate(&self, ctx: WriteCtx, op: &str) -> Result<()> {
+        match self.write_policy_for(ctx).await? {
+            WritePolicy::Direct => Ok(()),
+            WritePolicy::Propose => Err(OrigoFSError::PermissionDenied(format!(
+                "actor {} is propose-only and cannot {op} directly; \
+                 this operation has no suggestion form to review",
+                ctx.actor
+            ))),
+        }
+    }
+
+    /// Delete `path` **governed by the actor's write policy** — the deletion
+    /// counterpart of [`write_or_propose`](Self::write_or_propose).
+    ///
+    /// A `Direct` actor's delete applies; a `Propose` actor's is queued as a
+    /// delete suggestion for review. Deleting was the sharpest gap in the old
+    /// enforcement: an agent an operator had restricted to proposals could still
+    /// remove any file in the workspace outright, which is more destructive than
+    /// the edits the policy was protecting against.
+    pub async fn remove_or_propose(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        summary: Option<&str>,
+    ) -> Result<WriteOutcome> {
+        match self.write_policy_for(ctx).await? {
+            WritePolicy::Direct => {
+                self.remove(path).await?;
+                Ok(WriteOutcome::Wrote)
+            }
+            WritePolicy::Propose => {
+                let id = self.suggest_delete(ctx, path, summary).await?;
+                Ok(WriteOutcome::Proposed(id))
+            }
+        }
+    }
+
+    /// Rename, subject to the actor's write policy. Refused for a propose-only
+    /// actor — a rename has no suggestion form (see [`ensure_may_mutate`](Self::ensure_may_mutate)).
+    pub async fn rename_as(&self, ctx: WriteCtx, from: &str, to: &str) -> Result<()> {
+        self.ensure_may_mutate(ctx, "rename").await?;
+        self.rename(from, to).await
+    }
+
+    /// `mkdir -p`, subject to the actor's write policy. Refused for a
+    /// propose-only actor. Returns the leaf directory's inode, like [`Fs::mkdir_p`].
+    pub async fn mkdir_p_as(&self, ctx: WriteCtx, path: &str) -> Result<Ino> {
+        self.ensure_may_mutate(ctx, "create directories").await?;
+        self.mkdir_p(path).await
+    }
+
     /// Submit an edit to `path` **governed by the actor's write policy** (§6): a
     /// [`Direct`](WritePolicy::Direct) actor writes straight to the working tree; a
     /// [`Propose`](WritePolicy::Propose) actor's edit is instead queued as a
@@ -187,16 +266,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         data: &[u8],
         summary: Option<&str>,
     ) -> Result<WriteOutcome> {
-        // An unknown actor has no policy on record: default to direct (matching the
-        // column default). Identity is resolved server-side before we get here, so
-        // in practice the actor always exists.
-        let policy = self
-            .meta
-            .get_actor(ctx.actor)
-            .await?
-            .map(|a| a.write_policy)
-            .unwrap_or(WritePolicy::Direct);
-        match policy {
+        match self.write_policy_for(ctx).await? {
             WritePolicy::Direct => {
                 self.write_as(ctx, path, data).await?;
                 Ok(WriteOutcome::Wrote)
@@ -498,6 +568,18 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 let hash = Hash::from_hex(hex)
                     .ok_or_else(|| OrigoFSError::Metadata("bad proposed hash".into()))?;
                 let bytes = self.content_bytes(&hash).await?;
+                // Create any missing parent directories *here*, where the edit
+                // actually lands. Surfaces used to do it when the suggestion was
+                // recorded, which meant an edit merely queued for review had
+                // already mutated the tree — precisely what a propose-only actor
+                // must not be able to do. `write_as` requires the parent to exist,
+                // so without this a proposal for a new subdirectory could never be
+                // accepted.
+                if let Some((parent, _)) = s.path.rsplit_once('/')
+                    && !parent.is_empty()
+                {
+                    self.mkdir_p(parent).await?;
+                }
                 // Apply atomically: the write only lands if the file is *still* at
                 // the base it was proposed against, so a change that slipped in
                 // after the staleness check above can't be silently clobbered.

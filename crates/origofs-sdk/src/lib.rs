@@ -854,6 +854,61 @@ impl Workspace {
         Ok(outcome)
     }
 
+    /// Delete `path` under the actor's write policy — the deletion counterpart of
+    /// [`write_or_propose`](Self::write_or_propose). A `Direct` actor's delete
+    /// applies; a `Propose` actor's is queued as a delete suggestion for review.
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path, actor = ctx.actor))]
+    pub async fn remove_or_propose(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        summary: Option<&str>,
+    ) -> Result<WriteOutcome> {
+        let outcome = self.fs.remove_or_propose(ctx, path, summary).await?;
+        // As in `write_or_propose`: the propose path emits its own event.
+        if matches!(outcome, WriteOutcome::Wrote) {
+            self.emit("remove", path, None, Some(ctx.actor), ctx.session)
+                .await;
+        }
+        Ok(outcome)
+    }
+
+    /// Rename under the actor's write policy. A rename has no suggestion form, so
+    /// a propose-only actor is refused rather than silently allowed.
+    #[tracing::instrument(level = "debug", skip_all, fields(from = %from, to = %to, actor = ctx.actor))]
+    pub async fn rename_as(&self, ctx: WriteCtx, from: &str, to: &str) -> Result<()> {
+        self.fs.rename_as(ctx, from, to).await?;
+        self.emit(
+            "rename",
+            from,
+            Some(to.to_string()),
+            Some(ctx.actor),
+            ctx.session,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// `mkdir -p` under the actor's write policy. Refused for a propose-only actor.
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path, actor = ctx.actor))]
+    pub async fn mkdir_p_as(&self, ctx: WriteCtx, path: &str) -> Result<()> {
+        self.fs.mkdir_p_as(ctx, path).await?;
+        self.emit("mkdir", path, None, Some(ctx.actor), ctx.session)
+            .await;
+        Ok(())
+    }
+
+    /// Whether `ctx`'s actor may perform a mutation with no suggestion form.
+    /// Surfaces call this before an operation the policy can only refuse.
+    pub async fn ensure_may_mutate(&self, ctx: WriteCtx, op: &str) -> Result<()> {
+        self.fs.ensure_may_mutate(ctx, op).await
+    }
+
+    /// The effective [`WritePolicy`] for `ctx`'s actor.
+    pub async fn write_policy_for(&self, ctx: WriteCtx) -> Result<WritePolicy> {
+        self.fs.write_policy_for(ctx).await
+    }
+
     /// Suggestions, optionally filtered by status and/or path, newest first.
     pub async fn list_suggestions(
         &self,

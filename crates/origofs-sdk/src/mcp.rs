@@ -6,7 +6,7 @@
 //! actor, so blame + the edit-op audit come "for free" from how the agent works
 //! — reading and writing files *is* the tool call.
 
-use crate::{OrigoFSError, SuggestionStatus, Workspace, WriteCtx, WriteOutcome};
+use crate::{OrigoFSError, SuggestionStatus, Workspace, WriteCtx, WriteOutcome, WritePolicy};
 use serde_json::{Value, json};
 
 type Result<T> = std::result::Result<T, OrigoFSError>;
@@ -123,14 +123,22 @@ impl McpServer {
             "origofs_write" => {
                 let p = path();
                 let data = args.get("content").and_then(Value::as_str).unwrap_or("");
-                if let Some((parent, _)) = p.rsplit_once('/')
+                // Governed by this agent's write policy: a direct agent writes
+                // straight to the tree; a propose-only agent's edit is queued for
+                // review instead of landing.
+                //
+                // Parents are created only on the direct path. Doing it first meant
+                // a "queued for review" edit had already mutated the tree — exactly
+                // what the policy exists to prevent. `accept_suggestion` creates
+                // them when the edit lands.
+                if matches!(
+                    self.ws.write_policy_for(self.ctx()).await?,
+                    WritePolicy::Direct
+                ) && let Some((parent, _)) = p.rsplit_once('/')
                     && !parent.is_empty()
                 {
                     self.ws.mkdir_p(parent).await?;
                 }
-                // Governed by this agent's write policy: a direct agent writes
-                // straight to the tree; a propose-only agent's edit is queued for
-                // review instead of landing.
                 let summary = format!("write {p} via mcp agent");
                 match self
                     .ws
@@ -212,11 +220,8 @@ impl McpServer {
                 let p = path();
                 let data = args.get("content").and_then(Value::as_str).unwrap_or("");
                 let summary = args.get("summary").and_then(Value::as_str);
-                if let Some((parent, _)) = p.rsplit_once('/')
-                    && !parent.is_empty()
-                {
-                    self.ws.mkdir_p(parent).await?;
-                }
+                // Deliberately no `mkdir_p`: proposing must not touch the tree.
+                // The accept path creates any missing parents.
                 let id = self
                     .ws
                     .suggest(self.ctx(), p, data.as_bytes(), summary)
@@ -357,12 +362,27 @@ impl McpServer {
                     .join("\n"))
             }
             "origofs_mkdir" => {
-                self.ws.mkdir_p(path()).await?;
+                // A directory creation has no suggestion form, so a propose-only
+                // agent is refused rather than silently allowed.
+                self.ws.mkdir_p_as(self.ctx(), path()).await?;
                 Ok(format!("created {}", path()))
             }
             "origofs_rm" => {
-                self.ws.remove(path()).await?;
-                Ok(format!("removed {}", path()))
+                // Governed by the policy: a propose-only agent's delete is queued
+                // for review. It used to bypass the gate entirely — an agent an
+                // operator had restricted to proposals could still delete any file.
+                let summary = format!("remove {} via mcp agent", path());
+                match self
+                    .ws
+                    .remove_or_propose(self.ctx(), path(), Some(&summary))
+                    .await?
+                {
+                    WriteOutcome::Wrote => Ok(format!("removed {}", path())),
+                    WriteOutcome::Proposed(id) => Ok(format!(
+                        "proposed suggestion #{id} to remove {} (pending review)",
+                        path()
+                    )),
+                }
             }
             "origofs_blame" => {
                 let ranges = self.ws.blame(path()).await?;

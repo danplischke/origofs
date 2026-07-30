@@ -27,7 +27,7 @@ use origofs_sdk::{
 use pyo3::create_exception;
 use pyo3::exceptions::{
     PyFileExistsError, PyFileNotFoundError, PyIsADirectoryError, PyNotADirectoryError, PyOSError,
-    PyValueError,
+    PyPermissionError, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -51,6 +51,9 @@ fn to_pyerr(e: origofs_sdk::OrigoFSError) -> PyErr {
         DirectoryNotEmpty(_) => PyOSError::new_err(msg),
         InvalidArgument(_) | InvalidPath(_) => PyValueError::new_err(msg),
         Conflict(_) => ConflictError::new_err(msg),
+        // The actor's write policy forbids it — the closest built-in is
+        // `PermissionError`, which is what a caller would `except` on.
+        PermissionDenied(_) => PyPermissionError::new_err(msg),
         _ => OrigoFSError::new_err(msg),
     }
 }

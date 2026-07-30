@@ -407,3 +407,65 @@ async fn agent_identity_is_stable_across_restarts() {
         .count();
     assert_eq!(claude_actors, 1, "one actor per agent, not one per launch");
 }
+
+// The policy has to hold for *every* mutating tool, not just `origofs_write`.
+// It was consulted in one place, so a propose-only agent could still call
+// `origofs_rm` and `origofs_mkdir` freely — an operator who set the gate would
+// watch its writes queue for review while it deleted files outright.
+#[tokio::test]
+async fn propose_only_agent_cannot_delete_or_mkdir_directly() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let agent = ws.create_agent("claude", "opus", None).await.unwrap();
+    let session = ws.create_session(agent, Some("mcp")).await.unwrap();
+    ws.set_write_policy(agent, WritePolicy::Propose)
+        .await
+        .unwrap();
+    let human = ws.create_human("dan", None).await.unwrap();
+    ws.write_as(WriteCtx::actor(human), "/notes.txt", b"important")
+        .await
+        .unwrap();
+    let s = McpServer::new(ws.clone(), agent, session);
+
+    // Deleting is queued for review; the file survives.
+    let rm = s
+        .handle(call("origofs_rm", json!({"path":"/notes.txt"})))
+        .await
+        .unwrap();
+    assert_eq!(rm["result"]["isError"], false);
+    assert!(
+        text(&rm).contains("proposed suggestion"),
+        "a propose-only agent's delete must be queued, got: {}",
+        text(&rm)
+    );
+    assert_eq!(&ws.read("/notes.txt").await.unwrap()[..], b"important");
+
+    // Creating a directory has no suggestion form, so it is refused outright.
+    let mk = s
+        .handle(call("origofs_mkdir", json!({"path":"/newdir"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        mk["result"]["isError"],
+        true,
+        "a propose-only agent must not create directories: {}",
+        text(&mk)
+    );
+    assert!(ws.stat("/newdir").await.is_err());
+
+    // And a proposal must not have quietly created directories either.
+    let w = s
+        .handle(call(
+            "origofs_write",
+            json!({"path":"/deep/nested/f.txt","content":"x"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(w["result"]["isError"], false);
+    assert!(
+        ws.stat("/deep").await.is_err(),
+        "queuing an edit for review must not mutate the tree"
+    );
+}
