@@ -234,6 +234,33 @@ impl ContentStore for ObjectContentStore {
         Ok(out)
     }
 
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        use futures::StreamExt;
+        // Epoch seconds on both sides, so this needs no date-time crate of its own
+        // (`last_modified` is a chrono type from `object_store`, but `.timestamp()`
+        // is all we want from it).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let prefix = OsPath::from(self.prefix.clone());
+        let mut stream = self.store.list(Some(&prefix));
+        let mut out = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(OrigoFSError::from)?;
+            let parts: Vec<&str> = meta.location.as_ref().rsplit('/').collect();
+            if parts.len() >= 2
+                && let Some(h) = Hash::from_hex(&format!("{}{}", parts[1], parts[0]))
+            {
+                // A future-dated object (clock skew between writer and bucket)
+                // reports `None` — unknown, so the sweep leaves it alone.
+                let age = now - meta.last_modified.timestamp();
+                out.push((h, u64::try_from(age).ok()));
+            }
+        }
+        Ok(out)
+    }
+
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         let path = self.path_for(hash);
         let size = match self.store.head(&path).await {

@@ -51,7 +51,7 @@ pub use corpus::{Passage, PassageOptions, Segmentation};
 pub use encrypt::EncryptedStore;
 pub use engine::{Fs, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
-pub use gc::GcStats;
+pub use gc::{DEFAULT_GC_GRACE_SECS, GcStats};
 pub use merge::{Conflict, MergeOutcome};
 pub use metadata::{MetaTxn, MetadataStore};
 pub use metrics::OpTimer;

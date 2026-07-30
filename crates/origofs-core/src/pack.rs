@@ -367,6 +367,19 @@ impl ContentStore for PackStore {
         Ok(out)
     }
 
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        // A chunk's age is its *index entry's* age: the index is what makes it
+        // reachable, and a repack rewrites the entry when the chunk moves packs.
+        let mut out = self.index.list_with_age().await?;
+        // Still buffered, so written moments ago by definition — age 0 keeps them
+        // inside any grace period.
+        let p = self.pending.lock();
+        for h in p.resident.keys() {
+            out.push((*h, Some(0)));
+        }
+        Ok(out)
+    }
+
     async fn ping(&self) -> Result<()> {
         // The data store is the (possibly remote) backend whose reachability
         // gates readiness; the index is a local sidecar.

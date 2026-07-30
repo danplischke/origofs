@@ -20,13 +20,13 @@ pub use futures::stream::BoxStream;
 #[cfg(feature = "metrics")]
 pub use origofs_core::metrics;
 pub use origofs_core::{
-    Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DiffEntry, DiffStatus, DirEntry,
-    DirEntryAttr, DirPage, EditOp, EncryptedStore, Event, EventInit, EventSubscription, FileKind,
-    GcStats, GcsConfig, Hash, Inode, LiveDoc, MemStore, MergeOutcome, ObjectContentStore,
-    OrigoFSError, PackStore, Passage, PassageOptions, Presence, RebuildReport, ResyncOutcome,
-    ResyncReport, S3Config, Segmentation, Suggestion, SuggestionContent, SuggestionInit,
-    SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats, VerifyingStore,
-    VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DEFAULT_GC_GRACE_SECS,
+    DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, EncryptedStore, Event,
+    EventInit, EventSubscription, FileKind, GcStats, GcsConfig, Hash, Inode, LiveDoc, MemStore,
+    MergeOutcome, ObjectContentStore, OrigoFSError, PackStore, Passage, PassageOptions, Presence,
+    RebuildReport, ResyncOutcome, ResyncReport, S3Config, Segmentation, Suggestion,
+    SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit,
+    TransferStats, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
 #[cfg(feature = "coedit")]
 pub use origofs_core::{COEDIT_SIDECAR_DIR, CoeditDoc, CoeditRelayNote, CoeditRelaySub};
@@ -543,6 +543,13 @@ impl Workspace {
     #[tracing::instrument(skip_all)]
     pub async fn gc(&self) -> Result<GcStats> {
         self.fs.gc().await
+    }
+
+    /// [`gc`](Self::gc) with an explicit grace period, in seconds. Only content
+    /// unreferenced *and* untouched for at least that long is reclaimed. `0`
+    /// disables the age gate and is only safe on a store with no active writers.
+    pub async fn gc_with_grace(&self, grace_secs: u64) -> Result<GcStats> {
+        self.fs.gc_with_grace(grace_secs).await
     }
 
     /// Rebuild refs and the working tree from the content store's object graph,

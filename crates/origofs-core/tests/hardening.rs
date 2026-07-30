@@ -77,7 +77,7 @@ async fn gc_keeps_pending_suggestion_content() {
         .unwrap();
 
     // A GC pass on the (otherwise quiescent) store must keep the proposed blob.
-    fs.gc().await.unwrap();
+    fs.gc_with_grace(0).await.unwrap();
 
     assert!(fs.suggestion_diff(sid).await.unwrap().contains("+two"));
     fs.accept_suggestion(sid, WriteCtx::actor(reviewer))
@@ -591,7 +591,7 @@ async fn rename_into_own_descendant_is_refused() {
     // Still reachable and intact, and — the part that mattered — still live as
     // far as GC is concerned.
     assert_eq!(&fs.read("/a/payload.txt").await.unwrap()[..], b"precious");
-    fs.gc().await.unwrap();
+    fs.gc_with_grace(0).await.unwrap();
     assert_eq!(
         &fs.read("/a/payload.txt").await.unwrap()[..],
         b"precious",

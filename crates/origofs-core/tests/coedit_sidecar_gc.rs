@@ -88,7 +88,7 @@ async fn gc_does_not_reclaim_a_live_sidecar_and_the_doc_still_resumes() {
     fs.write("/scratch.bin", &vec![9u8; 200 * 1024])
         .await
         .unwrap();
-    let stats = fs.gc().await.unwrap();
+    let stats = fs.gc_with_grace(0).await.unwrap();
     assert!(stats.deleted > 0, "the sweep really ran");
 
     assert_all_present(&*store, &objects, "after gc").await;
@@ -142,7 +142,7 @@ async fn the_sidecar_rides_into_the_commit_tree_and_survives_checkout() {
     );
 
     // A GC pass now marks it through the commit root as well as the working tree.
-    let stats = fs.gc().await.unwrap();
+    let stats = fs.gc_with_grace(0).await.unwrap();
     assert_all_present(&*store, &objects, "after commit + checkout + gc").await;
     assert!(stats.reachable > 0);
 
@@ -174,7 +174,7 @@ async fn an_orphaned_sidecar_is_reclaimable_and_reopening_is_clean() {
     fs.remove(&coedit_sidecar_path("/gone.md")).await.unwrap();
     fs.end_coedit("/gone.md").await.unwrap();
 
-    fs.gc().await.unwrap();
+    fs.gc_with_grace(0).await.unwrap();
     for h in &objects {
         assert!(
             !store.has(h).await.unwrap(),

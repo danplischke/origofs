@@ -165,6 +165,10 @@ impl ContentStore for EncryptedStore {
         self.inner.list().await
     }
 
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        self.inner.list_with_age().await
+    }
+
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         self.inner.delete(hash).await
     }

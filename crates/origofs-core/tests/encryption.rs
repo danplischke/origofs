@@ -144,7 +144,7 @@ async fn gc_works_through_encryption() {
     fs.write("/a.bin", &vec![2u8; 200 * 1024]).await.unwrap(); // orphan v1
     assert!(backend.len() > before);
 
-    let stats = fs.gc().await.unwrap();
+    let stats = fs.gc_with_grace(0).await.unwrap();
     assert!(stats.deleted > 0);
     // Live body still decrypts after collection.
     assert_eq!(

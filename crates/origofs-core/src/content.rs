@@ -67,6 +67,29 @@ pub trait ContentStore: Send + Sync {
     /// collection to find unreachable objects.
     async fn list(&self) -> Result<Vec<Hash>>;
 
+    /// Every stored object with its **age in seconds**, measured by the backend's
+    /// own clock — `None` when the backend cannot tell.
+    ///
+    /// This is what makes garbage collection safe alongside writers. Content is
+    /// written *before* the metadata that references it (the durability barrier),
+    /// so every object is legitimately unreferenced for the window between its
+    /// `put` and the commit of the transaction that names it. A mark-and-sweep
+    /// that trusts reachability alone deletes exactly those objects — the write in
+    /// flight — and the writer then fails with `ContentMissing` on content it had
+    /// just stored. Skipping anything younger than a grace period longer than that
+    /// window closes it without any per-write bookkeeping.
+    ///
+    /// The age is relative to the backend's own notion of now, not the engine's
+    /// clock, so an injected test clock cannot make a real store look ancient.
+    ///
+    /// The default reports `None` for everything, which
+    /// [`Fs::gc`](crate::Fs::gc) treats as "not safe to sweep" — a custom backend
+    /// that cannot date its objects collects nothing rather than collecting
+    /// something live.
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        Ok(self.list().await?.into_iter().map(|h| (h, None)).collect())
+    }
+
     /// Delete an object, returning the bytes freed. Idempotent: deleting an
     /// absent hash succeeds and frees `0`.
     async fn delete(&self, hash: &Hash) -> Result<u64>;
@@ -253,6 +276,44 @@ impl ContentStore for LocalCasStore {
         Ok(Self::exists(&self.path_for(hash)).await)
     }
 
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        let now = std::time::SystemTime::now();
+        let objects = self.root.join("objects");
+        let mut out = Vec::new();
+        let mut shards = match tokio::fs::read_dir(&objects).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(shard) = shards.next_entry().await? {
+            if !shard.file_type().await?.is_dir() {
+                continue;
+            }
+            let prefix = shard.file_name().to_string_lossy().into_owned();
+            let mut entries = tokio::fs::read_dir(shard.path()).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".tmp") {
+                    continue; // an in-flight write; not yet a committed object
+                }
+                let Some(h) = Hash::from_hex(&format!("{prefix}{name}")) else {
+                    continue;
+                };
+                // An unreadable or future-dated mtime reports `None` (unknown),
+                // which the sweep treats as "don't touch".
+                let age = entry
+                    .metadata()
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs());
+                out.push((h, age));
+            }
+        }
+        Ok(out)
+    }
+
     async fn list(&self) -> Result<Vec<Hash>> {
         let objects = self.root.join("objects");
         let mut out = Vec::new();
@@ -322,6 +383,9 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
     async fn list(&self) -> Result<Vec<Hash>> {
         (**self).list().await
     }
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        (**self).list_with_age().await
+    }
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         (**self).delete(hash).await
     }
@@ -340,11 +404,23 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
 #[derive(Default)]
 pub struct MemStore {
     map: Mutex<HashMap<Hash, Bytes>>,
+    /// When each object was first stored, so the store can report an age the way
+    /// a real backend does (see [`ContentStore::list_with_age`]).
+    born: Mutex<HashMap<Hash, std::time::Instant>>,
 }
 
 impl MemStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record `hash` as newly stored, unless it already was.
+    fn touch_born(&self, hash: Hash) {
+        self.born
+            .lock()
+            .expect("mem store poisoned")
+            .entry(hash)
+            .or_insert_with(std::time::Instant::now);
     }
 
     /// Number of distinct blobs stored (useful for dedup assertions in tests).
@@ -366,7 +442,19 @@ impl ContentStore for MemStore {
             .expect("mem store poisoned")
             .entry(hash)
             .or_insert_with(|| Bytes::copy_from_slice(bytes));
+        self.touch_born(hash);
         Ok(hash)
+    }
+
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        let born = self.born.lock().expect("mem store poisoned");
+        Ok(self
+            .map
+            .lock()
+            .expect("mem store poisoned")
+            .keys()
+            .map(|h| (*h, born.get(h).map(|t| t.elapsed().as_secs())))
+            .collect())
     }
 
     async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
@@ -374,6 +462,7 @@ impl ContentStore for MemStore {
             .lock()
             .expect("mem store poisoned")
             .insert(*key, Bytes::copy_from_slice(bytes));
+        self.touch_born(*key);
         Ok(())
     }
 
@@ -383,6 +472,7 @@ impl ContentStore for MemStore {
             .expect("mem store poisoned")
             .entry(*key)
             .or_insert_with(|| Bytes::copy_from_slice(bytes));
+        self.touch_born(*key);
         Ok(())
     }
 
@@ -421,6 +511,7 @@ impl ContentStore for MemStore {
     }
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {
+        self.born.lock().expect("mem store poisoned").remove(hash);
         Ok(self
             .map
             .lock()
@@ -508,6 +599,10 @@ impl ContentStore for TieredStore {
         // The backend is authoritative (writes are write-through); the cache
         // holds only a subset.
         self.backend.list().await
+    }
+
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        self.backend.list_with_age().await
     }
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {
@@ -603,6 +698,10 @@ impl ContentStore for VerifyingStore {
 
     async fn list(&self) -> Result<Vec<Hash>> {
         self.inner.list().await
+    }
+
+    async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
+        self.inner.list_with_age().await
     }
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {
