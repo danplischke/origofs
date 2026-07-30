@@ -43,23 +43,21 @@ async fn init_stamps_a_fresh_store() {
     );
 }
 
-/// A store from before descriptors existed holds only v1 objects, so it opens
-/// normally — and comes away stamped, so the *next* reader gets the check.
+/// Stamping is idempotent: reopening the same store neither fails nor rewrites it
+/// into something a second reader would read differently.
 #[tokio::test]
-async fn an_unstamped_store_opens_and_gets_stamped() {
-    // A store from the pre-descriptor world: real objects in it, no slot.
+async fn reopening_a_stamped_store_leaves_the_stamp_alone() {
     let store = Arc::new(MemStore::new());
-    store.put(b"an object written long ago").await.unwrap();
-    assert!(store.get_meta(SLOT).await.unwrap().is_none());
-
     let fs = open(store.clone()).await.unwrap();
     fs.write("/a.txt", b"hello").await.unwrap();
+    drop(fs);
 
+    let fs = open(store.clone()).await.unwrap();
     assert_eq!(
         store.get_meta(SLOT).await.unwrap().as_deref(),
-        Some(DESCRIPTOR_V1),
-        "opening an unstamped store must stamp it, so the next reader gets checked"
+        Some(DESCRIPTOR_V1)
     );
+    fs.write("/b.txt", b"world").await.unwrap();
 }
 
 /// The headline case: the store says it needs a reader this build doesn't have.

@@ -1,11 +1,10 @@
-//! Pack objects and pack index entries carry a tag + format version, and packs
-//! written before they did still read.
+//! Pack objects and pack index entries carry a tag + format version.
 //!
 //! The pack layout had no version marker at all: a change to the trailer or the
 //! index entry would have been read as valid by an old binary and produce wrong
 //! offsets. `VerifyingStore` would eventually catch it as `Corrupt` (chunks are
 //! content-addressed), which is safe but tells the operator exactly the wrong
-//! story. These tests pin the framing and the legacy fallback.
+//! story. These tests pin the framing.
 
 use origofs_core::{ContentStore, Hash, MemStore, PackStore};
 use std::sync::Arc;
@@ -21,9 +20,9 @@ fn packed(target: usize) -> (PackStore, Arc<MemStore>, Arc<MemStore>) {
     (store, data, index)
 }
 
-/// Build a pack the way the code did before the footer was versioned:
-/// `body ‖ trailer ‖ trailer_len(u32)`, with no tag.
-fn legacy_pack(chunks: &[&[u8]]) -> Vec<u8> {
+/// Hand-build a pack — `body ‖ trailer ‖ trailer_len(u32) ‖ ORGP ‖ version` — so a
+/// test can plant one at a version the engine would never write.
+fn pack_bytes(chunks: &[&[u8]], version: u8) -> Vec<u8> {
     let mut buf = Vec::new();
     for c in chunks {
         buf.extend_from_slice(c);
@@ -35,12 +34,16 @@ fn legacy_pack(chunks: &[&[u8]]) -> Vec<u8> {
     }
     let tlen = (buf.len() - body_len) as u32;
     buf.extend_from_slice(&tlen.to_le_bytes());
+    buf.extend_from_slice(b"ORGP");
+    buf.push(version);
     buf
 }
 
-/// A pre-versioning index entry: the bare 40-byte body, no `ORGI` header.
-fn legacy_index_entry(pack: Hash, offset: u32, len: u32) -> Vec<u8> {
-    let mut e = Vec::with_capacity(40);
+/// Hand-build an index entry at an arbitrary version, likewise.
+fn index_entry(pack: Hash, offset: u32, len: u32, version: u8) -> Vec<u8> {
+    let mut e = Vec::with_capacity(45);
+    e.extend_from_slice(b"ORGI");
+    e.push(version);
     e.extend_from_slice(pack.as_bytes());
     e.extend_from_slice(&offset.to_le_bytes());
     e.extend_from_slice(&len.to_le_bytes());
@@ -83,33 +86,29 @@ async fn tagging_the_footer_does_not_move_chunks() {
     }
 }
 
-/// Packs and index entries written before this change must keep working — the
-/// whole point of a version byte is that it doesn't orphan what came before.
+/// `repack` is the only thing that parses a trailer, so exercise it end to end.
 #[tokio::test]
-async fn legacy_packs_and_index_entries_still_read_and_repack() {
+async fn repack_reads_the_trailer_and_rewrites_survivors() {
     let (store, data, index) = packed(1 << 20);
-    let a = b"first legacy chunk".as_slice();
-    let b = b"second legacy chunk".as_slice();
+    let a = b"first chunk".as_slice();
+    let b = b"second chunk".as_slice();
 
-    let pack = data.put(&legacy_pack(&[a, b])).await.unwrap();
+    let pack = data.put(&pack_bytes(&[a, b], 1)).await.unwrap();
     index
-        .put_keyed(&Hash::of(a), &legacy_index_entry(pack, 0, a.len() as u32))
+        .put_keyed(&Hash::of(a), &index_entry(pack, 0, a.len() as u32, 1))
         .await
         .unwrap();
     index
         .put_keyed(
             &Hash::of(b),
-            &legacy_index_entry(pack, a.len() as u32, b.len() as u32),
+            &index_entry(pack, a.len() as u32, b.len() as u32, 1),
         )
         .await
         .unwrap();
 
-    // Reads resolve through the untagged index entry into the untagged pack.
     assert_eq!(&store.get(&Hash::of(a)).await.unwrap()[..], a);
     assert_eq!(&store.get(&Hash::of(b)).await.unwrap()[..], b);
 
-    // `repack` parses the legacy trailer to learn the pack's membership; dropping
-    // one chunk must rewrite the survivor rather than choke on the old framing.
     store.delete(&Hash::of(a)).await.unwrap();
     store.repack().await.unwrap();
 
@@ -121,24 +120,18 @@ async fn legacy_packs_and_index_entries_still_read_and_repack() {
         "the old pack is gone, one fresh pack left"
     );
     let bytes = data.get(&survivor[0]).await.unwrap();
-    assert_eq!(
-        &bytes[bytes.len() - 5..],
-        b"ORGP\x01",
-        "the rewritten pack is written in the current format"
-    );
+    assert_eq!(&bytes[bytes.len() - 5..], b"ORGP\x01");
 }
 
-/// A pack from a future origofs is refused, not misread as a legacy footer.
+/// A pack from a future origofs is refused, not parsed into wrong offsets.
 #[tokio::test]
 async fn a_too_new_pack_footer_is_refused() {
     let (store, data, index) = packed(1 << 20);
     let a = b"chunk in a pack from the future".as_slice();
 
-    let mut pack_bytes = legacy_pack(&[a]);
-    pack_bytes.extend_from_slice(b"ORGP\x02");
-    let pack = data.put(&pack_bytes).await.unwrap();
+    let pack = data.put(&pack_bytes(&[a], 2)).await.unwrap();
     index
-        .put_keyed(&Hash::of(a), &legacy_index_entry(pack, 0, a.len() as u32))
+        .put_keyed(&Hash::of(a), &index_entry(pack, 0, a.len() as u32, 1))
         .await
         .unwrap();
 
@@ -151,17 +144,16 @@ async fn a_too_new_pack_footer_is_refused() {
     assert!(err.to_string().contains("pack"), "{err}");
 }
 
-/// Likewise for an index entry — and a truncated one stays plain malformed, so a
-/// short read never masquerades as a version problem.
+/// Likewise for an index entry.
 #[tokio::test]
 async fn a_too_new_index_entry_is_refused() {
     let (store, data, index) = packed(1 << 20);
     let a = b"a chunk".as_slice();
-    let pack = data.put(&legacy_pack(&[a])).await.unwrap();
-
-    let mut entry = b"ORGI\x02".to_vec();
-    entry.extend_from_slice(&legacy_index_entry(pack, 0, a.len() as u32));
-    index.put_keyed(&Hash::of(a), &entry).await.unwrap();
+    let pack = data.put(&pack_bytes(&[a], 1)).await.unwrap();
+    index
+        .put_keyed(&Hash::of(a), &index_entry(pack, 0, a.len() as u32, 2))
+        .await
+        .unwrap();
 
     let err = match store.get(&Hash::of(a)).await {
         Err(e) => e,
@@ -171,21 +163,25 @@ async fn a_too_new_index_entry_is_refused() {
     assert!(err.to_string().contains("pack index entry"), "{err}");
 }
 
-/// A 41-byte entry is neither a legacy 40-byte body nor a valid tagged one, so it
-/// stays plain malformed — a short read must never masquerade as "too new".
+/// An untagged or wrong-length entry is plain malformed — a short read must never
+/// masquerade as "too new", and an entry without the header is not a valid entry.
 #[tokio::test]
-async fn a_malformed_index_entry_is_not_reported_as_too_new() {
-    let (store, _data, index) = packed(1 << 20);
+async fn an_untagged_or_short_index_entry_is_malformed() {
     let a = b"a chunk".as_slice();
-    index.put_keyed(&Hash::of(a), &[0u8; 41]).await.unwrap();
+    // 40 zero bytes: the body with no header at all. 45 with a wrong tag. 41: short.
+    for entry in [vec![0u8; 40], vec![0u8; 45], vec![0u8; 41]] {
+        let (store, _data, index) = packed(1 << 20);
+        index.put_keyed(&Hash::of(a), &entry).await.unwrap();
 
-    let err = match store.get(&Hash::of(a)).await {
-        Err(e) => e,
-        Ok(_) => panic!("read accepted a malformed index entry"),
-    };
-    assert!(
-        !err.is_unsupported_version(),
-        "truncation is not a version problem: {err}"
-    );
-    assert_eq!(err.code(), "content_error");
+        let err = match store.get(&Hash::of(a)).await {
+            Err(e) => e,
+            Ok(_) => panic!("read accepted a {}-byte index entry", entry.len()),
+        };
+        assert!(
+            !err.is_unsupported_version(),
+            "{}-byte entry is not a version problem: {err}",
+            entry.len()
+        );
+        assert_eq!(err.code(), "content_error");
+    }
 }

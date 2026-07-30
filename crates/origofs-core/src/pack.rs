@@ -21,13 +21,10 @@
 //!
 //! **Where the version sits, and why at the end.** Everything else origofs writes
 //! is tagged at byte 0 ([`crate::format`]), but a pack *starts* with raw user
-//! bytes — a file whose contents begin with `ORGP` would be indistinguishable
-//! from a header, so a leading tag could not tell a v1 pack from a pre-versioning
-//! one. The footer can: a legacy pack ends with `trailer_len`, and for its last
-//! bytes to read as `ORGP` the trailer would have to be ~21 MiB (≈600k chunks in
-//! one 4 MiB pack). [`parse_trailer`] accepts both shapes, so packs written before
-//! this existed keep working. The read path never touches either: a chunk is a
-//! ranged GET at the offset its index entry records.
+//! bytes: a chunk whose contents begin with `ORGP` would be indistinguishable
+//! from a header, so byte 0 cannot carry a trustworthy tag here. The footer can —
+//! it is always origofs's own framing, never user data. The read path never parses
+//! either end: a chunk is a ranged GET at the offset its index entry records.
 
 use crate::content::ContentStore;
 use crate::error::{OrigoFSError, Result};
@@ -51,7 +48,7 @@ struct PackLoc {
 
 /// Body of an index entry: `pack(32) ‖ offset(4) ‖ len(4)`.
 const LOC_BODY: usize = 40;
-/// A versioned entry is the body behind a `ORGI ‖ version` header.
+/// A whole entry: the body behind an `ORGI ‖ version` header.
 const LOC_ENTRY: usize = format::HEADER_LEN + LOC_BODY;
 
 impl PackLoc {
@@ -67,16 +64,10 @@ impl PackLoc {
     }
 
     fn decode(b: &[u8]) -> Result<Self> {
-        // Entries written before the header existed are exactly the 40-byte body
-        // and can't be confused with a versioned one, which is 45 and tagged.
-        let body = if b.len() == LOC_BODY {
-            b
-        } else {
-            match format::PACK_INDEX.version_of(b)? {
-                1 if b.len() == LOC_ENTRY => &b[format::HEADER_LEN..],
-                1 => return Err(format::PACK_INDEX.malformed()),
-                v => return Err(format::PACK_INDEX.unsupported(v)),
-            }
+        let body = match format::PACK_INDEX.version_of(b)? {
+            1 if b.len() == LOC_ENTRY => &b[format::HEADER_LEN..],
+            1 => return Err(format::PACK_INDEX.malformed()),
+            v => return Err(format::PACK_INDEX.unsupported(v)),
         };
         let mut pack = [0u8; 32];
         pack.copy_from_slice(&body[..32]);
@@ -267,31 +258,16 @@ impl PackStore {
 
 /// Parse a pack's trailer into `(chunk_hash, offset, len)` in stored order.
 ///
-/// Accepts both the versioned footer (`trailer_len ‖ ORGP ‖ version`) and the
-/// pre-versioning one (`trailer_len` alone) — see the module docs for why the tag
-/// lives at the end and why the two can't be confused.
+/// The footer is `trailer_len(u32) ‖ ORGP ‖ version` — see the module docs for why
+/// the tag lives at the end.
 fn parse_trailer(pack: &[u8]) -> Result<Vec<(Hash, u32, u32)>> {
     let bad = || OrigoFSError::Content("malformed pack trailer".into());
-    if pack.len() < 4 {
-        return Err(bad());
+    const FOOTER: usize = 4 + format::HEADER_LEN;
+    let len_at = pack.len().checked_sub(FOOTER).ok_or_else(bad)?;
+    match format::PACK.version_of(&pack[len_at + 4..])? {
+        1 => {}
+        v => return Err(format::PACK.unsupported(v)),
     }
-    // `version_of` rejects a too-new pack with `UnsupportedVersion` rather than
-    // letting a future layout be misread as a legacy footer.
-    let tag = pack
-        .len()
-        .checked_sub(format::HEADER_LEN)
-        .map(|i| &pack[i..]);
-    let footer = match tag {
-        Some(t) if format::PACK.tagged(t) => match format::PACK.version_of(t)? {
-            1 => 4 + format::HEADER_LEN,
-            v => return Err(format::PACK.unsupported(v)),
-        },
-        _ => 4, // written before the pack footer was versioned
-    };
-    if pack.len() < footer {
-        return Err(bad());
-    }
-    let len_at = pack.len() - footer;
     let tlen = u32::from_le_bytes(pack[len_at..len_at + 4].try_into().unwrap()) as usize;
     let trailer_start = len_at.checked_sub(tlen).ok_or_else(bad)?;
     let trailer = &pack[trailer_start..len_at];

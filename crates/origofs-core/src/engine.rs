@@ -146,10 +146,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// bytes they can't parse as *absent*, which turns "upgrade origofs" into
     /// silent data loss.
     ///
-    /// A store with no descriptor is one written before descriptors existed (or a
-    /// brand-new one): everything in it is v1, so stamp it and carry on. A backend
-    /// that doesn't implement named slots reports "never written" forever and is
-    /// simply never checked — see [`ContentStore::put_meta`].
+    /// A store with no descriptor is a fresh one — stamp it. A backend that doesn't
+    /// implement named slots reports "never written" forever and is simply never
+    /// checked — see [`ContentStore::put_meta`].
     async fn check_store_format(&self) -> Result<()> {
         use crate::format::{STORE_DESCRIPTOR_SLOT, StoreDescriptor};
         let current = StoreDescriptor::current();
