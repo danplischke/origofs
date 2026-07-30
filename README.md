@@ -12,8 +12,8 @@ and every byte knows who wrote it.**
 
 [**Quickstart**](#quickstart) · [**Agents**](#working-with-agents) ·
 [**Attribution**](#know-who-did-what) · [**Versioning**](#versioning) ·
-[**Teams**](#running-for-a-team) · [**Backends**](#storage-backends) ·
-[**Design**](docs/DESIGN.md)
+[**Teams**](#running-for-a-team) · [**Python**](#python) ·
+[**Backends**](#storage-backends) · [**Design**](docs/DESIGN.md)
 
 </div>
 
@@ -442,6 +442,188 @@ histograms. Rust embedders record into the same facade — enable
 `origofs-core`'s `metrics` feature and install any [`metrics`](https://docs.rs/metrics)
 recorder.
 
+## Python
+
+`origofs-py` is the binding layer for the surface most people build on top of:
+a Python service that already knows *which user or agent* is calling. Every I/O
+method is a coroutine, so it drops straight into `async def` handlers, and
+structured results come back as plain JSON-serializable `dict`/`list`.
+
+```bash
+cd crates/origofs-py
+python -m venv .venv && . .venv/bin/activate
+pip install maturin && maturin develop     # builds the extension + installs `origofs`
+```
+
+Wheels are abi3 (`maturin build --release` — one wheel works on CPython ≥ 3.9).
+The integrations below ship as extras: `fastapi`, `fsspec`, `upath`,
+`llamaindex`, `markitdown`, `db`.
+
+```python
+import origofs
+
+ws = await origofs.Workspace.open_local("meta.db", "cas")
+# ...or the production combo — Postgres metadata + S3-shared content:
+#   cfg = origofs.S3Config(bucket="my-bucket", region="us-east-1")
+#   ws  = await origofs.Workspace.open_pg_s3(dsn, cfg)   # GcsConfig/open_pg_gcs too
+
+# map your app's user id onto an origofs actor (idempotent — no side table needed)
+actor = await ws.find_or_create_human("user_42", "Dan")
+ctx   = origofs.WriteCtx.session(actor, await ws.create_session(actor))
+
+await ws.write_as(ctx, "/notes.txt", b"hello")   # attributed → blame + audit
+await ws.blame("/notes.txt")   # [{"byte_start","byte_end","line_start","actor",…}, …]
+
+sid = await ws.suggest(ctx, "/main.rs", b"patched", "fix bug")   # proposed, not applied
+await ws.accept_suggestion(sid, origofs.WriteCtx.actor(reviewer))
+```
+
+The same [write policy](#propose-and-review-not-just-apply) applies here, because
+it lives in the engine: `write_or_propose` on a propose-only actor queues a
+suggestion instead of writing, and returns a `WriteOutcome` telling you which
+happened. Errors map onto Python's own: a missing path raises `FileNotFoundError`,
+a bad argument `ValueError`, a stale suggestion base `origofs.ConflictError`.
+
+### FastAPI — bring your own auth
+
+origofs ships no authentication, on purpose: a blame trail is only trustworthy if
+the identity behind each write is, and only your app knows how to resolve it.
+`origofs.fastapi.build_router` wires up every workspace endpoint against an auth
+dependency **you** provide:
+
+```python
+# app.py — pip install "origofs[fastapi]"
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Header, HTTPException
+import origofs
+from origofs.fastapi import build_router
+
+
+async def authn(
+    x_actor_id: Optional[int] = Header(default=None),
+    x_session_id: Optional[int] = Header(default=None),
+) -> origofs.WriteCtx:
+    """Resolve the request's principal to the actor to attribute it to."""
+    # swap this for your real auth: decode a JWT, look up a session, validate
+    # an agent token — then map that principal to an origofs actor id
+    if x_actor_id is None:
+        raise HTTPException(status_code=401, detail="unauthenticated")
+    if x_session_id is not None:
+        return origofs.WriteCtx.session(x_actor_id, x_session_id)
+    return origofs.WriteCtx.actor(x_actor_id)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ws = await origofs.Workspace.open_local("meta.db", "cas")   # or open_pg_s3(dsn, cfg)
+    app.include_router(build_router(ws, authn=authn), prefix="/fs")
+    app.state.ws = ws
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# your own endpoints sit alongside it — e.g. onboarding, which maps your user id
+# to the actor `authn` will later resolve to (idempotent, so no side table)
+@app.post("/users")
+async def upsert_user(external_id: str, name: str):
+    return {"actor_id": await app.state.ws.find_or_create_human(external_id, name)}
+```
+
+```bash
+uvicorn app:app --reload
+
+curl -X PUT --data-binary 'hello' -H 'X-Actor-Id: 1' \
+     http://127.0.0.1:8000/fs/files/notes.txt
+curl http://127.0.0.1:8000/fs/files/notes.txt        # → hello
+curl http://127.0.0.1:8000/fs/blame/notes.txt        # credited to actor 1
+curl -X PUT --data-binary 'x' http://127.0.0.1:8000/fs/files/y   # 401: no identity
+```
+
+One `build_router` call mounts the whole workspace: files, dirs, stat, rename,
+blame, commit/log/status, diff, branches/checkout, the suggestion review queue,
+the change feed, presence, actors/sessions, and the
+[co-editing](#live-co-editing-crdt) WebSocket at `/coedit/{path}` (long-lived
+rooms are created once per router, not per request).
+
+Every mutating route depends on `authn` and hands its `WriteCtx` straight to the
+workspace — the request body never names an actor, so a client can't forge
+attribution, and a propose-only actor's `PUT` lands in the review queue instead
+of the working tree. Reads are open by default: pass `reader=<dependency>` to
+gate them, or `dependencies=[…]` (forwarded to `APIRouter`, along with `tags`
+and the rest) to gate everything. `GET /files/{path}` streams rather than
+buffering a whole file, and honors a single-range `Range` header (`206`/`416`),
+so large files behave like a static file server.
+
+### The PyData stack reads origofs paths directly
+
+`origofs.fsspec.OrigoFileSystem` is a genuine `fsspec.asyn.AsyncFileSystem` — usable
+synchronously *and* by awaiting the `_`-prefixed coroutines on your own loop — so
+pandas, Dask, PyArrow, and Zarr work against a workspace with no glue:
+
+```python
+import origofs.fsspec                                    # registers "origofs://"
+import pandas as pd
+
+df = pd.read_parquet("origofs:///data/events.parquet",
+                     storage_options={"db_path": "meta.db", "cas_dir": "cas"})
+
+fs = origofs.fsspec.OrigoFileSystem(db_path="meta.db", cas_dir="cas", actor=actor)
+fs.pipe_file("/notes.txt", b"hello")      # attributed — fs.blame() credits it
+fs.cat_file("/notes.txt", start=0, end=5) # ranged: reads only the covering chunks
+```
+
+It passes fsspec's own conformance suite, and with the `upath` extra a workspace
+is a `pathlib`-shaped `UPath("origofs:///notes.txt", db_path=…, cas_dir=…)`.
+
+### RAG that knows who wrote each passage
+
+Retrieval over origofs isn't "object storage + embeddings": each passage carries
+**who wrote it** (from blame) and is keyed by a content hash, so only
+genuinely-changed passages need re-embedding. `content_defined` segmentation is
+the default because it puts boundaries where the bytes decide — an edit near the
+top of a file doesn't reshuffle every later passage's hash:
+
+```python
+from origofs.rag import read_passages
+for p in await read_passages(ws, root="/docs", segmentation="content_defined"):
+    p.text, p.hash, p.authors        # per-byte authorship, not a file-level guess
+
+from origofs.llamaindex import SimpleWorkspaceReader     # one Document per passage
+docs = SimpleWorkspaceReader(ws, root="/docs", convert="markitdown").load_data()
+```
+
+Non-text documents (PDF, DOCX, …) go through a pluggable converter to Markdown
+first; their provenance is document-level, since the extracted text no longer
+maps to the original bytes.
+
+### Feeds, agents, and mounts
+
+```python
+sub = await ws.subscribe(after_seq=0, branch="main")   # Postgres LISTEN/NOTIFY push
+events = await sub.recv()          # blocks until the next batch — ideal behind SSE
+
+from origofs.overlay import run    # agent in a live overlay, attributed as it types
+code = await run("./ws", agent_actor, ["claude", "-p", "refactor the parser"])
+
+with ws.mount("/mnt/origofs") as m: ...   # FUSE (Linux); NFSv3 elsewhere:
+await ws.serve_nfs("127.0.0.1:11111")  # a task that runs until cancelled
+```
+
+`origofs.db` additionally declares the whole metadata schema as SQLAlchemy models
+with packaged **Alembic** migrations, for when a deploy step (not the engine's own
+automatic on-open migration) should own the database — and for read-only
+reporting queries alongside the async API.
+
+Full details, the complete API surface, and the example apps live in
+[`crates/origofs-py/README.md`](crates/origofs-py/README.md) — start with
+[`examples/collab_app.py`](crates/origofs-py/examples/collab_app.py), which runs
+the whole human-writes → agent-suggests → reviewer-accepts story end to end with
+no server or curl needed.
+
 ## Built to not lose or corrupt data
 
 Because agents can generate a lot of churn against shared storage, correctness
@@ -541,21 +723,15 @@ origofs --workspace "$WS" gc     # run when idle — not safe alongside active w
 |---|---|
 | **`origofs` CLI** | Scripting and day-to-day workspace operations |
 | **Rust SDK** (`origofs-sdk`) | Embedding origofs in a Rust service |
-| **Python** (`origofs-py`) | Async-native PyO3 bindings — FastAPI-ready, resolve identity yourself |
+| **[Python](#python)** (`origofs-py`) | Async-native PyO3 bindings — FastAPI, fsspec, RAG; resolve identity yourself |
 | **HTTP API** (`origofs-sdk` `api` feature) | Any language / any client over JSON |
 | **MCP** (`origofs-sdk` `mcp` feature) | Agents calling filesystem tools directly, attributed |
 | **Overlay mount** | Running an agent live in a fast native mount |
 | **FUSE / NFS** | Mounting the workspace as a POSIX filesystem |
 
-Python, for example, keeps every I/O method awaitable so it composes with
-FastAPI, and lets you inject the user/agent behind each write:
-
-```python
-import origofs
-ws  = await origofs.Workspace.open_local("meta.db", "cas")   # or open_pg(dsn, cas)
-ctx = origofs.WriteCtx.session(actor_id, session_id)          # your resolved identity
-await ws.write_as(ctx, "/notes.txt", b"hello")            # attributed → blame + audit
-```
+They all funnel into the same engine, so a write lands on the change feed and
+carries attribution no matter which one it came through. [**Python**](#python)
+gets its own section above — it's the surface most services are built on.
 
 ## Development
 
