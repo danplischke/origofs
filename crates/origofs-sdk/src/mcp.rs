@@ -25,9 +25,50 @@ impl McpServer {
         Self { ws, agent, session }
     }
 
-    /// Register an agent actor + session and bind a server to them.
+    /// The agent actor every mutating tool call on this server is attributed to.
+    /// Stable across restarts for a given agent name — see [`create`](Self::create).
+    pub fn actor(&self) -> i64 {
+        self.agent
+    }
+
+    /// This process's session. A fresh one per server, unlike the actor.
+    pub fn session(&self) -> i64 {
+        self.session
+    }
+
+    /// Bind a server to the agent actor named `agent_name`, creating it only on
+    /// its first run, plus a fresh session for this process.
+    ///
+    /// The actor is *resolved* by a stable subject rather than minted per launch.
+    /// This used to call `create_agent`, an unconditional INSERT, so every
+    /// `origofs mcp` start produced a brand-new actor. Three consequences, all
+    /// bad for a system whose point is attribution: a write policy set on
+    /// yesterday's agent silently reverted to `Direct` today — so the review gate
+    /// could never be applied to the MCP surface at all; the `actor` table grew a
+    /// row per launch; and one logical agent's blame fragmented across dozens of
+    /// identically-named actors a reviewer cannot tell apart.
+    ///
+    /// The *session* stays per-process — that is what a session is.
+    ///
+    /// An existing actor is returned as-is: `model` is used only when creating
+    /// one, so re-running an agent under a new model keeps its identity (and its
+    /// history) rather than forking it.
     pub async fn create(ws: Workspace, agent_name: &str, model: &str) -> Result<Self> {
-        let agent = ws.create_agent(agent_name, model, None).await?;
+        Self::create_as(ws, &format!("mcp:{agent_name}"), agent_name, model).await
+    }
+
+    /// [`create`](Self::create) with an explicit auth subject, for an embedder
+    /// that resolves agent identity itself — an API key, an OIDC subject — instead
+    /// of deriving it from a name off the command line.
+    pub async fn create_as(
+        ws: Workspace,
+        auth_subject: &str,
+        agent_name: &str,
+        model: &str,
+    ) -> Result<Self> {
+        let agent = ws
+            .find_or_create_agent(auth_subject, agent_name, model, None)
+            .await?;
         let session = ws.create_session(agent, Some("mcp")).await?;
         Ok(Self::new(ws, agent, session))
     }

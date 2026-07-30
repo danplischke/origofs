@@ -332,3 +332,78 @@ async fn edit_is_governed_by_write_policy() {
     // unchanged until a different actor accepts
     assert_eq!(&ws.read("/f.txt").await.unwrap()[..], b"hello world\n");
 }
+
+// The MCP agent's identity must survive a restart. `create` used to call
+// `create_agent`, an unconditional INSERT, so every `origofs mcp` launch minted a
+// brand-new actor with the same display name. That quietly defeated the review
+// gate — a `propose` policy set on the agent applied to an actor no later run
+// would ever use again — and scattered one agent's blame across a growing pile of
+// indistinguishable actors.
+#[tokio::test]
+async fn agent_identity_is_stable_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || async {
+        Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+            .await
+            .unwrap()
+    };
+
+    let first = McpServer::create(open().await, "claude", "claude-opus-4-8")
+        .await
+        .unwrap();
+    let (actor, first_session) = (first.actor(), first.session());
+
+    // An operator gates this agent between runs.
+    open()
+        .await
+        .set_write_policy(actor, WritePolicy::Propose)
+        .await
+        .unwrap();
+
+    let second = McpServer::create(open().await, "claude", "claude-opus-4-8")
+        .await
+        .unwrap();
+    assert_eq!(
+        second.actor(),
+        actor,
+        "the same agent name must resolve to the same actor across restarts"
+    );
+    assert_ne!(
+        second.session(),
+        first_session,
+        "each process still gets its own session"
+    );
+
+    // The decisive check: the policy still applies, so the write is queued for
+    // review rather than landing directly.
+    let w = second
+        .handle(call(
+            "origofs_write",
+            json!({"path":"/notes.txt","content":"after restart"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(w["result"]["isError"], false);
+    assert!(
+        text(&w).contains("proposed suggestion"),
+        "a policy set before the restart must still gate this write, got: {}",
+        text(&w)
+    );
+
+    // A different agent name is still a different actor.
+    let other = McpServer::create(open().await, "gemini", "gemini-3")
+        .await
+        .unwrap();
+    assert_ne!(other.actor(), actor);
+
+    // One actor per agent name, not one per launch.
+    let claude_actors = open()
+        .await
+        .list_actors()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.display_name == "claude")
+        .count();
+    assert_eq!(claude_actors, 1, "one actor per agent, not one per launch");
+}
