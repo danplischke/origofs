@@ -521,7 +521,16 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             SuggestionKind::Crdt => return Err(crdt_needs_feature(s.id)),
         }
 
-        self.meta
+        // The status transition and its audit event commit together, so the feed
+        // can't record an acceptance that didn't stick (or miss one that did).
+        //
+        // The `bool` is checked rather than discarded: it exists precisely to
+        // detect that someone else resolved this suggestion first, and ignoring it
+        // meant two reviewers could both be told their accept succeeded while only
+        // one approver was recorded.
+        let branch = self.current_branch().await.ok().flatten();
+        let mut txn = self.meta.begin().await?;
+        let applied = txn
             .resolve_suggestion(
                 id,
                 SuggestionStatus::Accepted,
@@ -529,15 +538,24 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 self.now_secs(),
             )
             .await?;
-        self.record_event(EventInit {
-            actor_id: Some(approver.actor),
-            session_id: approver.session,
-            kind: "accept".to_string(),
-            path: s.path.clone(),
-            detail: Some(format!("suggestion #{id}")),
-            branch: self.current_branch().await.ok().flatten(),
-        })
+        if !applied {
+            return Err(OrigoFSError::Conflict(format!(
+                "suggestion #{id} was resolved by another reviewer while this accept was applying"
+            )));
+        }
+        txn.append_event(
+            EventInit {
+                actor_id: Some(approver.actor),
+                session_id: approver.session,
+                kind: "accept".to_string(),
+                path: s.path.clone(),
+                detail: Some(format!("suggestion #{id}")),
+                branch,
+            },
+            self.now_secs(),
+        )
         .await?;
+        txn.commit().await?;
         // The accept moved the file, so any *other* pending byte proposal against
         // the old base is now about a version that no longer exists. Retire those
         // to `Superseded` instead of leaving them Pending forever for a reviewer to

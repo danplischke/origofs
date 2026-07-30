@@ -187,21 +187,26 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // content store batches writes).
         self.content.flush().await?;
 
+        // The branch advance and the merge-state clear commit together. Separately,
+        // a crash after the CAS left `MERGE_HEAD` set and the conflicts recorded
+        // forever: the workspace reads as permanently mid-merge, and the *next*
+        // commit re-adds the same second parent.
         let expect = parent.map(|h| h.to_hex());
-        let swapped = self
-            .meta
+        let mut txn = self.meta.begin().await?;
+        let swapped = txn
             .cas_ref(&branch, expect.as_deref(), &commit_hash.to_hex())
             .await?;
         if !swapped {
+            // Dropping rolls back; nothing was applied.
             return Err(OrigoFSError::Metadata(
                 "branch moved concurrently; retry the commit".to_string(),
             ));
         }
-        // Merge resolved: clear the in-progress state.
         if merge_head.is_some() {
-            self.meta.delete_ref("MERGE_HEAD").await?;
-            self.meta.clear_conflicts().await?;
+            txn.delete_ref("MERGE_HEAD").await?;
+            txn.clear_conflicts().await?;
         }
+        txn.commit().await?;
         self.mirror_refs().await?;
         Ok(commit_hash)
     }
@@ -287,8 +292,15 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             Hash::from_hex(&value).ok_or_else(|| OrigoFSError::Metadata("bad ref value".into()))?;
         let commit = Commit::decode(&self.content.get(&commit_hash).await?)?;
 
-        self.replace_working_tree(commit.tree).await?;
-        self.meta.set_ref(HEAD, &format!("ref:{branch}")).await?;
+        // The tree swap and the HEAD move commit together. Separately, a crash
+        // between them left branch B's tree in the working tree while HEAD still
+        // named branch A — and the *next* commit would then snapshot B's tree onto
+        // A's tip, whose CAS succeeds because A's parent hasn't moved. A checkout
+        // silently force-overwriting the branch you came from.
+        let mut txn = self.meta.begin().await?;
+        self.replace_working_tree_in(&mut *txn, commit.tree).await?;
+        txn.set_ref(HEAD, &format!("ref:{branch}")).await?;
+        txn.commit().await?;
         self.mirror_refs().await?;
         Ok(())
     }
@@ -296,15 +308,29 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Atomically replace the working tree with the contents of `tree_hash`:
     /// truncate the current tree and rematerialize the new one inside a single
     /// metadata transaction, so a failure mid-materialize — or a concurrent
-    /// reader — never observes a half-emptied tree (audit #9). Used by checkout,
-    /// merge, and rebuild.
+    /// reader — never observes a half-emptied tree (audit #9). Used by rebuild.
+    ///
+    /// Prefer [`replace_working_tree_in`](Self::replace_working_tree_in) when the
+    /// caller has ref or conflict state to write alongside the tree: a tree swap
+    /// that commits *separately* from the ref describing it is exactly the torn
+    /// state `docs/DESIGN.md` §7 claims not to exist.
     pub(crate) async fn replace_working_tree(&self, tree_hash: Hash) -> Result<()> {
         let mut txn = self.meta.begin().await?;
-        txn.truncate_tree().await?;
-        self.materialize_into_txn(&mut *txn, tree_hash, self.root_ino)
-            .await?;
+        self.replace_working_tree_in(&mut *txn, tree_hash).await?;
         txn.commit().await?;
         Ok(())
+    }
+
+    /// Stage a whole-tree replacement into an existing transaction, so the caller
+    /// can commit it together with the refs and conflict rows that describe it.
+    pub(crate) async fn replace_working_tree_in(
+        &self,
+        txn: &mut dyn MetaTxn,
+        tree_hash: Hash,
+    ) -> Result<()> {
+        txn.truncate_tree().await?;
+        self.materialize_into_txn(txn, tree_hash, self.root_ino)
+            .await
     }
 
     /// Materialize a tree's entries as children of `parent_ino`, staging every

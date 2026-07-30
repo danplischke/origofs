@@ -1334,6 +1334,96 @@ impl MetaTxn for SqliteTxn {
         Ok(conn.last_insert_rowid())
     }
 
+    async fn set_ref(&mut self, name: &str, value: &str) -> Result<()> {
+        let ws = self.workspace_id;
+        self.conn().execute(
+            "INSERT INTO ref(workspace_id, name, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id, name) DO UPDATE SET value = excluded.value",
+            params![ws, name, value],
+        )?;
+        Ok(())
+    }
+
+    async fn cas_ref(&mut self, name: &str, expect: Option<&str>, new: &str) -> Result<bool> {
+        let ws = self.workspace_id;
+        let conn = self.conn();
+        let changed = match expect {
+            None => conn.execute(
+                "INSERT INTO ref(workspace_id, name, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(workspace_id, name) DO NOTHING",
+                params![ws, name, new],
+            )?,
+            Some(v) => conn.execute(
+                "UPDATE ref SET value = ?1 WHERE workspace_id = ?2 AND name = ?3 AND value = ?4",
+                params![new, ws, name, v],
+            )?,
+        };
+        Ok(changed == 1)
+    }
+
+    async fn delete_ref(&mut self, name: &str) -> Result<()> {
+        let ws = self.workspace_id;
+        self.conn().execute(
+            "DELETE FROM ref WHERE workspace_id = ?1 AND name = ?2",
+            params![ws, name],
+        )?;
+        Ok(())
+    }
+
+    async fn set_conflict(&mut self, path: &str, kind: &str) -> Result<()> {
+        let ws = self.workspace_id;
+        self.conn().execute(
+            "INSERT INTO conflict(workspace_id, path, kind) VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id, path) DO UPDATE SET kind = excluded.kind",
+            params![ws, path, kind],
+        )?;
+        Ok(())
+    }
+
+    async fn clear_conflicts(&mut self) -> Result<()> {
+        let ws = self.workspace_id;
+        self.conn()
+            .execute("DELETE FROM conflict WHERE workspace_id = ?1", params![ws])?;
+        Ok(())
+    }
+
+    async fn set_config(&mut self, key: &str, value: &str) -> Result<()> {
+        let ws = self.workspace_id;
+        self.conn().execute(
+            "INSERT INTO config(workspace_id, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_id, key) DO UPDATE SET value = excluded.value",
+            params![ws, key, value],
+        )?;
+        Ok(())
+    }
+
+    async fn append_event(&mut self, ev: EventInit, ts: i64) -> Result<i64> {
+        let ws = self.workspace_id;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO fs_event(workspace_id, actor_id, session_id, kind, path, detail, ts, branch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![ws, ev.actor_id, ev.session_id, ev.kind, ev.path, ev.detail, ts, ev.branch],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    async fn resolve_suggestion(
+        &mut self,
+        id: i64,
+        status: SuggestionStatus,
+        resolved_by: Option<i64>,
+        ts: i64,
+    ) -> Result<bool> {
+        let ws = self.workspace_id;
+        let n = self.conn().execute(
+            "UPDATE suggestion SET status = ?1, resolved_by = ?2, resolved_ts = ?3
+             WHERE id = ?4 AND workspace_id = ?5 AND status = 'pending'",
+            params![status.as_str(), resolved_by, ts, id, ws],
+        )?;
+        Ok(n == 1)
+    }
+
     async fn truncate_tree(&mut self) -> Result<()> {
         // Same as MetadataStore::truncate_tree, staged in this transaction.
         let ws = self.workspace_id;

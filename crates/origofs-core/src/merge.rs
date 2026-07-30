@@ -248,22 +248,28 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
         if self.is_ancestor(ours, theirs).await? {
             let theirs_commit = self.commit_at(&theirs).await?;
-            // Advance the ref FIRST (checked): if the branch moved concurrently
-            // the CAS fails and we abort *before* clobbering the working tree,
-            // rather than silently overwriting it and reporting success.
-            let swapped = self
-                .meta
+            // A fast-forward doesn't merge bytes, it materializes theirs wholesale
+            // — which still overwrites a live path. Report the ones it changes.
+            let stale = self.live_changed_between(ours, theirs, &live).await?;
+            // The checked ref advance and the tree it describes commit together.
+            // The CAS still comes first *within* the transaction, so a branch that
+            // moved concurrently aborts before any of the tree work is staged;
+            // committing them separately meant a crash in between advanced the
+            // branch while the working tree still held the old content, and the
+            // next commit would snapshot that stale tree on top — silently
+            // reverting the merge.
+            let mut txn = self.meta.begin().await?;
+            if !txn
                 .cas_ref(&branch, Some(&ours.to_hex()), &theirs.to_hex())
-                .await?;
-            if !swapped {
+                .await?
+            {
                 return Err(OrigoFSError::Conflict(format!(
                     "branch {branch} moved concurrently; retry the merge"
                 )));
             }
-            // A fast-forward doesn't merge bytes, it materializes theirs wholesale
-            // — which still overwrites a live path. Report the ones it changes.
-            let stale = self.live_changed_between(ours, theirs, &live).await?;
-            self.replace_working_tree(theirs_commit.tree).await?;
+            self.replace_working_tree_in(&mut *txn, theirs_commit.tree)
+                .await?;
+            txn.commit().await?;
             self.mirror_refs().await?;
             return Ok((MergeOutcome::FastForward(theirs), stale));
         }
@@ -299,30 +305,43 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 timestamp: self.now_secs(),
             };
             let commit_hash = self.content.put(&commit.encode()).await?;
-            // Advance the ref FIRST (checked), then reflect it in the working
-            // tree — so a concurrent branch move aborts the merge before we
-            // overwrite the working tree or drop `theirs` from history.
-            let swapped = self
-                .meta
+            // Ref advance + working tree in one transaction. The CAS is still
+            // first, so a concurrent branch move aborts before anything is
+            // staged; and because they now commit together, a crash can no longer
+            // leave the branch advanced onto a tree that was never materialized.
+            let mut txn = self.meta.begin().await?;
+            if !txn
                 .cas_ref(&branch, Some(&ours.to_hex()), &commit_hash.to_hex())
-                .await?;
-            if !swapped {
+                .await?
+            {
                 return Err(OrigoFSError::Conflict(format!(
                     "branch {branch} moved concurrently; retry the merge"
                 )));
             }
-            self.replace_working_tree(merged_tree).await?;
+            self.replace_working_tree_in(&mut *txn, merged_tree).await?;
+            txn.commit().await?;
             self.mirror_refs().await?;
             Ok((MergeOutcome::Merged(commit_hash), stale))
         } else {
             // Conflicts: reflect the merge (with markers) and record MERGE_HEAD;
             // the ref intentionally does NOT advance until the user commits.
-            self.replace_working_tree(merged_tree).await?;
-            self.meta.clear_conflicts().await?;
+            //
+            // All of it in one transaction. This was the worst of the torn states:
+            // five separate writes, so a crash before `MERGE_HEAD` landed left a
+            // working tree full of conflict markers with *no record that a merge
+            // was in progress* — and the next commit then produced a single-parent
+            // commit containing the markers, dropping `theirs` from history
+            // entirely. A concurrent reader could also catch the window between
+            // `clear_conflicts` and the re-inserts and see zero conflicts over a
+            // marker-laden tree.
+            let mut txn = self.meta.begin().await?;
+            self.replace_working_tree_in(&mut *txn, merged_tree).await?;
+            txn.clear_conflicts().await?;
             for c in &conflicts {
-                self.meta.set_conflict(&c.path, &c.kind).await?;
+                txn.set_conflict(&c.path, &c.kind).await?;
             }
-            self.meta.set_ref(MERGE_HEAD, &theirs.to_hex()).await?;
+            txn.set_ref(MERGE_HEAD, &theirs.to_hex()).await?;
+            txn.commit().await?;
             self.mirror_refs().await?;
             Ok((MergeOutcome::Conflicts(conflicts), stale))
         }

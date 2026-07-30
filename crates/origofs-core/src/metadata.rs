@@ -363,6 +363,46 @@ pub trait MetaTxn: Send {
     /// concurrent reader never sees a half-emptied tree. Blame (keyed by content
     /// hash) is deliberately not cleared.
     async fn truncate_tree(&mut self) -> Result<()>;
+    // --- refs, conflicts, config, feed, suggestions -------------------------
+    //
+    // These exist so a *logical* operation can be one transaction. Without them
+    // `commit`, `checkout`, `merge`, and `accept_suggestion` each had to touch the
+    // working tree in a transaction and then make several further writes outside
+    // it, so an interruption between the parts left the workspace in a state no
+    // caller could produce deliberately: a branch advanced onto a tree that was
+    // never materialized, conflict markers with no `MERGE_HEAD`, a suggestion
+    // still `Pending` after its edit had landed. See `docs/DESIGN.md` §7's
+    // "torn multi-step mutations".
+
+    /// Set (or replace) a ref, as part of this transaction.
+    async fn set_ref(&mut self, name: &str, value: &str) -> Result<()>;
+    /// Compare-and-set a ref (`expect` `None` = "must not exist"), returning
+    /// whether it applied. The branch advance every commit/merge is built on.
+    async fn cas_ref(&mut self, name: &str, expect: Option<&str>, new: &str) -> Result<bool>;
+    /// Delete a ref (no-op if absent).
+    async fn delete_ref(&mut self, name: &str) -> Result<()>;
+    /// Record a merge conflict at `path`.
+    async fn set_conflict(&mut self, path: &str, kind: &str) -> Result<()>;
+    /// Drop every recorded conflict.
+    async fn clear_conflicts(&mut self) -> Result<()>;
+    /// Set a config value (the ref-mirror generation pointer, versioning mode…).
+    async fn set_config(&mut self, key: &str, value: &str) -> Result<()>;
+    /// Append a change-feed event, returning its sequence number.
+    ///
+    /// In the transaction so a subscriber cannot observe an event for a mutation
+    /// that rolled back, nor miss one that committed — the feed is a log of
+    /// *applied* state or it is not trustworthy.
+    async fn append_event(&mut self, ev: EventInit, ts: i64) -> Result<i64>;
+    /// Transition a suggestion out of `pending`, returning whether it applied
+    /// (`false` means someone else resolved it first).
+    async fn resolve_suggestion(
+        &mut self,
+        id: i64,
+        status: SuggestionStatus,
+        resolved_by: Option<i64>,
+        ts: i64,
+    ) -> Result<bool>;
+
     /// Commit every staged mutation atomically. Consumes the transaction.
     async fn commit(self: Box<Self>) -> Result<()>;
 }
