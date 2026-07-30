@@ -213,6 +213,20 @@ enum Cmd {
     },
     /// Show per-line authorship (blame) for a file.
     Blame { path: String },
+    /// Undo exactly the lines one actor authored in one session, across every file
+    /// that session touched, leaving other actors' edits intact. `--by` is the
+    /// actor performing the revert (must be permitted to write).
+    RevertSession {
+        /// The actor whose work is being undone.
+        #[arg(long)]
+        actor: i64,
+        /// The session to undo.
+        #[arg(long)]
+        session: i64,
+        /// The actor performing the revert; checked against the write policy.
+        #[arg(long)]
+        by: Option<i64>,
+    },
     /// Run a command over a copy-on-write view of the workspace, then import what
     /// it changed as an attributed commit (or `--discard`). By default this is an
     /// edit-capture view, not a security sandbox — the command runs with your
@@ -850,6 +864,19 @@ async fn main() -> Result<()> {
             })?;
             ws.set_write_policy(actor, p).await?;
             println!("actor #{actor} write policy set to {}", p.as_str());
+        }
+        Cmd::RevertSession { actor, session, by } => {
+            // A revert is performed *on* someone else's work, so the target comes
+            // from `--actor` while `--by` is the reviewer doing it. When `--by` is
+            // given its write policy is checked, so a propose-only actor cannot
+            // revert anyone.
+            if let Some(by) = by {
+                let s = ws.create_session(by, Some("cli")).await?;
+                ws.ensure_may_write(WriteCtx::session(by, s), "revert a session")
+                    .await?;
+            }
+            let changed = ws.revert_session(actor, session).await?;
+            println!("reverted actor {actor} session {session}: {changed} file(s) changed");
         }
         Cmd::Blame { path } => {
             for r in ws.blame(&path).await? {

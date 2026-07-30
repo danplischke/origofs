@@ -159,7 +159,12 @@ let bytes = ws.read("/notes/a.txt").await?;
 let spans = ws.blame("/notes/a.txt").await?;               // who wrote which bytes
 ```
 
-Python is the same API with `await` on every call — see [Python](#python).
+Python mirrors this API with `await` on every call — see [Python](#python). The
+binding covers the workspace, versioning, merge, attribution, suggestions, the
+change feed, multi-workspace, maintenance (`gc`/`flush`/`repack`/
+`backup_metadata`), and encryption at rest. Genuinely Rust-only today: the
+`resync` reconciliation flow, direct object push/fetch between workspaces, and
+assembling a custom backend stack by hand.
 
 ## Working with agents
 
@@ -275,6 +280,20 @@ authored, leaving surrounding human edits in place:
 
 ```rust
 let files_changed = ws.revert_session(agent_id, session_id).await?;
+```
+
+Reachable from every surface:
+
+```bash
+origofs revert-session --actor 7 --session 42 --by 1   # --by is checked against the write policy
+```
+
+```python
+files_changed = await ws.revert_session(agent_id, session_id)
+```
+
+```http
+POST /v1/revert-session   {"actor": 7, "session": 42}
 ```
 
 ## Versioning

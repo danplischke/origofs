@@ -290,6 +290,7 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
         .route("/suggestions/{id}/accept", post(accept_suggestion))
         .route("/suggestions/{id}/reject", post(reject_suggestion))
         .route("/actors", post(create_actor))
+        .route("/revert-session", post(revert_session))
         .route("/sessions", post(create_session));
     if options.gate_reads {
         // Require a valid credential for every data route, reads included.
@@ -1193,6 +1194,40 @@ async fn checkout(
 ) -> ApiResult<Json<serde_json::Value>> {
     ws.checkout_as(principal.write_ctx(), &req.name).await?;
     Ok(Json(json!({ "branch": req.name })))
+}
+
+/// The body of `POST /v1/revert-session`.
+#[derive(Deserialize)]
+struct RevertReq {
+    actor: i64,
+    session: i64,
+}
+
+/// Undo exactly the lines one actor authored in one session, across every file
+/// that session touched, leaving other actors' edits intact.
+///
+/// This is the feature the README leads with — "can I undo just the agent's
+/// work?" — and it existed only in the Rust SDK: no CLI subcommand, no HTTP route,
+/// no MCP tool, no Python binding. Well-tested core logic, simply unexposed.
+///
+/// Gated, and the actor being reverted comes from the *body* on purpose: this is a
+/// review action performed *on* someone else's work, so the target is not the
+/// caller. The caller's own identity still has to clear the write policy — a
+/// propose-only actor cannot revert anyone, including itself.
+async fn revert_session(
+    State(ws): State<Shared>,
+    Auth(principal): Auth,
+    Json(req): Json<RevertReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    ws.ensure_may_write(principal.write_ctx(), "revert a session")
+        .await?;
+    let files_changed = ws.revert_session(req.actor, req.session).await?;
+    Ok(Json(json!({
+        "actor": req.actor,
+        "session": req.session,
+        "files_changed": files_changed,
+        "reverted_by": principal.actor,
+    })))
 }
 
 // --- attribution ------------------------------------------------------------

@@ -902,6 +902,84 @@ impl Workspace {
         })
     }
 
+    /// Open a local workspace **encrypted at rest**: SQLite metadata at `db_path`,
+    /// content under `cas_dir` sealed with XChaCha20-Poly1305 under a key derived
+    /// from `passphrase` (Argon2id) over a per-store random salt.
+    ///
+    /// Encryption was reachable only from Rust — no binding existed at all — so a
+    /// Python deployment could not have encryption at rest, whatever the docs
+    /// implied.
+    ///
+    /// The same passphrase must be given on every open; a wrong one fails loudly
+    /// rather than returning garbage. The salt is created on first open, is not
+    /// secret, and lives beside the content store so it survives losing the
+    /// metadata database.
+    ///
+    /// Two things to know. Key derivation is Argon2id and deliberately slow, and it
+    /// runs on the calling thread — call this at startup, not per request. And
+    /// addresses stay the *plaintext* hash (convergent encryption) so dedup still
+    /// works, which makes a shared encrypted store an existence oracle: use
+    /// per-tenant keys if that matters.
+    #[staticmethod]
+    fn open_local_encrypted<'py>(
+        py: Python<'py>,
+        db_path: String,
+        cas_dir: String,
+        passphrase: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            let ws = CoreWorkspace::open_local_encrypted(&db_path, &cas_dir, &passphrase)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Py::new(py, Workspace { inner: ws }))
+        })
+    }
+
+    /// Open an S3-backed workspace **encrypted at rest**. See
+    /// [`open_local_encrypted`] for the key-derivation and dedup caveats.
+    #[staticmethod]
+    fn open_s3_encrypted<'py>(
+        py: Python<'py>,
+        db_path: String,
+        cfg: S3Config,
+        passphrase: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            let meta: Arc<dyn origofs_sdk::MetadataStore> =
+                Arc::new(origofs_sdk::SqliteMetadataStore::open(&db_path).map_err(to_pyerr)?);
+            let backend: Arc<dyn origofs_sdk::ContentStore> =
+                Arc::new(origofs_sdk::ObjectContentStore::s3(cfg.inner).map_err(to_pyerr)?);
+            let ws = CoreWorkspace::open_encrypted(meta, backend, &passphrase)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Py::new(py, Workspace { inner: ws }))
+        })
+    }
+
+    /// Open a Postgres + S3 workspace **encrypted at rest** — the production
+    /// pairing with encryption on. See [`open_local_encrypted`] for the caveats.
+    #[staticmethod]
+    fn open_pg_s3_encrypted<'py>(
+        py: Python<'py>,
+        dsn: String,
+        cfg: S3Config,
+        passphrase: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            let meta: Arc<dyn origofs_sdk::MetadataStore> = Arc::new(
+                origofs_sdk::PostgresMetadataStore::connect(&dsn)
+                    .await
+                    .map_err(to_pyerr)?,
+            );
+            let backend: Arc<dyn origofs_sdk::ContentStore> =
+                Arc::new(origofs_sdk::ObjectContentStore::s3(cfg.inner).map_err(to_pyerr)?);
+            let ws = CoreWorkspace::open_encrypted(meta, backend, &passphrase)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Py::new(py, Workspace { inner: ws }))
+        })
+    }
+
     /// Open a local workspace whose chunks are batched into pack objects
     /// (`data_dir`), with the pack index under `index_dir`.
     #[staticmethod]
@@ -2199,6 +2277,570 @@ impl Workspace {
     fn serve_nfs(&self, _addr: String, _shutdown: Option<Bound<'_, PyAny>>) -> PyResult<()> {
         Err(unsupported("NFS serving"))
     }
+
+    // ── multi-workspace ──────────────────────────────────────────────────────
+    //
+    // `workspace`/`workspaces` had no binding at all, so a Python caller got
+    // exactly one workspace — the `default` one every `open_*` lands in — and the
+    // whole workspace layer of `docs/MULTI_TENANCY.md` was unreachable from the
+    // surface most services are built on.
+
+    /// Open (creating on first use) another **workspace** in this same store.
+    ///
+    /// Workspaces share the store's content and identity (actors, blame, audit)
+    /// and are separated by a `workspace_id`; each has its own root, refs, working
+    /// tree, suggestion queue, change feed, and presence. The returned handle
+    /// shares this one's connection pool and content store, so it is cheap.
+    ///
+    /// Note there is no actor→workspace mapping in origofs: which actor may reach
+    /// which workspace is for the layer that resolves identity to enforce.
+    fn workspace<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let scoped = ws.workspace(&name).await.map_err(to_pyerr)?;
+            Python::attach(|py| Py::new(py, Workspace { inner: scoped }))
+        })
+    }
+
+    /// The names of every workspace in this store, oldest first.
+    fn workspaces<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move { ws.workspaces().await.map_err(to_pyerr) })
+    }
+
+    // ── attributed mutations ─────────────────────────────────────────────────
+    //
+    // Only `write_as`/`write_or_propose` were bound. `remove`/`rename`/`mkdir_p`/
+    // `commit`/`checkout`/`create_branch` were available *only* in their
+    // unattributed forms, which are exempt from the §6 write policy by
+    // construction — so `set_write_policy(actor, "propose")`, which *was* bound,
+    // had no effect on any of them. The gate looked enforced and was not, and none
+    // of those mutations carried blame or an edit-op.
+
+    /// Remove `path`, attributed to `ctx` and governed by its write policy: a
+    /// `Direct` actor removes it; a propose-only actor's removal is queued for
+    /// review. Returns a [`WriteOutcome`].
+    #[pyo3(signature = (ctx, path, summary = None))]
+    fn remove_or_propose<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        summary: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let outcome = ws
+                .remove_or_propose(c, &path, summary.as_deref())
+                .await
+                .map_err(to_pyerr)?;
+            let (wrote, suggestion_id) = match outcome {
+                CoreWriteOutcome::Wrote => (true, None),
+                CoreWriteOutcome::Proposed(id) => (false, Some(id)),
+            };
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    WriteOutcome {
+                        wrote,
+                        suggestion_id,
+                    },
+                )
+            })
+        })
+    }
+
+    /// Move/rename a path, attributed to `ctx` and subject to its write policy.
+    /// See [`Workspace::rename`] for why the parameter is `from_`.
+    fn rename_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        from_: String,
+        to: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.rename_as(c, &from_, &to).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Create a directory and any missing parents, attributed to `ctx` and
+    /// subject to its write policy.
+    fn mkdir_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.mkdir_as(c, &path).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Create a symlink at `linkpath` pointing at `target`, attributed to `ctx`
+    /// and subject to its write policy.
+    fn symlink_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        target: String,
+        linkpath: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.symlink_as(c, &target, &linkpath)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Snapshot the working tree into a commit, attributed to `ctx` and subject to
+    /// its write policy. Returns the commit hash as hex.
+    fn commit_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        author: String,
+        message: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let h = ws.commit_as(c, &author, &message).await.map_err(to_pyerr)?;
+            Ok(h.to_hex())
+        })
+    }
+
+    /// Create a branch at the current HEAD, attributed to `ctx` and subject to its
+    /// write policy.
+    fn create_branch_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.create_branch_as(c, &name).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Switch the working tree to `branch`, attributed to `ctx` and subject to its
+    /// write policy.
+    ///
+    /// This is the destructive one: checkout truncates and rematerializes the
+    /// entire working tree, discarding every uncommitted edit. Prefer it over the
+    /// unattributed `checkout` whenever an actor is known.
+    fn checkout_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        branch: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.checkout_as(c, &branch).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Raise `PermissionError` if `ctx`'s actor is propose-only.
+    ///
+    /// Every attributed method above applies this itself; it is exposed for the
+    /// administrative operations that have no attributed variant (registering an
+    /// actor, setting a policy), so a Python surface can gate those the same way.
+    fn ensure_may_write<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        op: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.ensure_may_write(c, &op).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    // ── symlinks ─────────────────────────────────────────────────────────────
+
+    /// Create a symlink at `linkpath` pointing at `target` (unattributed; prefer
+    /// `symlink_as`).
+    fn symlink<'py>(
+        &self,
+        py: Python<'py>,
+        target: String,
+        linkpath: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.symlink(&target, &linkpath).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Read a symlink's target.
+    fn readlink<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(
+            py,
+            async move { ws.readlink(&path).await.map_err(to_pyerr) },
+        )
+    }
+
+    // ── maintenance ──────────────────────────────────────────────────────────
+    //
+    // None of this was bound, while the *packed* constructors were — so a Python
+    // caller could open a store whose space could never be reclaimed, and could
+    // not back up the one half of a workspace that `fsck --rebuild` cannot
+    // reconstruct.
+
+    /// Reclaim content unreachable from any ref or the live working tree. Returns
+    /// `{reachable, deleted, bytes_freed, skipped_young, skipped_undated}`.
+    ///
+    /// Safe alongside active writers (the sweep is age-gated), though cheapest on
+    /// a quiet workspace. A packed content store additionally needs `repack()` to
+    /// actually hand the space back.
+    fn gc<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let stats = ws.gc().await.map_err(to_pyerr)?;
+            Python::attach(|py| gc_stats_dict(py, &stats))
+        })
+    }
+
+    /// [`gc`] with an explicit grace period in seconds. `0` disables the age gate
+    /// and is only safe on a quiesced store; a value between 0 and the
+    /// dedup-refresh floor is refused rather than silently honoured.
+    fn gc_with_grace<'py>(&self, py: Python<'py>, grace_secs: u64) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let stats = ws.gc_with_grace(grace_secs).await.map_err(to_pyerr)?;
+            Python::attach(|py| gc_stats_dict(py, &stats))
+        })
+    }
+
+    /// Seal any buffered content so it is durable. A no-op on most backends; on a
+    /// packed store it seals the open pack.
+    fn flush<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.flush().await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Rewrite packs to drop dead chunks, returning the bytes reclaimed. Only a
+    /// packed store has anything to do here — and on one, this is the *only* way
+    /// deleted content's space comes back.
+    fn repack<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move { ws.repack().await.map_err(to_pyerr) })
+    }
+
+    /// Write a consistent snapshot of the **metadata** store to `dest`, returning
+    /// a description of what was written.
+    ///
+    /// This is the half of a workspace nothing can reconstruct: `rebuild()`
+    /// recovers committed files, directories, symlinks, and branches from the
+    /// content store alone, but blame, the audit log, the actor registry, and
+    /// every uncommitted edit live only in the database. SQLite uses the online
+    /// backup API, so a live workspace can be snapshotted without stopping
+    /// writers; Postgres refuses and points at `pg_dump`/PITR rather than
+    /// producing something that merely resembles a backup.
+    fn backup_metadata<'py>(&self, py: Python<'py>, dest: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.backup_metadata(&dest).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Drop presence rows for sessions that stopped heartbeating more than
+    /// `grace_secs` ago, returning how many were removed. A long-running server
+    /// should call this periodically; nothing else does it.
+    fn reap_presence<'py>(&self, py: Python<'py>, grace_secs: i64) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.reap_presence(grace_secs).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Retire pending suggestions for `path` whose base content has already moved
+    /// on, returning how many were superseded. Without this they sit in the review
+    /// queue looking actionable and fail on accept.
+    fn supersede_stale_suggestions<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.supersede_stale_suggestions(&path)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Probe both backends: `{ready, metadata, content}` where each store is
+    /// `None` when healthy and an error string otherwise. The Python counterpart
+    /// of the HTTP `/readyz`.
+    fn ready<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let r = ws.ready().await;
+            Python::attach(|py| {
+                let d = PyDict::new(py);
+                d.set_item("ready", r.is_ready())?;
+                d.set_item("metadata", r.metadata.clone())?;
+                d.set_item("content", r.content.clone())?;
+                Ok(d.unbind())
+            })
+        })
+    }
+
+    // ── versioning: merge and mode ───────────────────────────────────────────
+    //
+    // `create_branch`/`checkout` were bound but `merge` was not, which made
+    // branching a one-way door from Python: you could diverge and never reconcile.
+
+    /// Merge `branch` into the current branch. Returns
+    /// `{outcome, commit, conflicts}` — `outcome` is one of `"up_to_date"`,
+    /// `"fast_forward"`, `"merged"`, or `"conflicts"`.
+    #[pyo3(signature = (branch, author, message = None))]
+    fn merge_branch<'py>(
+        &self,
+        py: Python<'py>,
+        branch: String,
+        author: String,
+        message: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let message = message.unwrap_or_else(|| format!("merge {branch}"));
+            let outcome = ws
+                .merge_branch(&branch, &author, &message)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| merge_outcome_dict(py, &outcome))
+        })
+    }
+
+    /// Unresolved merge conflicts as a list of `{path, kind}`.
+    fn conflicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let conflicts = ws.conflicts().await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                conflicts
+                    .into_iter()
+                    .map(|(path, kind)| {
+                        let d = PyDict::new(py);
+                        d.set_item("path", path)?;
+                        d.set_item("kind", kind)?;
+                        Ok(d.unbind())
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// This workspace's versioning mode: `"off"`, `"native"`, or `"git"`.
+    fn versioning_mode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let mode = ws.versioning_mode().await.map_err(to_pyerr)?;
+            Ok(mode.as_str().to_string())
+        })
+    }
+
+    /// Set the versioning mode. `"off"` disables commits entirely.
+    fn set_versioning_mode<'py>(
+        &self,
+        py: Python<'py>,
+        mode: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let parsed = origofs_sdk::VersioningMode::parse(&mode).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "unknown versioning mode {mode:?}; expected \"off\", \"native\", or \"git\""
+                ))
+            })?;
+            ws.set_versioning_mode(parsed).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    // ── locks ────────────────────────────────────────────────────────────────
+
+    /// Take an advisory exclusive lock on `path`. Returns `True` if acquired.
+    fn lock<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        owner: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(
+            py,
+            async move { ws.lock(&path, &owner).await.map_err(to_pyerr) },
+        )
+    }
+
+    /// Release a lock held by `owner`. Returns `True` if one was released.
+    fn unlock<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        owner: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.unlock(&path, &owner).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Held locks as a list of `{path, owner, acquired_at}`.
+    fn locks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let locks = ws.locks().await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                locks
+                    .into_iter()
+                    .map(|(path, owner, at)| {
+                        let d = PyDict::new(py);
+                        d.set_item("path", path)?;
+                        d.set_item("owner", owner)?;
+                        d.set_item("acquired_at", at)?;
+                        Ok(d.unbind())
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    // ── attribution: the op-log and session revert ───────────────────────────
+    //
+    // `revert_session` is a headline feature ("undo just the agent's work") that
+    // existed *only* in the Rust SDK — no CLI subcommand, no HTTP route, no MCP
+    // tool, no binding.
+
+    /// Remove exactly the lines an actor authored in one session, across every
+    /// file that session touched, leaving other actors' edits intact. Returns the
+    /// number of files changed.
+    fn revert_session<'py>(
+        &self,
+        py: Python<'py>,
+        actor_id: i64,
+        session_id: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.revert_session(actor_id, session_id)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// The append-only edit-op log for an actor (optionally one session) — the
+    /// ground truth behind blame, as a list of dicts.
+    #[pyo3(signature = (actor_id, session_id = None))]
+    fn edit_ops<'py>(
+        &self,
+        py: Python<'py>,
+        actor_id: i64,
+        session_id: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let ops = ws.edit_ops(actor_id, session_id).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                ops.into_iter()
+                    .map(|o| {
+                        let d = PyDict::new(py);
+                        d.set_item("id", o.id)?;
+                        d.set_item("actor_id", o.actor_id)?;
+                        d.set_item("session_id", o.session_id)?;
+                        d.set_item("path", o.path)?;
+                        d.set_item("op", o.op)?;
+                        d.set_item("byte_start", o.byte_start)?;
+                        d.set_item("byte_len", o.byte_len)?;
+                        d.set_item("pre_hash", o.pre_hash)?;
+                        d.set_item("post_hash", o.post_hash)?;
+                        d.set_item("ts", o.ts)?;
+                        Ok(d.unbind())
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+}
+
+/// `GcStats` as a plain dict, so it is directly JSON-serializable in a response.
+fn gc_stats_dict(py: Python<'_>, s: &origofs_sdk::GcStats) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("reachable", s.reachable)?;
+    d.set_item("deleted", s.deleted)?;
+    d.set_item("bytes_freed", s.bytes_freed)?;
+    d.set_item("skipped_young", s.skipped_young)?;
+    d.set_item("skipped_undated", s.skipped_undated)?;
+    Ok(d.unbind())
+}
+
+/// `MergeOutcome` flattened into `{outcome, commit, conflicts}`.
+///
+/// A tagged dict rather than four separate result types: the caller almost always
+/// wants to branch on the tag and read one field, and this stays JSON-serializable
+/// straight into an API response.
+fn merge_outcome_dict(py: Python<'_>, outcome: &origofs_sdk::MergeOutcome) -> PyResult<Py<PyDict>> {
+    use origofs_sdk::MergeOutcome::*;
+    let d = PyDict::new(py);
+    match outcome {
+        AlreadyUpToDate => {
+            d.set_item("outcome", "already_up_to_date")?;
+            d.set_item("commit", py.None())?;
+            d.set_item("conflicts", Vec::<String>::new())?;
+        }
+        FastForward(h) => {
+            d.set_item("outcome", "fast_forward")?;
+            d.set_item("commit", h.to_hex())?;
+            d.set_item("conflicts", Vec::<String>::new())?;
+        }
+        Merged(h) => {
+            d.set_item("outcome", "merged")?;
+            d.set_item("commit", h.to_hex())?;
+            d.set_item("conflicts", Vec::<String>::new())?;
+        }
+        Conflicts(cs) => {
+            d.set_item("outcome", "conflicts")?;
+            d.set_item("commit", py.None())?;
+            let list: Vec<Py<PyDict>> = cs
+                .iter()
+                .map(|c| {
+                    let e = PyDict::new(py);
+                    e.set_item("path", c.path.clone())?;
+                    e.set_item("kind", c.kind.clone())?;
+                    Ok(e.unbind())
+                })
+                .collect::<PyResult<_>>()?;
+            d.set_item("conflicts", list)?;
+        }
+    }
+    Ok(d.unbind())
 }
 
 /// Whether a FUSE mount is possible here (`/dev/fuse` present and usable).
