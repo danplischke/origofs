@@ -558,8 +558,10 @@ pub fn coedit_sidecar_path(path: &str) -> String {
 const SIDECAR_MAGIC: u8 = 1;
 
 /// Split a framed sidecar blob into `(flat_hash, ydoc_state)`, or `None` if it
-/// isn't in the current format (a legacy or corrupt blob — the caller then rebuilds
-/// from the flat file, which is always safe).
+/// isn't in the current format (a truncated or corrupt blob — the caller then
+/// rebuilds from the flat file, which is always safe). Unlike the content-store
+/// objects in [`crate::format`], the sidecar is a resumable *cache*, so an
+/// unreadable one costs a rebuild rather than data: falling back is correct here.
 fn parse_sidecar(blob: &[u8]) -> Option<(&[u8], &[u8])> {
     if blob.len() >= 33 && blob[0] == SIDECAR_MAGIC {
         Some((&blob[1..33], &blob[33..]))

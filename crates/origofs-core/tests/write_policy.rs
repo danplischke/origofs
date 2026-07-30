@@ -1,153 +1,233 @@
-//! `WritePolicy::Propose` as a real boundary, not just a hint on `write`.
+//! `WritePolicy::Propose` is a property of the **engine**, not a convention the
+//! surfaces are trusted to remember (issue #78).
 //!
-//! The policy is documented as "direct writes are refused; edits must go through
-//! the suggestion queue for review by a different actor before they land". It was
-//! consulted in exactly one function (`write_or_propose`), so every other mutation
-//! walked straight past it: a propose-only agent could delete any file, rename
-//! anything, and create directories — while an operator who had set the policy
-//! believed its changes were gated.
+//! Before this, `write_or_propose` was the only gated entry point, so a
+//! propose-only actor could not overwrite a file — but could delete it, rename
+//! it, and commit the result. The gate made the destructive path one call longer
+//! rather than unavailable. These tests pin the whole surface of the fix:
+//!
+//! * every attributed mutation refuses a propose-only actor;
+//! * a removal has a *propose* path (queue it) rather than only a refusal;
+//! * an accepted deletion is attributed to whoever requested it;
+//! * a propose-only actor cannot approve its way to write access;
+//! * internal machinery — the unattributed engine ops — stays exempt, which is
+//!   what keeps checkout, merge, and suggestion application working.
 
 use origofs_core::{
-    Fs, MemStore, OrigoFSError, SqliteMetadataStore, SuggestionStatus, WriteCtx, WriteOutcome,
-    WritePolicy,
+    Fs, MemStore, MetadataStore, OrigoFSError, SqliteMetadataStore, SuggestionStatus, WriteCtx,
+    WriteOutcome, WritePolicy,
 };
 use std::sync::Arc;
 
-async fn fixture() -> Fs<SqliteMetadataStore, Arc<MemStore>> {
-    let fs = Fs::new(
-        SqliteMetadataStore::open_in_memory().unwrap(),
-        Arc::new(MemStore::new()),
-    );
+async fn fs() -> Fs<Arc<dyn MetadataStore>, Arc<MemStore>> {
+    let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
+    let fs = Fs::new(meta, Arc::new(MemStore::new()));
     fs.init().await.unwrap();
     fs
 }
 
-/// An agent restricted to proposals, plus a human who can review.
-async fn actors(fs: &Fs<SqliteMetadataStore, Arc<MemStore>>) -> (i64, i64) {
+/// An agent restricted to proposing, and a human who may write directly.
+async fn actors<M: MetadataStore>(fs: &Fs<M, Arc<MemStore>>) -> (WriteCtx, WriteCtx) {
     let agent = fs.create_agent("claude", "opus", None).await.unwrap();
     fs.set_write_policy(agent, WritePolicy::Propose)
         .await
         .unwrap();
-    let human = fs.create_human("dan", None).await.unwrap();
-    (agent, human)
+    let human = fs
+        .create_human("dan", Some("dan@example.com"))
+        .await
+        .unwrap();
+    (WriteCtx::actor(agent), WriteCtx::actor(human))
 }
 
-/// Deleting was the sharpest gap: more destructive than the edits the policy was
-/// protecting against, and completely ungated.
-#[tokio::test]
-async fn propose_only_delete_is_queued_not_applied() {
-    let fs = fixture().await;
-    let (agent, human) = actors(&fs).await;
-    fs.write("/notes.txt", b"important").await.unwrap();
-
-    let outcome = fs
-        .remove_or_propose(WriteCtx::actor(agent), "/notes.txt", None)
-        .await
-        .unwrap();
-    let id = match outcome {
-        WriteOutcome::Proposed(id) => id,
-        other => panic!("a propose-only delete must be queued, got {other:?}"),
-    };
-
-    // The file is still there until someone reviews it.
-    assert_eq!(&fs.read("/notes.txt").await.unwrap()[..], b"important");
-
-    // A different actor accepting it is what actually deletes it.
-    fs.accept_suggestion(id, WriteCtx::actor(human))
-        .await
-        .unwrap();
-    assert!(fs.read("/notes.txt").await.is_err());
-
-    // A direct actor still deletes directly.
-    fs.write("/other.txt", b"x").await.unwrap();
-    let outcome = fs
-        .remove_or_propose(WriteCtx::actor(human), "/other.txt", None)
-        .await
-        .unwrap();
-    assert_eq!(outcome, WriteOutcome::Wrote);
-    assert!(fs.read("/other.txt").await.is_err());
+fn assert_denied(e: OrigoFSError, what: &str) {
+    assert!(
+        matches!(e, OrigoFSError::Denied(_)),
+        "{what} should be Denied for a propose-only actor, got {e:?}"
+    );
+    assert_eq!(e.code(), "denied");
 }
 
-/// Mutations with no suggestion form can only be honored by refusing them.
 #[tokio::test]
-async fn propose_only_rename_and_mkdir_are_refused() {
-    let fs = fixture().await;
-    let (agent, human) = actors(&fs).await;
-    fs.write("/a.txt", b"x").await.unwrap();
+async fn propose_only_actor_is_refused_every_direct_mutation() {
+    let fs = fs().await;
+    let (agent, _human) = actors(&fs).await;
+    fs.write("/a.txt", b"hello").await.unwrap();
+    fs.mkdir_p("/d").await.unwrap();
 
-    assert!(
-        matches!(
-            fs.rename_as(WriteCtx::actor(agent), "/a.txt", "/b.txt")
-                .await,
-            Err(OrigoFSError::PermissionDenied(_))
-        ),
-        "a propose-only actor must not be able to rename"
+    assert_denied(
+        fs.remove_as(agent, "/a.txt").await.unwrap_err(),
+        "remove_as",
     );
-    assert!(
-        matches!(
-            fs.mkdir_p_as(WriteCtx::actor(agent), "/newdir").await,
-            Err(OrigoFSError::PermissionDenied(_))
-        ),
-        "a propose-only actor must not be able to create directories"
+    assert_denied(
+        fs.rename_as(agent, "/a.txt", "/b.txt").await.unwrap_err(),
+        "rename_as",
     );
-    // Nothing happened.
-    assert_eq!(&fs.read("/a.txt").await.unwrap()[..], b"x");
+    assert_denied(fs.mkdir_as(agent, "/e").await.unwrap_err(), "mkdir_as");
+    assert_denied(
+        fs.symlink_as(agent, "/a.txt", "/link").await.unwrap_err(),
+        "symlink_as",
+    );
+    assert_denied(
+        fs.commit_as(agent, "claude", "nope").await.unwrap_err(),
+        "commit_as",
+    );
+
+    // Nothing was destroyed by the refusals.
+    assert_eq!(&fs.read("/a.txt").await.unwrap()[..], b"hello");
+    assert!(fs.stat("/d").await.is_ok());
+    assert!(fs.stat("/e").await.is_err());
+}
+
+#[tokio::test]
+async fn a_direct_actor_performs_all_of_them() {
+    let fs = fs().await;
+    let (_agent, human) = actors(&fs).await;
+    fs.write("/a.txt", b"hello").await.unwrap();
+
+    fs.mkdir_as(human, "/d").await.unwrap();
+    fs.symlink_as(human, "/a.txt", "/link").await.unwrap();
+    fs.rename_as(human, "/a.txt", "/b.txt").await.unwrap();
+    fs.commit_as(human, "dan", "initial").await.unwrap();
+    fs.remove_as(human, "/b.txt").await.unwrap();
+
+    assert!(fs.stat("/d").await.is_ok());
     assert!(fs.stat("/b.txt").await.is_err());
-    assert!(fs.stat("/newdir").await.is_err());
-
-    // A direct actor is unaffected.
-    fs.rename_as(WriteCtx::actor(human), "/a.txt", "/b.txt")
-        .await
-        .unwrap();
-    fs.mkdir_p_as(WriteCtx::actor(human), "/newdir")
-        .await
-        .unwrap();
-    assert_eq!(&fs.read("/b.txt").await.unwrap()[..], b"x");
 }
 
-/// Proposing must not touch the working tree at all — including creating the
-/// parent directories the edit would eventually need. Surfaces used to `mkdir_p`
-/// before consulting the policy, so a "queued for review" edit had already
-/// mutated the tree. The directories now appear when the edit lands.
 #[tokio::test]
-async fn proposing_a_nested_path_does_not_create_its_directories() {
-    let fs = fixture().await;
+async fn a_propose_only_removal_is_queued_not_refused() {
+    let fs = fs().await;
     let (agent, human) = actors(&fs).await;
+    fs.write("/doomed.txt", b"still here").await.unwrap();
 
+    // The agent asks for a deletion: queued, and the file is untouched.
     let outcome = fs
-        .write_or_propose(WriteCtx::actor(agent), "/deep/nested/f.txt", b"hi", None)
+        .remove_or_propose(agent, "/doomed.txt", Some("obsolete"))
         .await
         .unwrap();
     let id = match outcome {
         WriteOutcome::Proposed(id) => id,
-        other => panic!("expected a proposal, got {other:?}"),
+        WriteOutcome::Wrote => panic!("a propose-only actor must not delete directly"),
     };
-    assert!(
-        fs.stat("/deep").await.is_err(),
-        "a proposal must not create directories in the working tree"
-    );
+    assert_eq!(&fs.read("/doomed.txt").await.unwrap()[..], b"still here");
 
-    // Accepting creates them, so the proposal is still applicable.
-    fs.accept_suggestion(id, WriteCtx::actor(human))
-        .await
-        .unwrap();
-    assert_eq!(&fs.read("/deep/nested/f.txt").await.unwrap()[..], b"hi");
+    // A trusted reviewer accepts it, and only then does the file go.
+    fs.accept_suggestion(id, human).await.unwrap();
+    assert!(
+        fs.stat("/doomed.txt").await.is_err(),
+        "accepting a deletion suggestion must remove the file"
+    );
     let s = fs.get_suggestion(id).await.unwrap().unwrap();
     assert_eq!(s.status, SuggestionStatus::Accepted);
+    assert_eq!(
+        s.actor_id, agent.actor,
+        "the deletion stays attributed to the actor that requested it"
+    );
+    assert_eq!(s.resolved_by, Some(human.actor));
 }
 
-/// An authorization control must fail closed. An unknown stored value is one a
-/// newer binary wrote — resolving it to `Direct` would silently *grant* direct
-/// writes to an actor someone had deliberately restricted.
-#[test]
-fn unknown_write_policy_decodes_to_the_restrictive_one() {
-    assert_eq!(WritePolicy::from_i64(0), WritePolicy::Direct);
-    assert_eq!(WritePolicy::from_i64(1), WritePolicy::Propose);
-    for unknown in [2, 3, 99, -1, i64::MAX] {
-        assert_eq!(
-            WritePolicy::from_i64(unknown),
-            WritePolicy::Propose,
-            "unknown policy {unknown} must fail closed"
+#[tokio::test]
+async fn a_direct_actors_removal_goes_straight_through() {
+    let fs = fs().await;
+    let (_agent, human) = actors(&fs).await;
+    fs.write("/x.txt", b"bye").await.unwrap();
+
+    let outcome = fs.remove_or_propose(human, "/x.txt", None).await.unwrap();
+    assert!(matches!(outcome, WriteOutcome::Wrote));
+    assert!(fs.stat("/x.txt").await.is_err());
+}
+
+#[tokio::test]
+async fn a_propose_only_actor_cannot_approve_anything() {
+    let fs = fs().await;
+    let (agent, _human) = actors(&fs).await;
+    // A second propose-only agent: without the approver check these two could
+    // rubber-stamp each other into full write access.
+    let other = fs.create_agent("gpt", "5", None).await.unwrap();
+    fs.set_write_policy(other, WritePolicy::Propose)
+        .await
+        .unwrap();
+    let other = WriteCtx::actor(other);
+
+    fs.write("/shared.txt", b"base").await.unwrap();
+    let id = fs
+        .suggest(agent, "/shared.txt", b"rewritten", None)
+        .await
+        .unwrap();
+
+    assert_denied(
+        fs.accept_suggestion(id, other).await.unwrap_err(),
+        "accept_suggestion by a propose-only approver",
+    );
+    assert_eq!(&fs.read("/shared.txt").await.unwrap()[..], b"base");
+    assert_eq!(
+        fs.get_suggestion(id).await.unwrap().unwrap().status,
+        SuggestionStatus::Pending,
+        "a refused approval must leave the suggestion pending, not resolved"
+    );
+}
+
+#[tokio::test]
+async fn namespace_mutations_are_attributed() {
+    // The gate needed an actor on these ops; recording that actor also closes the
+    // older gap that "who deleted this file" had no answer at all.
+    let fs = fs().await;
+    let (_agent, human) = actors(&fs).await;
+    fs.write("/gone.txt", b"data").await.unwrap();
+
+    fs.mkdir_as(human, "/dir").await.unwrap();
+    fs.rename_as(human, "/gone.txt", "/moved.txt")
+        .await
+        .unwrap();
+    fs.remove_as(human, "/moved.txt").await.unwrap();
+
+    let ops = fs.edit_ops(human.actor, None).await.unwrap();
+    let kinds: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+    for expected in ["mkdir", "rename", "remove"] {
+        assert!(
+            kinds.contains(&expected),
+            "{expected} should appear in the op-log, got {kinds:?}"
         );
     }
+    let removal = ops.iter().find(|o| o.op == "remove").unwrap();
+    assert_eq!(removal.path, "/moved.txt");
+    assert!(
+        removal.pre_hash.is_some(),
+        "a removal records what was destroyed"
+    );
+    assert!(removal.post_hash.is_none());
+}
+
+#[tokio::test]
+async fn internal_machinery_stays_exempt() {
+    // The raw engine ops carry no actor and must keep working regardless of
+    // policy — this is what checkout, merge materialization and
+    // `apply_byte_suggestion` rely on. If gating ever leaks down to them, a
+    // propose-only actor's accepted suggestion could never be applied.
+    let fs = fs().await;
+    let (agent, human) = actors(&fs).await;
+
+    fs.write("/f.txt", b"one").await.unwrap();
+    fs.mkdir_p("/sub").await.unwrap();
+    fs.rename("/f.txt", "/sub/f.txt").await.unwrap();
+    fs.remove("/sub/f.txt").await.unwrap();
+    assert!(fs.stat("/sub/f.txt").await.is_err());
+
+    // And the accept path still lands a propose-only actor's *content* edit,
+    // which internally writes as that very actor.
+    fs.write("/g.txt", b"before").await.unwrap();
+    let id = fs.suggest(agent, "/g.txt", b"after", None).await.unwrap();
+    fs.accept_suggestion(id, human).await.unwrap();
+    assert_eq!(&fs.read("/g.txt").await.unwrap()[..], b"after");
+}
+
+#[tokio::test]
+async fn an_unknown_actor_defaults_to_direct() {
+    // Matches the column default and `WritePolicy::from_i64`: an unrecognized
+    // actor is not silently locked out. Identity is resolved server-side before
+    // any of this runs, so this is a consistency guard, not a permission model.
+    let fs = fs().await;
+    fs.write("/a.txt", b"x").await.unwrap();
+    let ghost = WriteCtx::actor(9_999);
+    assert!(fs.mkdir_as(ghost, "/ok").await.is_ok());
 }

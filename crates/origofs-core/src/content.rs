@@ -54,6 +54,36 @@ pub trait ContentStore: Send + Sync {
         self.put_keyed(key, bytes).await
     }
 
+    /// Write a small **named slot** beside the store's objects, overwriting any
+    /// previous value.
+    ///
+    /// Slots are *not* content-addressed and live **outside** the object
+    /// namespace, so [`list`](Self::list) never returns them and `gc` can never
+    /// sweep them. They exist for the handful of facts that must be findable
+    /// without knowing a hash and must survive a metadata-DB loss — today only the
+    /// store format descriptor stamped by [`Fs::init`](crate::Fs::init)
+    /// (`crate::format`). Keep values tiny: a slot is one object/file, never
+    /// chunked or deduplicated.
+    ///
+    /// `name` must be a single non-empty component of `[a-z0-9._-]` (no `/`, no
+    /// `..`), so a slot can never escape the store's root.
+    ///
+    /// The default discards the write, paired with a `get_meta` that always
+    /// reports "never written". A backend that doesn't override **both** forfeits
+    /// the open-time format check — it cannot be stamped, so it cannot be
+    /// verified. Every backend in this crate overrides them.
+    async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let _ = (name, bytes);
+        Ok(())
+    }
+
+    /// Read a named slot, or `None` if it was never written. See
+    /// [`put_meta`](Self::put_meta).
+    async fn get_meta(&self, name: &str) -> Result<Option<Bytes>> {
+        let _ = name;
+        Ok(None)
+    }
+
     /// Fetch the full blob for `hash`.
     async fn get(&self, hash: &Hash) -> Result<Bytes>;
 
@@ -179,6 +209,28 @@ fn sidecar_file(name: &str) -> Result<String> {
         )));
     }
     Ok(name.to_string())
+}
+
+/// Reject a slot name that isn't a single safe path component.
+///
+/// Backends turn a slot name into a path or object key, so this is the same
+/// fail-closed rule `validate_component` applies to filenames in the metadata
+/// layer: a poisoned name must never be *stored*, let alone escape the store root.
+pub(crate) fn validate_slot_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
+        && name != "."
+        && name != "..";
+    if ok {
+        Ok(())
+    } else {
+        Err(OrigoFSError::InvalidArgument(format!(
+            "invalid content-store slot name: {name:?}"
+        )))
+    }
 }
 
 /// A content-addressed store backed by a local directory.
@@ -308,6 +360,25 @@ impl ContentStore for LocalCasStore {
         // `write_at` is temp-file + rename, so the key never resolves to a
         // half-written value and never to nothing.
         self.write_at(&self.path_for(key), bytes).await
+    }
+
+    /// Slots live in `<root>/meta/`, a sibling of `objects/` — so `list` (which
+    /// walks `objects/` only) never sees them.
+    async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        validate_slot_name(name)?;
+        let path = self.root.join("meta").join(name);
+        // Not content-addressed, so unlike `put_keyed` this overwrites: the
+        // durable temp-then-rename in `write_at` makes the replacement atomic.
+        self.write_at(&path, bytes).await
+    }
+
+    async fn get_meta(&self, name: &str) -> Result<Option<Bytes>> {
+        validate_slot_name(name)?;
+        match tokio::fs::read(self.root.join("meta").join(name)).await {
+            Ok(v) => Ok(Some(Bytes::from(v))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
@@ -460,6 +531,12 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         (**self).put_keyed(key, bytes).await
     }
+    async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        (**self).put_meta(name, bytes).await
+    }
+    async fn get_meta(&self, name: &str) -> Result<Option<Bytes>> {
+        (**self).get_meta(name).await
+    }
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         (**self).get(hash).await
     }
@@ -505,6 +582,9 @@ pub struct MemStore {
     /// Named sidecars, kept out of `map` so `list()` never enumerates them and GC
     /// therefore cannot sweep them (see [`ContentStore::get_sidecar`]).
     sidecars: Mutex<HashMap<String, Vec<u8>>>,
+    /// Named slots, kept apart from `map` so they stay invisible to `list`/`gc`
+    /// exactly as they are on a real backend.
+    slots: Mutex<HashMap<String, Bytes>>,
 }
 
 impl MemStore {
@@ -591,6 +671,25 @@ impl ContentStore for MemStore {
             .or_insert_with(|| Bytes::copy_from_slice(bytes));
         self.touch_born(*key);
         Ok(())
+    }
+
+    async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        validate_slot_name(name)?;
+        self.slots
+            .lock()
+            .expect("mem store poisoned")
+            .insert(name.to_string(), Bytes::copy_from_slice(bytes));
+        Ok(())
+    }
+
+    async fn get_meta(&self, name: &str) -> Result<Option<Bytes>> {
+        validate_slot_name(name)?;
+        Ok(self
+            .slots
+            .lock()
+            .expect("mem store poisoned")
+            .get(name)
+            .cloned())
     }
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
@@ -690,6 +789,16 @@ impl ContentStore for TieredStore {
             let _ = self.cache.delete(key).await;
         }
         Ok(())
+    }
+
+    /// Slots go to the backend only. They are mutable, and a stale cached copy of
+    /// "which format is this store" is worse than a round-trip on open.
+    async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.backend.put_meta(name, bytes).await
+    }
+
+    async fn get_meta(&self, name: &str) -> Result<Option<Bytes>> {
+        self.backend.get_meta(name).await
     }
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
@@ -806,6 +915,17 @@ impl ContentStore for VerifyingStore {
 
     async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         self.inner.replace_keyed(key, bytes).await
+    }
+
+    /// Pass through unverified: a slot is deliberately not content-addressed, so
+    /// there is no address to check it against. Slot payloads carry their own
+    /// tag+version header instead.
+    async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put_meta(name, bytes).await
+    }
+
+    async fn get_meta(&self, name: &str) -> Result<Option<Bytes>> {
+        self.inner.get_meta(name).await
     }
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {

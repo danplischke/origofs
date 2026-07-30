@@ -29,20 +29,41 @@ pub enum OrigoFSError {
     #[error("conflict: {0}")]
     Conflict(String),
 
-    /// The caller's actor is not permitted to perform this operation — today,
-    /// a [`WritePolicy::Propose`](crate::WritePolicy::Propose) actor attempting a
-    /// mutation that has no suggestion form and so cannot be reviewed.
-    ///
-    /// Distinct from [`InvalidArgument`](Self::InvalidArgument): the request is
-    /// well-formed and would succeed for another actor. Surfaces map it to 403.
-    #[error("permission denied: {0}")]
-    PermissionDenied(String),
+    /// The actor is not permitted to perform this operation — today, an actor
+    /// whose [`WritePolicy`](crate::WritePolicy) is
+    /// [`Propose`](crate::WritePolicy::Propose) attempting a direct mutation
+    /// (§6). Distinct from [`InvalidArgument`](OrigoFSError::InvalidArgument):
+    /// the request is well-formed and would have succeeded for a permitted
+    /// actor, so a surface maps it to `403`, not `400`.
+    #[error("denied: {0}")]
+    Denied(String),
 
     #[error("too large: {0}")]
     TooLarge(String),
 
     #[error("corrupt object: {0}")]
     Corrupt(String),
+
+    /// A content-store object carries a format version this build cannot decode:
+    /// it was written by a **newer** origofs (`crate::format`).
+    ///
+    /// Deliberately distinct from [`Corrupt`](OrigoFSError::Corrupt) — the bytes
+    /// are almost certainly intact and the fix is to upgrade the reader, not to
+    /// restore from a backup. Before this existed, a bumped version byte failed
+    /// the whole-magic comparison and surfaced as "malformed tree object",
+    /// indistinguishable from bit rot.
+    #[error(
+        "unsupported {kind} format version {found} (this build reads up to v{max_supported}): \
+         the object was written by a newer origofs — upgrade origofs to read it"
+    )]
+    UnsupportedVersion {
+        /// The object kind, e.g. `tree`, `commit`, `manifest`, `ref snapshot`.
+        kind: &'static str,
+        /// The version found in the object header.
+        found: u8,
+        /// The highest version this build can decode.
+        max_supported: u8,
+    },
 
     #[error("content missing for hash {0}")]
     ContentMissing(String),
@@ -141,6 +162,13 @@ impl OrigoFSError {
         matches!(self, OrigoFSError::Backend { class, .. } if class.retryable())
     }
 
+    /// Whether this error means "an object was written by a newer origofs"
+    /// ([`UnsupportedVersion`](OrigoFSError::UnsupportedVersion)). Surfaces can
+    /// branch on it to tell the user to upgrade rather than to suspect data loss.
+    pub fn is_unsupported_version(&self) -> bool {
+        matches!(self, OrigoFSError::UnsupportedVersion { .. })
+    }
+
     /// The [`ErrorClass`] of a backend error, or `None` for the non-backend
     /// variants.
     pub fn class(&self) -> Option<ErrorClass> {
@@ -164,9 +192,10 @@ impl OrigoFSError {
             InvalidPath(_) => "invalid_path",
             InvalidArgument(_) => "invalid_argument",
             Conflict(_) => "conflict",
-            PermissionDenied(_) => "permission_denied",
+            Denied(_) => "denied",
             TooLarge(_) => "too_large",
             Corrupt(_) => "corrupt",
+            UnsupportedVersion { .. } => "unsupported_version",
             ContentMissing(_) => "content_missing",
             Metadata(_) => "metadata_error",
             Content(_) => "content_error",

@@ -1045,6 +1045,21 @@ async fn main() -> Result<()> {
                 "fsck: scanned {} object(s){corrupt}, found {} commit(s)",
                 report.objects_scanned, report.commits_found
             );
+            // Only reachable on the dry run: `--rebuild` refuses outright when an
+            // object it can't read would change what gets restored.
+            if report.unsupported > 0 {
+                let kinds = report
+                    .unsupported_kinds
+                    .iter()
+                    .map(|(kind, v)| format!("{kind} v{v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "  WARNING: {} object(s) written by a NEWER origofs ({kinds}) — \
+                     upgrade origofs before rebuilding, or history it can't read will be lost",
+                    report.unsupported
+                );
+            }
             if report.branches.is_empty() {
                 println!("  no commits to recover (empty or non-versioned workspace)");
             } else {

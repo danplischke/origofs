@@ -21,7 +21,8 @@
 
 use crate::content::ContentStore;
 use crate::engine::Fs;
-use crate::error::Result;
+use crate::error::{OrigoFSError, Result};
+use crate::format;
 use crate::metadata::MetadataStore;
 use crate::objectgraph::{Commit, RefSnapshot, Tree, TreeKind};
 use crate::types::Hash;
@@ -66,6 +67,18 @@ pub struct RebuildReport {
     /// Additional (non-`default`) workspaces recovered from tagged ref mirrors — a
     /// multi-workspace store restores each of its workspaces (`docs/MULTI_TENANCY.md`).
     pub extra_workspaces: usize,
+    /// Commit / ref-snapshot objects whose header names a known origofs object
+    /// kind but a format version this build cannot decode — they were written by
+    /// a **newer** origofs ([`crate::format`]).
+    ///
+    /// A dry-run [`scan_content`](Fs::scan_content) only reports these;
+    /// [`rebuild_from_content`](Fs::rebuild_from_content) *fails* when one of them
+    /// would change what it restores, rather than quietly recovering less than the
+    /// store holds.
+    pub unsupported: usize,
+    /// `(kind, version)` for the objects counted by `unsupported`, deduped and
+    /// sorted — e.g. `[("commit", 2)]`.
+    pub unsupported_kinds: Vec<(String, u8)>,
 }
 
 /// The commit DAG + the newest ref-mirror snapshot recovered *per workspace* from a
@@ -73,12 +86,60 @@ pub struct RebuildReport {
 struct Scan {
     commits: HashMap<Hash, Commit>,
     mirrors: HashMap<String, RefSnapshot>,
+    /// Commit objects this build is too old to decode, by address → version.
+    unsupported_commits: HashMap<Hash, u8>,
+    /// Versions of the ref-mirror snapshots this build is too old to decode.
+    unsupported_refs: Vec<u8>,
+}
+
+impl Scan {
+    /// Why this scan must not be turned into a rebuild, if it must not.
+    ///
+    /// A recovery tool's worst failure mode is restoring *less* than the store
+    /// holds while reporting success, so an object written by a newer origofs is
+    /// an error whenever it could change the outcome. The test is deliberately
+    /// narrow, because a raw data chunk can begin with an object tag by
+    /// coincidence and must not be able to block a legitimate rebuild:
+    ///
+    /// - **any** unreadable ref mirror — it may be the newest one, and its
+    ///   `generation` (the field that would prove otherwise) is inside the bytes
+    ///   we can't parse;
+    /// - an unreadable commit that a readable mirror names as a branch tip;
+    /// - with no readable mirror at all, any unreadable commit — head inference
+    ///   over a partial DAG would invent wrong branches.
+    ///
+    /// A stray unreadable object that is *not* load-bearing only lands in the
+    /// report's `unsupported` count.
+    fn blocking_unsupported(&self) -> Option<OrigoFSError> {
+        if let Some(&v) = self.unsupported_refs.iter().max() {
+            return Some(format::REFS.unsupported(v));
+        }
+        if self.unsupported_commits.is_empty() {
+            return None;
+        }
+        if self.mirrors.is_empty() {
+            let v = *self.unsupported_commits.values().max().expect("non-empty");
+            return Some(format::COMMIT.unsupported(v));
+        }
+        self.mirrors
+            .values()
+            .flat_map(|snap| &snap.refs)
+            .filter_map(|(_, value)| Hash::from_hex(value))
+            .filter_map(|h| self.unsupported_commits.get(&h))
+            .max()
+            .map(|&v| format::COMMIT.unsupported(v))
+    }
 }
 
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Read-only: scan the content store and report what a rebuild *would*
     /// recover (commits, branches, the branch that would be checked out), without
     /// touching the metadata DB.
+    ///
+    /// Never fails on an object written by a newer origofs — it counts them in
+    /// [`RebuildReport::unsupported`] so an operator can diagnose the store with
+    /// an old binary. [`rebuild_from_content`](Self::rebuild_from_content) is the
+    /// one that refuses.
     pub async fn scan_content(&self) -> Result<RebuildReport> {
         let mut report = RebuildReport::default();
         let scan = self.scan(&mut report).await?;
@@ -122,12 +183,24 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// recovery, not against a live DB with uncommitted work. Attribution is not
     /// recovered (it lives only in the DB). Reading every object also
     /// integrity-checks it: a corrupt object is skipped and counted.
+    ///
+    /// Fails with [`OrigoFSError::UnsupportedVersion`] if the store holds a
+    /// load-bearing object written by a newer origofs (see
+    /// `Scan::blocking_unsupported`) — restoring a silently truncated history is
+    /// worse than refusing. Upgrade origofs and re-run; `scan_content` still works
+    /// on the old binary and reports what it can't read.
     pub async fn rebuild_from_content(&self) -> Result<RebuildReport>
     where
         C: Clone,
     {
         let mut report = RebuildReport::default();
         let scan = self.scan(&mut report).await?;
+        // Refuse rather than restore a partial view: see `Scan::blocking_unsupported`.
+        // The dry run reports the same finding without failing, so the operator can
+        // see the full picture with `scan_content` before upgrading.
+        if let Some(e) = scan.blocking_unsupported() {
+            return Err(e);
+        }
 
         if scan.mirrors.is_empty() {
             // No usable mirror: infer a single default workspace (synthetic branch
@@ -184,9 +257,18 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// on demand during materialization, so they're ignored here. Fills the scan
     /// counters on `report`. Reading each object integrity-checks it; corrupt
     /// objects are skipped and counted.
+    ///
+    /// Objects are classified by their 4-byte **type tag** before decoding, so an
+    /// object of a known kind that this build is too old to decode is counted as
+    /// `unsupported` instead of being silently ignored. (Trying `Commit::decode`
+    /// and falling through on *any* error, as this used to, made "written by a
+    /// newer origofs" indistinguishable from "not a commit" — a rebuild would then
+    /// report success having quietly dropped the history it couldn't read.)
     async fn scan(&self, report: &mut RebuildReport) -> Result<Scan> {
         let mut commits: HashMap<Hash, Commit> = HashMap::new();
         let mut mirrors: HashMap<String, RefSnapshot> = HashMap::new();
+        let mut unsupported_commits: HashMap<Hash, u8> = HashMap::new();
+        let mut unsupported_refs: Vec<u8> = Vec::new();
         let all = self.content.list().await?;
         report.objects_scanned = all.len();
         for hash in all {
@@ -197,29 +279,65 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                     continue;
                 }
             };
-            if let Ok(commit) = Commit::decode(&bytes) {
-                // Guard a chunk that merely starts with the commit magic: a real
-                // commit's tree object is present in the store.
-                if self.content.has(&commit.tree).await.unwrap_or(false) {
-                    commits.insert(hash, commit);
+            if format::COMMIT.tagged(&bytes) {
+                match Commit::decode(&bytes) {
+                    // Guard a chunk that merely starts with the commit tag: a real
+                    // commit's tree object is present in the store.
+                    Ok(commit) => {
+                        if self.content.has(&commit.tree).await.unwrap_or(false) {
+                            commits.insert(hash, commit);
+                        }
+                    }
+                    Err(OrigoFSError::UnsupportedVersion { found, .. }) => {
+                        unsupported_commits.insert(hash, found);
+                    }
+                    // Malformed under a version we *do* support: a data chunk that
+                    // happens to start with the tag, not a commit.
+                    Err(_) => {}
                 }
-            } else if let Ok(snap) = RefSnapshot::decode(&bytes) {
-                let ws = snap
-                    .refs
-                    .iter()
-                    .find(|(k, _)| k == WORKSPACE_MIRROR_KEY)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_else(|| DEFAULT_WS_NAME.to_string());
-                if mirrors
-                    .get(&ws)
-                    .is_none_or(|s| snap.generation > s.generation)
-                {
-                    mirrors.insert(ws, snap);
+            } else if format::REFS.tagged(&bytes) {
+                match RefSnapshot::decode(&bytes) {
+                    Ok(snap) => {
+                        let ws = snap
+                            .refs
+                            .iter()
+                            .find(|(k, _)| k == WORKSPACE_MIRROR_KEY)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_else(|| DEFAULT_WS_NAME.to_string());
+                        if mirrors
+                            .get(&ws)
+                            .is_none_or(|s| snap.generation > s.generation)
+                        {
+                            mirrors.insert(ws, snap);
+                        }
+                    }
+                    Err(OrigoFSError::UnsupportedVersion { found, .. }) => {
+                        unsupported_refs.push(found);
+                    }
+                    Err(_) => {}
                 }
             }
         }
         report.commits_found = commits.len();
-        Ok(Scan { commits, mirrors })
+        report.unsupported = unsupported_commits.len() + unsupported_refs.len();
+        let mut kinds: Vec<(String, u8)> = unsupported_commits
+            .values()
+            .map(|&v| (format::COMMIT.name().to_string(), v))
+            .chain(
+                unsupported_refs
+                    .iter()
+                    .map(|&v| (format::REFS.name().to_string(), v)),
+            )
+            .collect();
+        kinds.sort();
+        kinds.dedup();
+        report.unsupported_kinds = kinds;
+        Ok(Scan {
+            commits,
+            mirrors,
+            unsupported_commits,
+            unsupported_refs,
+        })
     }
 
     /// Count the dirs/files/symlinks reachable from a tree (for the report).
