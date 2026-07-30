@@ -48,8 +48,31 @@ impl OrigoFSNfs {
 /// address (the default) and reach it over an SSH tunnel / VPN, or otherwise keep
 /// it behind a network boundary; never expose it on an untrusted network.
 pub async fn serve(ws: Workspace, addr: &str) -> std::io::Result<()> {
+    serve_until(ws, addr, crate::shutdown_signal()).await
+}
+
+/// [`serve`], returning when `shutdown` resolves.
+///
+/// `nfsserve`'s listener has no drain hook, so this stops accepting and returns
+/// rather than waiting for in-flight RPCs — a plain stop, not the true drain the
+/// HTTP surface gets. That is still the right behaviour on a `SIGTERM`: NFSv3 is
+/// designed around clients retrying idempotent RPCs against a server that went
+/// away, whereas the previous behaviour — no signal handling at all — left the
+/// process to be killed outright, which looks identical to the client but gives
+/// the operator no orderly stop.
+pub async fn serve_until(
+    ws: Workspace,
+    addr: &str,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> std::io::Result<()> {
     let listener = NFSTcpListener::bind(addr, OrigoFSNfs::new(ws)).await?;
-    listener.handle_forever().await
+    tokio::select! {
+        r = listener.handle_forever() => r,
+        _ = shutdown => {
+            tracing::info!("shutdown signal received; stopping the NFS listener");
+            Ok(())
+        }
+    }
 }
 
 /// Map an origofs error to the closest NFSv3 status.

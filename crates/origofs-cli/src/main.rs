@@ -1046,7 +1046,9 @@ async fn main() -> Result<()> {
                 println!("exposing Prometheus metrics at http://{addr}/metrics");
             }
             tracing::info!(%addr, "starting origofs HTTP API");
-            println!("serving origofs at http://{addr} (Ctrl-C to stop)");
+            println!(
+                "serving origofs at http://{addr} (SIGTERM/Ctrl-C to stop; in-flight requests drain)"
+            );
             origofs_sdk::api::serve(std::sync::Arc::new(ws), addr, auth).await?;
         }
         Cmd::Nfs { addr } => {
@@ -1061,7 +1063,7 @@ async fn main() -> Result<()> {
                 );
             }
             println!(
-                "serving origofs over NFSv3 at {addr}\n  mount with: mount -t nfs -o vers=3,tcp,port=<port>,mountport=<port>,nolock <host>:/ /mnt"
+                "serving origofs over NFSv3 at {addr} (SIGTERM/Ctrl-C to stop)\n  mount with: mount -t nfs -o vers=3,tcp,port=<port>,mountport=<port>,nolock <host>:/ /mnt"
             );
             origofs_sdk::nfs::serve(ws, &addr).await?;
         }

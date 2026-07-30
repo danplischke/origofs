@@ -49,6 +49,51 @@ pub mod nfs;
 #[cfg(feature = "sandbox")]
 pub mod sandbox;
 
+/// Resolves when the process is asked to stop: `SIGTERM` or `SIGINT` on Unix,
+/// Ctrl-C elsewhere.
+///
+/// `SIGTERM` is the one that matters in production — it is what Kubernetes and
+/// `docker stop` send, and what a long-running server previously had no handler
+/// for at all, so every in-flight request was severed at whatever point it had
+/// reached. `SIGINT` is here so an interactive Ctrl-C drains the same way.
+///
+/// Returning a future rather than installing a handler keeps the choice with the
+/// caller: an embedder that already has its own shutdown plumbing passes that to
+/// [`api::serve_until`] instead.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // If a handler can't be installed, wait forever rather than shutting down
+        // immediately — a spurious instant shutdown is far worse than no handler.
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; shutdown will not be graceful");
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGINT");
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => tracing::info!("received SIGTERM"),
+            _ = int.recv() => tracing::info!("received SIGINT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("received Ctrl-C");
+    }
+}
+
 type Meta = Arc<dyn MetadataStore>;
 type Content = Arc<dyn ContentStore>;
 

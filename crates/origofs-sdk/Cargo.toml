@@ -16,6 +16,9 @@ tracing = "0.1"
 # `fs`/`io-util`/`rt-multi-thread`/`macros`/`time`.
 tokio = { version = "1.53.1", features = [
     "rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "process", "io-std", "time",
+    # `signal` for graceful shutdown: SIGTERM is what an orchestrator sends, and
+    # without a handler every in-flight request was severed mid-flight.
+    "signal",
 ] }
 
 # ── Access-surface dependencies ─────────────────────────────────────────────
