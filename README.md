@@ -492,24 +492,71 @@ the identity behind each write is, and only your app knows how to resolve it.
 dependency **you** provide:
 
 ```python
-from fastapi import FastAPI, Header
-from origofs.fastapi import build_router
-import origofs
+# app.py — pip install "origofs[fastapi]"
+from contextlib import asynccontextmanager
+from typing import Optional
 
-async def authn(x_actor_id: int = Header(...)) -> origofs.WriteCtx:
-    # decode your JWT / session / agent token → the actor to attribute to
+from fastapi import FastAPI, Header, HTTPException
+import origofs
+from origofs.fastapi import build_router
+
+
+async def authn(
+    x_actor_id: Optional[int] = Header(default=None),
+    x_session_id: Optional[int] = Header(default=None),
+) -> origofs.WriteCtx:
+    """Resolve the request's principal to the actor to attribute it to."""
+    # swap this for your real auth: decode a JWT, look up a session, validate
+    # an agent token — then map that principal to an origofs actor id
+    if x_actor_id is None:
+        raise HTTPException(status_code=401, detail="unauthenticated")
+    if x_session_id is not None:
+        return origofs.WriteCtx.session(x_actor_id, x_session_id)
     return origofs.WriteCtx.actor(x_actor_id)
 
-app = FastAPI()
-app.include_router(build_router(ws, authn=authn), prefix="/fs")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ws = await origofs.Workspace.open_local("meta.db", "cas")   # or open_pg_s3(dsn, cfg)
+    app.include_router(build_router(ws, authn=authn), prefix="/fs")
+    app.state.ws = ws
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# your own endpoints sit alongside it — e.g. onboarding, which maps your user id
+# to the actor `authn` will later resolve to (idempotent, so no side table)
+@app.post("/users")
+async def upsert_user(external_id: str, name: str):
+    return {"actor_id": await app.state.ws.find_or_create_human(external_id, name)}
 ```
 
-Every mutating route depends on `authn` and hands its `WriteCtx` to the
+```bash
+uvicorn app:app --reload
+
+curl -X PUT --data-binary 'hello' -H 'X-Actor-Id: 1' \
+     http://127.0.0.1:8000/fs/files/notes.txt
+curl http://127.0.0.1:8000/fs/files/notes.txt        # → hello
+curl http://127.0.0.1:8000/fs/blame/notes.txt        # credited to actor 1
+curl -X PUT --data-binary 'x' http://127.0.0.1:8000/fs/files/y   # 401: no identity
+```
+
+One `build_router` call mounts the whole workspace: files, dirs, stat, rename,
+blame, commit/log/status, diff, branches/checkout, the suggestion review queue,
+the change feed, presence, actors/sessions, and the
+[co-editing](#live-co-editing-crdt) WebSocket at `/coedit/{path}` (long-lived
+rooms are created once per router, not per request).
+
+Every mutating route depends on `authn` and hands its `WriteCtx` straight to the
 workspace — the request body never names an actor, so a client can't forge
-attribution. Reads are open by default (`reader=` gates them, `dependencies=[…]`
-gates everything); `GET /files/{path}` streams rather than buffering and honors a
-`Range` header. The [co-editing](#live-co-editing-crdt) WebSocket is served here
-too, at `GET /coedit/{path}`.
+attribution, and a propose-only actor's `PUT` lands in the review queue instead
+of the working tree. Reads are open by default: pass `reader=<dependency>` to
+gate them, or `dependencies=[…]` (forwarded to `APIRouter`, along with `tags`
+and the rest) to gate everything. `GET /files/{path}` streams rather than
+buffering a whole file, and honors a single-range `Range` header (`206`/`416`),
+so large files behave like a static file server.
 
 ### The PyData stack reads origofs paths directly
 
