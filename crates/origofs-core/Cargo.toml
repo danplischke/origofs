@@ -32,10 +32,12 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # rustls and the native root store are already in the tree via `object_store`, so
 # this adds a connector and no new TLS stack. `ring` is named explicitly so the
 # client config picks its provider rather than depending on a process-wide
-# default a *library* has no business installing.
+# default a *library* has no business installing. PEM parsing for the CA bundle
+# comes from `rustls::pki_types::pem` rather than `rustls-pemfile`: the latter is
+# unmaintained (RUSTSEC-2025-0134) and 2.x is only a thin wrapper over this same
+# code, so using it directly drops a dependency instead of adding one.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
-rustls-pemfile = "2"
 similar = "3.1.1"
 tokio-postgres-rustls = "0.13"
 thiserror = "2.0.19"

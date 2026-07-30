@@ -60,6 +60,35 @@ pub struct PostgresMetadataStore {
 /// for a Postgres presenting a certificate from a private CA.
 pub const PG_CA_FILE_ENV: &str = "ORIGOFS_PG_CA_FILE";
 
+/// Read the PEM bundle at `path` into certificates.
+///
+/// A real CA bundle is rarely one bare certificate: it usually carries several,
+/// with OpenSSL's human-readable preamble between them and whatever trailing text
+/// the tool that concatenated it left behind. Every certificate in the file is
+/// returned and the surrounding noise ignored — stopping at the first non-PEM line
+/// would silently trust only part of the bundle, which surfaces much later as a
+/// server that inexplicably fails to verify.
+///
+/// A bundle that yields *nothing* usable is an error rather than a silent
+/// fall-back to the platform roots, since the operator named this file precisely
+/// because those roots are not enough.
+fn load_ca_bundle(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+
+    let pem = std::fs::read(path).map_err(|e| {
+        OrigoFSError::Metadata(format!("{PG_CA_FILE_ENV}: cannot read {path}: {e}"))
+    })?;
+    // Malformed entries are skipped rather than fatal, matching the tolerance
+    // applied to the platform root store.
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(&pem).flatten().collect();
+    if certs.is_empty() {
+        return Err(OrigoFSError::Metadata(format!(
+            "{PG_CA_FILE_ENV} ({path}) contains no certificates"
+        )));
+    }
+    Ok(certs)
+}
+
 /// Build the TLS connector every Postgres connection uses.
 ///
 /// `tokio-postgres` ships only `NoTls`, and that is what origofs used — so it could
@@ -88,20 +117,10 @@ fn tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
         let _ = roots.add(cert);
     }
     if let Ok(path) = std::env::var(PG_CA_FILE_ENV) {
-        let pem = std::fs::read(&path).map_err(|e| {
-            OrigoFSError::Metadata(format!("{PG_CA_FILE_ENV}: cannot read {path}: {e}"))
-        })?;
-        let mut added = 0usize;
-        for cert in rustls_pemfile::certs(&mut pem.as_slice()).flatten() {
+        for cert in load_ca_bundle(&path)? {
             roots
                 .add(cert)
                 .map_err(|e| OrigoFSError::Metadata(format!("{PG_CA_FILE_ENV} ({path}): {e}")))?;
-            added += 1;
-        }
-        if added == 0 {
-            return Err(OrigoFSError::Metadata(format!(
-                "{PG_CA_FILE_ENV} ({path}) contains no certificates"
-            )));
         }
     }
     if roots.is_empty() {
@@ -2177,5 +2196,98 @@ impl PostgresMetadataStore {
             )
             .await?;
         Ok(row.get(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two self-signed CAs, long-lived so these tests do not rot. Only their
+    /// *parsing* is under test — nothing verifies a chain against them — so expiry
+    /// is deliberately not part of what is asserted.
+    const CA_ONE: &str = "-----BEGIN CERTIFICATE-----
+MIIBkzCCATmgAwIBAgIUPMPvouh0uiI6Tdl1TgfxVD0/lQkwCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTb3JpZ29mcy10ZXN0LWNhLW9uZTAgFw0yNjA3MzAxMTM4MzJa
+GA8yMTI2MDcwNjExMzgzMlowHjEcMBoGA1UEAwwTb3JpZ29mcy10ZXN0LWNhLW9u
+ZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABCb/5GuGDR/RqARGulE6Xkq472Qo
+ZtON09yucyiE7FNo4UPj1QAd9Sox/LOxNCCjrEeRWOvwBlL5A/McvDiG8WujUzBR
+MB0GA1UdDgQWBBQX6q4LfhrQjc9BZ10fapw3/+Nb6jAfBgNVHSMEGDAWgBQX6q4L
+fhrQjc9BZ10fapw3/+Nb6jAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gA
+MEUCIQDHHuR5h4aRnkw9Jbis3tuIK50Sl1Ddrc1oajCWPV5DXgIgSKKMVQnKufxA
+brgubkkchZOzzrml5MTLkzc216Exz+Y=
+-----END CERTIFICATE-----
+";
+
+    const CA_TWO: &str = "-----BEGIN CERTIFICATE-----
+MIIBlDCCATmgAwIBAgIUEy4wZSsI4c8c1kkdnsPm4U9QxLcwCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTb3JpZ29mcy10ZXN0LWNhLXR3bzAgFw0yNjA3MzAxMTM4MzJa
+GA8yMTI2MDcwNjExMzgzMlowHjEcMBoGA1UEAwwTb3JpZ29mcy10ZXN0LWNhLXR3
+bzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABOD6ti5O1W3/fvhoRWGz+ZtKCTn0
+c71ORnGd2om3M4zcVlJeOgwunK5tb2d/DA/zZ5XIVHmMsWRTqtGR2ofOiJKjUzBR
+MB0GA1UdDgQWBBRozCeGNdnnaZJ7YK0HfH3kmEhYqDAfBgNVHSMEGDAWgBRozCeG
+NdnnaZJ7YK0HfH3kmEhYqDAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kA
+MEYCIQC7A4rQxYlr7zsrAXK80KMBjisVJh+pA0qevSbuvvKERQIhAMLLUq5p6xCY
+yfosoM84rjsOMr7BDRLh0CR+NVw5yuPV
+-----END CERTIFICATE-----
+";
+
+    /// Every certificate in a bundle must be read, not just the first — and the
+    /// human-readable noise real bundles carry (OpenSSL's preamble, blank lines,
+    /// trailing text) must not cut the parse short. A bundle silently truncated to
+    /// its first certificate surfaces much later, as a server that inexplicably
+    /// fails to verify.
+    #[test]
+    fn a_multi_certificate_bundle_is_read_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.pem");
+        std::fs::write(
+            &path,
+            format!(
+                "# origofs test bundle\n\n{CA_ONE}\n\
+                 # a comment between the two certificates\n\n{CA_TWO}\n\
+                 trailing junk that is not a certificate\n"
+            ),
+        )
+        .unwrap();
+
+        let certs = load_ca_bundle(path.to_str().unwrap()).expect("bundle must parse");
+        assert_eq!(certs.len(), 2, "both certificates must be read");
+
+        // And both must be acceptable as roots, which is what they are read for.
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert).expect("a self-signed CA is a valid root");
+        }
+        assert_eq!(roots.len(), 2);
+    }
+
+    /// A bundle with nothing usable in it is an error, not a silent fall-back to
+    /// the platform roots — the operator named the file because those are not
+    /// enough.
+    #[test]
+    fn a_bundle_with_no_certificates_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("junk.pem");
+        std::fs::write(&path, b"not a certificate\n").unwrap();
+
+        let err = load_ca_bundle(path.to_str().unwrap()).expect_err("junk must be refused");
+        assert!(
+            err.to_string().contains("no certificates"),
+            "expected a clear parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_bundle_is_a_clean_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.pem");
+
+        let err =
+            load_ca_bundle(path.to_str().unwrap()).expect_err("a missing file must be refused");
+        assert!(
+            err.to_string().contains("cannot read"),
+            "expected a clear read error, got: {err}"
+        );
     }
 }
