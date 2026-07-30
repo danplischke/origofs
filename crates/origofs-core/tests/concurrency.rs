@@ -288,3 +288,85 @@ async fn concurrent_mkdir_p_is_idempotent_and_orphan_free() {
         );
     }
 }
+
+/// Concurrent identical `put`s against a **real on-disk** store must each return
+/// an object whose bytes hash to the address they were given.
+///
+/// Every other test in this file runs over `MemStore`, which is a `HashMap` and
+/// so immune by construction — but `LocalCasStore` writes a temp sibling and
+/// renames. When that temp name was derived from the object's path it was shared
+/// by every writer of the same content, which is precisely what dedup produces:
+/// two agents writing the same chunk, `mirror_refs`, a `store_body` retry.
+/// `File::create` truncates, so one writer could zero another's partially-written
+/// file, and the first would then fsync and rename a zero-filled hole into place —
+/// returning `Ok(hash)` for bytes that don't hash to `hash`. The loser of the
+/// rename race would see a spurious `ENOENT` for a write that had succeeded.
+///
+/// The body is large enough that a write spans several syscalls, which is what
+/// gives the interleaving room to happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_identical_puts_to_a_real_cas_never_corrupt() {
+    use origofs_core::{ContentStore, Hash, LocalCasStore};
+
+    for round in 0..8u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalCasStore::open(dir.path()).await.unwrap());
+
+        // Distinct per round so no round can be satisfied by another's leftovers.
+        let body: Vec<u8> = (0..4 * 1024 * 1024)
+            .map(|i| (i as u64 ^ round).to_le_bytes()[0])
+            .collect();
+        let want = Hash::of(&body);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = Arc::clone(&store);
+            let body = body.clone();
+            handles.push(tokio::spawn(async move { store.put(&body).await }));
+        }
+        for h in handles {
+            let got = h
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("round {round}: a racing put failed: {e}"));
+            assert_eq!(got, want, "round {round}: put returned the wrong address");
+        }
+
+        // The decisive check: what is actually on disk must hash to its address.
+        let stored = store.get(&want).await.unwrap();
+        assert_eq!(
+            Hash::of(&stored),
+            want,
+            "round {round}: stored bytes do not hash to their address ({} bytes)",
+            stored.len()
+        );
+        assert_eq!(&stored[..], &body[..], "round {round}: stored bytes differ");
+
+        // No temp files left behind.
+        let leftovers = walk_tmp(dir.path());
+        assert!(
+            leftovers.is_empty(),
+            "round {round}: temp files left behind: {leftovers:?}"
+        );
+    }
+}
+
+/// Every `*.tmp` under `root`, recursively.
+fn walk_tmp(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "tmp") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}

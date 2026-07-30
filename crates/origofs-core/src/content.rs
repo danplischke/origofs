@@ -88,6 +88,8 @@ pub struct LocalCasStore {
     /// lets tests assert the durability barrier actually ran (C3). Not part of
     /// the [`ContentStore`] contract.
     syncs: AtomicU64,
+    /// Counter making each write's temp filename unique — see [`Self::write_at`].
+    tmp_seq: AtomicU64,
 }
 
 impl LocalCasStore {
@@ -98,6 +100,7 @@ impl LocalCasStore {
         Ok(Self {
             root,
             syncs: AtomicU64::new(0),
+            tmp_seq: AtomicU64::new(0),
         })
     }
 
@@ -124,17 +127,46 @@ impl LocalCasStore {
     /// then the parent directory is fsynced so the rename entry itself survives.
     /// This establishes the invariant the metadata layer relies on: content is
     /// on disk before any metadata references it.
+    ///
+    /// The temp name is unique per write, not derived from the object's path.
+    /// Deriving it from the path gives every concurrent writer of the *same*
+    /// content one shared temp file — and that is the common case, because
+    /// identical content is exactly what dedup produces. Since `File::create`
+    /// truncates, one writer could zero another's partially-written file and the
+    /// first would then fsync and rename the hole into place, returning `Ok(hash)`
+    /// for bytes that do not hash to `hash`; the loser of the rename race would
+    /// meanwhile see a spurious `ENOENT` for a write that had in fact succeeded.
+    /// With distinct temps both writers rename their own complete copy, and rename
+    /// is atomic, so the last one simply wins with identical bytes.
     async fn write_at(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = path.with_extension("tmp");
-        let mut f = tokio::fs::File::create(&tmp).await?;
+        // pid + counter is unique among *live* writers: within a process the
+        // counter never repeats, and a recycled pid means the other process is
+        // gone. Kept a sibling of `path` so the rename stays within one directory
+        // (and so atomic).
+        let tmp = path.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            self.tmp_seq.fetch_add(1, Ordering::Relaxed)
+        ));
+        let res = self.write_tmp_then_rename(&tmp, path, bytes).await;
+        if res.is_err() {
+            // Nothing will ever reuse this name, so a partial temp would just
+            // accumulate. Best-effort: the write already failed.
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        res
+    }
+
+    async fn write_tmp_then_rename(&self, tmp: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut f = tokio::fs::File::create(tmp).await?;
         f.write_all(bytes).await?;
         f.sync_all().await?;
         drop(f);
         self.syncs.fetch_add(1, Ordering::Relaxed);
-        tokio::fs::rename(&tmp, path).await?;
+        tokio::fs::rename(tmp, path).await?;
         // Directory fsync makes the rename durable. Unix-only: Windows has no
         // portable directory-fsync, and the temp-file fsync above still bounds
         // the exposure there.
