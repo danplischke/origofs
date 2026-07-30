@@ -10,7 +10,8 @@ and every byte knows who wrote it.**
 [![rust](https://img.shields.io/badge/rust-1.88%2B-dea584)](#install)
 [![design](https://img.shields.io/badge/docs-DESIGN.md-informational)](docs/DESIGN.md)
 
-[**Quickstart**](#quickstart) · [**Agents**](#working-with-agents) ·
+[**What it is**](#what-origofs-is) · [**Quickstart**](#quickstart) ·
+[**Agents**](#working-with-agents) ·
 [**Attribution**](#know-who-did-what) · [**Versioning**](#versioning) ·
 [**Teams**](#running-for-a-team) · [**Python**](#python) ·
 [**Backends**](#storage-backends) · [**Design**](docs/DESIGN.md)
@@ -19,17 +20,52 @@ and every byte knows who wrote it.**
 
 ---
 
-Point an agent at your files and let it work. Then ask what it did — not the
-chat log, not a diff you hope is complete. Ask the **filesystem**:
+## What origofs is
+
+origofs is a **storage engine for files**. You keep your files in an origofs
+*workspace* instead of a plain directory, and read and write them through a CLI,
+a Rust or Python SDK, an HTTP API, or a real POSIX mount.
+
+What it adds to a directory is **identity**. Every write names an *actor* — a
+person, or a specific agent — and origofs records that per byte, permanently. So a
+file here can answer a question a plain directory can't: *who wrote this line, a
+human or an agent?*
+
+### See it in one minute
+
+Two writers editing one file:
 
 ```bash
 origofs --workspace ./ws init
-AGENT=$(origofs --workspace ./ws actor claude --agent --model claude-opus-4-8)
 
-# the agent edits in a fast native mount; every change streams into origofs, attributed, live
-origofs --workspace ./ws overlay --actor "$AGENT" -- claude -p "refactor the parser"
+# register the two actors; each command prints an id
+DAN=$(origofs --workspace ./ws actor dan)                                  # a person
+BOT=$(origofs --workspace ./ws actor claude --agent --model claude-opus-4-8)   # an agent
 
-# who wrote which lines?
+# dan writes two lines; the agent later rewrites the file with a third
+printf 'alpha\nbeta\n'        | origofs --workspace ./ws write /notes.md --actor "$DAN"
+printf 'alpha\nbeta\ngamma\n' | origofs --workspace ./ws write /notes.md --actor "$BOT"
+
+origofs --workspace ./ws blame /notes.md
+```
+
+```text
+   1-2     human:dan
+   3       agent:claude     ← credited only with the line it actually added
+```
+
+The agent submitted the *whole* file, but blame is keyed by **content**, not by
+line number — so dan keeps his lines and the agent is credited with exactly what
+it changed. That holds up when lines move, when the file is reformatted, and
+across commits and branch switches.
+
+### In practice: let the agent work, then check what it did
+
+You don't hand an agent's writes to origofs yourself. Run the agent *inside* the
+workspace and its edits stream in as it works, already attributed:
+
+```bash
+origofs --workspace ./ws overlay --actor "$BOT" -- claude -p "refactor the parser"
 origofs --workspace ./ws blame /src/parser.rs
 ```
 
@@ -41,29 +77,34 @@ origofs --workspace ./ws blame /src/parser.rs
 
 Don't like the result? `ws.revert_session(agent, session)` undoes **everything
 that agent did in that session** — across every file it touched — and leaves the
-human edits standing.
+human edits standing. Or don't let it land in the first place: an agent can be
+made *propose-only*, so its writes queue up for [review](#propose-and-review-not-just-apply)
+instead of applying.
 
-origofs is content-addressed storage with a real metadata database (Postgres or
-SQLite), opt-in Git-style versioning, and per-actor attribution recorded in the
-write path itself. It isn't a wrapper over `git` or a VFS shim — it's a storage
+### Under the hood
+
+origofs is content-addressed storage (BLAKE3-hashed chunks, deduplicated and
+verified on read) over a real metadata database (SQLite solo, Postgres for a
+team), with opt-in Git-style versioning and attribution recorded in the write
+path itself. It is **not** a wrapper over `git` or a VFS shim — it's a storage
 engine, exposed through a CLI, a Rust SDK, Python bindings, an HTTP API, MCP, and
 real filesystem mounts (FUSE/NFS).
 
 > **Pre-1.0 and moving fast.** Build from source ([Install](#install)); the
 > `overlay` and `sandbox` commands need Linux (unprivileged overlayfs).
 
-## Why origofs
+## What you get
 
 Six questions a directory of files can't answer:
 
-|  |  |
+| Question | origofs's answer |
 |---|---|
-| **Who wrote this line — a person or an agent?** | Every attributed write records the actor, session, and tool-call behind it. `origofs blame` reports it per line; the record survives commits, branch switches, and reformatting. |
-| **Can I undo just the agent's work?** | Revert an agent's entire session across every file it touched, keeping everyone else's edits intact. |
-| **Can I review before it lands?** | Agents can *propose* edits into a review queue instead of applying them; a human accepts (credited to the agent) or rejects. An actor can even be made *propose-only*, so its writes are gated into that queue automatically. |
-| **Can people and agents edit together, live?** | Opt-in CRDT co-editing lets humans, agents, and browser editors type into the same document at once and converge — with every character still attributed to whoever wrote it. |
-| **Will it hold up for a team?** | The Postgres backend is built for many concurrent writers — humans and agents — sharing one workspace, with a live change feed and presence so every client sees edits as they happen. |
-| **Can I trust what I read back?** | Content is BLAKE3-addressed and verified on every read: silent bit-rot or tampering in object storage surfaces as an error instead of being served as if it were real. |
+| **Who wrote this line — a person or an agent?** | `origofs blame` reports it per line. Every attributed write also records the session and tool-call behind it. |
+| **Can I undo just the agent's work?** | Revert one agent's whole session across every file it touched; everyone else's edits stay. |
+| **Can I review before it lands?** | Agents can *propose* edits into a review queue; a human accepts (credited to the agent) or rejects. |
+| **Can people and agents edit together, live?** | Opt-in CRDT co-editing: humans, agents, and browser editors type into one document and converge, still attributed per character. |
+| **Will it hold up for a team?** | Postgres backs many concurrent writers on one workspace, with a live change feed and presence. |
+| **Can I trust what I read back?** | Content is verified against its hash on every read, so bit-rot or tampering is an error, never silently served. |
 
 ## Install
 
@@ -75,31 +116,50 @@ cargo install --path crates/origofs-cli     # installs the `origofs` binary
 cargo build --release                    # ./target/release/origofs
 ```
 
-A workspace is just a directory origofs manages (metadata DB + content store). For a
-team deployment, point it at Postgres and object storage instead — see
+A workspace is a directory origofs manages: a metadata database (`meta.db`) next to
+a content store (`cas/`). You never edit those by hand — the paths you use
+(`/notes/a.txt`) live *inside* the workspace, not on your disk. For a team
+deployment, point it at Postgres and object storage instead — see
 [Running for a team](#running-for-a-team) and [Storage backends](#storage-backends).
 
 ## Quickstart
 
+The ordinary file operations, from the shell. `write` takes its bytes from stdin
+(or `--from <file>`), and paths are absolute within the workspace:
+
 ```bash
 WS=./ws
-origofs --workspace "$WS" init
+origofs --workspace "$WS" init                     # create the workspace
+
 echo 'hello from origofs' | origofs --workspace "$WS" write /notes/a.txt
-origofs --workspace "$WS" ls   /notes
-origofs --workspace "$WS" read /notes/a.txt
-origofs --workspace "$WS" stat /notes/a.txt
+origofs --workspace "$WS" ls   /notes              # list a directory
+origofs --workspace "$WS" read /notes/a.txt        # bytes to stdout
+origofs --workspace "$WS" stat /notes/a.txt        # size, kind, timestamps
+
+# ...and the same write, on the record: `--actor` is what makes blame possible
+DAN=$(origofs --workspace "$WS" actor dan)
+echo 'hello from dan' | origofs --workspace "$WS" write /notes/a.txt --actor "$DAN"
+origofs --workspace "$WS" blame /notes/a.txt
 ```
 
-From Rust:
+The same thing from Rust — `write` is unattributed, `write_as` carries an
+identity, and everything else is the same call:
 
 ```rust
-use origofs_sdk::Workspace;
+use origofs_sdk::{Workspace, WriteCtx};
 
 let ws = Workspace::open_local("meta.db", "cas").await?;   // or open_pg(dsn, cas)
 ws.mkdir_p("/notes").await?;
-ws.write("/notes/a.txt", b"hello").await?;
+
+let dan = ws.create_human("dan", None).await?;             // an actor id
+let ctx = WriteCtx::session(dan, ws.create_session(dan, None).await?);
+ws.write_as(ctx, "/notes/a.txt", b"hello").await?;         // attributed
+
 let bytes = ws.read("/notes/a.txt").await?;
+let spans = ws.blame("/notes/a.txt").await?;               // who wrote which bytes
 ```
+
+Python is the same API with `await` on every call — see [Python](#python).
 
 ## Working with agents
 
