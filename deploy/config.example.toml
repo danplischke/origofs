@@ -64,3 +64,33 @@ packed = true                     # batch chunks into pack objects (recommended 
 #   ORIGOFS_S3_CONNECT_TIMEOUT_SECS=10    # fail fast on a mis-set endpoint
 #   ORIGOFS_S3_MAX_RETRIES=5
 #   ORIGOFS_S3_RETRY_TIMEOUT_SECS=180     # total elapsed retry budget
+
+# ── Postgres + native GCS ─────────────────────────────────────────────────────
+#
+# The Google Cloud pairing. Uncomment and adjust; see docs/DEPLOY-GCS-POSTGRES.md
+# for the caveats that actually bite (packed index locality, Cloud SQL TLS, and
+# what garbage collection does and does not reclaim).
+#
+# [metadata]
+# backend = "postgres"
+# # Cloud SQL over a private IP or the auth proxy. Managed Postgres requires TLS:
+# # set ORIGOFS_PG_CA_FILE to the server CA bundle.
+# dsn = "host=10.0.0.5 user=origofs dbname=origofs sslmode=require"
+#
+# [content]
+# backend = "gcs"
+# bucket = "my-origofs-content"
+# # Credentials resolve in this order: an explicit service-account key or key file,
+# # then Application Default Credentials, then the GKE/GCE metadata server. On
+# # workload identity, set none of them.
+# # service_account_path = "/var/secrets/gcs.json"
+# prefix = "objects"
+# # `packed` batches chunks into few large objects, which is the right default for
+# # a metered object store — but the per-chunk index is a LOCAL directory, so it is
+# # single-writer-per-index. With more than one replica, either give each its own
+# # index on a persistent volume and accept that they cannot share deduplication,
+# # or leave `packed = false`.
+# packed = false
+# # index_dir = "/var/lib/origofs/index"
+# # Plaintext endpoint — for a local emulator only. Never with real GCS.
+# # allow_http = false

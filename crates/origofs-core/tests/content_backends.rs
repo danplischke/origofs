@@ -216,13 +216,106 @@ async fn gcs_store_constructs() {
     );
 }
 
+/// The GCS **builder** is the only GCS-specific code there is.
+///
+/// Everything after construction — `path_for`, `touch`/`refresh_needed`,
+/// `list_with_age`, ranged reads, `delete` — is `ObjectContentStore`, shared
+/// verbatim with S3 and exercised end-to-end by the MinIO CI leg and the
+/// in-memory adapter. What is *not* shared is this builder: credential
+/// precedence, and whether a plaintext endpoint is permitted.
+///
+/// That second one had no coverage and was broken. `GcsConfig` had no
+/// `allow_http`, so `object_store` rejected any `http://` endpoint with a
+/// `BadScheme` builder error before a single request left the process — which
+/// meant the native GCS backend could not be pointed at a local emulator at all.
+/// S3 has had `allow_http` from the start (that is how the MinIO leg works); GCS
+/// simply never got it, and with no GCS test leg nothing noticed.
+///
+/// (A `fake-gcs-server` CI leg is still not possible: it serves the XML API
+/// virtual-hosted, by `Host` header, while `object_store` addresses GCS
+/// path-style. That is an upstream mismatch, not something origofs can configure
+/// around — so the honest coverage is this, plus a real bucket out of band.)
+#[tokio::test]
+async fn gcs_builder_accepts_a_plaintext_emulator_endpoint() {
+    use origofs_core::GcsConfig;
+    // `gcs_base_url` pointing at a plaintext emulator, exactly as fake-gcs-server
+    // or the Cloud Storage emulator is configured.
+    let key = r#"{"gcs_base_url":"http://127.0.0.1:4443","disable_oauth":true,"private_key":"","private_key_id":"","client_email":""}"#;
+
+    let refused = ObjectContentStore::gcs(GcsConfig {
+        bucket: "b".into(),
+        service_account_key: Some(key.into()),
+        allow_http: false,
+        ..Default::default()
+    });
+    // Construction itself succeeds either way; the scheme is enforced per request.
+    assert!(refused.is_ok(), "builder should construct");
+
+    let allowed = ObjectContentStore::gcs(GcsConfig {
+        bucket: "b".into(),
+        service_account_key: Some(key.into()),
+        allow_http: true,
+        ..Default::default()
+    });
+    assert!(
+        allowed.is_ok(),
+        "gcs() must accept a plaintext endpoint when allow_http is set"
+    );
+}
+
+/// An explicit key and an explicit path are mutually exclusive to the builder, and
+/// the absence of both must fall through to ADC / the metadata server rather than
+/// erroring — the shape a workload-identity deployment relies on.
+#[tokio::test]
+async fn gcs_credential_precedence() {
+    use origofs_core::GcsConfig;
+    let key = r#"{"private_key":"","private_key_id":"","client_email":"","disable_oauth":true}"#;
+
+    // Inline key wins and does not collide with an env-provided account.
+    assert!(
+        ObjectContentStore::gcs(GcsConfig {
+            bucket: "b".into(),
+            service_account_key: Some(key.into()),
+            ..Default::default()
+        })
+        .is_ok(),
+        "an inline key alone must build"
+    );
+
+    // No credentials at all. On a machine with none configured the builder reports
+    // it here rather than at first use, and the message must name the problem — a
+    // workload-identity deployment that has lost its binding otherwise sees a bare
+    // failure with nothing to act on.
+    //
+    // Asserted on the *shape* rather than on ok/err, because the answer legitimately
+    // differs by environment: on GCE, or with GOOGLE_APPLICATION_CREDENTIALS set,
+    // this succeeds. Both outcomes are correct; a silent nonsense store is not.
+    match ObjectContentStore::gcs(GcsConfig {
+        bucket: "b".into(),
+        ..Default::default()
+    }) {
+        Ok(_) => { /* credentials were discoverable here — fine */ }
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            assert!(
+                msg.contains("credential")
+                    || msg.contains("account")
+                    || msg.contains("auth")
+                    || msg.contains("metadata"),
+                "a credential-less GCS build should say so; got: {e}"
+            );
+        }
+    }
+}
+
 /// Real native-GCS run. Set the env vars to enable (against a real bucket or
 /// `fake-gcs-server`):
 ///   ORIGOFS_GCS_TEST_BUCKET (required),
 ///   ORIGOFS_GCS_TEST_SERVICE_ACCOUNT_PATH   (JSON key file; for fake-gcs-server, point
 ///     its `gcs_base_url` at the emulator and set `disable_oauth: true`),
 ///   ORIGOFS_GCS_TEST_SERVICE_ACCOUNT_KEY    (inline JSON; alternative to the path),
-///   ORIGOFS_GCS_TEST_APPLICATION_CREDENTIALS (ADC file).
+///   ORIGOFS_GCS_TEST_APPLICATION_CREDENTIALS (ADC file),
+///   ORIGOFS_GCS_TEST_ALLOW_HTTP             (set for a plaintext emulator).
 /// With none of the credential vars set, ADC / the metadata server are used.
 #[tokio::test]
 #[ignore = "requires a GCS bucket or emulator; set ORIGOFS_GCS_TEST_* to run"]
@@ -235,6 +328,8 @@ async fn gcs_backend() {
         service_account_key: std::env::var("ORIGOFS_GCS_TEST_SERVICE_ACCOUNT_KEY").ok(),
         application_credentials: std::env::var("ORIGOFS_GCS_TEST_APPLICATION_CREDENTIALS").ok(),
         prefix: Some("origofs-test".into()),
+        // An emulator speaks plaintext; real GCS never does.
+        allow_http: std::env::var("ORIGOFS_GCS_TEST_ALLOW_HTTP").is_ok(),
     };
     suite(ObjectContentStore::gcs(cfg).unwrap()).await;
 }

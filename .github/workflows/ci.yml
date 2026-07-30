@@ -21,8 +21,11 @@ jobs:
     timeout-minutes: 45
     # Exercise the Postgres (multi-writer / production) metadata backend. Without
     # ORIGOFS_PG_TEST_URL every PG leg self-skips and only the SQLite path is
-    # tested — including the dual-backend invariant suites (atomicity.rs), whose
-    # whole point is that the *production* backend is covered.
+    # tested — including the dual-backend invariant suites (atomicity.rs) and
+    # `pg_object_store.rs`, which covers the Postgres + object-store composition
+    # the `open_pg_gcs`/`open_pg_s3` constructors build. That pairing had no test
+    # at all, which is how a `gc()` that could never acquire its lease on Postgres
+    # shipped.
     env:
       ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
     services:

@@ -65,6 +65,35 @@ fn entry_map(tree: &Tree) -> HashMap<&str, &TreeEntry> {
     tree.entries.iter().map(|e| (e.name.as_str(), e)).collect()
 }
 
+/// Reject a lock path that could collide with an internal lease, or that the
+/// metadata store cannot represent.
+///
+/// `lock`/`unlock` take a caller-supplied string and pass it straight to the
+/// store — unlike every other path-taking operation, which walks through
+/// `validate_component`. Two things follow from that, and both were live:
+///
+/// * A NUL byte reaches a `text` column, and **Postgres rejects it** with
+///   `invalid byte sequence for encoding "UTF8"`. That is a hard error from a
+///   caller-controlled string, on the production backend only.
+/// * Internal leases live in the same table (`gc.rs`'s `GC_LEASE_KEY`), so
+///   without a rule separating them, a caller could take or release one.
+///
+/// Requiring an absolute path fixes both: it is what a real workspace path always
+/// is, and it is what the internal keys deliberately are not.
+fn validate_lock_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        return Err(OrigoFSError::InvalidPath(format!(
+            "lock path must be absolute: {path:?}"
+        )));
+    }
+    if path.contains('\0') {
+        return Err(OrigoFSError::InvalidPath(format!(
+            "lock path contains a NUL byte: {path:?}"
+        )));
+    }
+    Ok(())
+}
+
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     async fn commit_at(&self, h: &Hash) -> Result<Commit> {
         Commit::decode(&self.content.get(h).await?)
@@ -605,11 +634,13 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Acquire an exclusive lock on `path` for `owner`; `false` if already held.
     pub async fn lock(&self, path: &str, owner: &str) -> Result<bool> {
+        validate_lock_path(path)?;
         self.meta.acquire_lock(path, owner, self.now_secs()).await
     }
 
     /// Release `owner`'s lock on `path`.
     pub async fn unlock(&self, path: &str, owner: &str) -> Result<bool> {
+        validate_lock_path(path)?;
         self.meta.release_lock(path, owner).await
     }
 

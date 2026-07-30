@@ -65,6 +65,7 @@ class GcsConfig:
         service_account_key: Optional[str] = None,
         application_credentials: Optional[str] = None,
         prefix: Optional[str] = None,
+        allow_http: bool = False,
     ) -> None: ...
 
 if sys.platform != "win32":
@@ -176,6 +177,14 @@ class Workspace:
     @staticmethod
     async def open_pg_s3_encrypted(
         dsn: str, cfg: S3Config, passphrase: str
+    ) -> "Workspace": ...
+    @staticmethod
+    async def open_gcs_encrypted(
+        db_path: str, cfg: GcsConfig, passphrase: str
+    ) -> "Workspace": ...
+    @staticmethod
+    async def open_pg_gcs_encrypted(
+        dsn: str, cfg: GcsConfig, passphrase: str
     ) -> "Workspace": ...
     @staticmethod
     async def open_local_packed(db_path: str, data_dir: str, index_dir: str) -> "Workspace": ...

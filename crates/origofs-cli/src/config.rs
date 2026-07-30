@@ -110,6 +110,10 @@ struct GcsContent {
     application_credentials: Option<String>,
     #[serde(default)]
     prefix: Option<String>,
+    /// Allow a plaintext (`http://`) endpoint — for a local GCS emulator only.
+    /// Real GCS is always https, so leave this unset in production.
+    #[serde(default)]
+    allow_http: bool,
     #[serde(default)]
     packed: bool,
     #[serde(default)]
@@ -138,6 +142,7 @@ impl GcsContent {
             service_account_key: self.service_account_key.clone(),
             application_credentials: self.application_credentials.clone(),
             prefix: self.prefix.clone(),
+            allow_http: self.allow_http,
         }
     }
 }

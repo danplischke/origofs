@@ -85,6 +85,17 @@ pub struct GcsConfig {
     pub application_credentials: Option<String>,
     /// Key prefix for stored objects (default `objects`).
     pub prefix: Option<String>,
+    /// Allow a plaintext (`http://`) endpoint.
+    ///
+    /// Needed to point the native GCS backend at a local emulator
+    /// (`fake-gcs-server`), whose `gcs_base_url` is `http://`. Without it
+    /// `object_store` refuses the request with a `BadScheme` builder error before
+    /// anything leaves the process — which is why GCS had no emulator-backed test
+    /// leg while S3 had a MinIO one: the option simply did not exist here.
+    ///
+    /// Leave `false` against real GCS; it exists for emulators and never applies to
+    /// `https://storage.googleapis.com`.
+    pub allow_http: bool,
 }
 
 impl std::fmt::Debug for GcsConfig {
@@ -99,6 +110,7 @@ impl std::fmt::Debug for GcsConfig {
             )
             .field("application_credentials", &self.application_credentials)
             .field("prefix", &self.prefix)
+            .field("allow_http", &self.allow_http)
             .finish()
     }
 }
@@ -208,7 +220,7 @@ impl ObjectContentStore {
             GoogleCloudStorageBuilder::from_env()
         }
         .with_bucket_name(&cfg.bucket)
-        .with_client_options(client_options())
+        .with_client_options(client_options().with_allow_http(cfg.allow_http))
         .with_retry(retry_config());
         if let Some(key) = &cfg.service_account_key {
             builder = builder.with_service_account_key(key);

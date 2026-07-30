@@ -7,6 +7,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
+### Fixed — Postgres + object storage
+
+- **Garbage collection could never run on Postgres.** The lease serializing
+  collections was keyed `"\0gc-lease"`, chosen because path validation rejects
+  NUL so no user lock could collide with it — true of paths, but the key is
+  stored in a `text` column and Postgres cannot hold a NUL byte in one. Every
+  `gc()` on the production metadata backend failed at `acquire_lock` with
+  `invalid byte sequence for encoding "UTF8": 0x00`, so a Postgres deployment
+  reclaimed nothing, ever. Every GC test ran on SQLite, which stores the byte
+  happily.
+- `lock`/`unlock` passed a caller-supplied string straight to the store, unlike
+  every other path-taking operation. A NUL was therefore a hard Postgres error
+  from user input, and nothing separated user paths from internal lease keys.
+  Both now require an absolute path.
+- `GcsConfig` had no `allow_http`, so the native GCS backend could not be pointed
+  at a plaintext endpoint at all — `object_store` refused it with a `BadScheme`
+  builder error before any request left the process. S3 has had the option from
+  the start (it is how the MinIO CI leg works); GCS never got it, and with no GCS
+  test leg nothing noticed. This is what a local emulator needs.
+- `PostgresMetadataStore::schema_version` detected "table not created yet" by
+  string-matching an error whose `Display` is a generic kind — the message lives
+  in its source, so the match never fired. Now keyed on SQLSTATE `42P01`, which is
+  also stable across server locales.
+
 ### Fixed — data loss
 
 - `impl ContentStore for Arc<T>` did not forward `replace_keyed`. It is the one
@@ -92,6 +116,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 - Request budget on the HTTP surface: a 60s per-request timeout, a 512-request
   concurrency cap, and a 64 MiB body limit (was 1 GiB, unchangeable).
 - `origofs serve` runs presence reaping on a timer; it previously had no caller.
+- Python: `open_gcs_encrypted` and `open_pg_gcs_encrypted`, so encryption at rest
+  is available on the GCS pairing as well as the S3 one.
+- `allow_http` on `GcsConfig` across Rust, Python, and the `--config` TOML.
 
 ### Changed
 

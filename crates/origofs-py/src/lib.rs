@@ -468,6 +468,7 @@ impl GcsConfig {
         service_account_key = None,
         application_credentials = None,
         prefix = None,
+        allow_http = false,
     ))]
     fn new(
         bucket: String,
@@ -475,6 +476,8 @@ impl GcsConfig {
         service_account_key: Option<String>,
         application_credentials: Option<String>,
         prefix: Option<String>,
+        // Only for a plaintext emulator; real GCS is always https.
+        allow_http: bool,
     ) -> Self {
         Self {
             inner: CoreGcsConfig {
@@ -483,6 +486,7 @@ impl GcsConfig {
                 service_account_key,
                 application_credentials,
                 prefix,
+                allow_http,
             },
         }
     }
@@ -973,6 +977,52 @@ impl Workspace {
             );
             let backend: Arc<dyn origofs_sdk::ContentStore> =
                 Arc::new(origofs_sdk::ObjectContentStore::s3(cfg.inner).map_err(to_pyerr)?);
+            let ws = CoreWorkspace::open_encrypted(meta, backend, &passphrase)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Py::new(py, Workspace { inner: ws }))
+        })
+    }
+
+    /// Open a GCS-backed workspace **encrypted at rest**. See
+    /// [`open_local_encrypted`] for the key-derivation and dedup caveats.
+    #[staticmethod]
+    fn open_gcs_encrypted<'py>(
+        py: Python<'py>,
+        db_path: String,
+        cfg: GcsConfig,
+        passphrase: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            let meta: Arc<dyn origofs_sdk::MetadataStore> =
+                Arc::new(origofs_sdk::SqliteMetadataStore::open(&db_path).map_err(to_pyerr)?);
+            let backend: Arc<dyn origofs_sdk::ContentStore> =
+                Arc::new(origofs_sdk::ObjectContentStore::gcs(cfg.inner).map_err(to_pyerr)?);
+            let ws = CoreWorkspace::open_encrypted(meta, backend, &passphrase)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Py::new(py, Workspace { inner: ws }))
+        })
+    }
+
+    /// Open a Postgres + native-GCS workspace **encrypted at rest** — the
+    /// production pairing on Google Cloud with encryption on. See
+    /// [`open_local_encrypted`] for the caveats.
+    #[staticmethod]
+    fn open_pg_gcs_encrypted<'py>(
+        py: Python<'py>,
+        dsn: String,
+        cfg: GcsConfig,
+        passphrase: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            let meta: Arc<dyn origofs_sdk::MetadataStore> = Arc::new(
+                origofs_sdk::PostgresMetadataStore::connect(&dsn)
+                    .await
+                    .map_err(to_pyerr)?,
+            );
+            let backend: Arc<dyn origofs_sdk::ContentStore> =
+                Arc::new(origofs_sdk::ObjectContentStore::gcs(cfg.inner).map_err(to_pyerr)?);
             let ws = CoreWorkspace::open_encrypted(meta, backend, &passphrase)
                 .await
                 .map_err(to_pyerr)?;

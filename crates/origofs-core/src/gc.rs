@@ -63,9 +63,18 @@ use std::collections::HashSet;
 /// being generous is only that garbage lingers one extra cycle.
 pub const DEFAULT_GC_GRACE_SECS: u64 = 600;
 
-/// Key of the advisory lease that serializes collections. Not a valid path — no
-/// user `lock` can collide with it, because `validate_component` rejects the NUL.
-const GC_LEASE_KEY: &str = "\0gc-lease";
+/// Key of the advisory lease that serializes collections.
+///
+/// Not a valid path, so no user `lock` can collide with it: every workspace path
+/// is absolute, and [`Fs::lock`](Fs::lock) refuses one that is not.
+///
+/// It used to be `"\0gc-lease"`, relying on `validate_component` rejecting NUL.
+/// That reasoning held for *paths*, but the key is stored in a `text` column and
+/// **Postgres cannot store a NUL byte in one** — so `acquire_lock` failed with
+/// `invalid byte sequence for encoding "UTF8": 0x00` and garbage collection was
+/// broken outright on the production metadata backend. Every GC test was
+/// SQLite-only, so nothing noticed.
+const GC_LEASE_KEY: &str = "origofs:gc-lease";
 
 /// How long a GC lease is honored before another collection may take it. Bounds
 /// how long a crashed collector blocks the next one.
