@@ -83,6 +83,53 @@ pub(crate) const REFS: ObjectKind = ObjectKind {
     max_read_version: 1,
 };
 
+/// Store descriptor — the named slot stamped at the store's root ([`StoreDescriptor`]).
+pub(crate) const STORE: ObjectKind = ObjectKind {
+    tag: b"ORGS",
+    name: "store descriptor",
+    write_version: 1,
+    max_read_version: 1,
+};
+
+/// Pack object footer ([`crate::pack::PackStore`]).
+pub(crate) const PACK: ObjectKind = ObjectKind {
+    tag: b"ORGP",
+    name: "pack",
+    write_version: 1,
+    max_read_version: 1,
+};
+
+/// Pack index entry ([`crate::pack::PackStore`]).
+pub(crate) const PACK_INDEX: ObjectKind = ObjectKind {
+    tag: b"ORGI",
+    name: "pack index entry",
+    write_version: 1,
+    max_read_version: 1,
+};
+
+/// Every object kind whose version a *store* has to account for. Excludes the
+/// store descriptor itself (it describes them; it cannot describe itself) and the
+/// pack encoding (a private detail of one backend, not of the object graph).
+const GRAPH_KINDS: [&ObjectKind; 4] = [&MANIFEST, &TREE, &COMMIT, &REFS];
+
+/// The highest object-graph format version this build ever writes.
+pub(crate) fn current_format_version() -> u8 {
+    GRAPH_KINDS
+        .iter()
+        .map(|k| k.write_version)
+        .max()
+        .unwrap_or(1)
+}
+
+/// The highest object-graph format version this build can read.
+pub(crate) fn max_readable_format_version() -> u8 {
+    GRAPH_KINDS
+        .iter()
+        .map(|k| k.max_read_version)
+        .max()
+        .unwrap_or(1)
+}
+
 impl ObjectKind {
     /// The 5 header bytes an encoder emits.
     pub(crate) fn header(&self) -> [u8; HEADER_LEN] {
@@ -138,11 +185,82 @@ impl ObjectKind {
     }
 }
 
+/// The name of the [`StoreDescriptor`] slot, under
+/// [`ContentStore::get_meta`](crate::ContentStore::get_meta).
+pub(crate) const STORE_DESCRIPTOR_SLOT: &str = "format";
+
+/// What a content store says about the object formats inside it.
+///
+/// Stamped into a named slot at the store's root by [`Fs::init`](crate::Fs::init)
+/// and checked on every open, so a build that is too old to read a store learns
+/// it **once, at open**, instead of N objects later with N confusing per-object
+/// errors — or worse, not at all, from a code path that treats an undecodable
+/// object as absent.
+///
+/// The slot is *not* content-addressed: it lives outside the object namespace, so
+/// `list` never returns it and `gc` can never sweep it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StoreDescriptor {
+    /// The highest object-graph format version any writer has put in this store.
+    pub format_version: u8,
+    /// The lowest reader that can read this store *completely*. Equal to
+    /// `format_version` today; they diverge only if a future version is additive
+    /// enough that an older reader can still see everything that matters, which is
+    /// a judgement the writer makes when it bumps `format_version`.
+    pub min_reader_version: u8,
+}
+
+impl StoreDescriptor {
+    /// What this build stamps on a store it is the first to touch.
+    pub(crate) fn current() -> Self {
+        Self {
+            format_version: current_format_version(),
+            min_reader_version: current_format_version(),
+        }
+    }
+
+    /// `ORGS | version | format_version(u8) | min_reader_version(u8)`
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = STORE.header().to_vec();
+        out.push(self.format_version);
+        out.push(self.min_reader_version);
+        out
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        match STORE.version_of(bytes)? {
+            1 => {
+                if bytes.len() < HEADER_LEN + 2 {
+                    return Err(STORE.malformed());
+                }
+                Ok(Self {
+                    format_version: bytes[HEADER_LEN],
+                    min_reader_version: bytes[HEADER_LEN + 1],
+                })
+            }
+            v => Err(STORE.unsupported(v)),
+        }
+    }
+
+    /// Whether this build can read the store the descriptor describes.
+    pub(crate) fn check_readable(&self) -> Result<()> {
+        let max = max_readable_format_version();
+        if self.min_reader_version > max {
+            return Err(OrigoFSError::UnsupportedVersion {
+                kind: "store",
+                found: self.min_reader_version,
+                max_supported: max,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL: [&ObjectKind; 4] = [&MANIFEST, &TREE, &COMMIT, &REFS];
+    const ALL: [&ObjectKind; 7] = [&MANIFEST, &TREE, &COMMIT, &REFS, &STORE, &PACK, &PACK_INDEX];
 
     #[test]
     fn readers_are_never_behind_writers() {
@@ -200,5 +318,35 @@ mod tests {
             "content_error"
         );
         assert_eq!(TREE.version_of(b"ORG").unwrap_err().code(), "content_error");
+    }
+
+    #[test]
+    fn store_descriptor_round_trips_and_gates_on_min_reader() {
+        let d = StoreDescriptor::current();
+        assert_eq!(StoreDescriptor::decode(&d.encode()).unwrap(), d);
+        d.check_readable().expect("a store we stamped is readable");
+
+        // A store only a future origofs can read fully: one error, at open.
+        let future = StoreDescriptor {
+            format_version: 9,
+            min_reader_version: 9,
+        };
+        let e = future.check_readable().unwrap_err();
+        assert!(matches!(
+            e,
+            OrigoFSError::UnsupportedVersion {
+                kind: "store",
+                found: 9,
+                ..
+            }
+        ));
+
+        // Additive change: written by a newer build, still fully readable here.
+        StoreDescriptor {
+            format_version: 9,
+            min_reader_version: 1,
+        }
+        .check_readable()
+        .expect("min_reader_version is what gates, not format_version");
     }
 }

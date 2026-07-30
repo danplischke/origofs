@@ -165,6 +165,26 @@ stay backwards-compatible, so three rules apply:
 A version above what a build can read surfaces as `UnsupportedVersion` (machine code `unsupported_version`),
 deliberately **not** `Corrupt`: the bytes are fine and the fix is to upgrade origofs, not to restore a backup.
 
+**Store descriptor.** Per-object versions only help a caller that reaches the object, and several paths treat
+bytes they can't parse as *absent* (recovery classification, the co-edit sidecar's rebuild-on-unparseable
+fallback). So `Fs::init` — which every `Workspace::open_*` funnels through — stamps a tiny descriptor
+(`ORGS | version | format_version | min_reader_version`) into a **named slot** on the content store and checks it
+on every open: one loud, actionable failure at open instead of N confusing ones later. `min_reader_version` is
+what gates, so a future additive change can leave older readers working. Named slots
+(`ContentStore::put_meta`/`get_meta`) are mutable, are not content-addressed, and live *outside* the object
+namespace — `<root>/meta/<name>` on a local CAS, `<prefix>.meta/<name>` on an object store — so `list` never
+returns them and GC can never sweep them. A store with no descriptor predates them, holds only v1 objects, and is
+stamped on open so the next reader is covered. `EncryptedStore` passes slots through in plaintext (like the
+Argon2id salt) so "needs a newer origofs" stays distinguishable from "wrong passphrase".
+
+**Packs are versioned at the end, not the start.** A pack object *begins* with raw user bytes, so a leading tag
+could not distinguish a v1 pack from a pre-versioning one — a file whose contents start with `ORGP` would look
+like a header. The footer can: `… ‖ trailer ‖ trailer_len(u32) ‖ ORGP ‖ version`, where a legacy pack ends at
+`trailer_len` and would need a ~21 MiB trailer (≈600k chunks in a 4 MiB pack) to be mistaken for a tag. Index
+entries are tagged normally (`ORGI | version | pack(32) | offset(4) | len(4)`, 45 bytes); a bare 40-byte body is
+unambiguously a pre-versioning entry. Both legacy shapes still read, and the hot path never parses either — a
+chunk read is a ranged GET at the offset its index entry records.
+
 **Pluggable backends** behind one trait:
 
 ```rust

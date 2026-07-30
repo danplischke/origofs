@@ -14,13 +14,24 @@
 //! storage: small index local, big packed data remote — the layout restic, borg,
 //! and git packfiles use.
 //!
-//! A pack is `chunk₀ ‖ chunk₁ ‖ … ‖ trailer ‖ trailer_len(u32)`, where the
-//! trailer lists `(chunk_hash, len)` in order so [`PackStore::repack`] can see a
-//! pack's full membership and reclaim dead space (deleted chunks) by rewriting
-//! the survivors and dropping the old pack.
+//! A pack is `chunk₀ ‖ chunk₁ ‖ … ‖ trailer ‖ trailer_len(u32) ‖ ORGP ‖ version`,
+//! where the trailer lists `(chunk_hash, len)` in order so [`PackStore::repack`]
+//! can see a pack's full membership and reclaim dead space (deleted chunks) by
+//! rewriting the survivors and dropping the old pack.
+//!
+//! **Where the version sits, and why at the end.** Everything else origofs writes
+//! is tagged at byte 0 ([`crate::format`]), but a pack *starts* with raw user
+//! bytes — a file whose contents begin with `ORGP` would be indistinguishable
+//! from a header, so a leading tag could not tell a v1 pack from a pre-versioning
+//! one. The footer can: a legacy pack ends with `trailer_len`, and for its last
+//! bytes to read as `ORGP` the trailer would have to be ~21 MiB (≈600k chunks in
+//! one 4 MiB pack). [`parse_trailer`] accepts both shapes, so packs written before
+//! this existed keep working. The read path never touches either: a chunk is a
+//! ranged GET at the offset its index entry records.
 
 use crate::content::ContentStore;
 use crate::error::{OrigoFSError, Result};
+use crate::format;
 use crate::types::Hash;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -38,25 +49,41 @@ struct PackLoc {
     len: u32,
 }
 
+/// Body of an index entry: `pack(32) ‖ offset(4) ‖ len(4)`.
+const LOC_BODY: usize = 40;
+/// A versioned entry is the body behind a `ORGI ‖ version` header.
+const LOC_ENTRY: usize = format::HEADER_LEN + LOC_BODY;
+
 impl PackLoc {
-    /// `pack(32) ‖ offset(4) ‖ len(4)`.
-    fn encode(&self) -> [u8; 40] {
-        let mut out = [0u8; 40];
-        out[..32].copy_from_slice(self.pack.as_bytes());
-        out[32..36].copy_from_slice(&self.offset.to_le_bytes());
-        out[36..40].copy_from_slice(&self.len.to_le_bytes());
+    /// `ORGI ‖ version ‖ pack(32) ‖ offset(4) ‖ len(4)`.
+    fn encode(&self) -> [u8; LOC_ENTRY] {
+        let mut out = [0u8; LOC_ENTRY];
+        out[..format::HEADER_LEN].copy_from_slice(&format::PACK_INDEX.header());
+        let body = &mut out[format::HEADER_LEN..];
+        body[..32].copy_from_slice(self.pack.as_bytes());
+        body[32..36].copy_from_slice(&self.offset.to_le_bytes());
+        body[36..40].copy_from_slice(&self.len.to_le_bytes());
         out
     }
+
     fn decode(b: &[u8]) -> Result<Self> {
-        if b.len() != 40 {
-            return Err(OrigoFSError::Content("malformed pack index entry".into()));
-        }
+        // Entries written before the header existed are exactly the 40-byte body
+        // and can't be confused with a versioned one, which is 45 and tagged.
+        let body = if b.len() == LOC_BODY {
+            b
+        } else {
+            match format::PACK_INDEX.version_of(b)? {
+                1 if b.len() == LOC_ENTRY => &b[format::HEADER_LEN..],
+                1 => return Err(format::PACK_INDEX.malformed()),
+                v => return Err(format::PACK_INDEX.unsupported(v)),
+            }
+        };
         let mut pack = [0u8; 32];
-        pack.copy_from_slice(&b[..32]);
+        pack.copy_from_slice(&body[..32]);
         Ok(PackLoc {
             pack: Hash::from_array(pack),
-            offset: u32::from_le_bytes(b[32..36].try_into().unwrap()),
-            len: u32::from_le_bytes(b[36..40].try_into().unwrap()),
+            offset: u32::from_le_bytes(body[32..36].try_into().unwrap()),
+            len: u32::from_le_bytes(body[36..40].try_into().unwrap()),
         })
     }
 }
@@ -139,7 +166,7 @@ impl PackStore {
             (order, chunks)
         };
 
-        // body ‖ trailer ‖ trailer_len
+        // body ‖ trailer ‖ trailer_len ‖ ORGP ‖ version
         let mut buf = Vec::new();
         let mut locs: Vec<(Hash, u32, u32)> = Vec::with_capacity(order.len());
         for (h, b) in order.iter().zip(&chunks) {
@@ -154,6 +181,7 @@ impl PackStore {
         }
         let trailer_len = (buf.len() - body_len) as u32;
         buf.extend_from_slice(&trailer_len.to_le_bytes());
+        buf.extend_from_slice(&format::PACK.header());
 
         let pack = self.data.put(&buf).await?;
         for (h, offset, len) in &locs {
@@ -238,14 +266,35 @@ impl PackStore {
 }
 
 /// Parse a pack's trailer into `(chunk_hash, offset, len)` in stored order.
+///
+/// Accepts both the versioned footer (`trailer_len ‖ ORGP ‖ version`) and the
+/// pre-versioning one (`trailer_len` alone) — see the module docs for why the tag
+/// lives at the end and why the two can't be confused.
 fn parse_trailer(pack: &[u8]) -> Result<Vec<(Hash, u32, u32)>> {
     let bad = || OrigoFSError::Content("malformed pack trailer".into());
     if pack.len() < 4 {
         return Err(bad());
     }
-    let tlen = u32::from_le_bytes(pack[pack.len() - 4..].try_into().unwrap()) as usize;
-    let trailer_start = pack.len().checked_sub(4 + tlen).ok_or_else(bad)?;
-    let trailer = &pack[trailer_start..pack.len() - 4];
+    // `version_of` rejects a too-new pack with `UnsupportedVersion` rather than
+    // letting a future layout be misread as a legacy footer.
+    let tag = pack
+        .len()
+        .checked_sub(format::HEADER_LEN)
+        .map(|i| &pack[i..]);
+    let footer = match tag {
+        Some(t) if format::PACK.tagged(t) => match format::PACK.version_of(t)? {
+            1 => 4 + format::HEADER_LEN,
+            v => return Err(format::PACK.unsupported(v)),
+        },
+        _ => 4, // written before the pack footer was versioned
+    };
+    if pack.len() < footer {
+        return Err(bad());
+    }
+    let len_at = pack.len() - footer;
+    let tlen = u32::from_le_bytes(pack[len_at..len_at + 4].try_into().unwrap()) as usize;
+    let trailer_start = len_at.checked_sub(tlen).ok_or_else(bad)?;
+    let trailer = &pack[trailer_start..len_at];
     if !tlen.is_multiple_of(36) {
         return Err(bad());
     }
@@ -281,6 +330,16 @@ impl ContentStore for PackStore {
 
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         self.stage(*key, bytes, true).await
+    }
+
+    /// Slots go to the **data** backend — that's the one that travels with the
+    /// store and survives a lost index (which is rebuildable from pack trailers).
+    async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.data.put_meta(name, bytes).await
+    }
+
+    async fn get_meta(&self, name: &str) -> Result<Option<Bytes>> {
+        self.data.get_meta(name).await
     }
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {

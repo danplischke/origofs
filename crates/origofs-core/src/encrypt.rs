@@ -128,6 +128,21 @@ impl ContentStore for EncryptedStore {
         self.inner.put_keyed(key, &ciphertext).await
     }
 
+    /// Slots pass through **in plaintext**, by design.
+    ///
+    /// The nonce here is derived from a content address, and a slot has none — but
+    /// more importantly the format descriptor has to be readable *without* the key,
+    /// so "this store needs a newer origofs" and "you gave the wrong passphrase"
+    /// stay distinguishable. It carries no user data, exactly like the Argon2id
+    /// salt already stored beside the content store.
+    async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put_meta(name, bytes).await
+    }
+
+    async fn get_meta(&self, name: &str) -> Result<Option<Bytes>> {
+        self.inner.get_meta(name).await
+    }
+
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         let ciphertext = self.inner.get(hash).await?;
         Ok(Bytes::from(self.decrypt(hash, &ciphertext)?))
