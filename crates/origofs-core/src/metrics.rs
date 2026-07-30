@@ -71,6 +71,12 @@ pub const FEED_LAG_EVENTS: &str = "origofs_feed_lag_events";
 /// bounded.
 pub const ERRORS_TOTAL: &str = "origofs_errors_total";
 
+/// Counter, labeled `op` (a fixed operation name): transactions the backend asked
+/// to retry (`40001`/`40P01`/`SQLITE_BUSY`). A rising rate is contention, not
+/// breakage — but it is what turns into user-visible errors once an operation
+/// exhausts its attempts.
+pub const RETRIES_TOTAL: &str = "origofs_retries_total";
+
 /// Histogram, labeled `op` (a fixed operation name such as `write`, `read`,
 /// `commit`, `gc`): wall-clock duration of an engine operation, **in seconds**.
 pub const OP_DURATION_SECONDS: &str = "origofs_op_duration_seconds";
@@ -156,6 +162,11 @@ pub fn describe() {
             CHUNKS_DEDUPED_TOTAL,
             Unit::Count,
             "Chunks the content store already had (dedup hits)."
+        );
+        describe_counter!(
+            RETRIES_TOTAL,
+            Unit::Count,
+            "Transactions re-run after the backend asked for a retry."
         );
         describe_counter!(
             COMMITS_TOTAL,
@@ -316,6 +327,16 @@ pub fn record_error(err: &crate::OrigoFSError) {
     }
     #[cfg(not(feature = "metrics"))]
     let _ = err;
+}
+
+/// Count one retried transaction. `op` is the fixed name of the logical
+/// operation being re-run — a closed set, like [`record_op_duration`]'s.
+#[inline]
+pub fn record_retry(op: &'static str) {
+    #[cfg(feature = "metrics")]
+    ::metrics::counter!(RETRIES_TOTAL, "op" => op).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = op;
 }
 
 /// Record the duration of an engine operation. `op` must be a fixed, small set of

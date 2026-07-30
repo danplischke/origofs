@@ -756,3 +756,32 @@ async fn postgres_readdir_paging() {
     );
     assert_eq!(meta.dentry_name(1, 9_999_999).await.unwrap(), None);
 }
+
+/// Every `MetaTxn` opens at a *stated* isolation level, not an inherited one.
+///
+/// A bare `BEGIN` takes whatever `default_transaction_isolation` happens to be —
+/// a server or pooler setting an operator can change without ever seeing the
+/// engine's code, which would silently move the level that every cross-row
+/// invariant is argued against. READ COMMITTED is the level the design wants:
+/// `MetaTxn` exposes no plain reads, so nothing depends on two statements sharing
+/// a snapshot, while a conditional `UPDATE … WHERE value = $expected` re-evaluates
+/// against the latest committed row after waiting — exactly what `cas_ref` needs.
+#[tokio::test]
+async fn a_transaction_opens_at_a_stated_isolation_level() {
+    let Some(dsn) = dsn() else {
+        eprintln!("skipping isolation check: ORIGOFS_PG_TEST_URL unset");
+        return;
+    };
+    let _guard = pg_lock().lock().await;
+    let meta = PostgresMetadataStore::connect(&dsn).await.unwrap();
+    assert_eq!(
+        meta.begin_isolation_self().await.unwrap(),
+        "read committed",
+        "the level the server actually applies must match what `begin` asks for"
+    );
+    // And the level is genuinely asked for, not inherited from the default.
+    assert!(
+        origofs_core::postgres::BEGIN_TXN.contains("ISOLATION LEVEL"),
+        "a bare BEGIN would inherit `default_transaction_isolation`"
+    );
+}

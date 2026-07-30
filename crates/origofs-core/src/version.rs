@@ -174,6 +174,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Snapshot the working tree into a new commit, advancing the current branch.
     pub async fn commit(&self, author: &str, message: &str) -> Result<Hash> {
+        crate::retry::retrying("commit", || self.commit_attempt(author, message)).await
+    }
+
+    /// One attempt at [`commit`](Self::commit); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn commit_attempt(&self, author: &str, message: &str) -> Result<Hash> {
         self.ensure_commits_enabled().await?;
         let branch = self.current_branch().await?.ok_or_else(|| {
             OrigoFSError::InvalidArgument("cannot commit with a detached HEAD".into())
@@ -299,6 +305,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Switch the working tree to `branch`, materializing its commit.
     pub async fn checkout(&self, branch: &str) -> Result<()> {
+        crate::retry::retrying("checkout", || self.checkout_attempt(branch)).await
+    }
+
+    /// One attempt at [`checkout`](Self::checkout); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn checkout_attempt(&self, branch: &str) -> Result<()> {
         // Validated even though the ref must already exist: `HEAD` is written as
         // `ref:{branch}`, and the git layer turns that back into a host path.
         crate::engine::validate_ref_name(branch)?;

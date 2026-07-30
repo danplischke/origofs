@@ -757,7 +757,29 @@ impl MetadataStore for PostgresMetadataStore {
         // transaction's statements run on this same connection; it returns to
         // the pool only on commit or rollback.
         let obj = self.client().await?;
-        obj.batch_execute("BEGIN").await?;
+        // The isolation level is stated rather than inherited. A bare `BEGIN`
+        // takes whatever `default_transaction_isolation` happens to be, which is
+        // a server/pooler setting an operator can change without ever seeing this
+        // code — so the level every invariant below is argued against would be
+        // silently swappable.
+        //
+        // READ COMMITTED is the right level *because* [`MetaTxn`] exposes no
+        // plain reads. Every method on it is a blind write or a conditional one
+        // (`cas_ref`, `set_content_if`, `resolve_suggestion`), so no flow depends
+        // on two statements seeing the same snapshot — which is the one thing
+        // READ COMMITTED does not give you. Cross-row invariants rest on those
+        // conditional writes, on unique indexes, and on `bump_counter`, none of
+        // which need snapshot isolation.
+        //
+        // Under READ COMMITTED a conditional `UPDATE … WHERE value = $expected`
+        // that collides re-reads the row after the other writer commits and
+        // re-evaluates the predicate, so the CAS decides on the latest committed
+        // value — exactly the semantics `cas_ref` needs. REPEATABLE READ would
+        // instead abort with `40001`, needing a retry to reach the same answer.
+        //
+        // **Keep `MetaTxn` write-only.** The moment a read lands on it, this
+        // argument stops holding and the level has to be revisited.
+        obj.batch_execute(BEGIN_TXN).await?;
         Ok(Box::new(PostgresTxn {
             obj: Some(obj),
             workspace_id: self.workspace_id,
@@ -2060,7 +2082,27 @@ fn row_to_suggestion(r: &Row) -> Suggestion {
     }
 }
 
+/// The statement every [`MetaTxn`] opens with. Named so the isolation level is a
+/// single, testable fact rather than a string buried in one method — see the
+/// comment at its use site in `begin` for why READ COMMITTED is the level the
+/// design argues for, and `tests/postgres.rs` for the assertion that the server
+/// agrees.
+#[doc(hidden)]
+pub const BEGIN_TXN: &str = "BEGIN ISOLATION LEVEL READ COMMITTED";
+
 impl PostgresMetadataStore {
+    /// The isolation level the server reports for a transaction opened the way
+    /// [`MetadataStore::begin`] opens one. Test-only introspection.
+    #[doc(hidden)]
+    pub async fn begin_isolation_self(&self) -> Result<String> {
+        let c = self.client().await?;
+        c.batch_execute(BEGIN_TXN).await?;
+        let row = c.query_one("SHOW transaction_isolation", &[]).await?;
+        let level: String = row.get(0);
+        c.batch_execute("ROLLBACK").await?;
+        Ok(level)
+    }
+
     /// Whether the server reports *this* pooled connection as TLS-encrypted.
     /// Test-only introspection; not part of the `MetadataStore` contract.
     #[doc(hidden)]

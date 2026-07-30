@@ -224,6 +224,20 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         author: &str,
         message: &str,
     ) -> Result<(MergeOutcome, Vec<LiveDoc>)> {
+        crate::retry::retrying("merge_live", || {
+            self.merge_live_attempt(theirs, author, message)
+        })
+        .await
+    }
+
+    /// One attempt at [`merge_live`](Self::merge_live); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn merge_live_attempt(
+        &self,
+        theirs: Hash,
+        author: &str,
+        message: &str,
+    ) -> Result<(MergeOutcome, Vec<LiveDoc>)> {
         self.ensure_commits_enabled().await?;
         let branch = self.current_branch().await?.ok_or_else(|| {
             OrigoFSError::InvalidArgument("cannot merge with a detached HEAD".into())

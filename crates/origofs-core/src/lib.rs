@@ -31,6 +31,7 @@ pub mod pack;
 pub mod postgres;
 pub mod recover;
 pub mod resync;
+mod retry;
 pub mod sqlite;
 pub mod suggest;
 pub mod types;

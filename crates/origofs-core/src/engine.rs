@@ -265,6 +265,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Create a single directory; its parent must already exist.
     pub async fn mkdir(&self, path: &str) -> Result<Ino> {
+        crate::retry::retrying("mkdir", || self.mkdir_attempt(path)).await
+    }
+
+    /// One attempt at [`mkdir`](Self::mkdir); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn mkdir_attempt(&self, path: &str) -> Result<Ino> {
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
         if self.meta.lookup(parent, name).await?.is_some() {
@@ -462,6 +468,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Write `data` as the entire contents of `path`, creating the file if needed.
     /// The body is content-defined-chunked; unchanged chunks are deduplicated.
     pub async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+        crate::retry::retrying("write", || self.write_attempt(path, data)).await
+    }
+
+    /// One attempt at [`write`](Self::write); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn write_attempt(&self, path: &str, data: &[u8]) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
         // Content is made durable first (store_body flushes), then the metadata
@@ -778,6 +790,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Remove a file or an empty directory.
     pub async fn remove(&self, path: &str) -> Result<()> {
+        crate::retry::retrying("remove", || self.remove_attempt(path)).await
+    }
+
+    /// One attempt at [`remove`](Self::remove); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn remove_attempt(&self, path: &str) -> Result<()> {
         let inode = self.stat(path).await?;
         if inode.kind == FileKind::Dir {
             self.rmdir(path).await
@@ -826,6 +844,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Rename/move `from` to `to`. Overwrites an existing regular file or an
     /// existing empty directory at `to`.
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        crate::retry::retrying("rename", || self.rename_attempt(from, to)).await
+    }
+
+    /// One attempt at [`rename`](Self::rename); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn rename_attempt(&self, from: &str, to: &str) -> Result<()> {
         let (sp, sn) = self.resolve_parent(from).await?;
         let sino = self
             .meta
@@ -880,6 +904,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Create a symbolic link at `linkpath` pointing at `target`.
     pub async fn symlink(&self, target: &str, linkpath: &str) -> Result<Ino> {
+        crate::retry::retrying("symlink", || self.symlink_attempt(target, linkpath)).await
+    }
+
+    /// One attempt at [`symlink`](Self::symlink); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn symlink_attempt(&self, target: &str, linkpath: &str) -> Result<Ino> {
         let (parent, name) = self.resolve_parent(linkpath).await?;
         self.ensure_dir(parent).await?;
         if self.meta.lookup(parent, name).await?.is_some() {

@@ -289,6 +289,18 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         data: &[u8],
         summary: Option<&str>,
     ) -> Result<i64> {
+        crate::retry::retrying("suggest", || self.suggest_attempt(ctx, path, data, summary)).await
+    }
+
+    /// One attempt at [`suggest`](Self::suggest); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn suggest_attempt(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        data: &[u8],
+        summary: Option<&str>,
+    ) -> Result<i64> {
         let base_hash = self.current_content_hex(path).await?;
         let (mhash, _size) = self.store_body(data).await?;
         let proposed_hash = match mhash {
@@ -485,6 +497,15 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     ///   **not** subject to the staleness guard — that guard false-rejected every
     ///   concurrent edit over an always-mergeable document.
     pub async fn accept_suggestion(&self, id: i64, approver: WriteCtx) -> Result<()> {
+        crate::retry::retrying("accept_suggestion", || {
+            self.accept_suggestion_attempt(id, approver)
+        })
+        .await
+    }
+
+    /// One attempt at [`accept_suggestion`](Self::accept_suggestion); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn accept_suggestion_attempt(&self, id: i64, approver: WriteCtx) -> Result<()> {
         let s = self
             .meta
             .get_suggestion(id)

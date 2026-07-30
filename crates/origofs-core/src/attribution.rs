@@ -449,6 +449,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Write `data` to `path`, attributing the change to `ctx`'s actor and
     /// updating per-line authorship. Creates the file if needed.
     pub async fn write_as(&self, ctx: WriteCtx, path: &str, data: &[u8]) -> Result<()> {
+        crate::retry::retrying("write_as", || self.write_as_attempt(ctx, path, data)).await
+    }
+
+    /// One attempt at [`write_as`](Self::write_as); see [`crate::retry`] for why the
+    /// retry wrapper sits outside the whole operation rather than inside it.
+    async fn write_as_attempt(&self, ctx: WriteCtx, path: &str, data: &[u8]) -> Result<()> {
         self.write_as_inner(ctx, path, data, None, None).await
     }
 
