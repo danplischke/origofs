@@ -152,6 +152,28 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(Hash::from_hex(&value))
     }
 
+    /// Snapshot the working tree into a new commit, attributed to `ctx` and
+    /// subject to its write policy (§6).
+    ///
+    /// A commit crystallizes whatever is in the working tree into history and
+    /// advances the branch — including, when a merge is in progress, resolving it.
+    /// That is a trusted act even though it authors no bytes itself, so a
+    /// propose-only actor is refused. There is no "propose a commit" equivalent:
+    /// the reviewable unit is the edit, and a propose-only actor's edits are held
+    /// in the suggestion queue precisely so they never reach a commit unreviewed.
+    ///
+    /// [`commit`](Self::commit) remains the unattributed form for the CLI, tests,
+    /// and internal machinery.
+    pub async fn commit_as(
+        &self,
+        ctx: crate::WriteCtx,
+        author: &str,
+        message: &str,
+    ) -> Result<Hash> {
+        self.ensure_may_write(ctx, "commit").await?;
+        self.commit(author, message).await
+    }
+
     /// Snapshot the working tree into a new commit, advancing the current branch.
     pub async fn commit(&self, author: &str, message: &str) -> Result<Hash> {
         self.ensure_commits_enabled().await?;

@@ -171,6 +171,79 @@ fn crdt_needs_feature(id: i64) -> OrigoFSError {
 }
 
 impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
+    /// The actor's [`WritePolicy`], or the column default for an unknown actor.
+    ///
+    /// Unknown actors resolve to [`Direct`](WritePolicy::Direct) to match the
+    /// column default — identity is resolved server-side before any of this runs,
+    /// so in practice the actor always exists.
+    pub(crate) async fn write_policy_of(&self, actor: i64) -> Result<WritePolicy> {
+        Ok(self
+            .meta
+            .get_actor(actor)
+            .await?
+            .map(|a| a.write_policy)
+            .unwrap_or(WritePolicy::Direct))
+    }
+
+    /// **The trust gate (§6).** Refuse `op` outright when `ctx`'s actor is
+    /// [`Propose`](WritePolicy::Propose)-only.
+    ///
+    /// This is the one place a direct mutation is authorized, and every
+    /// actor-attributed mutating entry point on [`Fs`](crate::Fs) calls it — so a
+    /// new surface cannot forget the check by simply not knowing about it, which
+    /// is exactly how `origofs_rm` shipped ungated (issue #78).
+    ///
+    /// Operations that have a propose-shaped equivalent (`write` →
+    /// [`write_or_propose`](Self::write_or_propose), `remove` →
+    /// [`remove_or_propose`](Self::remove_or_propose)) should prefer that, so a
+    /// propose-only actor's request is *queued* rather than refused. This is the
+    /// backstop for the ones that have no such equivalent — rename, mkdir,
+    /// symlink, commit, accepting someone else's suggestion.
+    ///
+    /// Internal machinery is exempt **by construction**, not by flag: it calls the
+    /// raw unattributed engine ops ([`remove`](crate::Fs::remove),
+    /// [`rename`](crate::Fs::rename), [`write_as`](Self::write_as)), which do not
+    /// route through here. Checkout, merge materialization and
+    /// [`accept_suggestion`](Self::accept_suggestion) applying an approved edit are
+    /// all system actions with no requesting actor to police.
+    pub(crate) async fn ensure_may_write(&self, ctx: WriteCtx, op: &str) -> Result<()> {
+        match self.write_policy_of(ctx.actor).await? {
+            WritePolicy::Direct => Ok(()),
+            WritePolicy::Propose => Err(OrigoFSError::Denied(format!(
+                "actor {} is propose-only and may not {op} directly; \
+                 submit a suggestion for review instead",
+                ctx.actor
+            ))),
+        }
+    }
+
+    /// Submit a removal of `path` **governed by the actor's write policy** (§6) —
+    /// the deletion counterpart of [`write_or_propose`](Self::write_or_propose).
+    ///
+    /// A [`Direct`](WritePolicy::Direct) actor removes the path immediately (as an
+    /// attributed op); a [`Propose`](WritePolicy::Propose) actor's request becomes
+    /// a pending deletion suggestion via [`suggest_delete`](Self::suggest_delete),
+    /// which a different actor reviews. Without this, a propose-only actor blocked
+    /// from *overwriting* a file could still delete it — the same destruction, one
+    /// call further along (issue #78).
+    pub async fn remove_or_propose(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        summary: Option<&str>,
+    ) -> Result<WriteOutcome> {
+        match self.write_policy_of(ctx.actor).await? {
+            WritePolicy::Direct => {
+                self.remove_as(ctx, path).await?;
+                Ok(WriteOutcome::Wrote)
+            }
+            WritePolicy::Propose => {
+                let id = self.suggest_delete(ctx, path, summary).await?;
+                Ok(WriteOutcome::Proposed(id))
+            }
+        }
+    }
+
     /// Submit an edit to `path` **governed by the actor's write policy** (§6): a
     /// [`Direct`](WritePolicy::Direct) actor writes straight to the working tree; a
     /// [`Propose`](WritePolicy::Propose) actor's edit is instead queued as a
@@ -427,7 +500,15 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             )));
         }
 
-        // The review gate: a suggestion's own author cannot approve it. This is
+        // The review gate, part one: an approver must itself be trusted to write.
+        // Accepting lands a real attributed edit in the working tree, so letting a
+        // propose-only actor approve would be a direct write wearing a review as a
+        // costume — and two propose-only agents could rubber-stamp each other into
+        // full write access (issue #78).
+        self.ensure_may_write(approver, "accept suggestions")
+            .await?;
+
+        // Part two: a suggestion's own author cannot approve it. This is
         // what makes "an agent proposes, a different actor reviews" a real gate
         // rather than a rubber stamp the proposer can apply to itself.
         if approver.actor == s.actor_id {
@@ -599,6 +680,15 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 "suggestion #{id} is already {}",
                 s.status.as_str()
             )));
+        }
+        // Reviewing is a trusted act in both directions. Rejecting mutates no
+        // bytes, but it *disposes of someone else's proposal* — leaving it open to
+        // propose-only actors would let one agent quietly clear another's work out
+        // of the review queue. An actor that cannot write cannot review (#78).
+        // Withdrawing your own proposal is a different operation and stays open.
+        if approver.actor != s.actor_id {
+            self.ensure_may_write(approver, "reject others' suggestions")
+                .await?;
         }
         self.meta
             .resolve_suggestion(

@@ -411,6 +411,8 @@ impl IntoResponse for ApiError {
                 let status = match &e {
                     NotFound(_) | ContentMissing(_) => StatusCode::NOT_FOUND,
                     AlreadyExists(_) | Conflict(_) => StatusCode::CONFLICT,
+                    // Well-formed, but this actor may not do it (§6 write policy).
+                    Denied(_) => StatusCode::FORBIDDEN,
                     IsADirectory(_) | NotADirectory(_) | DirectoryNotEmpty(_) | InvalidPath(_)
                     | InvalidArgument(_) => StatusCode::BAD_REQUEST,
                     // A transient backend failure: tell the client it may retry.
@@ -639,12 +641,21 @@ async fn write_file(
 
 async fn delete_file(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Path(path): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let p = abspath(&path);
-    ws.remove(&p).await?;
-    Ok(Json(json!({ "removed": p })))
+    // Policy-governed like `PUT`: a propose-only actor's delete is queued for
+    // review, not applied. Otherwise it could destroy a file it was refused
+    // permission to overwrite (issue #78).
+    let summary = format!("delete {p}");
+    match ws
+        .remove_or_propose(principal.write_ctx(), &p, Some(&summary))
+        .await?
+    {
+        WriteOutcome::Wrote => Ok(Json(json!({ "removed": p }))),
+        WriteOutcome::Proposed(id) => Ok(Json(json!({ "path": p, "proposed": id }))),
+    }
 }
 
 // --- directories ------------------------------------------------------------
@@ -685,11 +696,11 @@ async fn make_root(State(_ws): State<Shared>, _auth: Auth) -> ApiResult<Json<ser
 
 async fn make_dir(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Path(path): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let p = abspath(&path);
-    ws.mkdir_p(&p).await?;
+    ws.mkdir_as(principal.write_ctx(), &p).await?;
     Ok(Json(json!({ "created": p })))
 }
 
@@ -725,10 +736,11 @@ struct RenameReq {
 
 async fn rename(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Json(req): Json<RenameReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    ws.rename(&req.from, &req.to).await?;
+    ws.rename_as(principal.write_ctx(), &req.from, &req.to)
+        .await?;
     Ok(Json(json!({ "from": req.from, "to": req.to })))
 }
 
@@ -751,7 +763,9 @@ async fn commit(
         .await?
         .map(|a| a.display_name)
         .unwrap_or_else(|| format!("actor:{}", principal.actor));
-    let hash = ws.commit(&author, &req.message).await?;
+    let hash = ws
+        .commit_as(principal.write_ctx(), &author, &req.message)
+        .await?;
     origofs_core::metrics::record_commit();
     Ok(Json(json!({ "hash": hash.to_hex() })))
 }

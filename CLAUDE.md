@@ -155,6 +155,18 @@ write path enforces this and you must not weaken it:
   only on `accept`, and `accept` lands the edit **attributed to the original
   author** while recording the approver (and refuses a stale base). Reviewer must
   differ from author.
+- **The `Propose` write policy is enforced in the engine, not per surface.**
+  Every *attributed* mutation on `Fs` — `write_or_propose`, `remove_or_propose`,
+  `rename_as`, `mkdir_as`, `symlink_as`, `commit_as`, `accept_suggestion`,
+  `reject_suggestion` — runs `ensure_may_write` (`suggest.rs`), which refuses a
+  propose-only actor with `OrigoFSError::Denied` (`403` on the HTTP API). Ops with
+  a propose-shaped equivalent queue instead of refusing. **A new mutating endpoint
+  on any surface must call an attributed variant**, never the raw `remove`/
+  `rename`/`mkdir_p`/`symlink`/`commit` — those take no actor, exist for internal
+  machinery (checkout, merge materialization, applying an accepted suggestion),
+  and are exempt by construction. `tests/mcp.rs` fails on an unclassified MCP tool
+  so a new ungated one can't ship silently; the FUSE/NFS mounts remain a
+  deliberate bypass (a mount has no actor context). Issue #78.
 
 ## Versioning
 

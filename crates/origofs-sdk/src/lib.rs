@@ -854,6 +854,86 @@ impl Workspace {
         Ok(outcome)
     }
 
+    /// Submit a removal of `path` governed by the actor's write policy — the
+    /// deletion counterpart of [`write_or_propose`](Self::write_or_propose). A
+    /// `Direct` actor's removal happens now; a `Propose` actor's becomes a pending
+    /// deletion suggestion. An untrusted surface must route deletes through this
+    /// rather than [`remove`](Self::remove), or a propose-only actor can destroy
+    /// what it is forbidden to overwrite (issue #78).
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path))]
+    pub async fn remove_or_propose(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        summary: Option<&str>,
+    ) -> Result<WriteOutcome> {
+        let outcome = self.fs.remove_or_propose(ctx, path, summary).await?;
+        // As in `write_or_propose`: the propose path emits its own `suggest` event
+        // in the engine, so only the direct removal is emitted here.
+        if matches!(outcome, WriteOutcome::Wrote) {
+            self.emit("remove", path, None, Some(ctx.actor), ctx.session)
+                .await;
+        }
+        Ok(outcome)
+    }
+
+    /// Rename `from` to `to`, attributed to `ctx` and refused for a propose-only
+    /// actor. There is no propose-shaped equivalent for a rename, so this is a
+    /// gate rather than a queue.
+    #[tracing::instrument(level = "debug", skip_all, fields(from = %from, to = %to))]
+    pub async fn rename_as(&self, ctx: WriteCtx, from: &str, to: &str) -> Result<()> {
+        self.fs.rename_as(ctx, from, to).await?;
+        self.emit(
+            "rename",
+            from,
+            Some(to.to_string()),
+            Some(ctx.actor),
+            ctx.session,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Create a directory (and missing parents), attributed to `ctx` and refused
+    /// for a propose-only actor.
+    pub async fn mkdir_as(&self, ctx: WriteCtx, path: &str) -> Result<()> {
+        self.fs.mkdir_as(ctx, path).await?;
+        self.emit("mkdir", path, None, Some(ctx.actor), ctx.session)
+            .await;
+        Ok(())
+    }
+
+    /// Create a symlink, attributed to `ctx` and refused for a propose-only actor.
+    pub async fn symlink_as(&self, ctx: WriteCtx, target: &str, linkpath: &str) -> Result<()> {
+        self.fs.symlink_as(ctx, target, linkpath).await?;
+        self.emit(
+            "symlink",
+            linkpath,
+            Some(target.to_string()),
+            Some(ctx.actor),
+            ctx.session,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Snapshot the working tree into a commit, attributed to `ctx` and refused
+    /// for a propose-only actor — committing crystallizes the working tree into
+    /// history (and resolves a merge in progress), which is a trusted act.
+    #[tracing::instrument(skip_all, fields(author = %author))]
+    pub async fn commit_as(&self, ctx: WriteCtx, author: &str, message: &str) -> Result<Hash> {
+        let hash = self.fs.commit_as(ctx, author, message).await?;
+        self.emit(
+            "commit",
+            "/",
+            Some(message.to_string()),
+            Some(ctx.actor),
+            ctx.session,
+        )
+        .await;
+        Ok(hash)
+    }
+
     /// Suggestions, optionally filtered by status and/or path, newest first.
     pub async fn list_suggestions(
         &self,
