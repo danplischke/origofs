@@ -21,18 +21,26 @@ pub use origofs_core::metrics;
 // compose one.
 pub use origofs_core::{
     Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DEFAULT_GC_GRACE_SECS,
-    DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, EncryptedStore, Event,
-    EventInit, EventSubscription, FileKind, GcStats, GcsConfig, Hash, Inode, LiveDoc, MemStore,
-    MergeOutcome, ObjectContentStore, OrigoFSError, PackStore, Passage, PassageOptions, Presence,
-    RebuildReport, ResyncOutcome, ResyncReport, S3Config, Segmentation, Suggestion,
+    DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event, EventInit, FileKind,
+    GcStats, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError, PackStore, Passage,
+    PassageOptions, Presence, RebuildReport, ResyncOutcome, ResyncReport, Segmentation, Suggestion,
     SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit,
     TransferStats, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
+// Backend-specific re-exports, gated to match `origofs-core`'s own features.
+#[cfg(feature = "encryption")]
+pub use origofs_core::EncryptedStore;
 #[cfg(feature = "coedit")]
-pub use origofs_core::{COEDIT_SIDECAR_DIR, CoeditDoc, CoeditRelayNote, CoeditRelaySub};
-pub use origofs_core::{
-    ContentStore, LocalCasStore, MetadataStore, PostgresMetadataStore, SqliteMetadataStore,
-};
+pub use origofs_core::{COEDIT_SIDECAR_DIR, CoeditDoc};
+// The cross-worker co-editing relay rides on Postgres `LISTEN`/`NOTIFY`, so
+// these types exist only when both features are on.
+#[cfg(all(feature = "coedit", feature = "postgres"))]
+pub use origofs_core::{CoeditRelayNote, CoeditRelaySub};
+pub use origofs_core::{ContentStore, LocalCasStore, MetadataStore, SqliteMetadataStore};
+#[cfg(feature = "postgres")]
+pub use origofs_core::{EventSubscription, PostgresMetadataStore};
+#[cfg(feature = "object-store")]
+pub use origofs_core::{GcsConfig, ObjectContentStore, S3Config};
 
 // ── Access surfaces ─────────────────────────────────────────────────────────
 // Each surface that was formerly its own crate is now an opt-in, feature-gated
@@ -134,6 +142,7 @@ pub struct Workspace {
     /// The concrete Postgres store, kept when opened on Postgres so the
     /// `LISTEN/NOTIFY` change-feed subscription is reachable (it is PG-specific
     /// and not on the object-safe `MetadataStore` trait). `None` otherwise.
+    #[cfg(feature = "postgres")]
     pg: Option<Arc<PostgresMetadataStore>>,
 }
 
@@ -143,7 +152,11 @@ impl Workspace {
     pub async fn open(meta: Meta, content: Content) -> Result<Self> {
         let fs = Fs::new(meta, content);
         fs.init().await?;
-        Ok(Self { fs, pg: None })
+        Ok(Self {
+            fs,
+            #[cfg(feature = "postgres")]
+            pg: None,
+        })
     }
 
     /// SQLite metadata + content-addressed blobs under a local directory.
@@ -153,6 +166,7 @@ impl Workspace {
         Self::open(meta, content).await
     }
 
+    #[cfg(feature = "encryption")]
     /// SQLite metadata + a local content store **encrypted at rest** with a key
     /// derived from `passphrase` (Argon2id) and a per-store random salt kept in
     /// `cas_dir/keysalt`. The same passphrase must be used on reopen; the wrong
@@ -169,6 +183,7 @@ impl Workspace {
         Self::open_encrypted(meta, backend, passphrase).await
     }
 
+    #[cfg(feature = "encryption")]
     /// Any metadata store + any content backend, **encrypted at rest** with a key
     /// derived from `passphrase` (Argon2id) over a per-store random salt.
     ///
@@ -193,6 +208,7 @@ impl Workspace {
         Self::open(meta, content).await
     }
 
+    #[cfg(feature = "object-store")]
     /// SQLite metadata + an S3-compatible object store for content.
     pub async fn open_s3(db_path: impl AsRef<Path>, cfg: S3Config) -> Result<Self> {
         let meta: Meta = Arc::new(SqliteMetadataStore::open(db_path)?);
@@ -218,6 +234,7 @@ impl Workspace {
         Self::open(meta, content).await
     }
 
+    #[cfg(feature = "object-store")]
     /// SQLite metadata + an S3-compatible object store whose chunks are batched
     /// into **pack objects** (few large PUTs instead of many tiny ones — batched *within* a write; see
     /// [`PackStore`] for where that stops), with the
@@ -238,6 +255,7 @@ impl Workspace {
         Self::open(meta, content).await
     }
 
+    #[cfg(feature = "postgres")]
     /// Postgres metadata (multi-writer) over the given content backend.
     pub async fn open_pg(dsn: &str, content: Content) -> Result<Self> {
         let pg = Arc::new(PostgresMetadataStore::connect(dsn).await?);
@@ -246,6 +264,7 @@ impl Workspace {
         Ok(ws)
     }
 
+    #[cfg(feature = "postgres")]
     /// Postgres metadata (multi-writer) + a local content-addressed store — the
     /// single-host production pairing (one shared database, content on local disk).
     /// For content shared across hosts use [`Workspace::open_pg_s3`] /
@@ -255,6 +274,8 @@ impl Workspace {
         Self::open_pg(dsn, content).await
     }
 
+    // Needs both halves: a Postgres metadata store and an object content store.
+    #[cfg(all(feature = "postgres", feature = "object-store"))]
     /// Postgres metadata (multi-writer) + an S3-compatible object store for
     /// content — the production pairing for a shared human+agent workspace: many
     /// writers on one database, one shared content store. Reads are integrity-
@@ -268,6 +289,8 @@ impl Workspace {
         Ok(ws)
     }
 
+    // Needs both halves: a Postgres metadata store and an object content store.
+    #[cfg(all(feature = "postgres", feature = "object-store"))]
     /// Postgres metadata + a **packed** S3 object store (few large PUTs instead of
     /// many tiny ones — batched *within* a write; see [`PackStore`] for where that
     /// stops), with the per-chunk index in a local directory. The
@@ -295,6 +318,7 @@ impl Workspace {
         Ok(ws)
     }
 
+    #[cfg(feature = "object-store")]
     /// SQLite metadata + a **native** GCS object store for content (GCS JSON API +
     /// OAuth2, so service-account / ADC / workload-identity credentials work; see
     /// [`GcsConfig`]). Reads are integrity-verified (a bit-rotted object surfaces
@@ -306,6 +330,7 @@ impl Workspace {
         Self::open(meta, content).await
     }
 
+    #[cfg(feature = "object-store")]
     /// SQLite metadata + a **packed** native GCS object store (few large PUTs
     /// instead of many tiny ones — batched *within* a write; see [`PackStore`] for
     /// where that stops), with the per-chunk index under `index_dir`. The
@@ -323,6 +348,8 @@ impl Workspace {
         Self::open(meta, content).await
     }
 
+    // Needs both halves: a Postgres metadata store and an object content store.
+    #[cfg(all(feature = "postgres", feature = "object-store"))]
     /// Postgres metadata (multi-writer) + a **native** GCS object store — the
     /// production pairing for a shared human+agent workspace on Google Cloud: many
     /// writers on one database, one shared content store. Reads are integrity-
@@ -336,6 +363,8 @@ impl Workspace {
         Ok(ws)
     }
 
+    // Needs both halves: a Postgres metadata store and an object content store.
+    #[cfg(all(feature = "postgres", feature = "object-store"))]
     /// Postgres metadata + a **packed** native GCS object store, with the per-chunk
     /// index in a local directory. The recommended object-storage layout for a team
     /// on Google Cloud; seal the open pack with [`Workspace::flush`] (or `commit`)
@@ -362,6 +391,7 @@ impl Workspace {
         Ok(ws)
     }
 
+    #[cfg(feature = "object-store")]
     /// SQLite metadata + an **in-memory** object store — the same object-store
     /// adapter as [`Workspace::open_s3`] minus the network, so it exercises the
     /// real object-storage content path (integrity verification included). For
@@ -440,6 +470,7 @@ impl Workspace {
             fs,
             // Re-scope the Postgres push-feed handle to this workspace, so
             // `subscribe` tails only this workspace's change feed.
+            #[cfg(feature = "postgres")]
             pg: self.pg.as_ref().map(|p| p.for_workspace(id)),
         })
     }
@@ -1188,6 +1219,7 @@ impl Workspace {
         self.fs.events_since(after_seq, 1000).await
     }
 
+    #[cfg(feature = "postgres")]
     /// A **push** subscription to the change feed, backed by Postgres
     /// `LISTEN/NOTIFY` — call [`EventSubscription::recv`] to block until the next
     /// batch of events instead of polling [`watch`](Self::watch). Optionally
@@ -1205,6 +1237,7 @@ impl Workspace {
         }
     }
 
+    #[cfg(feature = "postgres")]
     /// Whether this workspace is backed by Postgres (multi-writer). The
     /// Postgres-only features — the push `subscribe` feed and the cross-worker
     /// co-edit relay — are available exactly when this is true.
@@ -1212,6 +1245,7 @@ impl Workspace {
         self.pg.is_some()
     }
 
+    #[cfg(feature = "postgres")]
     /// The Postgres store, or an error naming `op` as Postgres-only — the shared
     /// gate for the multi-writer/multi-worker features (the co-edit relay).
     #[cfg(feature = "coedit")]
@@ -1290,6 +1324,7 @@ impl Workspace {
         self.fs.end_coedit(path).await
     }
 
+    #[cfg(feature = "postgres")]
     /// Ensure the cross-worker relay's backing table exists (idempotent). Call it
     /// before a room starts accepting edits, so the first publish can't race the
     /// table into existence. Requires the Postgres backend + the `coedit` feature.
@@ -1300,6 +1335,7 @@ impl Workspace {
             .await
     }
 
+    #[cfg(feature = "postgres")]
     /// Publish a co-editing update `delta` for `path` to the cross-worker relay,
     /// tagged with this worker's `origin` id (so it can skip its own echo). Every
     /// other worker hosting `path` applies it and fans it out to its sockets, so
@@ -1313,6 +1349,7 @@ impl Workspace {
             .await
     }
 
+    #[cfg(feature = "postgres")]
     /// Every relayed op currently held for `path` — for a worker that has just
     /// started hosting `path` to replay and catch up to its peers' state (applying
     /// is idempotent). Requires the Postgres backend + the `coedit` feature.
@@ -1321,6 +1358,7 @@ impl Workspace {
         self.require_pg("coedit_replay")?.coedit_replay(path).await
     }
 
+    #[cfg(feature = "postgres")]
     /// Subscribe to the cross-worker co-editing relay: `recv()` on the returned
     /// [`CoeditRelaySub`] yields every worker's update deltas in order. Requires
     /// the Postgres backend + the `coedit` feature.
@@ -1407,8 +1445,10 @@ impl Workspace {
 ///
 /// For a local store the sidecar is `<cas_dir>/keysalt`, which is exactly where
 /// the salt lived before — existing encrypted workspaces keep working unchanged.
+#[cfg(feature = "encryption")]
 const KEYSALT: &str = "keysalt";
 
+#[cfg(feature = "encryption")]
 async fn read_or_create_salt(content: &Content) -> Result<Vec<u8>> {
     if let Some(salt) = content.get_sidecar(KEYSALT).await? {
         if salt.is_empty() {

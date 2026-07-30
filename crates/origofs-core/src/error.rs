@@ -234,6 +234,7 @@ impl OrigoFSError {
 /// non-transient server error. No SQLSTATE means the failure never reached a
 /// server response — a closed connection is `Unavailable`; anything else (a DSN
 /// parse error, a protocol error) is `Fatal` and must not be retried.
+#[cfg(feature = "postgres")]
 fn classify_pg(e: &tokio_postgres::Error) -> ErrorClass {
     match e.code().map(|c| c.code()) {
         Some("40001") | Some("40P01") => ErrorClass::Retryable,
@@ -270,6 +271,7 @@ impl From<rusqlite::Error> for OrigoFSError {
     }
 }
 
+#[cfg(feature = "postgres")]
 impl From<tokio_postgres::Error> for OrigoFSError {
     fn from(e: tokio_postgres::Error) -> Self {
         OrigoFSError::Backend {
@@ -280,6 +282,7 @@ impl From<tokio_postgres::Error> for OrigoFSError {
     }
 }
 
+#[cfg(feature = "postgres")]
 impl From<deadpool_postgres::PoolError> for OrigoFSError {
     fn from(e: deadpool_postgres::PoolError) -> Self {
         // Pool exhaustion / acquisition timeout / a dead pooled connection — the
@@ -297,6 +300,7 @@ impl From<deadpool_postgres::PoolError> for OrigoFSError {
     }
 }
 
+#[cfg(feature = "object-store")]
 impl From<object_store::Error> for OrigoFSError {
     fn from(e: object_store::Error) -> Self {
         // A missing object is a content-missing condition, not a backend failure

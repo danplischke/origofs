@@ -74,6 +74,7 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the push feed may block in `recv` before the watcher re-checks its
 /// stop flag. Purely a shutdown-responsiveness bound: no query is issued when it
 /// lapses, so it costs a wakeup and nothing else.
+#[cfg(feature = "postgres")]
 const SUBSCRIBE_WAKE: Duration = Duration::from_millis(250);
 
 /// How long an unmount waits for the change-feed watcher to confirm it is gone
@@ -300,6 +301,10 @@ async fn watch_loop(ws: Workspace, notifier: Notifier, stop: Arc<AtomicBool>) {
     // reason: there is nothing cached yet to go stale.
     let mut cursor = tail_cursor(&ws).await;
 
+    // The push feed is Postgres `LISTEN`/`NOTIFY`. Without that backend compiled
+    // in there is no feed to prefer, and the poll loop below is the whole story —
+    // which is exactly what a SQLite mount already does at runtime.
+    #[cfg(feature = "postgres")]
     if ws.is_postgres() {
         match ws.subscribe(cursor, None).await {
             Ok(mut sub) => {

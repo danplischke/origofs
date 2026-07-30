@@ -18,7 +18,11 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-origofs-core = { version = "0.1.0", path = "../origofs-core" }
+# `default-features = false` here, with the backends re-exposed as sdk features
+# below, so a consumer can build a SQLite-only workspace without linking the
+# Postgres, object-store, and encryption trees. `full` and the default feature
+# set keep all three on, so nothing changes unless you ask.
+origofs-core = { version = "0.1.0", path = "../origofs-core", default-features = false }
 bytes = "1.12.1"
 futures = "0.3.33"
 getrandom = "0.2"
@@ -60,7 +64,14 @@ libc     = { version = "0.2.189", optional = true }         # fuse
 nfsserve = { version = "0.11.0",  optional = true }         # nfs
 
 [features]
-default = []
+# The backends origofs-core makes optional, forwarded so an `origofs-sdk` consumer
+# can turn them off too. On by default: `Workspace::open_pg*`/`open_s3*`/
+# `open_gcs*`/`open_*_encrypted` need them, and silently losing a constructor would
+# be a worse surprise than a larger build.
+default = ["postgres", "object-store", "encryption"]
+postgres = ["origofs-core/postgres"]
+object-store = ["origofs-core/object-store"]
+encryption = ["origofs-core/encryption"]
 
 # Access surfaces — each was formerly a standalone crate (origofs-{api,mcp,…}),
 # now an opt-in feature-gated module over the same `Workspace`.

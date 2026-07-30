@@ -277,12 +277,24 @@ class _Rooms:
         self._lock = asyncio.Lock()
         # This worker's id, tagged on every published op to skip our own echo.
         self._origin = uuid.uuid4().hex
-        self._relay = bool(getattr(ws, "is_postgres", lambda: False)())
+        # Resolved lazily, not here. `build_router` is legitimately called before a
+        # workspace exists — the documented pattern for an app that opens its
+        # workspace in an async lifespan is to wire the router once at import time
+        # against a proxy, so the routes are stable while the workspace is swapped
+        # underneath. Probing the backend in `__init__` broke exactly that: it
+        # forced the proxy to resolve before the lifespan had run.
+        # (`examples/web/server/app.py` does this, and its test suite could not even
+        # be collected — which nothing noticed, because that suite was never run.)
+        self._relay: Optional[bool] = None
         self._drain_task: Optional["asyncio.Task[None]"] = None
 
     def ensure_relay(self) -> None:
         """Start the cross-worker drain task once (a no-op without Postgres, or
-        after the first call). Called on the first socket, in async context."""
+        after the first call). Called on the first socket, in async context —
+        which is also the first point at which the workspace is guaranteed live,
+        so the backend probe happens here."""
+        if self._relay is None:
+            self._relay = bool(getattr(self._ws, "is_postgres", lambda: False)())
         if self._relay and self._drain_task is None:
             self._drain_task = asyncio.create_task(self._drain())
 

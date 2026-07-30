@@ -51,6 +51,7 @@ const FANOUT_CAPACITY: usize = 256;
 /// The fan-out origin tag for frames that arrived over the cross-worker relay
 /// rather than from a local socket, so every local socket receives them (no local
 /// connection id equals `u64::MAX`).
+#[cfg(feature = "postgres")]
 const RELAY_ORIGIN: u64 = u64::MAX;
 
 /// A live co-editing room: one shared, attributed CRDT plus a fan-out channel.
@@ -78,7 +79,8 @@ pub struct Coordinator {
     rooms: Arc<Mutex<HashMap<String, RoomSlot>>>,
     next_conn: Arc<AtomicU64>,
     /// This worker's unique id, tagged on every published op so the relay drain
-    /// can skip our own echo.
+    /// can skip our own echo. Only meaningful with the relay, i.e. on Postgres.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     origin: Arc<str>,
     /// Whether the cross-worker relay is available (Postgres-backed workspace).
     relay: bool,
@@ -88,7 +90,13 @@ pub struct Coordinator {
 
 impl Coordinator {
     pub fn new(ws: Arc<Workspace>) -> Self {
+        // Without the Postgres backend compiled in there is no relay to run: a
+        // single-worker co-editing deployment is a supported configuration, so
+        // this is `false` rather than an unsupported build.
+        #[cfg(feature = "postgres")]
         let relay = ws.is_postgres();
+        #[cfg(not(feature = "postgres"))]
+        let relay = false;
         Self {
             ws,
             rooms: Arc::new(Mutex::new(HashMap::new())),
@@ -105,6 +113,7 @@ impl Coordinator {
         if !self.relay || self.relay_started.swap(true, Ordering::AcqRel) {
             return;
         }
+        #[cfg(feature = "postgres")]
         tokio::spawn(relay_drain(
             self.ws.clone(),
             self.rooms.clone(),
@@ -123,6 +132,10 @@ impl Coordinator {
             return Ok(slot.room.clone());
         }
         let doc = self.ws.open_coedit(ctx, path).await?;
+        // The relay is Postgres-backed (`LISTEN`/`NOTIFY`), so without that backend
+        // compiled in there is nothing to catch up from — a single-worker build is
+        // a valid configuration, not a degraded one.
+        #[cfg(feature = "postgres")]
         if self.relay {
             // Ensure the relay table exists before this room takes edits, so the
             // first publish can't race it, then replay recent ops to catch up.
@@ -155,12 +168,19 @@ impl Coordinator {
         if !self.relay {
             return;
         }
-        let ws = self.ws.clone();
-        let origin = self.origin.clone();
-        let path = path.to_string();
-        tokio::spawn(async move {
-            let _ = ws.coedit_publish(&path, &origin, &frame).await;
-        });
+        #[cfg(feature = "postgres")]
+        {
+            let ws = self.ws.clone();
+            let origin = self.origin.clone();
+            let path = path.to_string();
+            tokio::spawn(async move {
+                let _ = ws.coedit_publish(&path, &origin, &frame).await;
+            });
+        }
+        // Nothing to publish to without the relay; the local fan-out above has
+        // already delivered this frame to every socket on this worker.
+        #[cfg(not(feature = "postgres"))]
+        let _ = (path, frame);
     }
 
     /// Detach from the room for `path`. When the last socket leaves, checkpoint the
@@ -223,6 +243,7 @@ fn new_origin() -> String {
 /// already attributed by its origin) and fan it out to this worker's sockets.
 /// Runs until the subscription connection closes; a non-Postgres workspace makes
 /// `coedit_subscribe` error and the task exits immediately (single-worker mode).
+#[cfg(feature = "postgres")]
 async fn relay_drain(
     ws: Arc<Workspace>,
     rooms: Arc<Mutex<HashMap<String, RoomSlot>>>,

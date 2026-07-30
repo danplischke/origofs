@@ -765,8 +765,17 @@ impl MetadataStore for PostgresMetadataStore {
             .await
         {
             Ok(row) => Ok(row.get::<_, i64>(0)),
-            // A store that was never initialized has no schema_meta table yet.
-            Err(e) if e.to_string().contains("does not exist") => Ok(0),
+            // A store that was never initialized has no `schema_meta` table yet,
+            // which is version 0 rather than an error.
+            //
+            // Matched on the SQLSTATE, not on the message text. `tokio_postgres::
+            // Error`'s `Display` is a generic kind ("db error"); the `relation
+            // "schema_meta" does not exist` string lives in its *source*, so the
+            // obvious `e.to_string().contains("does not exist")` never matched and
+            // a fresh database surfaced a hard error here instead of 0. Nothing
+            // called `schema_version` before `init` until the metadata
+            // forward-compatibility guard did, which is what exposed it.
+            Err(e) if is_undefined_table(&e) => Ok(0),
             Err(e) => Err(e.into()),
         }
     }
@@ -2180,6 +2189,16 @@ impl Drop for PostgresTxn {
             }
         }
     }
+}
+
+/// Whether `e` is Postgres's `undefined_table` (SQLSTATE `42P01`).
+///
+/// Checked by code rather than by message: SQLSTATE is stable across Postgres
+/// versions and locales, while the message is neither — a server running under a
+/// non-English `lc_messages` does not say "does not exist" at all.
+fn is_undefined_table(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error()
+        .is_some_and(|db| *db.code() == tokio_postgres::error::SqlState::UNDEFINED_TABLE)
 }
 
 fn row_to_live_doc(r: &Row) -> LiveDoc {

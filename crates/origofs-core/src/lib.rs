@@ -16,6 +16,7 @@ pub mod coedit;
 pub mod collab;
 pub mod content;
 pub mod corpus;
+#[cfg(feature = "encryption")]
 pub mod encrypt;
 pub mod engine;
 pub mod error;
@@ -27,8 +28,10 @@ pub mod metadata;
 pub mod metrics;
 pub mod migrations;
 pub mod objectgraph;
+#[cfg(feature = "object-store")]
 pub mod objectstore;
 pub mod pack;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod recover;
 pub mod resync;
@@ -52,6 +55,7 @@ pub use content::{
     ContentStore, DEDUP_REFRESH_AFTER_SECS, LocalCasStore, MemStore, TieredStore, VerifyingStore,
 };
 pub use corpus::{Passage, PassageOptions, Segmentation};
+#[cfg(feature = "encryption")]
 pub use encrypt::EncryptedStore;
 pub use engine::{Fs, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
@@ -64,10 +68,13 @@ pub use objectgraph::{
     Commit, CommitInfo, DiffEntry, DiffStatus, RefSnapshot, Tree, TreeEntry, TreeKind,
     VersioningMode,
 };
+#[cfg(feature = "object-store")]
 pub use objectstore::{GcsConfig, ObjectContentStore, S3Config};
 pub use pack::{DEFAULT_PACK_SIZE, PackStore};
 #[cfg(feature = "coedit")]
+#[cfg(feature = "postgres")]
 pub use postgres::{CoeditRelayNote, CoeditRelaySub};
+#[cfg(feature = "postgres")]
 pub use postgres::{EventSubscription, PG_CA_FILE_ENV, PostgresMetadataStore};
 pub use recover::RebuildReport;
 pub use resync::{

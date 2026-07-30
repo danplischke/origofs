@@ -9,7 +9,7 @@
 //! origofs --workspace ./ws read /notes/a.txt
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use origofs_sdk::{MergeOutcome, SuggestionStatus, Workspace, WriteCtx};
 use std::io::{Read, Write};
@@ -1306,16 +1306,90 @@ async fn build_api_auth(
             },
         )));
     }
+    Ok(std::sync::Arc::new(parse_auth_specs(specs)?))
+}
+
+/// Parse `--auth-token TOKEN=ACTOR_ID[:SESSION_ID]` specs into a token map.
+///
+/// Split out of [`build_api_auth`] so it is testable without a workspace: this is
+/// argument parsing that decides who a request is attributed to, which makes it
+/// exactly the part worth pinning.
+fn parse_auth_specs(specs: &[String]) -> Result<origofs_sdk::api::BearerAuth> {
     let mut bearer = origofs_sdk::api::BearerAuth::new();
     for spec in specs {
-        let (token, who) = spec.split_once('=').ok_or_else(|| {
+        // Split from the *right*. The actor/session half never contains `=`, but
+        // the token half routinely does — base64 pads with it, and a bearer token
+        // is very often base64. Splitting on the first `=` made any such token
+        // unusable, with an error blaming the actor id.
+        let (token, who) = spec.rsplit_once('=').ok_or_else(|| {
             anyhow::anyhow!("bad --auth-token {spec:?}; expected TOKEN=ACTOR_ID[:SESSION_ID]")
         })?;
+        if token.is_empty() {
+            anyhow::bail!("bad --auth-token {spec:?}: the token is empty");
+        }
         let (actor, session) = match who.split_once(':') {
-            Some((a, s)) => (a.parse()?, Some(s.parse()?)),
-            None => (who.parse()?, None),
+            Some((a, s)) => (
+                a.parse().with_context(|| format!("actor id in {spec:?}"))?,
+                Some(
+                    s.parse()
+                        .with_context(|| format!("session id in {spec:?}"))?,
+                ),
+            ),
+            None => (
+                who.parse()
+                    .with_context(|| format!("actor id in {spec:?}"))?,
+                None,
+            ),
         };
         bearer = bearer.with_token(token.to_string(), actor, session);
     }
-    Ok(std::sync::Arc::new(bearer))
+    Ok(bearer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--auth-token` decides which actor a request's writes are attributed to, so
+    /// its parsing is worth pinning. The binary had no unit tests at all — 1,200
+    /// lines including this and the `--config` backend selection — and the Docker
+    /// job only exercised the happy path through `serve`.
+    #[test]
+    fn auth_token_specs_parse() {
+        let ok = parse_auth_specs(&[
+            "tok-a=7".to_string(),
+            "tok-b=9:42".to_string(),
+            // A base64 token ends in `=` padding, so the split has to be on the
+            // *last* separator — the actor half never contains one.
+            "dG9rZW4=:=11".to_string(),
+            "cGFk==11".to_string(),
+        ])
+        .expect("valid specs");
+        assert!(!ok.is_empty());
+    }
+
+    #[test]
+    fn auth_token_specs_reject_malformed_input() {
+        let bad = [
+            "no-equals-sign",   // missing the separator entirely
+            "=7",               // empty token
+            "tok=",             // no actor id
+            "tok=notanumber",   // actor id is not an integer
+            "tok=7:notanumber", // session id is not an integer
+            "tok=7:",           // empty session id
+        ];
+        for spec in bad {
+            assert!(
+                parse_auth_specs(&[spec.to_string()]).is_err(),
+                "{spec:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_spec_list_yields_an_empty_map() {
+        // The empty case is what routes `build_api_auth` into its loopback-only
+        // dev path, so it must stay distinguishable from "tokens configured".
+        assert!(parse_auth_specs(&[]).expect("no specs").is_empty());
+    }
 }
