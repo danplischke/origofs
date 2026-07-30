@@ -628,6 +628,128 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         )))
     }
 
+    // --- attributed namespace mutations (issue #78) -----------------------
+    //
+    // The raw `remove`/`rename`/`mkdir_p`/`symlink` on `Fs` take no `WriteCtx`:
+    // they are the *namespace* primitives, used by checkout, merge materialization
+    // and suggestion application, where there is no requesting actor to record.
+    // That left two holes at once — deleting a file had no author, and a mutation
+    // with no actor could not be policy-checked, so a propose-only agent could
+    // `rm` what it was forbidden to overwrite.
+    //
+    // These wrappers close both: they carry the actor, enforce the §6 write policy,
+    // and append to the op-log. A surface should reach for these; internal
+    // machinery keeps calling the raw forms and stays exempt by construction.
+    //
+    // The op-log entry for a namespace change carries no byte range (`byte_len` 0)
+    // — nothing was authored — and `edit_op.ino` has no foreign key, so a removal's
+    // op outlives the inode it names, which is what an append-only audit trail
+    // requires.
+
+    /// Remove a file or empty directory, attributed to `ctx` and subject to its
+    /// write policy.
+    ///
+    /// Prefer [`remove_or_propose`](Self::remove_or_propose) on a surface that
+    /// accepts requests from possibly-untrusted actors: it queues a propose-only
+    /// actor's removal for review instead of refusing it outright.
+    pub async fn remove_as(&self, ctx: WriteCtx, path: &str) -> Result<()> {
+        self.ensure_may_write(ctx, "remove files").await?;
+        // Capture identity and content *before* the removal: afterwards the inode
+        // is gone and the op-log could not name what was destroyed.
+        let inode = self.stat(path).await?;
+        self.remove(path).await?;
+        self.meta
+            .append_edit_op(EditOpInit {
+                session_id: ctx.session,
+                actor_id: ctx.actor,
+                tool_call_id: ctx.tool_call,
+                ino: inode.ino,
+                path: path.to_string(),
+                op: "remove".to_string(),
+                byte_start: 0,
+                byte_len: 0,
+                pre_hash: inode.content.map(|h| h.to_hex()),
+                post_hash: None,
+                ts: self.now_secs(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Rename/move `from` to `to`, attributed to `ctx` and subject to its write
+    /// policy.
+    ///
+    /// The op-log entry records the *destination* path — where the inode now lives.
+    /// The source is recoverable from the inode's earlier ops, and the change-feed
+    /// event emitted at the workspace boundary carries `from → to` in its `detail`.
+    pub async fn rename_as(&self, ctx: WriteCtx, from: &str, to: &str) -> Result<()> {
+        self.ensure_may_write(ctx, "rename files").await?;
+        let inode = self.stat(from).await?;
+        self.rename(from, to).await?;
+        self.meta
+            .append_edit_op(EditOpInit {
+                session_id: ctx.session,
+                actor_id: ctx.actor,
+                tool_call_id: ctx.tool_call,
+                ino: inode.ino,
+                path: to.to_string(),
+                op: "rename".to_string(),
+                byte_start: 0,
+                byte_len: 0,
+                pre_hash: inode.content.map(|h| h.to_hex()),
+                post_hash: inode.content.map(|h| h.to_hex()),
+                ts: self.now_secs(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Create a directory (and any missing parents), attributed to `ctx` and
+    /// subject to its write policy.
+    pub async fn mkdir_as(&self, ctx: WriteCtx, path: &str) -> Result<Ino> {
+        self.ensure_may_write(ctx, "create directories").await?;
+        let ino = self.mkdir_p(path).await?;
+        self.meta
+            .append_edit_op(EditOpInit {
+                session_id: ctx.session,
+                actor_id: ctx.actor,
+                tool_call_id: ctx.tool_call,
+                ino,
+                path: path.to_string(),
+                op: "mkdir".to_string(),
+                byte_start: 0,
+                byte_len: 0,
+                pre_hash: None,
+                post_hash: None,
+                ts: self.now_secs(),
+            })
+            .await?;
+        Ok(ino)
+    }
+
+    /// Create a symlink at `linkpath` pointing at `target`, attributed to `ctx`
+    /// and subject to its write policy.
+    pub async fn symlink_as(&self, ctx: WriteCtx, target: &str, linkpath: &str) -> Result<Ino> {
+        self.ensure_may_write(ctx, "create symlinks").await?;
+        let ino = self.symlink(target, linkpath).await?;
+        self.meta
+            .append_edit_op(EditOpInit {
+                session_id: ctx.session,
+                actor_id: ctx.actor,
+                tool_call_id: ctx.tool_call,
+                ino,
+                path: linkpath.to_string(),
+                op: "symlink".to_string(),
+                byte_start: 0,
+                byte_len: 0,
+                pre_hash: None,
+                post_hash: None,
+                ts: self.now_secs(),
+            })
+            .await?;
+        Ok(ino)
+    }
+
     // --- queries ----------------------------------------------------------
 
     /// Per-range authorship for `path`, distinguishing human vs agent. Each result

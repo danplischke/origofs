@@ -332,3 +332,128 @@ async fn edit_is_governed_by_write_policy() {
     // unchanged until a different actor accepts
     assert_eq!(&ws.read("/f.txt").await.unwrap()[..], b"hello world\n");
 }
+
+/// A propose-only agent over MCP is stopped at **every** mutating tool, not just
+/// `origofs_write` (issue #78).
+///
+/// Before the fix the agent could not overwrite `/keep.txt` but could delete it
+/// and commit the deletion — the gate lengthened the destructive path instead of
+/// closing it.
+#[tokio::test]
+async fn propose_only_agent_cannot_delete_mkdir_or_commit() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let human = ws.create_human("dan", None).await.unwrap();
+    ws.write("/keep.txt", b"precious").await.unwrap();
+
+    let agent = ws.create_agent("claude", "opus", None).await.unwrap();
+    let session = ws.create_session(agent, Some("mcp")).await.unwrap();
+    ws.set_write_policy(agent, WritePolicy::Propose)
+        .await
+        .unwrap();
+    let s = McpServer::new(ws.clone(), agent, session);
+
+    // `rm` has a propose-shaped path: queued for review, file untouched.
+    let rm = s
+        .handle(call("origofs_rm", json!({"path":"/keep.txt"})))
+        .await
+        .unwrap();
+    assert_eq!(rm["result"]["isError"], false, "{}", text(&rm));
+    assert!(
+        text(&rm).contains("proposed deletion"),
+        "expected a queued deletion, got: {}",
+        text(&rm)
+    );
+    assert_eq!(
+        &ws.read("/keep.txt").await.unwrap()[..],
+        b"precious",
+        "a propose-only agent must not be able to delete what it cannot overwrite"
+    );
+
+    // `mkdir` and `commit` have no propose-shaped equivalent: refused outright.
+    let md = s
+        .handle(call("origofs_mkdir", json!({"path":"/sneaky"})))
+        .await
+        .unwrap();
+    assert_eq!(md["result"]["isError"], true, "{}", text(&md));
+    let ci = s
+        .handle(call("origofs_commit", json!({"message":"mine now"})))
+        .await
+        .unwrap();
+    assert_eq!(ci["result"]["isError"], true, "{}", text(&ci));
+
+    // A reviewer accepting the deletion is what actually removes the file, and
+    // it stays attributed to the agent that asked.
+    let sid = ws
+        .list_suggestions(Some(SuggestionStatus::Pending), None)
+        .await
+        .unwrap()[0]
+        .id;
+    ws.accept_suggestion(sid, WriteCtx::actor(human))
+        .await
+        .unwrap();
+    assert!(ws.stat("/keep.txt").await.is_err());
+}
+
+/// Every advertised MCP tool is accounted for as read-only, policy-gated, or
+/// review-queued.
+///
+/// This is the regression guard for how `origofs_rm` shipped ungated: a new tool
+/// is invisible to the behavioural tests above, so it would have slipped in the
+/// same way. Adding one now fails here until it is classified — and the act of
+/// classifying it is the moment to notice it needs a policy check.
+#[tokio::test]
+async fn every_mutating_mcp_tool_is_policy_classified() {
+    // Read-only: no working-tree mutation, safe for any actor.
+    const READ_ONLY: &[&str] = &[
+        "origofs_read",
+        "origofs_ls",
+        "origofs_blame",
+        "origofs_log",
+        "origofs_live",
+        "origofs_suggestions",
+        "origofs_suggestion_diff",
+    ];
+    // The propose path itself: open to every actor by design — that is the whole
+    // point of a review queue. Touches no working-tree state.
+    const PROPOSE_PATH: &[&str] = &["origofs_suggest", "origofs_suggest_coedit"];
+    // Mutating or review-resolving, and routed through the §6 write policy: queued
+    // for a propose-only actor (`write`/`edit`/`rm`), or refused outright
+    // (`mkdir`/`commit`, and `accept`/`reject` via `ensure_may_write`).
+    const POLICY_GATED: &[&str] = &[
+        "origofs_write",
+        "origofs_edit",
+        "origofs_rm",
+        "origofs_mkdir",
+        "origofs_commit",
+        "origofs_accept",
+        "origofs_reject",
+    ];
+
+    let s = server().await;
+    let list = s
+        .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .await
+        .unwrap();
+    let names: Vec<String> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+
+    for name in &names {
+        let known = READ_ONLY.contains(&name.as_str())
+            || PROPOSE_PATH.contains(&name.as_str())
+            || POLICY_GATED.contains(&name.as_str());
+        assert!(
+            known,
+            "MCP tool {name} is not classified in this test. If it mutates the \
+             working tree it must route through the write policy (write_or_propose \
+             / remove_or_propose / an `_as` variant); if it only reads, add it to \
+             READ_ONLY. See issue #78."
+        );
+    }
+}

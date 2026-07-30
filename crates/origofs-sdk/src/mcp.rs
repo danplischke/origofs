@@ -316,12 +316,25 @@ impl McpServer {
                     .join("\n"))
             }
             "origofs_mkdir" => {
-                self.ws.mkdir_p(path()).await?;
+                self.ws.mkdir_as(self.ctx(), path()).await?;
                 Ok(format!("created {}", path()))
             }
             "origofs_rm" => {
-                self.ws.remove(path()).await?;
-                Ok(format!("removed {}", path()))
+                // Policy-governed, like `origofs_write`: a propose-only agent's
+                // removal is queued for review rather than destroying the file
+                // it was already forbidden to overwrite (issue #78).
+                let summary = format!("delete {}", path());
+                match self
+                    .ws
+                    .remove_or_propose(self.ctx(), path(), Some(&summary))
+                    .await?
+                {
+                    WriteOutcome::Wrote => Ok(format!("removed {}", path())),
+                    WriteOutcome::Proposed(id) => Ok(format!(
+                        "proposed deletion #{id} for {} (pending review)",
+                        path()
+                    )),
+                }
             }
             "origofs_blame" => {
                 let ranges = self.ws.blame(path()).await?;
@@ -344,7 +357,7 @@ impl McpServer {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("commit via mcp");
-                let hash = self.ws.commit("mcp-agent", message).await?;
+                let hash = self.ws.commit_as(self.ctx(), "mcp-agent", message).await?;
                 Ok(format!("committed {}", &hash.to_hex()[..12]))
             }
             "origofs_log" => {
@@ -501,7 +514,9 @@ fn tool_defs() -> Vec<Value> {
         ),
         tool(
             "origofs_rm",
-            "Remove a file or empty directory.",
+            "Remove a file or empty directory. Governed by your write policy the \
+             same way origofs_write is: if you are propose-only, this queues a \
+             deletion for review instead of removing anything.",
             path_prop.clone(),
             &["path"],
         ),

@@ -29,6 +29,15 @@ pub enum OrigoFSError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// The actor is not permitted to perform this operation — today, an actor
+    /// whose [`WritePolicy`](crate::WritePolicy) is
+    /// [`Propose`](crate::WritePolicy::Propose) attempting a direct mutation
+    /// (§6). Distinct from [`InvalidArgument`](OrigoFSError::InvalidArgument):
+    /// the request is well-formed and would have succeeded for a permitted
+    /// actor, so a surface maps it to `403`, not `400`.
+    #[error("denied: {0}")]
+    Denied(String),
+
     #[error("too large: {0}")]
     TooLarge(String),
 
@@ -155,6 +164,7 @@ impl OrigoFSError {
             InvalidPath(_) => "invalid_path",
             InvalidArgument(_) => "invalid_argument",
             Conflict(_) => "conflict",
+            Denied(_) => "denied",
             TooLarge(_) => "too_large",
             Corrupt(_) => "corrupt",
             ContentMissing(_) => "content_missing",
