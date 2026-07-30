@@ -11,8 +11,27 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+// `parking_lot::Mutex` rather than `std::sync::Mutex`: it does not poison, so a
+// panic under the lock cannot turn every later `MemStore` operation into a
+// panic of its own. `SqliteMetadataStore` moved for the same reason.
+use parking_lot::Mutex;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+
+/// How stale an already-stored object may be before a deduplicating `put`
+/// refreshes its recency stamp (see [`ContentStore::touch`]).
+///
+/// The refresh exists to stop a garbage collection from sweeping content a writer
+/// has just deduplicated onto. An object younger than this is already comfortably
+/// inside any valid grace period, so refreshing it buys nothing — this threshold
+/// is what keeps the refresh off the hot path, where deduping onto
+/// recently-written content is the norm.
+///
+/// It is a *floor* on the grace period, not merely a tuning knob: a sweep whose
+/// grace is shorter than this could reclaim an object in the band between the two.
+/// [`Fs::gc_with_grace`](crate::Fs::gc_with_grace) rejects a shorter grace for
+/// that reason.
+pub const DEDUP_REFRESH_AFTER_SECS: u64 = 60;
 
 /// A content-addressed blob store. Writes are idempotent: storing identical
 /// bytes yields the same [`Hash`] and does not duplicate storage.
@@ -118,6 +137,37 @@ pub trait ContentStore: Send + Sync {
     /// something live.
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
         Ok(self.list().await?.into_iter().map(|h| (h, None)).collect())
+    }
+
+    /// Refresh `hash`'s recency stamp, so a concurrent sweep treats it as a write
+    /// in flight rather than as long-dead garbage.
+    ///
+    /// **This is the other half of the age gate, and without it the gate leaks.**
+    /// [`list_with_age`](Self::list_with_age) makes garbage collection safe by
+    /// skipping anything younger than the grace period — the window between a
+    /// `put` and the commit that references it. But `put` is *deduplicating*: it
+    /// returns early when the object is already stored, and an object that already
+    /// exists does not get a fresh timestamp. So a writer that dedups onto an old,
+    /// currently-unreferenced object gets `Ok(hash)` for content the sweep is about
+    /// to reclaim, and the commit that follows references a hash that no longer
+    /// exists. That is not a rare shape: reverting a file, shared boilerplate, and
+    /// checking out an older commit all produce exactly it.
+    ///
+    /// Each backend's `put`/`put_keyed` therefore refreshes on the dedup path.
+    /// Backends age-gate the refresh themselves — an object younger than
+    /// [`DEDUP_REFRESH_AFTER_SECS`] is already inside any valid grace period, so
+    /// refreshing it would be pure cost. That keeps the common case (deduping onto
+    /// recently-written content) free, and pays only where the race is real.
+    ///
+    /// The default is a no-op, which is correct **only** for a backend that also
+    /// leaves `list_with_age` at its default — one that reports no ages collects
+    /// nothing, so it has no sweep to race. A backend that overrides
+    /// `list_with_age` **must** override this too; `tests/gc.rs::
+    /// every_dateable_backend_can_refresh_recency` enforces that for the backends
+    /// in this crate.
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        let _ = hash;
+        Ok(())
     }
 
     /// Read a small named **sidecar** value, or `None` if it was never written.
@@ -269,6 +319,32 @@ impl LocalCasStore {
         tokio::fs::metadata(path).await.is_ok()
     }
 
+    /// Age of the object at `path` in seconds, or `None` if it isn't there (or
+    /// the filesystem won't say). Mirrors what `list_with_age` reports, so the
+    /// dedup refresh and the sweep agree on what "old" means.
+    async fn age_secs(path: &Path) -> Option<u64> {
+        let meta = tokio::fs::metadata(path).await.ok()?;
+        let modified = meta.modified().ok()?;
+        std::time::SystemTime::now()
+            .duration_since(modified)
+            .ok()
+            .map(|d| d.as_secs())
+    }
+
+    /// Stamp `path`'s mtime to now, so a concurrent sweep sees a fresh object.
+    /// `File::set_times` needs a writable handle and is a blocking syscall, hence
+    /// the blocking pool. Best-effort at the call site: see `touch`.
+    async fn set_mtime_now(path: &Path) -> Result<()> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let f = std::fs::File::options().write(true).open(&path)?;
+            f.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+        })
+        .await
+        .map_err(|e| OrigoFSError::Content(format!("touch join: {e}")))??;
+        Ok(())
+    }
+
     /// Number of `fsync` operations durable writes have performed so far.
     /// Exposed for tests to verify the durability barrier ran.
     pub fn sync_count(&self) -> u64 {
@@ -341,8 +417,12 @@ impl ContentStore for LocalCasStore {
     async fn put(&self, bytes: &[u8]) -> Result<Hash> {
         let hash = Hash::of(bytes);
         let path = self.path_for(&hash);
+        // Already stored — content-addressed, so identical. Refresh its recency
+        // first: a sweep racing this write must not reclaim the object we are
+        // about to hand back as durable (see `ContentStore::touch`).
         if Self::exists(&path).await {
-            return Ok(hash); // already stored — content-addressed, so identical
+            self.touch(&hash).await?;
+            return Ok(hash);
         }
         self.write_at(&path, bytes).await?;
         Ok(hash)
@@ -351,9 +431,20 @@ impl ContentStore for LocalCasStore {
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         let path = self.path_for(key);
         if Self::exists(&path).await {
+            self.touch(key).await?;
             return Ok(());
         }
         self.write_at(&path, bytes).await
+    }
+
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        let path = self.path_for(hash);
+        match Self::age_secs(&path).await {
+            Some(age) if age >= DEDUP_REFRESH_AFTER_SECS => Self::set_mtime_now(&path).await,
+            // Young enough that any valid grace period already covers it, or gone
+            // (a `has`/`put` race) — nothing useful to refresh either way.
+            _ => Ok(()),
+        }
     }
 
     async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
@@ -531,6 +622,16 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         (**self).put_keyed(key, bytes).await
     }
+    // Forwarding this is not optional. `replace_keyed` has a *default* body — the
+    // unsafe delete-then-put the trait doc warns about — so omitting it here does
+    // not fail to compile, it silently downgrades every backend reached through an
+    // `Arc` to that default. `PackStore` holds its index as `Arc<dyn ContentStore>`
+    // and calls `replace_keyed` on the repack path, so the omission cost exactly
+    // the atomicity the method exists to provide. Covered by
+    // `tests/pack.rs::arc_forwards_replace_keyed_atomically`.
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        (**self).replace_keyed(key, bytes).await
+    }
     async fn put_meta(&self, name: &str, bytes: &[u8]) -> Result<()> {
         (**self).put_meta(name, bytes).await
     }
@@ -557,6 +658,9 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
     }
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
         (**self).list_with_age().await
+    }
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        (**self).touch(hash).await
     }
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         (**self).delete(hash).await
@@ -596,14 +700,13 @@ impl MemStore {
     fn touch_born(&self, hash: Hash) {
         self.born
             .lock()
-            .expect("mem store poisoned")
             .entry(hash)
             .or_insert_with(std::time::Instant::now);
     }
 
     /// Number of distinct blobs stored (useful for dedup assertions in tests).
     pub fn len(&self) -> usize {
-        self.map.lock().expect("mem store poisoned").len()
+        self.map.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -617,48 +720,50 @@ impl ContentStore for MemStore {
         let hash = Hash::of(bytes);
         self.map
             .lock()
-            .expect("mem store poisoned")
             .entry(hash)
             .or_insert_with(|| Bytes::copy_from_slice(bytes));
+        // Records a birth stamp for a new object and leaves an existing one
+        // alone; `touch` is what refreshes a stale one on the dedup path.
         self.touch_born(hash);
+        self.touch(&hash).await?;
         Ok(hash)
     }
 
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        let mut born = self.born.lock();
+        if let Some(t) = born.get_mut(hash)
+            && t.elapsed().as_secs() >= DEDUP_REFRESH_AFTER_SECS
+        {
+            *t = std::time::Instant::now();
+        }
+        Ok(())
+    }
+
     async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .sidecars
-            .lock()
-            .expect("mem store poisoned")
-            .get(name)
-            .cloned())
+        Ok(self.sidecars.lock().get(name).cloned())
     }
 
     async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         Ok(self
             .sidecars
             .lock()
-            .expect("mem store poisoned")
             .entry(name.to_string())
             .or_insert_with(|| bytes.to_vec())
             .clone())
     }
 
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
-        let born = self.born.lock().expect("mem store poisoned");
+        let born = self.born.lock();
         Ok(self
             .map
             .lock()
-            .expect("mem store poisoned")
             .keys()
             .map(|h| (*h, born.get(h).map(|t| t.elapsed().as_secs())))
             .collect())
     }
 
     async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
-        self.map
-            .lock()
-            .expect("mem store poisoned")
-            .insert(*key, Bytes::copy_from_slice(bytes));
+        self.map.lock().insert(*key, Bytes::copy_from_slice(bytes));
         self.touch_born(*key);
         Ok(())
     }
@@ -666,10 +771,10 @@ impl ContentStore for MemStore {
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         self.map
             .lock()
-            .expect("mem store poisoned")
             .entry(*key)
             .or_insert_with(|| Bytes::copy_from_slice(bytes));
         self.touch_born(*key);
+        self.touch(key).await?;
         Ok(())
     }
 
@@ -677,25 +782,18 @@ impl ContentStore for MemStore {
         validate_slot_name(name)?;
         self.slots
             .lock()
-            .expect("mem store poisoned")
             .insert(name.to_string(), Bytes::copy_from_slice(bytes));
         Ok(())
     }
 
     async fn get_meta(&self, name: &str) -> Result<Option<Bytes>> {
         validate_slot_name(name)?;
-        Ok(self
-            .slots
-            .lock()
-            .expect("mem store poisoned")
-            .get(name)
-            .cloned())
+        Ok(self.slots.lock().get(name).cloned())
     }
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         self.map
             .lock()
-            .expect("mem store poisoned")
             .get(hash)
             .cloned()
             .ok_or_else(|| OrigoFSError::ContentMissing(hash.to_hex()))
@@ -709,29 +807,18 @@ impl ContentStore for MemStore {
     }
 
     async fn has(&self, hash: &Hash) -> Result<bool> {
-        Ok(self
-            .map
-            .lock()
-            .expect("mem store poisoned")
-            .contains_key(hash))
+        Ok(self.map.lock().contains_key(hash))
     }
 
     async fn list(&self) -> Result<Vec<Hash>> {
-        Ok(self
-            .map
-            .lock()
-            .expect("mem store poisoned")
-            .keys()
-            .copied()
-            .collect())
+        Ok(self.map.lock().keys().copied().collect())
     }
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {
-        self.born.lock().expect("mem store poisoned").remove(hash);
+        self.born.lock().remove(hash);
         Ok(self
             .map
             .lock()
-            .expect("mem store poisoned")
             .remove(hash)
             .map(|b| b.len() as u64)
             .unwrap_or(0))
@@ -829,6 +916,14 @@ impl ContentStore for TieredStore {
 
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
         self.backend.list_with_age().await
+    }
+
+    /// Forwarded, like `list_with_age`. A decorator that reports the inner
+    /// store's ages must forward the refresh that keeps those ages honest,
+    /// or a deduplicating write through this layer stays invisible to the
+    /// sweep's grace period (`ContentStore::touch`).
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        self.backend.touch(hash).await
     }
 
     /// Forwarded to the backend, which is the authoritative store. Without this
@@ -960,6 +1055,14 @@ impl ContentStore for VerifyingStore {
 
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
         self.inner.list_with_age().await
+    }
+
+    /// Forwarded, like `list_with_age`. A decorator that reports the inner
+    /// store's ages must forward the refresh that keeps those ages honest,
+    /// or a deduplicating write through this layer stays invisible to the
+    /// sweep's grace period (`ContentStore::touch`).
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        self.inner.touch(hash).await
     }
 
     async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {

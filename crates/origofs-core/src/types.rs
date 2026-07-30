@@ -33,8 +33,20 @@ impl Hash {
         hex::encode(self.0)
     }
 
-    /// Parse a 64-char lowercase hex string, or `None` if malformed.
+    /// Parse a 64-char **lowercase** hex string, or `None` if malformed.
+    ///
+    /// Uppercase is rejected rather than accepted, even though `hex::decode`
+    /// would take it. A hash is a *storage key*: `to_hex` emits lowercase and
+    /// every backend derives an object's path from it, so accepting `AB…` here
+    /// would mint a `Hash` whose `path_for` points somewhere other than where the
+    /// name came from. The concrete failure is in `list()`, which reconstructs
+    /// hashes from directory entries — an uppercase name would parse, be reported
+    /// as present, and then be undeletable, because `delete` would look for the
+    /// lowercase path. One canonical spelling, checked at the boundary.
     pub fn from_hex(s: &str) -> Option<Self> {
+        if s.contains(|c: char| c.is_ascii_uppercase()) {
+            return None;
+        }
         let v = hex::decode(s).ok()?;
         let arr: [u8; 32] = v.try_into().ok()?;
         Some(Hash(arr))

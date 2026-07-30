@@ -184,6 +184,14 @@ impl ContentStore for EncryptedStore {
         self.inner.list_with_age().await
     }
 
+    /// Forwarded, like `list_with_age`. A decorator that reports the inner
+    /// store's ages must forward the refresh that keeps those ages honest,
+    /// or a deduplicating write through this layer stays invisible to the
+    /// sweep's grace period (`ContentStore::touch`).
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        self.inner.touch(hash).await
+    }
+
     /// Forwarded **unencrypted**, and necessarily so: the salt stored here is what
     /// derives this store's key, so it has to be readable before the key exists.
     /// It is not secret — Argon2id salts are public by design; they exist to make

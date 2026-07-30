@@ -126,6 +126,12 @@ impl PackStore {
             }
         }
         if dedup && self.index.has(&key).await? {
+            // Deduplicated onto a chunk that is already packed. Its liveness for
+            // GC is its *index entry's* age (see `list_with_age`), so refresh
+            // that entry — otherwise a sweep can reclaim the pack holding a chunk
+            // this write is about to reference. The index refresh is itself
+            // age-gated, so a hit on recently-written content costs nothing.
+            self.index.touch(&key).await?;
             return Ok(());
         }
         let full = {
@@ -421,6 +427,16 @@ impl ContentStore for PackStore {
             out.push((*h, Some(0)));
         }
         Ok(out)
+    }
+
+    /// A chunk's recency is its index entry's, matching `list_with_age`. A chunk
+    /// still buffered in the open pack already reports age 0, so there is nothing
+    /// to refresh for it.
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        if self.pending.lock().resident.contains_key(hash) {
+            return Ok(());
+        }
+        self.index.touch(hash).await
     }
 
     async fn ping(&self) -> Result<()> {

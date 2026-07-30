@@ -28,6 +28,19 @@
 //! overlapping, since a sweep is destructive and running it twice at once doubles
 //! the exposure for no benefit.
 //!
+//! **The age gate has a second half, and it is not optional.** `put` is
+//! deduplicating: it returns early when the content is already stored, and an
+//! object that already exists does not get a fresh timestamp. So the gate as
+//! described above protects only *newly written* bytes. A writer that dedups onto
+//! an old, currently-unreferenced object — reverting a file, shared boilerplate,
+//! checking out an older commit — gets `Ok(hash)` for content this sweep is about
+//! to reclaim, and the commit that follows references a hash that no longer
+//! exists. Every backend therefore refreshes an object's recency on the dedup path
+//! ([`ContentStore::touch`]), gated at
+//! [`DEDUP_REFRESH_AFTER_SECS`](crate::content::DEDUP_REFRESH_AFTER_SECS) so the common case
+//! stays free. [`Fs::gc_with_grace`] rejects a grace below
+//! that floor, because the band between the two is precisely where the race lives.
+//!
 //! This is not a substitute for running GC when the workspace is calm — it is what
 //! makes doing so on a *live, shared* workspace safe, which is the only option in
 //! a workspace agents are always writing to.
@@ -90,7 +103,32 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// committing — see the sweep below for why. `0` restores the old
     /// reachability-only behaviour and is unsafe with any concurrent writer; it
     /// exists for tests and for a genuinely quiesced store.
+    ///
+    /// Any other value below [`DEDUP_REFRESH_AFTER_SECS`](crate::content::DEDUP_REFRESH_AFTER_SECS)
+    /// is **rejected** rather
+    /// than honoured. The age gate has two halves: the sweep skips young objects,
+    /// and a deduplicating `put` refreshes an object that has gone stale
+    /// ([`ContentStore::touch`]). That refresh only
+    /// fires past `DEDUP_REFRESH_AFTER_SECS`, so a grace shorter than it leaves a
+    /// band where an object is old enough to sweep but not old enough to have been
+    /// refreshed — the exact race the gate exists to close. A caller asking for
+    /// that band has asked for something that cannot be delivered safely, and
+    /// silently widening it would hide the problem; `0` remains available as an
+    /// explicit, documented opt-out.
     pub async fn gc_with_grace(&self, grace_secs: u64) -> Result<GcStats> {
+        if grace_secs > 0 && grace_secs < crate::content::DEDUP_REFRESH_AFTER_SECS {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "gc grace of {grace_secs}s is below the {}s dedup-refresh floor: a sweep with \
+                 this grace can reclaim content a concurrent write has just deduplicated onto. \
+                 Use at least {}s, or 0 to sweep a quiesced store with no age gate at all.",
+                crate::content::DEDUP_REFRESH_AFTER_SECS,
+                crate::content::DEDUP_REFRESH_AFTER_SECS,
+            )));
+        }
+        self.gc_with_grace_unchecked(grace_secs).await
+    }
+
+    async fn gc_with_grace_unchecked(&self, grace_secs: u64) -> Result<GcStats> {
         // One collection at a time. Nothing guarded this before: two `gc()` calls
         // would interleave a mark against the other's sweep. The lease is the
         // existing advisory-lock table under a key no path can be, and it expires

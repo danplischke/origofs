@@ -644,18 +644,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let manifest = self.load_manifest(mhash).await?;
         // This buffers the whole body in memory. That is fine for ordinary files,
         // but a caller that must stay bounded on an arbitrarily large file should
-        // use [`Self::read_stream`] instead. We still refuse to *pre-allocate* from
-        // the manifest's declared size: even though `Manifest::decode` checks
-        // `size == Σ chunk.len`, a crafted manifest can declare many oversized
-        // chunk lengths, so we reserve a bounded amount up front and let the buffer
-        // grow as real chunk bytes arrive.
-        const INITIAL_HINT: usize = 8 * 1024 * 1024;
-        let hint = manifest
-            .chunks
-            .iter()
-            .fold(0usize, |a, c| a.saturating_add(c.len as usize))
-            .min(INITIAL_HINT);
-        let mut buf = BytesMut::with_capacity(hint);
+        // use [`Self::read_stream`] instead. The reservation is a capped hint
+        // rather than the manifest's declared size — see `Manifest::capacity_hint`.
+        let mut buf = BytesMut::with_capacity(manifest.capacity_hint());
         for c in &manifest.chunks {
             buf.extend_from_slice(&self.content.get(&c.hash).await?);
         }
@@ -776,7 +767,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if off >= end {
             return Ok(Bytes::new());
         }
-        let mut buf = BytesMut::with_capacity((end - off) as usize);
+        // Bounded by the same cap as a whole-body read: `end` derives from the
+        // manifest's declared size, which is attacker-controlled on a corrupt
+        // store (see `Manifest::capacity_hint`).
+        let mut buf =
+            BytesMut::with_capacity(((end - off) as usize).min(manifest.capacity_hint().max(1)));
         let mut pos: u64 = 0;
         for c in &manifest.chunks {
             let cstart = pos;

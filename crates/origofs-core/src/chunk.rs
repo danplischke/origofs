@@ -36,9 +36,34 @@ pub struct Manifest {
     pub chunks: Vec<ChunkRef>,
 }
 
+/// Upper bound on how much a reassembly buffer may reserve up front from a
+/// manifest's *declared* size. See [`Manifest::capacity_hint`].
+const MAX_REASSEMBLY_HINT: usize = 8 * 1024 * 1024;
+
 impl Manifest {
     pub fn is_empty(&self) -> bool {
         self.size == 0
+    }
+
+    /// How much to reserve before reassembling this manifest's body.
+    ///
+    /// **Never reserve `size` directly.** `decode` only checks that
+    /// `size == Σ chunk.len`, which a crafted or corrupt manifest satisfies
+    /// trivially: a 53-byte manifest declaring one chunk of `len = u32::MAX`
+    /// yields a consistent 4 GiB, and a few megabytes of manifest reaches
+    /// hundreds of terabytes. Reserving from that is an allocator abort driven by
+    /// untrusted bytes — the same hostile-input boundary the decoders guard, one
+    /// layer up.
+    ///
+    /// So the reservation is a *hint*, capped at [`MAX_REASSEMBLY_HINT`], and the
+    /// buffer grows as real chunk bytes arrive. An honest large file pays a few
+    /// reallocations; a dishonest one allocates 8 MiB and then fails on the first
+    /// missing chunk.
+    pub fn capacity_hint(&self) -> usize {
+        self.chunks
+            .iter()
+            .fold(0usize, |a, c| a.saturating_add(c.len as usize))
+            .min(MAX_REASSEMBLY_HINT)
     }
 
     /// Canonical serialization so identical content yields an identical manifest

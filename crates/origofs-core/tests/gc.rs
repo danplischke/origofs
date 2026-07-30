@@ -285,3 +285,217 @@ async fn concurrent_collections_are_serialized() {
     fs.gc().await.unwrap();
     assert_eq!(&fs.read("/a.txt").await.unwrap()[..], b"hello");
 }
+
+// --- the dedup half of the age gate -----------------------------------------
+
+/// Backdate every object in a `LocalCasStore` so it looks `secs` old.
+///
+/// This drives the *real* refresh path rather than a stand-in: `LocalCasStore`
+/// reads and writes exactly these mtimes, so a test can reach the dedup race
+/// without waiting out a 60-second threshold.
+fn backdate_objects(root: &std::path::Path, secs: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+    let times = std::fs::FileTimes::new().set_modified(when);
+    fn walk(dir: &std::path::Path, times: std::fs::FileTimes) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, times);
+            } else {
+                let f = std::fs::File::options().write(true).open(&path).unwrap();
+                f.set_times(times).unwrap();
+            }
+        }
+    }
+    walk(&root.join("objects"), times);
+}
+
+/// Deduplicating onto old, unreferenced content must refresh that content's age.
+///
+/// The age gate as originally written protected only *newly written* bytes: `put`
+/// returns early when the object is already stored, and an existing object got no
+/// fresh timestamp. So a writer that deduplicated onto an old, currently
+/// unreferenced chunk received `Ok(hash)` for content a concurrent sweep was about
+/// to reclaim — the sweep having marked *before* this write's metadata committed —
+/// and the commit that followed referenced a hash that no longer existed.
+/// Reverting a file to an earlier version is the ordinary way to hit it.
+///
+/// The race itself is a timing window and a test that tried to hit it directly
+/// would be flaky. What is deterministic — and what actually closes the window —
+/// is the invariant: **after a deduplicating write, the content it adopted is
+/// young again**, so any sweep with a valid grace skips it. That is what this
+/// asserts, through the engine's own write path.
+#[tokio::test]
+async fn dedup_onto_stale_content_refreshes_its_age() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalCasStore::open(dir.path()).await.unwrap());
+    let meta = SqliteMetadataStore::open_in_memory().unwrap();
+    let fs = Fs::new(meta, store.clone());
+    fs.init().await.unwrap();
+
+    let body = blob(200 * 1024, 7);
+
+    // Write it, then remove it: the chunks are stored but now unreferenced.
+    fs.write("/a.txt", &body).await.unwrap();
+    fs.remove("/a.txt").await.unwrap();
+
+    // Age that content past the refresh threshold, so a sweep would consider it
+    // collectable and the dedup path is obliged to refresh it.
+    let stale = origofs_core::DEDUP_REFRESH_AFTER_SECS * 10;
+    backdate_objects(dir.path(), stale);
+    assert!(
+        store
+            .list_with_age()
+            .await
+            .unwrap()
+            .iter()
+            .all(|(_, a)| a.unwrap() >= stale),
+        "backdating did not take"
+    );
+
+    // The revert: identical bytes, so every chunk deduplicates onto the stale
+    // objects instead of being written afresh.
+    fs.write("/b.txt", &body).await.unwrap();
+
+    // Every object the file now depends on must be young again. A sweep that
+    // marked before this write committed would otherwise reclaim it.
+    let still_stale: Vec<_> = store
+        .list_with_age()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|(_, age)| age.unwrap_or(0) >= origofs_core::DEDUP_REFRESH_AFTER_SECS)
+        .collect();
+
+    assert!(
+        still_stale.is_empty(),
+        "a deduplicating write left {} of {} objects looking old enough to sweep, \
+         so a gc that marked before this write committed would reclaim content the \
+         write had just adopted",
+        still_stale.len(),
+        store.list_with_age().await.unwrap().len(),
+    );
+
+    // And the file really is readable through those refreshed objects.
+    assert_eq!(fs.read("/b.txt").await.unwrap(), body);
+}
+
+/// The refresh is age-gated, so it must actually fire for a stale object — and
+/// must not waste work on a young one.
+#[tokio::test]
+async fn touch_refreshes_only_stale_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalCasStore::open(dir.path()).await.unwrap();
+
+    let hash = store.put(b"some content").await.unwrap();
+
+    async fn age_of(s: &LocalCasStore, h: &origofs_core::Hash) -> u64 {
+        s.list_with_age()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(x, _)| x == h)
+            .and_then(|(_, a)| a)
+            .unwrap()
+    }
+
+    // Young: nothing to do, and the stamp is left alone.
+    store.touch(&hash).await.unwrap();
+    assert_eq!(age_of(&store, &hash).await, 0);
+
+    // Stale: the refresh brings it back inside any valid grace period.
+    let stale = origofs_core::DEDUP_REFRESH_AFTER_SECS * 10;
+    backdate_objects(dir.path(), stale);
+    assert!(
+        age_of(&store, &hash).await >= stale,
+        "backdating did not take"
+    );
+
+    store.touch(&hash).await.unwrap();
+    assert!(
+        age_of(&store, &hash).await < origofs_core::DEDUP_REFRESH_AFTER_SECS,
+        "touch left a stale object stale"
+    );
+}
+
+/// The refresh only fires past the threshold, so a grace shorter than it leaves a
+/// band where an object is sweepable but was never refreshed. That configuration
+/// is refused rather than silently honoured.
+#[tokio::test]
+async fn a_grace_below_the_refresh_floor_is_refused() {
+    let (fs, _store) = mem_fixture().await;
+
+    let err = fs
+        .gc_with_grace(origofs_core::DEDUP_REFRESH_AFTER_SECS - 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, origofs_core::OrigoFSError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
+
+    // The two safe ends still work: 0 (explicit opt-out, quiesced store) and
+    // anything at or above the floor.
+    fs.gc_with_grace(0).await.unwrap();
+    fs.gc_with_grace(origofs_core::DEDUP_REFRESH_AFTER_SECS)
+        .await
+        .unwrap();
+}
+
+/// A backend that reports ages must be able to refresh them.
+///
+/// `touch` has a default no-op body, which is correct only for a backend that also
+/// leaves `list_with_age` at its default — one that reports no ages collects
+/// nothing, so it has no sweep to race. Overriding `list_with_age` without
+/// overriding `touch` re-opens the dedup race silently, exactly the way the
+/// missing `Arc` forwarder did for `replace_keyed`. This pins the pairing for the
+/// backends in this crate.
+#[test]
+fn every_dateable_backend_can_refresh_recency() {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut checked = 0usize;
+
+    for file in ["content.rs", "objectstore.rs", "pack.rs", "encrypt.rs"] {
+        let src = std::fs::read_to_string(src_dir.join(file)).unwrap();
+        for (at, _) in src.match_indices("impl ContentStore for ") {
+            let head = &src[at..];
+            let name: String = head
+                .trim_start_matches("impl ContentStore for ")
+                .chars()
+                .take_while(|c| !"{<".contains(*c))
+                .collect();
+            let Some(open) = head.find('{') else { continue };
+            let bytes = head.as_bytes();
+            let (mut depth, mut i) = (1usize, open + 1);
+            while i < bytes.len() && depth > 0 {
+                match bytes[i] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            let body = &head[open..i];
+            if body.contains("async fn list_with_age") {
+                checked += 1;
+                if !body.contains("async fn touch") {
+                    offenders.push(format!("{file}: impl ContentStore for {}", name.trim()));
+                }
+            }
+        }
+    }
+
+    // Guard against the scan silently matching nothing and passing vacuously.
+    assert!(
+        checked >= 6,
+        "expected to find the dateable backends, only matched {checked}"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these backends report object ages but cannot refresh them, so a \
+         deduplicating write onto stale content is invisible to gc's grace \
+         period — implement `ContentStore::touch`:\n  {}",
+        offenders.join("\n  ")
+    );
+}

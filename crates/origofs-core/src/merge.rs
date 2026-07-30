@@ -164,7 +164,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     pub(crate) async fn read_body(&self, mhash: &Hash) -> Result<Vec<u8>> {
         let manifest = self.load_manifest(mhash).await?;
-        let mut buf = Vec::with_capacity(manifest.size as usize);
+        // Capped hint, not `size`: see `Manifest::capacity_hint`.
+        let mut buf = Vec::with_capacity(manifest.capacity_hint());
         for c in &manifest.chunks {
             buf.extend_from_slice(&self.content.get(&c.hash).await?);
         }

@@ -29,7 +29,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Reassemble a whole file body from its blob-manifest hash.
     pub async fn read_blob_bytes(&self, manifest_hash: &Hash) -> Result<Bytes> {
         let manifest = self.load_manifest(manifest_hash).await?;
-        let mut buf = BytesMut::with_capacity(manifest.size as usize);
+        // Capped hint, not `size`: see `Manifest::capacity_hint`.
+        let mut buf = BytesMut::with_capacity(manifest.capacity_hint());
         for c in &manifest.chunks {
             buf.extend_from_slice(&self.content.get(&c.hash).await?);
         }

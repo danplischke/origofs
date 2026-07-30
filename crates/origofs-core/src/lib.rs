@@ -48,7 +48,9 @@ pub use clock::{Clock, SystemClock};
 #[cfg(feature = "coedit")]
 pub use coedit::{COEDIT_SIDECAR_DIR, CoeditDoc, coedit_sidecar_path};
 pub use collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, PRESENCE_WINDOW_SECS, Presence};
-pub use content::{ContentStore, LocalCasStore, MemStore, TieredStore, VerifyingStore};
+pub use content::{
+    ContentStore, DEDUP_REFRESH_AFTER_SECS, LocalCasStore, MemStore, TieredStore, VerifyingStore,
+};
 pub use corpus::{Passage, PassageOptions, Segmentation};
 pub use encrypt::EncryptedStore;
 pub use engine::{Fs, validate_ref_name};
