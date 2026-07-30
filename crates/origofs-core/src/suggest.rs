@@ -542,14 +542,31 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             SuggestionKind::Crdt => return Err(crdt_needs_feature(s.id)),
         }
 
-        self.meta
+        // `resolve_suggestion` is a compare-and-set on `status = 'pending'`, and its
+        // answer matters. Discarding it meant a *lost* CAS still reported success:
+        // the dangerous shape is an accept racing a reject, where the reject claims
+        // the row, the accept applies the proposed bytes anyway, and the caller is
+        // told the acceptance worked while the suggestion reads "rejected". The
+        // write has already landed by this point — that is inherent to applying
+        // before resolving — so this cannot be undone here, but it must not be
+        // silent.
+        if !self
+            .meta
             .resolve_suggestion(
                 id,
                 SuggestionStatus::Accepted,
                 Some(approver.actor),
                 self.now_secs(),
             )
-            .await?;
+            .await?
+        {
+            let now = self.meta.get_suggestion(id).await?;
+            let state = now.as_ref().map(|s| s.status.as_str()).unwrap_or("deleted");
+            return Err(OrigoFSError::Conflict(format!(
+                "suggestion #{id} was resolved as {state} by another reviewer while                  this acceptance was being applied; {} now holds the proposed                  content and should be reviewed directly",
+                s.path
+            )));
+        }
         self.record_event(EventInit {
             actor_id: Some(approver.actor),
             session_id: approver.session,
@@ -700,14 +717,25 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             self.ensure_may_write(approver, "reject others' suggestions")
                 .await?;
         }
-        self.meta
+        // Same CAS, same reason it must be checked — a reject that lost to a
+        // concurrent accept previously reported success while the proposed bytes
+        // were being written to the working tree.
+        if !self
+            .meta
             .resolve_suggestion(
                 id,
                 SuggestionStatus::Rejected,
                 Some(approver.actor),
                 self.now_secs(),
             )
-            .await?;
+            .await?
+        {
+            let now = self.meta.get_suggestion(id).await?;
+            let state = now.as_ref().map(|s| s.status.as_str()).unwrap_or("deleted");
+            return Err(OrigoFSError::Conflict(format!(
+                "suggestion #{id} was already resolved as {state} by another reviewer"
+            )));
+        }
         self.record_event(EventInit {
             actor_id: Some(approver.actor),
             session_id: approver.session,

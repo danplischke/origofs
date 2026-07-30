@@ -190,8 +190,42 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// build can read the content store's object format.
     pub async fn init(&self) -> Result<()> {
         self.check_store_format().await?;
+        self.check_schema_version().await?;
         self.meta.init().await?;
         self.init_versioning().await?;
+        Ok(())
+    }
+
+    /// Refuse a metadata database written by a **newer** origofs, before any
+    /// migration runs against it.
+    ///
+    /// The content store has had this guard from the start
+    /// ([`check_store_format`](Self::check_store_format)); the metadata half did
+    /// not, and the asymmetry was dangerous. `MetadataStore::init` applies every
+    /// migration whose version is absent from `schema_meta` and never compares the
+    /// database against `latest_schema_version()` — so a v15 binary opening a v16
+    /// database reported no error at all and simply proceeded against a schema it
+    /// does not know. Migrations here have changed primary keys (V11, V13), so
+    /// "proceed anyway" is the shape that corrupts rather than the shape that
+    /// fails.
+    ///
+    /// A fresh database reports version 0 and passes. The error is
+    /// [`UnsupportedVersion`](OrigoFSError::UnsupportedVersion), the same one the
+    /// content store raises, because the remedy is the same: upgrade the reader,
+    /// do not restore from a backup.
+    async fn check_schema_version(&self) -> Result<()> {
+        let found = self.meta.schema_version().await?;
+        let max = crate::migrations::latest_schema_version();
+        if found > max {
+            return Err(OrigoFSError::UnsupportedVersion {
+                kind: "metadata schema",
+                // Schema versions are small and monotonic; the cast is lossless in
+                // any reachable range and saturates rather than wrapping if that
+                // ever stops being true.
+                found: u8::try_from(found).unwrap_or(u8::MAX),
+                max_supported: u8::try_from(max).unwrap_or(u8::MAX),
+            });
+        }
         Ok(())
     }
 
@@ -368,7 +402,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                             ino = child;
                         }
                         Err(OrigoFSError::AlreadyExists(_)) => {
-                            drop(tx); // roll back the just-created inode
+                            // Awaited, not dropped: the `lookup` immediately
+                            // below must not race this rollback for the pooled
+                            // connection. See `MetaTxn::rollback`.
+                            tx.rollback().await?;
                             let existing = self
                                 .meta
                                 .lookup(ino, seg)
@@ -485,8 +522,17 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if data.is_empty() {
             return Ok((None, 0));
         }
-        let mut chunks = Vec::new();
-        for (off, len) in chunk_bounds(data) {
+        // The FastCDC scan is a CPU-bound pass over the whole buffer, and this is
+        // the path behind `write`, `write_as`, `write_or_propose`, `vfs_write`, and
+        // every merge. Run bare in an `async fn` it pins a runtime worker for the
+        // duration — seconds, on a large body — starving every other task; that
+        // matters most in the Python bindings, where one runtime serves the whole
+        // process. `write_reader` already chunks off-runtime; this brings `write`
+        // in line. (`block_in_place` rather than `spawn_blocking`, so `data` can
+        // stay borrowed instead of being copied wholesale — see the helper.)
+        let bounds = crate::util::blocking_section(|| chunk_bounds(data));
+        let mut chunks = Vec::with_capacity(bounds.len());
+        for (off, len) in bounds {
             let hash = self.content.put(&data[off..off + len]).await?;
             chunks.push(ChunkRef {
                 hash,
@@ -540,7 +586,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 None => match Self::create_file_in(tx.as_mut(), parent, name).await {
                     Ok(ino) => ino,
                     Err(OrigoFSError::AlreadyExists(_)) => {
-                        drop(tx);
+                        // Awaited: the loop's next iteration re-reads immediately.
+                        // See `MetaTxn::rollback`.
+                        tx.rollback().await?;
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -594,7 +642,20 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 len: data.len() as u32,
             });
         }
-        let _ = handle.await;
+        // The `JoinError` matters and must not be discarded. `StreamCDC`'s own
+        // errors arrive through the channel as `Err`, but a *panic* — most
+        // plausibly from a caller-supplied `Read` impl — drops the sender instead:
+        // `rx.recv()` returns `None`, the loop above exits perfectly normally, and
+        // what follows would build a manifest from the chunks that happened to
+        // arrive and commit it as the whole file. Silent truncation, reported as
+        // `Ok(())`. Surfacing the join failure turns that into an error before any
+        // metadata references the partial body.
+        handle.await.map_err(|e| {
+            OrigoFSError::Content(format!(
+                "chunking {path} failed before the stream ended, so the file was \
+                 only partially read: {e}"
+            ))
+        })?;
 
         let mhash = if size == 0 {
             None

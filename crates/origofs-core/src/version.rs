@@ -123,6 +123,34 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(())
     }
 
+    /// [`mirror_refs`](Self::mirror_refs) for the position it is actually called
+    /// from: *after* the transaction that advanced the refs has committed.
+    ///
+    /// Every caller of `mirror_refs` sits inside a `retrying(...)` wrapper — the
+    /// commit, checkout, and merge attempts all do `txn.commit()` then mirror. So a
+    /// retryable error out of the mirror (a `40001`, a `SQLITE_BUSY` on
+    /// `bump_counter`/`set_config`) propagated up to that wrapper and re-ran the
+    /// **whole attempt** against an already-advanced HEAD, producing a spurious
+    /// duplicate commit. `crate::retry`'s own rules say exactly this: "an operation
+    /// that has already committed metadata must not be retried."
+    ///
+    /// So the retry happens *here*, around the mirror alone, where re-running is
+    /// sound — and anything that survives it is reclassified as non-retryable
+    /// before it can reach the outer wrapper. The error still propagates, because
+    /// a silently skipped mirror is a silently degraded recovery story, but it can
+    /// no longer be mistaken for "the commit didn't happen".
+    pub(crate) async fn mirror_refs_post_commit(&self) -> Result<()> {
+        match crate::retry::retrying("mirror_refs", || self.mirror_refs()).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.retryable() => Err(OrigoFSError::Metadata(format!(
+                "the operation committed, but mirroring refs for disaster recovery \
+                 did not: {e}. The commit is durable; re-run the operation only if \
+                 you intend a second one."
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
     /// This engine's workspace name, resolved from its root inode via the registry
     /// (`"default"` for the root workspace). `None` only if no registry row matches
     /// the root — e.g. a pre-`workspace`-table store — in which case the mirror is
@@ -255,7 +283,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             txn.clear_conflicts().await?;
         }
         txn.commit().await?;
-        self.mirror_refs().await?;
+        self.mirror_refs_post_commit().await?;
         Ok(commit_hash)
     }
 
@@ -307,7 +335,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if !self.meta.cas_ref(name, None, &head.to_hex()).await? {
             return Err(OrigoFSError::AlreadyExists(format!("branch {name}")));
         }
-        self.mirror_refs().await?;
+        // The ref has already advanced, so the mirror must not be able to make a
+        // caller's retry wrapper re-run this. See `mirror_refs_post_commit`.
+        self.mirror_refs_post_commit().await?;
         Ok(())
     }
 
@@ -356,7 +386,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         self.replace_working_tree_in(&mut *txn, &plan).await?;
         txn.set_ref(HEAD, &format!("ref:{branch}")).await?;
         txn.commit().await?;
-        self.mirror_refs().await?;
+        self.mirror_refs_post_commit().await?;
         Ok(())
     }
 

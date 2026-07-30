@@ -139,9 +139,44 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(buf.freeze())
     }
 
+    /// How many times a `vfs_*` read-modify-write re-reads and retries after
+    /// losing a compare-and-set race.
+    ///
+    /// These paths must produce a single value from `read → modify → write`, and
+    /// doing that unconditionally is a lost update: two writes to *different*
+    /// offsets of one file would each rewrite the whole body, and the second would
+    /// erase the first. That is not an exotic case here — this is the FUSE/NFS
+    /// surface, where concurrent writers to one file are the norm.
+    ///
+    /// So the store is updated conditionally on the content the body was read from
+    /// (the same `set_content_if` guard the attributed write path uses), and a lost
+    /// race re-reads and reapplies. Retrying rather than returning a conflict is
+    /// what the surface requires: a POSIX `write(2)` has no way to tell the kernel
+    /// "re-read and try again", so resolving it here is the only place it can
+    /// happen. Bounded, so genuine livelock surfaces as an error instead of
+    /// spinning forever.
+    const VFS_CAS_ATTEMPTS: usize = 16;
+
     /// Write `data` at `offset` (extending the file as needed). Returns bytes written.
     pub async fn vfs_write(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32> {
+        for _ in 0..Self::VFS_CAS_ATTEMPTS {
+            match self.vfs_write_attempt(ino, offset, data).await? {
+                Some(n) => return Ok(n),
+                None => continue, // lost the CAS: someone else wrote; re-read and redo
+            }
+        }
+        Err(OrigoFSError::Conflict(format!(
+            "ino {ino}: write at offset {offset} lost {} compare-and-set races in a \
+             row; the file is under sustained concurrent modification",
+            Self::VFS_CAS_ATTEMPTS
+        )))
+    }
+
+    /// One read-modify-write attempt. `Ok(None)` means the file changed underneath
+    /// us and the caller should retry.
+    async fn vfs_write_attempt(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<Option<u32>> {
         let inode = self.vfs_getattr(ino).await?;
+        let pre = inode.content;
         let mut bytes = match inode.content {
             Some(h) => self.read_body(&h).await?,
             None => Vec::new(),
@@ -165,13 +200,37 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
         bytes[offset as usize..end].copy_from_slice(data);
         let (mhash, size) = self.store_body(&bytes).await?;
-        self.meta.set_content(ino, mhash, size).await?;
-        Ok(data.len() as u32)
+        // Conditional on the version this body was read from, so a concurrent
+        // write to another offset is not silently erased. The orphaned chunks a
+        // lost race leaves behind are ordinary unreferenced content; gc reclaims
+        // them.
+        let mut tx = self.meta.begin().await?;
+        let won = tx.set_content_if(ino, pre.as_ref(), mhash, size).await?;
+        if !won {
+            return Ok(None); // dropping `tx` rolls back
+        }
+        tx.commit().await?;
+        Ok(Some(data.len() as u32))
     }
 
     /// Truncate/extend a file to `size` bytes.
     pub async fn vfs_truncate(&self, ino: Ino, size: u64) -> Result<()> {
+        for _ in 0..Self::VFS_CAS_ATTEMPTS {
+            if self.vfs_truncate_attempt(ino, size).await? {
+                return Ok(());
+            }
+        }
+        Err(OrigoFSError::Conflict(format!(
+            "ino {ino}: truncate to {size} lost {} compare-and-set races in a row; \
+             the file is under sustained concurrent modification",
+            Self::VFS_CAS_ATTEMPTS
+        )))
+    }
+
+    /// One truncate attempt; `Ok(false)` means retry. See [`Self::vfs_write_attempt`].
+    async fn vfs_truncate_attempt(&self, ino: Ino, size: u64) -> Result<bool> {
         let inode = self.vfs_getattr(ino).await?;
+        let pre = inode.content;
         // No fixed ceiling: growing a file materializes it in memory, so bound
         // only by what can actually be addressed and allocated — a hostile size
         // (e.g. u64::MAX) fails as TooLarge instead of aborting the process.
@@ -189,8 +248,14 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
         bytes.resize(target, 0);
         let (mhash, sz) = self.store_body(&bytes).await?;
-        self.meta.set_content(ino, mhash, sz).await?;
-        Ok(())
+        // See `vfs_write_attempt`: conditional, so a concurrent write is not lost.
+        let mut tx = self.meta.begin().await?;
+        let won = tx.set_content_if(ino, pre.as_ref(), mhash, sz).await?;
+        if !won {
+            return Ok(false); // dropping `tx` rolls back
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Create a regular file under `parent`.

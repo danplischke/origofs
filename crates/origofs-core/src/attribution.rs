@@ -644,7 +644,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 None => match Self::create_file_in(tx.as_mut(), parent, name).await {
                     Ok(ino) => ino,
                     Err(OrigoFSError::AlreadyExists(_)) => {
-                        drop(tx);
+                        // Awaited: the retry re-reads immediately. See
+                        // `MetaTxn::rollback`.
+                        tx.rollback().await?;
                         // A conditional write that required absence can't proceed
                         // once the file exists.
                         if matches!(base, WriteBase::Expected(None)) {
@@ -859,6 +861,22 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // Map byte offsets to 1-based line numbers by walking the content once
         // alongside the (in-order) runs: a byte is on line `1 + newlines before it`.
         let bytes = self.read_body(&content).await?;
+        // The runs must describe exactly this body before any of them is used to
+        // index into it. `BlameMap::decode` is fully lenient — any `u64` length
+        // parses — and the runs are not necessarily this process's own work:
+        // `resync::carry_blame` copies a *peer's* blame string verbatim, only
+        // remapping actor ids, and a hand-edited or corrupt `blob_blame` row gets
+        // here too. Without this the slice below panics on an out-of-range index
+        // and `pos + r.len` overflows. `revert_session` has always made exactly
+        // this check; `blame` skipping it was an oversight, not a contract.
+        if map.total() != bytes.len() as u64 {
+            return Err(OrigoFSError::Corrupt(format!(
+                "{path}: blame map covers {} bytes but the content is {} — refusing \
+                 to attribute against a mismatched body",
+                map.total(),
+                bytes.len(),
+            )));
+        }
         let mut out = Vec::new();
         let mut pos: u64 = 0; // byte offset at the start of the current run
         let mut line: u32 = 1; // line number at `pos`

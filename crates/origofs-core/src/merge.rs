@@ -287,7 +287,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
             self.replace_working_tree_in(&mut *txn, &plan).await?;
             txn.commit().await?;
-            self.mirror_refs().await?;
+            self.mirror_refs_post_commit().await?;
             return Ok((MergeOutcome::FastForward(theirs), stale));
         }
 
@@ -338,7 +338,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
             self.replace_working_tree_in(&mut *txn, &plan).await?;
             txn.commit().await?;
-            self.mirror_refs().await?;
+            self.mirror_refs_post_commit().await?;
             Ok((MergeOutcome::Merged(commit_hash), stale))
         } else {
             // Conflicts: reflect the merge (with markers) and record MERGE_HEAD;
@@ -361,7 +361,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
             txn.set_ref(MERGE_HEAD, &theirs.to_hex()).await?;
             txn.commit().await?;
-            self.mirror_refs().await?;
+            self.mirror_refs_post_commit().await?;
             Ok((MergeOutcome::Conflicts(conflicts), stale))
         }
     }

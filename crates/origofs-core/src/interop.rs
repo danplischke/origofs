@@ -88,7 +88,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .cas_ref(branch, expect.as_deref(), &new.to_hex())
             .await?;
         if swapped {
-            self.mirror_refs().await?;
+            // The ref has already advanced; see `mirror_refs_post_commit`.
+            self.mirror_refs_post_commit().await?;
         }
         Ok(swapped)
     }

@@ -479,6 +479,21 @@ pub trait MetaTxn: Send {
 
     /// Commit every staged mutation atomically. Consumes the transaction.
     async fn commit(self: Box<Self>) -> Result<()>;
+
+    /// Discard every staged mutation, **awaiting** the rollback. Consumes the
+    /// transaction.
+    ///
+    /// Dropping a transaction also rolls it back, and for most error paths that
+    /// is enough. It is *not* enough when the very next thing the caller does
+    /// depends on the rollback having finished — the retry loops that drop a
+    /// transaction and immediately re-read (`engine.rs`'s create races,
+    /// `attribution.rs`'s conditional write) are exactly that shape. `Drop`
+    /// cannot await, so the Postgres implementation has to hand the rollback to a
+    /// spawned task and let the pinned connection return to the pool only once it
+    /// finishes; a caller racing that task can be given the same connection while
+    /// its transaction is still open. Rolling back explicitly removes the race
+    /// instead of narrowing it.
+    async fn rollback(self: Box<Self>) -> Result<()>;
 }
 
 /// Delegating impl so `Arc<dyn MetadataStore>` (and `Arc<ConcreteStore>`) is

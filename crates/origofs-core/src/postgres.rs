@@ -861,11 +861,20 @@ impl MetadataStore for PostgresMetadataStore {
         let hex = content.map(|h| h.to_hex());
         let size = size as i64;
         let now = now_secs();
-        c.execute(
-            "UPDATE inode SET content_hash = $1, size = $2, mtime = $3, ctime = $3 WHERE ino = $4",
-            &[&hex, &size, &now, &ino],
-        )
-        .await?;
+        let n = c
+            .execute(
+                "UPDATE inode SET content_hash = $1, size = $2, mtime = $3, ctime = $3 WHERE ino = $4",
+                &[&hex, &size, &now, &ino],
+            )
+            .await?;
+        // See the SQLite implementation: a zero-row update means the inode was
+        // unlinked while the content was being written, and reporting that as
+        // success loses the write silently.
+        if n == 0 {
+            return Err(OrigoFSError::NotFound(format!(
+                "inode {ino} was removed before its content could be written"
+            )));
+        }
         Ok(())
     }
 
@@ -1798,12 +1807,19 @@ impl MetaTxn for PostgresTxn {
         let hex = content.map(|h| h.to_hex());
         let size = size as i64;
         let now = now_secs();
-        self.conn()
+        let n = self
+            .conn()
             .execute(
                 "UPDATE inode SET content_hash = $1, size = $2, mtime = $3, ctime = $3 WHERE ino = $4",
                 &[&hex, &size, &now, &ino],
             )
             .await?;
+        // See the SQLite implementation.
+        if n == 0 {
+            return Err(OrigoFSError::NotFound(format!(
+                "inode {ino} was removed before its content could be written"
+            )));
+        }
         Ok(())
     }
 
@@ -2113,6 +2129,15 @@ impl MetaTxn for PostgresTxn {
         // `obj` drops here, returning a clean (no open txn) connection to the pool.
         Ok(())
     }
+
+    async fn rollback(mut self: Box<Self>) -> Result<()> {
+        let obj = self.obj.take().expect("transaction already finished");
+        // Awaited, unlike the `Drop` path: the connection is clean and back in the
+        // pool before this returns, so a caller's next query cannot be handed a
+        // connection with this transaction still open.
+        obj.batch_execute("ROLLBACK").await?;
+        Ok(())
+    }
 }
 
 impl Drop for PostgresTxn {
@@ -2121,14 +2146,38 @@ impl Drop for PostgresTxn {
         // connection returns to the pool — otherwise a reused connection would
         // inherit the open transaction. `Drop` can't `await`, so spawn the
         // ROLLBACK and move the connection into that task; it is recycled only
-        // once the rollback completes. Outside a runtime (a drop in sync
-        // context) we let the connection close instead.
-        if let Some(obj) = self.obj.take()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            handle.spawn(async move {
-                let _ = obj.batch_execute("ROLLBACK").await;
-            });
+        // once the rollback completes.
+        //
+        // This is the **backstop**, not the intended path: it cannot tell the
+        // caller when the rollback finished, so a caller whose next step depends
+        // on that ordering must call [`MetaTxn::rollback`] instead.
+        //
+        // Whatever happens, the connection must not go back to the pool with an
+        // open transaction. Two ways that could happen, both handled by detaching
+        // it (`Object::take` removes it from the pool permanently, so the manager
+        // opens a fresh one instead of handing this one out dirty):
+        //
+        //   * the ROLLBACK itself fails — the connection's state is then unknown;
+        //   * there is no runtime to spawn onto, so no rollback can be issued at
+        //     all. Dropping the object here would recycle it as-is.
+        //
+        // The remaining hole is a runtime that shuts down before the spawned task
+        // runs, which drops the task and with it the connection — dropping a
+        // `deadpool` object during shutdown returns it to a pool nothing will
+        // borrow from again, so it is harmless.
+        if let Some(obj) = self.obj.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        if obj.batch_execute("ROLLBACK").await.is_err() {
+                            let _ = deadpool_postgres::Object::take(obj);
+                        }
+                    });
+                }
+                Err(_) => {
+                    let _ = deadpool_postgres::Object::take(obj);
+                }
+            }
         }
     }
 }
