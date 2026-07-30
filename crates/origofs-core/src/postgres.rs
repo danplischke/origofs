@@ -1822,6 +1822,17 @@ impl MetaTxn for PostgresTxn {
         Ok(())
     }
 
+    async fn adjust_nlink(&mut self, ino: Ino, delta: i64) -> Result<i64> {
+        let row = self
+            .conn()
+            .query_one(
+                "UPDATE inode SET nlink = nlink + $1 WHERE ino = $2 RETURNING nlink",
+                &[&delta, &ino],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
     async fn delete_inode(&mut self, ino: Ino) -> Result<()> {
         let c = self.conn();
         c.execute("DELETE FROM symlink WHERE ino = $1", &[&ino])
@@ -1831,7 +1842,58 @@ impl MetaTxn for PostgresTxn {
         Ok(())
     }
 
+    async fn delete_inode_if_childless(&mut self, ino: Ino) -> Result<bool> {
+        let c = self.conn();
+        // Claim the row *before* asking whether it has children, with the same
+        // statement `add_dentry` uses. This ordering is load-bearing and was
+        // arrived at empirically (`postgres_rmdir_racing_mkdir_never_orphans_a_dentry`):
+        // relying on the conditional delete alone is not enough, because when it
+        // blocks on a concurrent locker Postgres re-evaluates its qualification
+        // against the *updated row* but keeps the original snapshot for the
+        // `dentry` subquery — so the child that just committed stays invisible
+        // and the delete goes through anyway.
+        //
+        // Blocking on the claim instead moves the wait one statement earlier. In
+        // READ COMMITTED each statement takes a fresh snapshot, so by the time
+        // the delete below runs the inserter has committed and its child *is*
+        // visible. The other order is safe too: a claim that matches no row means
+        // the inode is already gone.
+        if c.execute("UPDATE inode SET nlink = nlink WHERE ino = $1", &[&ino])
+            .await?
+            == 0
+        {
+            return Ok(false);
+        }
+        let n = c
+            .execute(
+                "DELETE FROM inode WHERE ino = $1
+                   AND NOT EXISTS (SELECT 1 FROM dentry WHERE parent_ino = $1)",
+                &[&ino],
+            )
+            .await?;
+        if n == 1 {
+            c.execute("DELETE FROM symlink WHERE ino = $1", &[&ino])
+                .await?;
+        }
+        Ok(n == 1)
+    }
+
     async fn add_dentry(&mut self, parent: Ino, name: &str, ino: Ino) -> Result<()> {
+        // Claim the parent first — a self-update rather than a read, so it both
+        // proves the directory still exists inside this transaction and takes its
+        // row. A concurrent `rmdir` then blocks here and, on re-evaluating its
+        // conditional delete against the updated row, sees this child. See the
+        // trait method's docs.
+        if self
+            .conn()
+            .execute("UPDATE inode SET nlink = nlink WHERE ino = $1", &[&parent])
+            .await?
+            == 0
+        {
+            return Err(OrigoFSError::NotFound(format!(
+                "parent inode {parent} no longer exists"
+            )));
+        }
         match self
             .conn()
             .execute(

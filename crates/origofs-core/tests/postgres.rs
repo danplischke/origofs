@@ -785,3 +785,49 @@ async fn a_transaction_opens_at_a_stated_isolation_level() {
         "a bare BEGIN would inherit `default_transaction_isolation`"
     );
 }
+
+/// The `rmdir`-races-`mkdir` guarantee on the backend that can actually run the
+/// two transactions at the same time.
+///
+/// SQLite serializes writers outright, so its version of this test only proves
+/// the existence check. Postgres runs both concurrently, which is where the
+/// contention has to come from the parent row: `add_dentry` claims it, so the
+/// conditional delete either loses the row or re-evaluates and finds the child.
+/// Asserted against a live server rather than argued from MVCC semantics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn postgres_rmdir_racing_mkdir_never_orphans_a_dentry() {
+    let Some(dsn) = dsn() else {
+        eprintln!("skipping pg rmdir race: ORIGOFS_PG_TEST_URL unset");
+        return;
+    };
+    let _guard = pg_lock().lock().await;
+    reset(&dsn).await;
+    let meta = Arc::new(PostgresMetadataStore::connect(&dsn).await.unwrap());
+    let fs = Arc::new(Fs::new(meta.clone(), Arc::new(MemStore::new())));
+    fs.init().await.unwrap();
+
+    for round in 0..40u64 {
+        let d = format!("/dir{round}");
+        fs.mkdir_p(&d).await.unwrap();
+        let dir = meta
+            .lookup(1, &format!("dir{round}"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (a, b) = (Arc::clone(&fs), Arc::clone(&fs));
+        let (d1, d2) = (d.clone(), format!("{d}/child"));
+        let remove = tokio::spawn(async move { a.remove(&d1).await });
+        let create = tokio::spawn(async move { b.mkdir_p(&d2).await });
+        let removed = remove.await.unwrap();
+        let created = create.await.unwrap();
+
+        let children = meta.child_count(dir).await.unwrap();
+        let parent_gone = meta.get_inode(dir).await.unwrap().is_none();
+        assert!(
+            !(parent_gone && children > 0),
+            "round {round}: {d} deleted with {children} orphaned child dentr(ies) \
+             (remove: {removed:?}, mkdir: {created:?})"
+        );
+    }
+}

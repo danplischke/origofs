@@ -366,13 +366,18 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if inode.kind != FileKind::Dir {
             return Err(OrigoFSError::NotADirectory(path.to_string()));
         }
+        // A cheap early answer for the common case; the binding check is the
+        // conditional delete below, which evaluates emptiness as part of the
+        // statement rather than trusting this read from before the transaction.
         if self.meta.child_count(ino).await? > 0 {
             return Err(OrigoFSError::DirectoryNotEmpty(path.to_string()));
         }
         // Unlink + free the inode atomically (C1/L3).
         let mut tx = self.meta.begin().await?;
         tx.remove_dentry(parent, name).await?;
-        tx.delete_inode(ino).await?;
+        if !tx.delete_inode_if_childless(ino).await? {
+            return Err(OrigoFSError::DirectoryNotEmpty(path.to_string()));
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -778,11 +783,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // crash can't drop the name yet leave the inode dangling (C1/L3).
         let mut tx = self.meta.begin().await?;
         tx.remove_dentry(parent, name).await?;
-        let nlink = inode.nlink - 1;
-        if nlink <= 0 {
+        // Decremented by the database, not by us: the `nlink` we read above
+        // happened before the transaction, so computing the new value here would
+        // let two concurrent unlinks both write the same one (see
+        // `MetaTxn::adjust_nlink`).
+        if tx.adjust_nlink(ino, -1).await? <= 0 {
             tx.delete_inode(ino).await?;
-        } else {
-            tx.set_nlink(ino, nlink).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -883,13 +889,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if let Some((dino, dinode)) = overwrite {
             tx.remove_dentry(dp, dn).await?;
             match dinode.kind {
-                FileKind::Dir => tx.delete_inode(dino).await?,
+                // Conditional, for the same reason `rmdir` is: the emptiness
+                // check above ran before this transaction opened.
+                FileKind::Dir => {
+                    if !tx.delete_inode_if_childless(dino).await? {
+                        return Err(OrigoFSError::DirectoryNotEmpty(to.to_string()));
+                    }
+                }
                 _ => {
-                    let nlink = dinode.nlink - 1;
-                    if nlink <= 0 {
+                    if tx.adjust_nlink(dino, -1).await? <= 0 {
                         tx.delete_inode(dino).await?;
-                    } else {
-                        tx.set_nlink(dino, nlink).await?;
                     }
                 }
             }

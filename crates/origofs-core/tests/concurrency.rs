@@ -521,3 +521,40 @@ async fn a_write_derived_from_a_replaced_version_is_refused() {
         "a refused write must not appear in the attribution ground truth"
     );
 }
+
+/// `rmdir` must not leave a dentry parented to an inode it deleted.
+///
+/// Emptiness used to be read *before* the transaction and then trusted, so a
+/// `mkdir` that committed in between produced a directory entry whose parent no
+/// longer exists: a row nothing can reach, invisible to `ls`, to `build_tree`,
+/// and to the GC mark — the same shape of loss as `rename`-into-itself. The
+/// check now runs as part of the delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn rmdir_racing_mkdir_never_orphans_a_dentry() {
+    for round in 0..80u64 {
+        let fs = shared().await;
+        fs.mkdir_p("/dir").await.unwrap();
+        let dir = fs
+            .meta
+            .lookup(1, "dir")
+            .await
+            .unwrap()
+            .expect("/dir exists");
+
+        let (a, b) = (Arc::clone(&fs), Arc::clone(&fs));
+        let remove = tokio::spawn(async move { a.remove("/dir").await });
+        let create = tokio::spawn(async move { b.mkdir_p("/dir/child").await });
+        let removed = remove.await.unwrap();
+        let created = create.await.unwrap();
+
+        // Whatever the interleaving, the two outcomes must agree: a surviving
+        // child implies a surviving parent.
+        let children = fs.meta.child_count(dir).await.unwrap();
+        let parent_gone = fs.meta.get_inode(dir).await.unwrap().is_none();
+        assert!(
+            !(parent_gone && children > 0),
+            "round {round}: /dir deleted with {children} orphaned child dentr(ies) \
+             (remove: {removed:?}, mkdir: {created:?})"
+        );
+    }
+}

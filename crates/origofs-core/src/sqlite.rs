@@ -1492,6 +1492,16 @@ impl MetaTxn for SqliteTxn {
         })
     }
 
+    async fn adjust_nlink(&mut self, ino: Ino, delta: i64) -> Result<i64> {
+        blocking_section(move || {
+            Ok(self.conn().query_row(
+                "UPDATE inode SET nlink = nlink + ?1 WHERE ino = ?2 RETURNING nlink",
+                params![delta, ino],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })
+    }
+
     async fn delete_inode(&mut self, ino: Ino) -> Result<()> {
         blocking_section(move || {
             let conn = self.conn();
@@ -1501,8 +1511,46 @@ impl MetaTxn for SqliteTxn {
         })
     }
 
+    async fn delete_inode_if_childless(&mut self, ino: Ino) -> Result<bool> {
+        blocking_section(move || {
+            let conn = self.conn();
+            // Claim the row first, mirroring the Postgres implementation — see
+            // there for why the ordering matters. SQLite serializes writers
+            // outright, so here it only reports that the inode still exists.
+            if conn.execute(
+                "UPDATE inode SET nlink = nlink WHERE ino = ?1",
+                params![ino],
+            )? == 0
+            {
+                return Ok(false);
+            }
+            let n = conn.execute(
+                "DELETE FROM inode WHERE ino = ?1
+                   AND NOT EXISTS (SELECT 1 FROM dentry WHERE parent_ino = ?1)",
+                params![ino],
+            )?;
+            if n == 1 {
+                conn.execute("DELETE FROM symlink WHERE ino = ?1", params![ino])?;
+            }
+            Ok(n == 1)
+        })
+    }
+
     async fn add_dentry(&mut self, parent: Ino, name: &str, ino: Ino) -> Result<()> {
         blocking_section(move || {
+            // Claim the parent first. A self-update rather than a read: it both
+            // proves the directory still exists *inside* this transaction and
+            // takes its row, so a concurrent `rmdir` cannot delete it out from
+            // under this insert. See the trait method's docs.
+            if self.conn().execute(
+                "UPDATE inode SET nlink = nlink WHERE ino = ?1",
+                params![parent],
+            )? == 0
+            {
+                return Err(OrigoFSError::NotFound(format!(
+                    "parent inode {parent} no longer exists"
+                )));
+            }
             match self.conn().execute(
                 "INSERT INTO dentry(parent_ino, name, ino) VALUES (?1, ?2, ?3)",
                 params![parent, name, ino],

@@ -244,11 +244,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
         let mut tx = self.meta.begin().await?;
         tx.remove_dentry(parent, name).await?;
-        let nlink = inode.nlink - 1;
-        if nlink <= 0 {
+        // The database decrements; see `MetaTxn::adjust_nlink` for why the
+        // `nlink` read above must not be turned into an absolute write.
+        if tx.adjust_nlink(ino, -1).await? <= 0 {
             tx.delete_inode(ino).await?;
-        } else {
-            tx.set_nlink(ino, nlink).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -265,12 +264,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if inode.kind != FileKind::Dir {
             return Err(OrigoFSError::NotADirectory(name.to_string()));
         }
+        // Early answer for the common case; the conditional delete below is the
+        // binding check — this read happens before the transaction opens.
         if self.meta.child_count(ino).await? > 0 {
             return Err(OrigoFSError::DirectoryNotEmpty(name.to_string()));
         }
         let mut tx = self.meta.begin().await?;
         tx.remove_dentry(parent, name).await?;
-        tx.delete_inode(ino).await?;
+        if !tx.delete_inode_if_childless(ino).await? {
+            return Err(OrigoFSError::DirectoryNotEmpty(name.to_string()));
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -314,13 +317,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if let Some((dino, dinode)) = overwrite {
             tx.remove_dentry(newparent, newname).await?;
             match dinode.kind {
-                FileKind::Dir => tx.delete_inode(dino).await?,
+                // Conditional, for the same reason `rmdir` is: the emptiness
+                // check above ran before this transaction opened.
+                FileKind::Dir => {
+                    if !tx.delete_inode_if_childless(dino).await? {
+                        return Err(OrigoFSError::DirectoryNotEmpty(format!("inode {dino}")));
+                    }
+                }
                 _ => {
-                    let nlink = dinode.nlink - 1;
-                    if nlink <= 0 {
+                    if tx.adjust_nlink(dino, -1).await? <= 0 {
                         tx.delete_inode(dino).await?;
-                    } else {
-                        tx.set_nlink(dino, nlink).await?;
                     }
                 }
             }

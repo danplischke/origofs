@@ -369,9 +369,59 @@ pub trait MetaTxn: Send {
     ) -> Result<bool>;
     /// Set an inode's link count.
     async fn set_nlink(&mut self, ino: Ino, nlink: i64) -> Result<()>;
+
+    /// Add `delta` to an inode's link count and return the new value.
+    ///
+    /// Prefer this over reading `nlink` and calling [`set_nlink`](Self::set_nlink)
+    /// with an absolute value. The read has to happen before the transaction (the
+    /// trait exposes no reads — see the note above), so two concurrent unlinks of
+    /// two hard links to one inode both read 2 and both write 1: both names go and
+    /// the inode is leaked at `nlink = 1` with nothing pointing at it, forever.
+    /// A delta computed by the database cannot lose an update that way.
+    ///
+    /// Latent today — nothing creates a second link — but it is the kind of thing
+    /// that is a silent leak the day a `link` op is added, and the delta form is
+    /// simpler than the read it replaces.
+    async fn adjust_nlink(&mut self, ino: Ino, delta: i64) -> Result<i64>;
+
+    /// Delete an inode **only if** no dentry names it as a parent, returning
+    /// whether it applied. `false` means the directory is not empty.
+    ///
+    /// `rmdir` cannot ask "is it empty?" and then delete: the answer is read
+    /// before the transaction opens, so a `mkdir` landing in between leaves its
+    /// dentry parented to an inode that no longer exists — a file that is in the
+    /// table and reachable from nothing.
+    ///
+    /// Implementations must claim the inode's row before testing emptiness, with
+    /// the same statement [`add_dentry`](Self::add_dentry) uses, so that the two
+    /// operations contend on one row. The conditional delete on its own is not
+    /// enough on Postgres; the backend implementations explain why, and
+    /// `postgres_rmdir_racing_mkdir_never_orphans_a_dentry` is the check.
+    ///
+    /// This is application-level integrity. A foreign key from
+    /// `dentry.parent_ino` to `inode.ino` would give it for free and in share
+    /// mode (so concurrent creates in one directory would stop serializing); the
+    /// schema declares no foreign keys at all today, which is why
+    /// `PRAGMA foreign_keys=ON` has nothing to enforce.
+    async fn delete_inode_if_childless(&mut self, ino: Ino) -> Result<bool>;
     /// Delete an inode (and any symlink row).
     async fn delete_inode(&mut self, ino: Ino) -> Result<()>;
     /// Link `name` in `parent` to `ino`. Errors if the name already exists.
+    /// Link `ino` into `parent` under `name`.
+    ///
+    /// Fails with [`OrigoFSError::NotFound`] if `parent` no longer exists, and —
+    /// this is the part that matters — takes the parent's row for update so that
+    /// an `rmdir` of it and this insert cannot both succeed. Callers resolve the
+    /// parent *before* the transaction, so without that contention a directory
+    /// removed in between leaves this dentry pointing at nothing: a row invisible
+    /// to `ls`, to `build_tree`, and to the GC mark, exactly like a `rename` into
+    /// its own descendant.
+    ///
+    /// The cost is that concurrent creates in one directory serialize on the
+    /// parent row. A foreign key from `dentry.parent_ino` to `inode.ino` would
+    /// buy the same guarantee in share mode, and is the better long-term answer;
+    /// the schema declares no foreign keys at all today, which is why
+    /// `PRAGMA foreign_keys=ON` has nothing to enforce.
     async fn add_dentry(&mut self, parent: Ino, name: &str, ino: Ino) -> Result<()>;
     /// Unlink `name` from `parent` (no-op if absent).
     async fn remove_dentry(&mut self, parent: Ino, name: &str) -> Result<()>;
