@@ -5,8 +5,12 @@
 # so the shipped `origofs serve` / `nfs` / `mcp` / `mount` daemons can front a
 # production (Postgres + object-store) backend with no custom host program.
 #
-# Encryption at rest (ORIGOFS_ENCRYPTION_KEY) is currently supported only with
-# the sqlite + local backend; it is rejected with any other backend here.
+# Encryption at rest: set ORIGOFS_ENCRYPTION_KEY (a passphrase) and it applies to
+# whichever backends you configure below, this one included. The key is derived
+# with Argon2id over a per-store random salt kept beside the content — in the
+# bucket for an object store — so it survives losing the metadata database and
+# garbage collection never touches it. The same passphrase must be used on every
+# open; a wrong one fails loudly rather than returning garbage.
 
 # --- metadata store ---------------------------------------------------------
 # backend = "sqlite"   # solo/offline (the default)

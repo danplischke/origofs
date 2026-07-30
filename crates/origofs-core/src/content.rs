@@ -90,6 +90,43 @@ pub trait ContentStore: Send + Sync {
         Ok(self.list().await?.into_iter().map(|h| (h, None)).collect())
     }
 
+    /// Read a small named **sidecar** value, or `None` if it was never written.
+    ///
+    /// A sidecar is deliberately *outside* the content-addressed namespace: it is
+    /// keyed by a name rather than a hash, and [`list`](Self::list) never
+    /// enumerates it, so garbage collection cannot see it and therefore cannot
+    /// sweep it. That last property is the whole point — the encryption salt lives
+    /// here, and a GC pass that reclaimed it would make every encrypted object in
+    /// the store permanently undecryptable.
+    ///
+    /// It also has to sit beside the *content*, not in the metadata database:
+    /// losing the database is a survivable event that `fsck --rebuild` recovers
+    /// from, and it must not also cost you the ability to read your bytes.
+    ///
+    /// Sidecars are for small, rarely-changing values only. The default has none.
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Write a sidecar **only if absent**, returning the value that is stored
+    /// afterwards — the caller's bytes, or the existing ones if another writer got
+    /// there first.
+    ///
+    /// Create-if-absent rather than plain write, because the salt is randomly
+    /// generated: two processes opening a fresh store concurrently would otherwise
+    /// each write a different salt, and whichever landed second would silently
+    /// invalidate the key the first had already derived and started writing with.
+    /// Returning the stored value makes both agree.
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        let _ = (name, bytes);
+        Err(OrigoFSError::Content(
+            "this content backend does not support sidecar values (needed for \
+             encryption-at-rest, which stores its key-derivation salt beside the content)"
+                .into(),
+        ))
+    }
+
     /// Delete an object, returning the bytes freed. Idempotent: deleting an
     /// absent hash succeeds and frees `0`.
     async fn delete(&self, hash: &Hash) -> Result<u64>;
@@ -121,6 +158,27 @@ pub trait ContentStore: Send + Sync {
     async fn ping(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Validate a sidecar name so it can be used as a single path/key component.
+///
+/// Same rule as every other name that becomes a path: no traversal, no separator,
+/// no NUL. Sidecar names are internal today, but this is the boundary where a
+/// future caller-supplied one would escape.
+fn sidecar_file(name: &str) -> Result<String> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name == "objects"
+    {
+        return Err(OrigoFSError::InvalidPath(format!(
+            "invalid sidecar name: {name:?}"
+        )));
+    }
+    Ok(name.to_string())
 }
 
 /// A content-addressed store backed by a local directory.
@@ -276,6 +334,37 @@ impl ContentStore for LocalCasStore {
         Ok(Self::exists(&self.path_for(hash)).await)
     }
 
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        match tokio::fs::read(self.root.join(sidecar_file(name)?)).await {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        let path = self.root.join(sidecar_file(name)?);
+        tokio::fs::create_dir_all(&self.root).await?;
+        // `create_new` is the exclusive-create: exactly one racing writer wins and
+        // the loser re-reads the winner's value.
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(mut f) => {
+                f.write_all(bytes).await?;
+                f.flush().await?;
+                Ok(bytes.to_vec())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(tokio::fs::read(&path).await?)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
         let now = std::time::SystemTime::now();
         let objects = self.root.join("objects");
@@ -383,6 +472,12 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
     async fn list(&self) -> Result<Vec<Hash>> {
         (**self).list().await
     }
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        (**self).get_sidecar(name).await
+    }
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        (**self).put_sidecar_if_absent(name, bytes).await
+    }
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
         (**self).list_with_age().await
     }
@@ -407,6 +502,9 @@ pub struct MemStore {
     /// When each object was first stored, so the store can report an age the way
     /// a real backend does (see [`ContentStore::list_with_age`]).
     born: Mutex<HashMap<Hash, std::time::Instant>>,
+    /// Named sidecars, kept out of `map` so `list()` never enumerates them and GC
+    /// therefore cannot sweep them (see [`ContentStore::get_sidecar`]).
+    sidecars: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl MemStore {
@@ -444,6 +542,25 @@ impl ContentStore for MemStore {
             .or_insert_with(|| Bytes::copy_from_slice(bytes));
         self.touch_born(hash);
         Ok(hash)
+    }
+
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .sidecars
+            .lock()
+            .expect("mem store poisoned")
+            .get(name)
+            .cloned())
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        Ok(self
+            .sidecars
+            .lock()
+            .expect("mem store poisoned")
+            .entry(name.to_string())
+            .or_insert_with(|| bytes.to_vec())
+            .clone())
     }
 
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
@@ -605,6 +722,27 @@ impl ContentStore for TieredStore {
         self.backend.list_with_age().await
     }
 
+    /// Forwarded to the backend, which is the authoritative store. Without this
+    /// the trait's no-op default silently swallows a batching backend's seal — a
+    /// `PackStore` behind a cache tier would never make its buffered chunks
+    /// durable, while metadata already referenced them.
+    async fn flush(&self) -> Result<()> {
+        self.backend.flush().await
+    }
+
+    /// See [`flush`](Self::flush).
+    async fn repack(&self) -> Result<u64> {
+        self.backend.repack().await
+    }
+
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.backend.get_sidecar(name).await
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.backend.put_sidecar_if_absent(name, bytes).await
+    }
+
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         let freed = self.backend.delete(hash).await?;
         let _ = self.cache.delete(hash).await; // best-effort cache eviction
@@ -702,6 +840,14 @@ impl ContentStore for VerifyingStore {
 
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
         self.inner.list_with_age().await
+    }
+
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get_sidecar(name).await
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.inner.put_sidecar_if_absent(name, bytes).await
     }
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {

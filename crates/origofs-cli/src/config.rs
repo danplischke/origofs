@@ -20,9 +20,13 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use origofs_sdk::{GcsConfig, S3Config, Workspace};
+use anyhow::{Context, Result};
+use origofs_sdk::{
+    ContentStore, GcsConfig, LocalCasStore, MetadataStore, ObjectContentStore, PackStore,
+    PostgresMetadataStore, S3Config, SqliteMetadataStore, Workspace,
+};
 use serde::Deserialize;
 
 /// A workspace's backend configuration, loaded from a TOML file.
@@ -150,19 +154,55 @@ impl Config {
         };
         let index_dir = |d: &Option<PathBuf>| d.clone().unwrap_or_else(|| workspace.join("index"));
 
-        // Encryption at rest (ORIGOFS_ENCRYPTION_KEY) is wired only for the local
-        // content store with SQLite metadata; fail loudly rather than silently
-        // storing plaintext against another backend.
         let enc = std::env::var("ORIGOFS_ENCRYPTION_KEY")
             .ok()
             .filter(|k| !k.is_empty());
-        let is_sqlite_local = matches!(self.metadata, Metadata::Sqlite { .. })
-            && matches!(self.content, Content::Local { .. });
-        if enc.is_some() && !is_sqlite_local {
-            bail!(
-                "ORIGOFS_ENCRYPTION_KEY is set, but encryption at rest is currently \
-                 supported only with the sqlite + local backend; unset it or switch backends"
-            );
+
+        // Encryption at rest, for **any** backend combination.
+        //
+        // This used to refuse everything but sqlite + a local directory, which
+        // meant the deployment `deploy/config.example.toml` recommends — Postgres
+        // over an object store — could not have encryption at all. `EncryptedStore`
+        // always composed over any `ContentStore`; the missing piece was somewhere
+        // to keep the key-derivation salt that survives losing the metadata
+        // database and that GC cannot sweep. That is now a content-store sidecar,
+        // so the stack is assembled here instead of going through the
+        // per-combination `open_*` recipes.
+        if let Some(key) = &enc {
+            let meta: Arc<dyn MetadataStore> = match &self.metadata {
+                Metadata::Sqlite { .. } => Arc::new(SqliteMetadataStore::open(sqlite_db())?),
+                Metadata::Postgres { dsn } => Arc::new(PostgresMetadataStore::connect(dsn).await?),
+            };
+            // The raw backend the salt sidecar lives on, packed if configured.
+            let backend: Arc<dyn ContentStore> = match &self.content {
+                Content::Local { path } => {
+                    let cas = path.clone().unwrap_or_else(|| workspace.join("cas"));
+                    Arc::new(LocalCasStore::open(&cas).await?)
+                }
+                Content::S3(s3) => {
+                    let data: Arc<dyn ContentStore> =
+                        Arc::new(ObjectContentStore::s3(s3.to_cfg())?);
+                    if s3.packed {
+                        let index: Arc<dyn ContentStore> =
+                            Arc::new(LocalCasStore::open(index_dir(&s3.index_dir)).await?);
+                        Arc::new(PackStore::new(data, index))
+                    } else {
+                        data
+                    }
+                }
+                Content::Gcs(gcs) => {
+                    let data: Arc<dyn ContentStore> =
+                        Arc::new(ObjectContentStore::gcs(gcs.to_cfg())?);
+                    if gcs.packed {
+                        let index: Arc<dyn ContentStore> =
+                            Arc::new(LocalCasStore::open(index_dir(&gcs.index_dir)).await?);
+                        Arc::new(PackStore::new(data, index))
+                    } else {
+                        data
+                    }
+                }
+            };
+            return Ok(Workspace::open_encrypted(meta, backend, key).await?);
         }
 
         let ws = match (&self.metadata, &self.content) {

@@ -367,6 +367,14 @@ impl ContentStore for PackStore {
         Ok(out)
     }
 
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.data.get_sidecar(name).await
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.data.put_sidecar_if_absent(name, bytes).await
+    }
+
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
         // A chunk's age is its *index entry's* age: the index is what makes it
         // reachable, and a repack rewrites the entry when the chunk moves packs.

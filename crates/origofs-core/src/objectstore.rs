@@ -227,6 +227,19 @@ impl ObjectContentStore {
         let hex = hash.to_hex();
         OsPath::from(format!("{}/{}/{}", self.prefix, &hex[0..2], &hex[2..]))
     }
+
+    /// A sidecar's key. Deliberately a *sibling* of the content prefix rather than
+    /// under it: `list()` enumerates `<prefix>/…`, so anything below it would be
+    /// seen by garbage collection and swept. Losing the encryption salt that way
+    /// would make every object in the bucket permanently undecryptable.
+    fn sidecar_path(&self, name: &str) -> Result<OsPath> {
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err(OrigoFSError::InvalidPath(format!(
+                "invalid sidecar name: {name:?}"
+            )));
+        }
+        Ok(OsPath::from(format!("{}-meta/{name}", self.prefix)))
+    }
 }
 
 #[async_trait]
@@ -323,6 +336,39 @@ impl ContentStore for ObjectContentStore {
             }
         }
         Ok(out)
+    }
+
+    async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        match self.store.get(&self.sidecar_path(name)?).await {
+            Ok(r) => Ok(Some(r.bytes().await.map_err(OrigoFSError::from)?.to_vec())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(OrigoFSError::from(e)),
+        }
+    }
+
+    async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        let path = self.sidecar_path(name)?;
+        // A conditional create, so two processes bootstrapping the same fresh
+        // store cannot each write a different random salt and have the second
+        // silently invalidate the first's key.
+        let opts = object_store::PutOptions::from(object_store::PutMode::Create);
+        match self
+            .store
+            .put_opts(&path, PutPayload::from(bytes.to_vec()), opts)
+            .await
+        {
+            Ok(_) => Ok(bytes.to_vec()),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                match self.get_sidecar(name).await? {
+                    Some(v) => Ok(v),
+                    // Vanished between the failed create and the read.
+                    None => Err(OrigoFSError::Content(format!(
+                        "sidecar {name} exists but could not be read back"
+                    ))),
+                }
+            }
+            Err(e) => Err(OrigoFSError::from(e)),
+        }
     }
 
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
