@@ -309,6 +309,21 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Materialize a tree's entries as children of `parent_ino`, staging every
     /// inode/dentry in `txn` so the whole subtree commits atomically.
+    ///
+    /// This is the door where a *stored* name comes from the content store rather
+    /// than from a caller, so every entry name is re-validated here. Objects are
+    /// integrity-checked against their address, but an address only proves the
+    /// bytes are the ones that were written — not that whoever wrote them was
+    /// honest. A tree reached from a shared bucket, a `git import`, or a `resync`
+    /// peer can name an entry `..`, and without this check it would land in the
+    /// dentry table, breaking the invariant that a poisoned name can never be
+    /// stored (and so can never escape a later host materialization).
+    ///
+    /// Rejecting fails the whole materialization: the caller's transaction rolls
+    /// back, so a hostile tree yields a clean error and an untouched working tree
+    /// rather than a half-applied one. Deliberately *not* enforced in
+    /// `Tree::decode` — GC and diff must still be able to walk such a tree in
+    /// order to reclaim or describe it.
     #[async_recursion]
     async fn materialize_into_txn(
         &self,
@@ -318,6 +333,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     ) -> Result<()> {
         let tree = Tree::decode(&self.content.get(&tree_hash).await?)?;
         for e in &tree.entries {
+            crate::engine::validate_component(&e.name)?;
             match e.kind {
                 TreeKind::Dir => {
                     let ino = txn

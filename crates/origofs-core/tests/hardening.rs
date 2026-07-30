@@ -254,6 +254,68 @@ async fn hostile_ref_names_are_rejected_everywhere() {
     origofs_core::validate_ref_name("MERGE_HEAD").unwrap();
 }
 
+// SEC: the *third* traversal door. Path components are validated on the way in
+// and ref names at the ref table — but a tree entry's name arrives from the
+// content store, and `materialize_into_txn` fed it straight to `add_dentry`. An
+// object's address proves its bytes are what was written, not that the writer was
+// honest: a tree from a shared bucket, a `git import`, or a `resync` peer can name
+// an entry `..`. Checkout/merge/rebuild must refuse it, and leave the working tree
+// alone when they do.
+#[tokio::test]
+async fn hostile_tree_entry_names_are_rejected_on_materialize() {
+    use origofs_core::{Commit, Tree, TreeEntry, TreeKind};
+
+    for bad in ["..", ".", "a/b", "x\0y", ""] {
+        let fs = fixture().await;
+        fs.write("/legit", b"original").await.unwrap();
+        fs.commit("a", "base").await.unwrap();
+
+        // A real manifest for the hostile entry to point at: write a file the
+        // ordinary way and reuse its content address.
+        fs.write("/payload-src", b"payload").await.unwrap();
+        let mhash = fs.stat("/payload-src").await.unwrap().content.unwrap();
+        let tree = Tree {
+            entries: vec![TreeEntry {
+                name: bad.to_string(),
+                mode: 0o100644,
+                kind: TreeKind::File,
+                hash: mhash,
+            }],
+        };
+        let tree_hash = fs.put_object(&tree.encode()).await.unwrap();
+        let commit = Commit {
+            tree: tree_hash,
+            parents: vec![],
+            author: "attacker".into(),
+            message: "poisoned tree".into(),
+            timestamp: 0,
+        };
+        let chash = fs.put_object(&commit.encode()).await.unwrap();
+        fs.set_branch("evil", chash).await.unwrap();
+
+        let err = fs.checkout("evil").await;
+        assert!(
+            matches!(err, Err(OrigoFSError::InvalidPath(_))),
+            "checkout of a tree naming {bad:?} should be rejected, got {err:?}"
+        );
+
+        // The transaction rolled back: the pre-existing tree is intact and the
+        // hostile name was never stored.
+        assert_eq!(&fs.read("/legit").await.unwrap()[..], b"original");
+        let names: Vec<String> = fs
+            .ls("/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.iter().all(|n| n == "legit" || n == "payload-src"),
+            "no entry from the poisoned tree may survive, got {names:?}"
+        );
+    }
+}
+
 // SEC (security audit #4): the object-graph decoders must bound their
 // pre-allocation, so a tiny crafted object declaring a hostile entry count
 // returns an error instead of aborting the process on a multi-GB
