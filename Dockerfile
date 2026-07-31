@@ -10,7 +10,7 @@
 # Must be >= the workspace MSRV enforced by the `msrv` CI job (edition 2024 sets a
 # 1.85 *language* floor, but the code uses let-chains, stabilized in 1.88). Keep
 # this in step with .github/workflows/ci.yml's `msrv` job.
-FROM rust:1.88-slim AS build
+FROM rust:1.97-slim AS build
 # The CLI enables origofs-sdk's `full` features; the FUSE surface (the `fuser`
 # crate) links libfuse3 via pkg-config. The object-store TLS stack is rustls, so
 # no OpenSSL dev headers are needed.
