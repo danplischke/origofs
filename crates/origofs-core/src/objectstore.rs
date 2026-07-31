@@ -85,6 +85,17 @@ pub struct GcsConfig {
     pub application_credentials: Option<String>,
     /// Key prefix for stored objects (default `objects`).
     pub prefix: Option<String>,
+    /// Allow a plaintext (`http://`) endpoint.
+    ///
+    /// Needed to point the native GCS backend at a local emulator
+    /// (`fake-gcs-server`), whose `gcs_base_url` is `http://`. Without it
+    /// `object_store` refuses the request with a `BadScheme` builder error before
+    /// anything leaves the process — which is why GCS had no emulator-backed test
+    /// leg while S3 had a MinIO one: the option simply did not exist here.
+    ///
+    /// Leave `false` against real GCS; it exists for emulators and never applies to
+    /// `https://storage.googleapis.com`.
+    pub allow_http: bool,
 }
 
 impl std::fmt::Debug for GcsConfig {
@@ -99,6 +110,7 @@ impl std::fmt::Debug for GcsConfig {
             )
             .field("application_credentials", &self.application_credentials)
             .field("prefix", &self.prefix)
+            .field("allow_http", &self.allow_http)
             .finish()
     }
 }
@@ -208,7 +220,7 @@ impl ObjectContentStore {
             GoogleCloudStorageBuilder::from_env()
         }
         .with_bucket_name(&cfg.bucket)
-        .with_client_options(client_options())
+        .with_client_options(client_options().with_allow_http(cfg.allow_http))
         .with_retry(retry_config());
         if let Some(key) = &cfg.service_account_key {
             builder = builder.with_service_account_key(key);
@@ -221,6 +233,34 @@ impl ObjectContentStore {
         let store = builder.build().map_err(OrigoFSError::from)?;
         let prefix = cfg.prefix.clone().unwrap_or_else(|| "objects".to_string());
         Ok(Self::new(Arc::new(store), prefix))
+    }
+
+    /// The largest object a single PUT can carry.
+    ///
+    /// There is no multipart upload here — by design: chunks are capped at
+    /// `MAX_CHUNK` (256 KiB), so batching (`PackStore`) is the answer to
+    /// per-request cost rather than multipart (`docs/DESIGN.md` §4a). The one
+    /// object that can approach a provider limit is a **manifest**, at 36 bytes
+    /// per chunk: a ~7.5 TiB file has a 4 GiB manifest, and a ~9 TiB file exceeds
+    /// S3's and GCS's 5 GiB single-request ceiling.
+    ///
+    /// Without this check that arrives as a raw provider error partway through a
+    /// long upload, after minutes of transfer, saying nothing about which origofs
+    /// object is at fault. 5 GiB is the common floor across S3 and GCS.
+    const MAX_SINGLE_PUT: usize = 5 * 1024 * 1024 * 1024;
+
+    fn check_put_size(bytes: &[u8]) -> Result<()> {
+        if bytes.len() > Self::MAX_SINGLE_PUT {
+            return Err(OrigoFSError::TooLarge(format!(
+                "object is {} bytes, past the {} byte single-PUT limit and this \
+                 backend does not use multipart. Only a manifest reaches this size \
+                 (~36 bytes per chunk), so the underlying file is on the order of \
+                 9 TiB; split it, or raise the chunk size to shrink the manifest",
+                bytes.len(),
+                Self::MAX_SINGLE_PUT
+            )));
+        }
+        Ok(())
     }
 
     fn path_for(&self, hash: &Hash) -> OsPath {
@@ -248,15 +288,47 @@ impl ObjectContentStore {
     fn slot_path(&self, name: &str) -> OsPath {
         OsPath::from(format!("{}.meta/{}", self.prefix, name))
     }
+
+    /// Whether an already-stored object is stale enough that a deduplicating write
+    /// onto it must refresh its recency (see [`ContentStore::touch`]). Uses the
+    /// same epoch-seconds arithmetic as `list_with_age`, so the write path and the
+    /// sweep agree on what "old" means. A future-dated object (clock skew) reports
+    /// as young here and as unknown-age there — both leave it alone.
+    fn refresh_needed(meta: &object_store::ObjectMeta) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        u64::try_from(now - meta.last_modified.timestamp())
+            .is_ok_and(|age| age >= crate::content::DEDUP_REFRESH_AFTER_SECS)
+    }
+
+    /// Overwrite an object in place with identical bytes, purely to move its
+    /// `last_modified` forward. An object PUT is atomic, so a concurrent reader
+    /// sees the old copy or the new one — and both are the same bytes.
+    async fn rewrite(&self, path: &OsPath, bytes: &[u8]) -> Result<()> {
+        self.store
+            .put(path, PutPayload::from(bytes.to_vec()))
+            .await
+            .map_err(OrigoFSError::from)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl ContentStore for ObjectContentStore {
     async fn put(&self, bytes: &[u8]) -> Result<Hash> {
+        Self::check_put_size(bytes)?;
         let hash = Hash::of(bytes);
         let path = self.path_for(&hash);
         // Idempotent: content-addressed, so an existing object is identical.
-        if self.store.head(&path).await.is_ok() {
+        // The `head` result is reused rather than discarded — its `last_modified`
+        // is what decides whether this dedup needs a recency refresh, so the
+        // common case costs no extra request (see `refresh_needed`).
+        if let Ok(meta) = self.store.head(&path).await {
+            if Self::refresh_needed(&meta) {
+                self.rewrite(&path, bytes).await?;
+            }
             return Ok(hash);
         }
         self.store
@@ -267,8 +339,12 @@ impl ContentStore for ObjectContentStore {
     }
 
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        Self::check_put_size(bytes)?;
         let path = self.path_for(key);
-        if self.store.head(&path).await.is_ok() {
+        if let Ok(meta) = self.store.head(&path).await {
+            if Self::refresh_needed(&meta) {
+                self.rewrite(&path, bytes).await?;
+            }
             return Ok(());
         }
         self.store
@@ -276,6 +352,36 @@ impl ContentStore for ObjectContentStore {
             .await
             .map_err(OrigoFSError::from)?;
         Ok(())
+    }
+
+    /// An object store has no `utimes`, so the only way to move an object's
+    /// `last_modified` forward is to write it again. That is why this is
+    /// age-gated: re-PUTting on every dedup hit would undo the point of dedup,
+    /// while re-PUTting only objects already older than
+    /// [`DEDUP_REFRESH_AFTER_SECS`](crate::content::DEDUP_REFRESH_AFTER_SECS) touches just
+    /// the ones a sweep could actually
+    /// reclaim. The bytes are content-addressed, so the rewrite is identical to
+    /// what is already there and readers never observe a gap.
+    ///
+    /// Unlike the `put` paths, this has no bytes in hand and must read them back
+    /// first — one extra GET, on the rare path. `PackStore` calls it on its index.
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        let path = self.path_for(hash);
+        let Ok(meta) = self.store.head(&path).await else {
+            return Ok(()); // gone already; nothing to keep alive
+        };
+        if !Self::refresh_needed(&meta) {
+            return Ok(());
+        }
+        let bytes = self
+            .store
+            .get(&path)
+            .await
+            .map_err(OrigoFSError::from)?
+            .bytes()
+            .await
+            .map_err(OrigoFSError::from)?;
+        self.rewrite(&path, &bytes).await
     }
 
     async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {

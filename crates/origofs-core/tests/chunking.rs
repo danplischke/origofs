@@ -38,10 +38,10 @@ fn manifest_roundtrip() {
             },
         ],
     };
-    let decoded = Manifest::decode(&m.encode()).unwrap();
+    let decoded = Manifest::decode(&m.encode().unwrap()).unwrap();
     assert_eq!(decoded, m);
     // identical content => identical manifest bytes (stable serialization)
-    assert_eq!(m.encode(), decoded.encode());
+    assert_eq!(m.encode().unwrap(), decoded.encode().unwrap());
     // garbage is rejected
     assert!(Manifest::decode(b"not a manifest").is_err());
     assert!(Manifest::decode(&[]).is_err());

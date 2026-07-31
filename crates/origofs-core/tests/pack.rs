@@ -329,3 +329,103 @@ async fn index_entries_can_be_updated_in_place() {
     index.replace_keyed(&key, b"second").await.unwrap();
     assert_eq!(&index.get(&key).await.unwrap()[..], b"second");
 }
+
+/// Counts `delete` calls, so a test can prove `replace_keyed` never took the
+/// delete-then-put path.
+struct CountsDeletes {
+    inner: Arc<MemStore>,
+    deletes: std::sync::atomic::AtomicUsize,
+}
+
+impl CountsDeletes {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(MemStore::new()),
+            deletes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn deletes(&self) -> usize {
+        self.deletes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ContentStore for CountsDeletes {
+    async fn put(&self, bytes: &[u8]) -> origofs_core::Result<Hash> {
+        self.inner.put(bytes).await
+    }
+    async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> origofs_core::Result<()> {
+        self.inner.put_keyed(key, bytes).await
+    }
+    async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> origofs_core::Result<()> {
+        self.inner.replace_keyed(key, bytes).await
+    }
+    async fn get(&self, hash: &Hash) -> origofs_core::Result<bytes::Bytes> {
+        self.inner.get(hash).await
+    }
+    async fn get_range(
+        &self,
+        hash: &Hash,
+        off: u64,
+        len: u64,
+    ) -> origofs_core::Result<bytes::Bytes> {
+        self.inner.get_range(hash, off, len).await
+    }
+    async fn has(&self, hash: &Hash) -> origofs_core::Result<bool> {
+        self.inner.has(hash).await
+    }
+    async fn list(&self) -> origofs_core::Result<Vec<Hash>> {
+        self.inner.list().await
+    }
+    async fn delete(&self, hash: &Hash) -> origofs_core::Result<u64> {
+        self.deletes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.delete(hash).await
+    }
+}
+
+/// `replace_keyed` must stay atomic when the backend is reached through an `Arc`.
+///
+/// `replace_keyed` is the one `ContentStore` method with a *default* body, and
+/// that default is the unsafe delete-then-put the trait doc warns about. So the
+/// blanket `impl ContentStore for Arc<T>` omitting it did not fail to compile —
+/// it silently downgraded every backend behind an `Arc` to the default. That is
+/// not a theoretical path: `PackStore` holds its index as `Arc<dyn ContentStore>`
+/// and calls `replace_keyed` on every repack, so a crash in the delete-then-put
+/// window left a live chunk with no index entry, invisible to the next repack,
+/// which then deletes the pack holding it.
+///
+/// Asserting on the *observable* difference (a `delete` call) rather than on the
+/// final value, because both paths end with the right bytes — only one of them
+/// passes through a state where the key resolves to nothing.
+#[tokio::test]
+async fn arc_forwards_replace_keyed_atomically() {
+    let counter = Arc::new(CountsDeletes::new());
+    let key = Hash::of(b"chunk");
+
+    counter.put_keyed(&key, b"first").await.unwrap();
+
+    // Through the concrete type.
+    counter.replace_keyed(&key, b"second").await.unwrap();
+    assert_eq!(counter.deletes(), 0, "concrete impl took the unsafe path");
+
+    // Through `Arc<dyn ContentStore>` — the way PackStore actually holds it.
+    let erased: Arc<dyn ContentStore> = counter.clone();
+    erased.replace_keyed(&key, b"third").await.unwrap();
+    assert_eq!(
+        counter.deletes(),
+        0,
+        "Arc<dyn ContentStore> fell through to the delete-then-put default"
+    );
+
+    // Through `Arc<ConcreteStore>`, the other shape the blanket impl serves.
+    let concrete: Arc<CountsDeletes> = counter.clone();
+    concrete.replace_keyed(&key, b"fourth").await.unwrap();
+    assert_eq!(
+        counter.deletes(),
+        0,
+        "Arc<ConcreteStore> fell through to the delete-then-put default"
+    );
+
+    assert_eq!(&counter.get(&key).await.unwrap()[..], b"fourth");
+}

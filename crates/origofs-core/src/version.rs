@@ -123,6 +123,34 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(())
     }
 
+    /// [`mirror_refs`](Self::mirror_refs) for the position it is actually called
+    /// from: *after* the transaction that advanced the refs has committed.
+    ///
+    /// Every caller of `mirror_refs` sits inside a `retrying(...)` wrapper — the
+    /// commit, checkout, and merge attempts all do `txn.commit()` then mirror. So a
+    /// retryable error out of the mirror (a `40001`, a `SQLITE_BUSY` on
+    /// `bump_counter`/`set_config`) propagated up to that wrapper and re-ran the
+    /// **whole attempt** against an already-advanced HEAD, producing a spurious
+    /// duplicate commit. `crate::retry`'s own rules say exactly this: "an operation
+    /// that has already committed metadata must not be retried."
+    ///
+    /// So the retry happens *here*, around the mirror alone, where re-running is
+    /// sound — and anything that survives it is reclassified as non-retryable
+    /// before it can reach the outer wrapper. The error still propagates, because
+    /// a silently skipped mirror is a silently degraded recovery story, but it can
+    /// no longer be mistaken for "the commit didn't happen".
+    pub(crate) async fn mirror_refs_post_commit(&self) -> Result<()> {
+        match crate::retry::retrying("mirror_refs", || self.mirror_refs()).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.retryable() => Err(OrigoFSError::Metadata(format!(
+                "the operation committed, but mirroring refs for disaster recovery \
+                 did not: {e}. The commit is durable; re-run the operation only if \
+                 you intend a second one."
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
     /// This engine's workspace name, resolved from its root inode via the registry
     /// (`"default"` for the root workspace). `None` only if no registry row matches
     /// the root — e.g. a pre-`workspace`-table store — in which case the mirror is
@@ -255,7 +283,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             txn.clear_conflicts().await?;
         }
         txn.commit().await?;
-        self.mirror_refs().await?;
+        self.mirror_refs_post_commit().await?;
         Ok(commit_hash)
     }
 
@@ -274,7 +302,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 FileKind::File => {
                     let h = match inode.content {
                         Some(h) => h,
-                        None => self.content.put(&Manifest::default().encode()).await?,
+                        None => self.content.put(&Manifest::default().encode()?).await?,
                     };
                     (TreeKind::File, h)
                 }
@@ -307,7 +335,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if !self.meta.cas_ref(name, None, &head.to_hex()).await? {
             return Err(OrigoFSError::AlreadyExists(format!("branch {name}")));
         }
-        self.mirror_refs().await?;
+        // The ref has already advanced, so the mirror must not be able to make a
+        // caller's retry wrapper re-run this. See `mirror_refs_post_commit`.
+        self.mirror_refs_post_commit().await?;
         Ok(())
     }
 
@@ -328,6 +358,31 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Switch the working tree to `branch`, materializing its commit.
     pub async fn checkout(&self, branch: &str) -> Result<()> {
         crate::retry::retrying("checkout", || self.checkout_attempt(branch)).await
+    }
+
+    /// [`checkout`](Self::checkout), attributed to `ctx` and subject to its write
+    /// policy (§6).
+    ///
+    /// Checkout is the most destructive operation on the working tree: it
+    /// truncates and rematerializes the whole thing, discarding every uncommitted
+    /// edit in the workspace. A propose-only actor — one deliberately barred from
+    /// overwriting a *single file* — must not be able to do that, so this is
+    /// policy-gated like `commit_as`. There is no propose-shaped equivalent: the
+    /// reviewable unit is an edit, and switching branches authors none.
+    ///
+    /// [`checkout`](Self::checkout) remains the unattributed form for the CLI,
+    /// tests, and internal machinery (merge materialization, recovery).
+    pub async fn checkout_as(&self, ctx: crate::WriteCtx, branch: &str) -> Result<()> {
+        self.ensure_may_write(ctx, "check out a branch").await?;
+        self.checkout(branch).await
+    }
+
+    /// [`create_branch`](Self::create_branch), attributed to `ctx` and subject to
+    /// its write policy (§6). Creating a ref mutates shared workspace state, so it
+    /// is gated for the same reason `commit_as` is.
+    pub async fn create_branch_as(&self, ctx: crate::WriteCtx, name: &str) -> Result<()> {
+        self.ensure_may_write(ctx, "create a branch").await?;
+        self.create_branch(name).await
     }
 
     /// One attempt at [`checkout`](Self::checkout); see [`crate::retry`] for why the
@@ -356,7 +411,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         self.replace_working_tree_in(&mut *txn, &plan).await?;
         txn.set_ref(HEAD, &format!("ref:{branch}")).await?;
         txn.commit().await?;
-        self.mirror_refs().await?;
+        self.mirror_refs_post_commit().await?;
         Ok(())
     }
 
@@ -616,7 +671,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                         .ok_or_else(|| OrigoFSError::NotFound(path.clone()))?;
                     let h = match inode.content {
                         Some(h) => h,
-                        None => Hash::of(&Manifest::default().encode()),
+                        None => Hash::of(&Manifest::default().encode()?),
                     };
                     map.insert(path, h);
                 }

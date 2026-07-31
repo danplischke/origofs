@@ -29,7 +29,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Reassemble a whole file body from its blob-manifest hash.
     pub async fn read_blob_bytes(&self, manifest_hash: &Hash) -> Result<Bytes> {
         let manifest = self.load_manifest(manifest_hash).await?;
-        let mut buf = BytesMut::with_capacity(manifest.size as usize);
+        // Capped hint, not `size`: see `Manifest::capacity_hint`.
+        let mut buf = BytesMut::with_capacity(manifest.capacity_hint());
         for c in &manifest.chunks {
             buf.extend_from_slice(&self.content.get(&c.hash).await?);
         }
@@ -41,7 +42,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub async fn store_blob_bytes(&self, data: &[u8]) -> Result<Hash> {
         match self.store_body(data).await? {
             (Some(h), _) => Ok(h),
-            (None, _) => self.content.put(&Manifest::default().encode()).await,
+            (None, _) => self.content.put(&Manifest::default().encode()?).await,
         }
     }
 
@@ -87,7 +88,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .cas_ref(branch, expect.as_deref(), &new.to_hex())
             .await?;
         if swapped {
-            self.mirror_refs().await?;
+            // The ref has already advanced; see `mirror_refs_post_commit`.
+            self.mirror_refs_post_commit().await?;
         }
         Ok(swapped)
     }

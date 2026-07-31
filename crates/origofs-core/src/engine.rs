@@ -13,7 +13,7 @@ use crate::metadata::{MetaTxn, MetadataStore};
 use crate::types::{DirEntry, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit};
 use bytes::{Bytes, BytesMut};
 use futures::Stream;
-use futures::stream::{BoxStream, StreamExt};
+use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use std::sync::Arc;
 
 const DIR_MODE: u32 = 0o040755;
@@ -25,6 +25,31 @@ const SYMLINK_MODE: u32 = 0o120777;
 /// updates it); the bound only guards against a pathological churn of
 /// create/delete on the same name.
 pub(crate) const CREATE_RETRIES: usize = 16;
+
+/// How many chunk uploads may be in flight at once during a write.
+///
+/// Chunks used to be stored one at a time — `put().await` in a loop — so a write
+/// cost one full round trip per chunk. That is invisible on a local store and
+/// dominant on object storage: content-defined chunking turns 1 GiB of
+/// incompressible data (media, archives, anything already compressed) into ~13,700
+/// chunks, so at a 30 ms round trip a single gigabyte took about seven minutes of
+/// pure latency, with the link nearly idle throughout.
+///
+/// The window is bounded rather than unlimited for three reasons: memory is
+/// `window x MAX_CHUNK` (16 x 256 KiB = 4 MiB), object stores rate-limit, and an
+/// unbounded window would let a fast reader queue the whole file. Override with
+/// `ORIGOFS_UPLOAD_CONCURRENCY` — raise it for a high-latency bucket, drop it to 1
+/// to recover the old sequential behaviour.
+fn upload_concurrency() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORIGOFS_UPLOAD_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(16)
+    })
+}
 
 /// Reject a single path component that could escape the workspace tree or
 /// corrupt the dentry graph: the traversal names `.`/`..`, an empty name, or a
@@ -190,8 +215,42 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// build can read the content store's object format.
     pub async fn init(&self) -> Result<()> {
         self.check_store_format().await?;
+        self.check_schema_version().await?;
         self.meta.init().await?;
         self.init_versioning().await?;
+        Ok(())
+    }
+
+    /// Refuse a metadata database written by a **newer** origofs, before any
+    /// migration runs against it.
+    ///
+    /// The content store has had this guard from the start
+    /// ([`check_store_format`](Self::check_store_format)); the metadata half did
+    /// not, and the asymmetry was dangerous. `MetadataStore::init` applies every
+    /// migration whose version is absent from `schema_meta` and never compares the
+    /// database against `latest_schema_version()` — so a v15 binary opening a v16
+    /// database reported no error at all and simply proceeded against a schema it
+    /// does not know. Migrations here have changed primary keys (V11, V13), so
+    /// "proceed anyway" is the shape that corrupts rather than the shape that
+    /// fails.
+    ///
+    /// A fresh database reports version 0 and passes. The error is
+    /// [`UnsupportedVersion`](OrigoFSError::UnsupportedVersion), the same one the
+    /// content store raises, because the remedy is the same: upgrade the reader,
+    /// do not restore from a backup.
+    async fn check_schema_version(&self) -> Result<()> {
+        let found = self.meta.schema_version().await?;
+        let max = crate::migrations::latest_schema_version();
+        if found > max {
+            return Err(OrigoFSError::UnsupportedVersion {
+                kind: "metadata schema",
+                // Schema versions are small and monotonic; the cast is lossless in
+                // any reachable range and saturates rather than wrapping if that
+                // ever stops being true.
+                found: u8::try_from(found).unwrap_or(u8::MAX),
+                max_supported: u8::try_from(max).unwrap_or(u8::MAX),
+            });
+        }
         Ok(())
     }
 
@@ -368,7 +427,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                             ino = child;
                         }
                         Err(OrigoFSError::AlreadyExists(_)) => {
-                            drop(tx); // roll back the just-created inode
+                            // Awaited, not dropped: the `lookup` immediately
+                            // below must not race this rollback for the pooled
+                            // connection. See `MetaTxn::rollback`.
+                            tx.rollback().await?;
                             let existing = self
                                 .meta
                                 .lookup(ino, seg)
@@ -485,19 +547,36 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if data.is_empty() {
             return Ok((None, 0));
         }
-        let mut chunks = Vec::new();
-        for (off, len) in chunk_bounds(data) {
-            let hash = self.content.put(&data[off..off + len]).await?;
-            chunks.push(ChunkRef {
-                hash,
-                len: len as u32,
-            });
-        }
+        // The FastCDC scan is a CPU-bound pass over the whole buffer, and this is
+        // the path behind `write`, `write_as`, `write_or_propose`, `vfs_write`, and
+        // every merge. Run bare in an `async fn` it pins a runtime worker for the
+        // duration — seconds, on a large body — starving every other task; that
+        // matters most in the Python bindings, where one runtime serves the whole
+        // process. `write_reader` already chunks off-runtime; this brings `write`
+        // in line. (`block_in_place` rather than `spawn_blocking`, so `data` can
+        // stay borrowed instead of being copied wholesale — see the helper.)
+        let bounds = crate::util::blocking_section(|| chunk_bounds(data));
+        // Bounded-concurrency upload, ordered: `buffered` keeps up to N puts in
+        // flight but yields results in submission order, so the manifest's chunk
+        // order — which *is* the file's byte order — is preserved without sorting.
+        let chunks: Vec<ChunkRef> = futures::stream::iter(bounds)
+            .map(|(off, len)| async move {
+                self.content
+                    .put(&data[off..off + len])
+                    .await
+                    .map(|hash| ChunkRef {
+                        hash,
+                        len: len as u32,
+                    })
+            })
+            .buffered(upload_concurrency())
+            .try_collect()
+            .await?;
         let manifest = Manifest {
             size: data.len() as u64,
             chunks,
         };
-        let mhash = self.content.put(&manifest.encode()).await?;
+        let mhash = self.content.put(&manifest.encode()?).await?;
         // Durability barrier (C4): make the content durable before the metadata
         // commit that will reference it. For LocalCasStore each `put` already
         // fsynced; for PackStore this seals the open pack so a crash can't lose
@@ -540,7 +619,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 None => match Self::create_file_in(tx.as_mut(), parent, name).await {
                     Ok(ino) => ino,
                     Err(OrigoFSError::AlreadyExists(_)) => {
-                        drop(tx);
+                        // Awaited: the loop's next iteration re-reads immediately.
+                        // See `MetaTxn::rollback`.
+                        tx.rollback().await?;
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -555,18 +636,32 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         )))
     }
 
-    /// Write a file by streaming from a blocking reader, chunking incrementally so
-    /// large files never need to be fully resident. Creates the file if needed.
-    pub async fn write_reader<R>(&self, path: &str, reader: R) -> Result<()>
+    /// Stream a reader into the content store, returning `(manifest, size)`.
+    ///
+    /// The streaming half of a large write, shared by [`write_reader`](Self::write_reader)
+    /// and [`write_reader_as`](Self::write_reader_as). It stores content and
+    /// nothing else: no inode is resolved, no metadata is touched, so the caller
+    /// owns the create-race and attribution decisions. Content is
+    /// content-addressed and therefore idempotent, which is what lets the caller
+    /// retry its metadata commit without re-reading the stream — and is why this
+    /// is split out rather than duplicated.
+    ///
+    /// Memory is bounded by the channel depth plus the in-flight upload window —
+    /// both `upload_concurrency()`, so <= 2 x 16 x `MAX_CHUNK` (8 MiB) at the
+    /// default — plus the accumulating `Vec<ChunkRef>`: 36 bytes per chunk, about
+    /// 0.055% of the file at the average chunk size. That manifest is the real
+    /// ceiling on file size; see `docs/LIMITS.md`.
+    pub(crate) async fn stream_body<R>(&self, path: &str, reader: R) -> Result<(Option<Hash>, u64)>
     where
         R: std::io::Read + Send + 'static,
     {
-        let (parent, name) = self.resolve_parent(path).await?;
-        self.ensure_dir(parent).await?;
-        let existing = self.lookup_file(parent, name, path).await?;
-
-        // Chunk on the blocking pool; deliver one chunk at a time to the async side.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<std::result::Result<Vec<u8>, String>>(8);
+        // Chunk on the blocking pool, delivering to the async side over a queue as
+        // deep as the upload window. Shallower and the window starves: `buffered(16)`
+        // cannot hold 16 puts in flight if only 8 chunks are ever available to it,
+        // which silently capped the effective concurrency at the old depth of 8.
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Vec<u8>, String>>(
+            upload_concurrency(),
+        );
         let handle = tokio::task::spawn_blocking(move || {
             for item in fastcdc::v2020::StreamCDC::new(reader, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
                 match item {
@@ -583,38 +678,104 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
         });
 
-        let mut chunks = Vec::new();
-        let mut size: u64 = 0;
-        while let Some(item) = rx.recv().await {
+        // Same bounded-concurrency window as `store_body`, fed by the chunker
+        // rather than a precomputed list.
+        //
+        // This must be one combinator over a *stream*, not a `recv()` loop that
+        // pushes into a `FuturesOrdered`: an in-flight upload only makes progress
+        // while something polls it, and a loop awaiting `rx.recv()` polls nothing
+        // else. That shape overlapped only during the brief windows between
+        // receives, yielding ~1.8x where the window should give ~16x — the first
+        // version of this did exactly that, and `upload_concurrency.rs` caught it.
+        // `buffered` polls the source and every in-flight put in the same poll, and
+        // yields in submission order so the manifest stays in byte order.
+        let chunks: Vec<ChunkRef> = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
+        .map(|item| async move {
             let data = item.map_err(OrigoFSError::Content)?;
-            size += data.len() as u64;
-            let hash = self.content.put(&data).await?;
-            chunks.push(ChunkRef {
-                hash,
-                len: data.len() as u32,
-            });
-        }
-        let _ = handle.await;
+            let len = data.len() as u32;
+            self.content
+                .put(&data)
+                .await
+                .map(|hash| ChunkRef { hash, len })
+        })
+        .buffered(upload_concurrency())
+        .try_collect()
+        .await?;
+        let size: u64 = chunks.iter().map(|c| c.len as u64).sum();
+        // The `JoinError` matters and must not be discarded. `StreamCDC`'s own
+        // errors arrive through the channel as `Err`, but a *panic* — most
+        // plausibly from a caller-supplied `Read` impl — drops the sender instead:
+        // `rx.recv()` returns `None`, the loop above exits perfectly normally, and
+        // what follows would build a manifest from the chunks that happened to
+        // arrive and commit it as the whole file. Silent truncation, reported as
+        // `Ok(())`. Surfacing the join failure turns that into an error before any
+        // metadata references the partial body.
+        handle.await.map_err(|e| {
+            OrigoFSError::Content(format!(
+                "chunking {path} failed before the stream ended, so the file was \
+                 only partially read: {e}"
+            ))
+        })?;
 
         let mhash = if size == 0 {
             None
         } else {
             let manifest = Manifest { size, chunks };
-            Some(self.content.put(&manifest.encode()).await?)
+            Some(self.content.put(&manifest.encode()?).await?)
         };
         // Durability barrier (C4): seal/flush content before metadata references it.
         self.content.flush().await?;
+        Ok((mhash, size))
+    }
+
+    /// Write a file by streaming from a blocking reader, chunking incrementally so
+    /// large files never need to be fully resident. Creates the file if needed.
+    ///
+    /// **Unattributed** — records no blame and no edit-op, and is exempt from the
+    /// §6 write policy by construction. Prefer
+    /// [`write_reader_as`](Self::write_reader_as) wherever an actor is known;
+    /// this exists for internal machinery and for genuinely actor-less imports.
+    pub async fn write_reader<R>(&self, path: &str, reader: R) -> Result<()>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let (parent, name) = self.resolve_parent(path).await?;
+        self.ensure_dir(parent).await?;
+
+        let (mhash, size) = self.stream_body(path, reader).await?;
+
         // Commit the metadata atomically — the txn spans only this fast final
         // step, not the whole stream, so a large upload doesn't hold the write
         // lock while chunking.
-        let mut txn = self.meta.begin().await?;
-        let ino = match existing {
-            Some(ino) => ino,
-            None => Self::create_file_in(txn.as_mut(), parent, name).await?,
-        };
-        txn.set_content(ino, mhash, size).await?;
-        txn.commit().await?;
-        Ok(())
+        //
+        // The lookup is inside the retry loop, and deliberately after the stream:
+        // a concurrent writer can create the same new path while we were reading,
+        // and the content is content-addressed (so already durable and idempotent)
+        // by the time we get here. Retrying costs a metadata round trip, not a
+        // re-read of the body.
+        for _ in 0..CREATE_RETRIES {
+            let existing = self.lookup_file(parent, name, path).await?;
+            let mut txn = self.meta.begin().await?;
+            let ino = match existing {
+                Some(ino) => ino,
+                None => match Self::create_file_in(txn.as_mut(), parent, name).await {
+                    Ok(ino) => ino,
+                    Err(OrigoFSError::AlreadyExists(_)) => {
+                        txn.rollback().await?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                },
+            };
+            txn.set_content(ino, mhash, size).await?;
+            txn.commit().await?;
+            return Ok(());
+        }
+        Err(OrigoFSError::Conflict(format!(
+            "{path}: too many concurrent creators"
+        )))
     }
 
     /// Read the entire contents of a file.
@@ -644,18 +805,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let manifest = self.load_manifest(mhash).await?;
         // This buffers the whole body in memory. That is fine for ordinary files,
         // but a caller that must stay bounded on an arbitrarily large file should
-        // use [`Self::read_stream`] instead. We still refuse to *pre-allocate* from
-        // the manifest's declared size: even though `Manifest::decode` checks
-        // `size == Σ chunk.len`, a crafted manifest can declare many oversized
-        // chunk lengths, so we reserve a bounded amount up front and let the buffer
-        // grow as real chunk bytes arrive.
-        const INITIAL_HINT: usize = 8 * 1024 * 1024;
-        let hint = manifest
-            .chunks
-            .iter()
-            .fold(0usize, |a, c| a.saturating_add(c.len as usize))
-            .min(INITIAL_HINT);
-        let mut buf = BytesMut::with_capacity(hint);
+        // use [`Self::read_stream`] instead. The reservation is a capped hint
+        // rather than the manifest's declared size — see `Manifest::capacity_hint`.
+        let mut buf = BytesMut::with_capacity(manifest.capacity_hint());
         for c in &manifest.chunks {
             buf.extend_from_slice(&self.content.get(&c.hash).await?);
         }
@@ -665,6 +817,109 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Resolve `path` for streaming: check it is a regular file and return its
     /// manifest (`None` if the file has no content, i.e. is empty). The manifest
     /// is loaded eagerly so its errors surface before any chunk is streamed.
+    /// [`read_range_stream`](Self::read_range_stream) with a `'static` lifetime, so
+    /// it can become an HTTP response body that outlives the handler — the same
+    /// reason [`read_stream_owned`](Self::read_stream_owned) exists beside
+    /// [`read_stream`](Self::read_stream).
+    pub fn read_range_stream_owned(
+        &self,
+        manifest: Manifest,
+        off: u64,
+        len: u64,
+    ) -> BoxStream<'static, Result<Bytes>>
+    where
+        C: Clone + 'static,
+    {
+        let end = off.saturating_add(len).min(manifest.size);
+        let mut plan: Vec<(Hash, u64, u64)> = Vec::new();
+        let mut pos: u64 = 0;
+        for c in &manifest.chunks {
+            let cstart = pos;
+            let cend = pos + c.len as u64;
+            pos = cend;
+            if cend <= off {
+                continue;
+            }
+            if cstart >= end {
+                break;
+            }
+            let from = off.max(cstart) - cstart;
+            let to = end.min(cend) - cstart;
+            plan.push((c.hash, from, to - from));
+        }
+        let store = self.content.clone();
+        futures::stream::unfold(Some((store, plan.into_iter())), |state| async move {
+            let (store, mut plan) = state?;
+            let (hash, from, len) = plan.next()?;
+            match store.get_range(&hash, from, len).await {
+                Ok(bytes) => Some((Ok(bytes), Some((store, plan)))),
+                Err(e) => Some((Err(e), None)),
+            }
+        })
+        .boxed()
+    }
+
+    /// Open a file for streaming and report its size, so a caller can answer a
+    /// ranged request without a second metadata round trip.
+    ///
+    /// `Content-Length` and `Content-Range` both need the size, and a `416` needs
+    /// it *before* any bytes are read — so returning it alongside the manifest is
+    /// what lets the HTTP surface answer a `Range` request in one pass.
+    pub async fn open_for_range(&self, path: &str) -> Result<(Option<Manifest>, u64)> {
+        let manifest = self.open_for_stream(path).await?;
+        let size = manifest.as_ref().map(|m| m.size).unwrap_or(0);
+        Ok((manifest, size))
+    }
+
+    /// Stream the byte range `[off, off+len)` of a file, fetching only the chunks
+    /// that cover it.
+    ///
+    /// The streaming counterpart of [`read_range`](Self::read_range), which
+    /// materializes the range in memory. That is fine for a small ranged read and
+    /// wrong for serving media over HTTP, where a player may request a range of
+    /// arbitrary size (including, quite legally, `bytes=0-` for the whole file) —
+    /// buffering that would undo the reason `read_file` streams at all.
+    ///
+    /// Boundary chunks are trimmed with `get_range` so the store fetches only the
+    /// needed slice of the first and last chunk, not the whole of either.
+    pub fn read_range_stream(
+        &self,
+        manifest: Manifest,
+        off: u64,
+        len: u64,
+    ) -> impl Stream<Item = Result<Bytes>> + Send + '_ {
+        let end = off.saturating_add(len).min(manifest.size);
+        // Precompute each covering chunk's (hash, from, to) so the stream itself
+        // stays a simple fetch loop.
+        let mut plan: Vec<(Hash, u64, u64)> = Vec::new();
+        let mut pos: u64 = 0;
+        for c in &manifest.chunks {
+            let cstart = pos;
+            let cend = pos + c.len as u64;
+            pos = cend;
+            if cend <= off {
+                continue;
+            }
+            if cstart >= end {
+                break;
+            }
+            let from = off.max(cstart) - cstart;
+            let to = end.min(cend) - cstart;
+            plan.push((c.hash, from, to - from));
+        }
+        futures::stream::unfold(
+            Some((&self.content, plan.into_iter())),
+            |state| async move {
+                let (content, mut plan) = state?;
+                let (hash, from, len) = plan.next()?;
+                match content.get_range(&hash, from, len).await {
+                    Ok(bytes) => Some((Ok(bytes), Some((content, plan)))),
+                    Err(e) => Some((Err(e), None)),
+                }
+            },
+        )
+    }
+
     async fn open_for_stream(&self, path: &str) -> Result<Option<Manifest>> {
         let ino = self.resolve(path).await?;
         let inode = self
@@ -776,7 +1031,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if off >= end {
             return Ok(Bytes::new());
         }
-        let mut buf = BytesMut::with_capacity((end - off) as usize);
+        // Bounded by the same cap as a whole-body read: `end` derives from the
+        // manifest's declared size, which is attacker-controlled on a corrupt
+        // store (see `Manifest::capacity_hint`).
+        let mut buf =
+            BytesMut::with_capacity(((end - off) as usize).min(manifest.capacity_hint().max(1)));
         let mut pos: u64 = 0;
         for c in &manifest.chunks {
             let cstart = pos;

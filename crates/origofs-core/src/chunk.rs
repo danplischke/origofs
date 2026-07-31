@@ -36,9 +36,34 @@ pub struct Manifest {
     pub chunks: Vec<ChunkRef>,
 }
 
+/// Upper bound on how much a reassembly buffer may reserve up front from a
+/// manifest's *declared* size. See [`Manifest::capacity_hint`].
+const MAX_REASSEMBLY_HINT: usize = 8 * 1024 * 1024;
+
 impl Manifest {
     pub fn is_empty(&self) -> bool {
         self.size == 0
+    }
+
+    /// How much to reserve before reassembling this manifest's body.
+    ///
+    /// **Never reserve `size` directly.** `decode` only checks that
+    /// `size == Σ chunk.len`, which a crafted or corrupt manifest satisfies
+    /// trivially: a 53-byte manifest declaring one chunk of `len = u32::MAX`
+    /// yields a consistent 4 GiB, and a few megabytes of manifest reaches
+    /// hundreds of terabytes. Reserving from that is an allocator abort driven by
+    /// untrusted bytes — the same hostile-input boundary the decoders guard, one
+    /// layer up.
+    ///
+    /// So the reservation is a *hint*, capped at [`MAX_REASSEMBLY_HINT`], and the
+    /// buffer grows as real chunk bytes arrive. An honest large file pays a few
+    /// reallocations; a dishonest one allocates 8 MiB and then fails on the first
+    /// missing chunk.
+    pub fn capacity_hint(&self) -> usize {
+        self.chunks
+            .iter()
+            .fold(0usize, |a, c| a.saturating_add(c.len as usize))
+            .min(MAX_REASSEMBLY_HINT)
     }
 
     /// Canonical serialization so identical content yields an identical manifest
@@ -46,16 +71,39 @@ impl Manifest {
     ///
     /// The bytes are the object's address, so this encoding is frozen for v1 —
     /// see the format-evolution rules in [`crate::format`].
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        // The count field is a `u32`, and this used to be a bare `as` cast. Past
+        // 2^32 chunks it wrapped silently: the manifest was written with a bogus
+        // count and `decode_v1`'s length cross-check rejected it — so the file was
+        // corrupted at *write* time and only discovered on the next read, which is
+        // the worst possible ordering.
+        //
+        // The decoder has always guarded this (see `decode_v1`, and
+        // `capacity_hint` for the allocation side). The encoder did not: the whole
+        // format layer reasoned carefully about hostile input coming *in* and not
+        // at all about honest data going *out* past a `u32`. Same for
+        // `PackLoc::encode` in `pack.rs`.
+        //
+        // Unreachable at any sane size — 2^32 chunks is 64 TiB even at `MIN_CHUNK`,
+        // and the in-memory `Vec<ChunkRef>` would be 154 GB first — but an error
+        // beats silent corruption, and it costs one comparison per write.
+        let count = u32::try_from(self.chunks.len()).map_err(|_| {
+            OrigoFSError::TooLarge(format!(
+                "manifest has {} chunks, more than the format's u32 count field can \
+                 hold ({} max)",
+                self.chunks.len(),
+                u32::MAX
+            ))
+        })?;
         let mut out = Vec::with_capacity(HEADER_LEN + self.chunks.len() * ENTRY_LEN);
         out.extend_from_slice(&format::MANIFEST.header());
         out.extend_from_slice(&self.size.to_le_bytes());
-        out.extend_from_slice(&(self.chunks.len() as u32).to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
         for c in &self.chunks {
             out.extend_from_slice(c.hash.as_bytes());
             out.extend_from_slice(&c.len.to_le_bytes());
         }
-        out
+        Ok(out)
     }
 
     /// Decode a manifest, dispatching on its header's format version. An object

@@ -23,7 +23,8 @@ async fn rebuild_infers_head_when_no_mirror() {
                     len: 2,
                 }],
             }
-            .encode(),
+            .encode()
+            .unwrap(),
         )
         .await
         .unwrap();

@@ -91,6 +91,11 @@ pub const MAX_ATTEMPTS: usize = 5;
 const RESYNC_CLIENT: &str = "origofs-resync";
 
 /// How much moved in one direction of a [`transfer`].
+/// `#[non_exhaustive]`: callers read this, they never construct it, so adding a
+/// counter should not be a breaking change. (Config structs like `S3Config` are
+/// deliberately left constructible — a caller has to be able to build those, and
+/// `..Default::default()` already absorbs new fields there.)
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TransferStats {
     /// Objects actually written to the destination.
@@ -110,6 +115,11 @@ impl TransferStats {
 }
 
 /// What a [`resync`] did.
+// Deliberately NOT `#[non_exhaustive]`. This is an *outcome* enum: its whole
+// purpose is to make the caller handle each case, so a new variant should be a
+// compile error at every call site. `non_exhaustive` would force a wildcard arm
+// that silently swallows it instead — the opposite of the intent. Adding a
+// variant here is a breaking change on purpose.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResyncOutcome {
     /// Both sides were already at the same commit (or neither had one).
@@ -150,6 +160,11 @@ impl ResyncOutcome {
 }
 
 /// The result of a [`resync`]: what happened, what moved, and what needs a human.
+/// `#[non_exhaustive]`: callers read this, they never construct it, so adding a
+/// counter should not be a breaking change. (Config structs like `S3Config` are
+/// deliberately left constructible — a caller has to be able to build those, and
+/// `..Default::default()` already absorbs new fields there.)
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ResyncReport {
     /// The branch that was reconciled.

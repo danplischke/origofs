@@ -9,7 +9,7 @@
 //! origofs --workspace ./ws read /notes/a.txt
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use origofs_sdk::{MergeOutcome, SuggestionStatus, Workspace, WriteCtx};
 use std::io::{Read, Write};
@@ -213,6 +213,20 @@ enum Cmd {
     },
     /// Show per-line authorship (blame) for a file.
     Blame { path: String },
+    /// Undo exactly the lines one actor authored in one session, across every file
+    /// that session touched, leaving other actors' edits intact. `--by` is the
+    /// actor performing the revert (must be permitted to write).
+    RevertSession {
+        /// The actor whose work is being undone.
+        #[arg(long)]
+        actor: i64,
+        /// The session to undo.
+        #[arg(long)]
+        session: i64,
+        /// The actor performing the revert; checked against the write policy.
+        #[arg(long)]
+        by: Option<i64>,
+    },
     /// Run a command over a copy-on-write view of the workspace, then import what
     /// it changed as an attributed commit (or `--discard`). By default this is an
     /// edit-capture view, not a security sandbox — the command runs with your
@@ -491,19 +505,54 @@ async fn main() -> Result<()> {
                     let file = std::fs::File::open(p)?;
                     ws.write_reader(&path, file).await?;
                 }
-                // Attributed write: read into memory, record blame + an edit-op.
+                // Attributed write. `--actor` used to force `std::fs::read` of the
+                // whole file — streaming and attribution were mutually exclusive
+                // until `write_reader_as` — so a large file could be written only
+                // by giving up the attribution that is the point of this system.
                 (from, Some(actor)) => {
-                    let data = match from {
-                        Some(p) => std::fs::read(p)?,
-                        None => {
-                            let mut buf = Vec::new();
-                            std::io::stdin().read_to_end(&mut buf)?;
-                            buf
-                        }
-                    };
                     let session = ws.create_session(actor, Some("cli")).await?;
-                    ws.write_as(WriteCtx::session(actor, session), &path, &data)
-                        .await?;
+                    let ctx = WriteCtx::session(actor, session);
+
+                    // A propose-only actor's edit is queued for review, and a
+                    // suggestion needs the bytes — so that path buffers, whatever
+                    // the source. That is fine by construction: nobody reviews a
+                    // multi-gigabyte diff. Deciding here rather than letting
+                    // `write_reader_as` refuse keeps `origofs policy <actor>
+                    // propose` behaving identically with and without `--from`.
+                    let may_write_directly = ws.ensure_may_write(ctx, "write a file").await.is_ok();
+
+                    match (from, may_write_directly) {
+                        // The good case: stream straight from the file.
+                        (Some(p), true) => {
+                            let file = std::fs::File::open(p)?;
+                            ws.write_reader_as(ctx, &path, file).await?;
+                        }
+                        // Buffered: stdin has no length to stream against here, and
+                        // a propose-only write has to hold the proposed bytes.
+                        (from, _) => {
+                            let data = match from {
+                                Some(p) => std::fs::read(p)?,
+                                None => {
+                                    let mut buf = Vec::new();
+                                    std::io::stdin().read_to_end(&mut buf)?;
+                                    buf
+                                }
+                            };
+                            // `write_or_propose`, not `write_as`: the raw attributed
+                            // write is exempt from the §6 policy by construction, so
+                            // `origofs policy <actor> propose` had no effect on
+                            // `origofs write` — the CLI ignored the gate its own
+                            // subcommand sets.
+                            match ws.write_or_propose(ctx, &path, &data, None).await? {
+                                origofs_sdk::WriteOutcome::Wrote => {}
+                                origofs_sdk::WriteOutcome::Proposed(suggestion_id) => {
+                                    println!(
+                                        "actor {actor} is propose-only: queued suggestion #{suggestion_id} for {path} (pending review)"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 (None, None) => {
                     let mut buf = Vec::new();
@@ -838,6 +887,19 @@ async fn main() -> Result<()> {
             ws.set_write_policy(actor, p).await?;
             println!("actor #{actor} write policy set to {}", p.as_str());
         }
+        Cmd::RevertSession { actor, session, by } => {
+            // A revert is performed *on* someone else's work, so the target comes
+            // from `--actor` while `--by` is the reviewer doing it. When `--by` is
+            // given its write policy is checked, so a propose-only actor cannot
+            // revert anyone.
+            if let Some(by) = by {
+                let s = ws.create_session(by, Some("cli")).await?;
+                ws.ensure_may_write(WriteCtx::session(by, s), "revert a session")
+                    .await?;
+            }
+            let changed = ws.revert_session(actor, session).await?;
+            println!("reverted actor {actor} session {session}: {changed} file(s) changed");
+        }
         Cmd::Blame { path } => {
             for r in ws.blame(&path).await? {
                 let who = format!("{}:{}", r.actor.kind.as_str(), r.actor.display_name);
@@ -863,6 +925,21 @@ async fn main() -> Result<()> {
             } else if !origofs_sdk::sandbox::overlay_supported() {
                 anyhow::bail!(
                     "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
+                );
+            } else {
+                // Say it at the moment it matters. Without `--isolate` the child
+                // runs with the invoker's privileges over a plain copy-on-write
+                // overlay: the whole host filesystem stays reachable, including
+                // this workspace's meta.db and cas, with no network namespace and
+                // no seccomp. That caveat lived only in `--help` and doc comments,
+                // while strictly less dangerous things (a non-loopback NFS or
+                // metrics bind) both warned at runtime.
+                eprintln!(
+                    "warning: running without --isolate: this captures edits but is NOT a \
+                     security boundary. The command runs with your privileges and can read \
+                     and modify anything you can, including this workspace's meta.db and \
+                     cas. Run only code you trust, or pass --isolate for a real filesystem \
+                     boundary (needs bwrap >= 0.8.0)."
                 );
             }
             let tmp = cli
@@ -901,6 +978,21 @@ async fn main() -> Result<()> {
             } else if !origofs_sdk::sandbox::overlay_supported() {
                 anyhow::bail!(
                     "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
+                );
+            } else {
+                // Say it at the moment it matters. Without `--isolate` the child
+                // runs with the invoker's privileges over a plain copy-on-write
+                // overlay: the whole host filesystem stays reachable, including
+                // this workspace's meta.db and cas, with no network namespace and
+                // no seccomp. That caveat lived only in `--help` and doc comments,
+                // while strictly less dangerous things (a non-loopback NFS or
+                // metrics bind) both warned at runtime.
+                eprintln!(
+                    "warning: running without --isolate: this captures edits but is NOT a \
+                     security boundary. The command runs with your privileges and can read \
+                     and modify anything you can, including this workspace's meta.db and \
+                     cas. Run only code you trust, or pass --isolate for a real filesystem \
+                     boundary (needs bwrap >= 0.8.0)."
                 );
             }
             let tmp = cli
@@ -1143,7 +1235,16 @@ async fn main() -> Result<()> {
             println!(
                 "serving origofs at http://{addr} (SIGTERM/Ctrl-C to stop; in-flight requests drain)"
             );
-            origofs_sdk::api::serve(std::sync::Arc::new(ws), addr, auth).await?;
+            let ws = std::sync::Arc::new(ws);
+            // Housekeeping. `reap_presence` and `supersede_stale_suggestions`
+            // existed with no caller anywhere, so a long-running `origofs serve`
+            // grew its presence table forever and left suggestions pending against
+            // bases that had already moved. A server is exactly the process that
+            // should be running them; nothing else is long-lived enough to.
+            let janitor = tokio::spawn(spawn_janitor(ws.clone()));
+            let result = origofs_sdk::api::serve(ws, addr, auth).await;
+            janitor.abort();
+            result?;
         }
         Cmd::Nfs { addr } => {
             // NFSv3 is unauthenticated; warn loudly if this isn't a loopback bind.
@@ -1168,6 +1269,42 @@ async fn main() -> Result<()> {
 /// Build the HTTP API authenticator from `--auth-token` specs. origofs never trusts a
 /// client-named actor, so the server must resolve identity itself. With no specs:
 /// refuse to expose a non-loopback address, and on loopback attribute all writes
+/// Periodic housekeeping for a long-running server.
+///
+/// Two maintenance operations shipped with no caller anywhere in the tree:
+///
+///   * `reap_presence` drops presence rows for sessions that stopped
+///     heartbeating. Without it the table only ever grows, and `presence()` —
+///     which every collaborative UI polls — gets slower forever.
+///   * `supersede_stale_suggestions` retires proposals whose base content has
+///     already moved on. Left pending, they sit in the review queue looking
+///     actionable, and accepting one just fails as superseded.
+///
+/// A server is the right place for both: it is the only process that lives long
+/// enough for either to matter. Every call is best-effort — housekeeping must never
+/// take the server down — and the interval is deliberately coarse, because neither
+/// operation is urgent and both touch shared tables.
+async fn spawn_janitor(ws: std::sync::Arc<origofs_sdk::Workspace>) {
+    /// How long a session may go without a heartbeat before its presence row is
+    /// reaped. Comfortably longer than any sane heartbeat interval, so a brief
+    /// network hiccup does not make a working collaborator vanish from the UI.
+    const PRESENCE_GRACE_SECS: i64 = 300;
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let mut ticker = tokio::time::interval(EVERY);
+    // The first tick fires immediately; skip straight to the cadence so startup
+    // isn't competing with a maintenance sweep.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        match ws.reap_presence(PRESENCE_GRACE_SECS).await {
+            Ok(n) if n > 0 => tracing::debug!(reaped = n, "reaped stale presence rows"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "presence reap failed"),
+        }
+    }
+}
+
 /// to an auto-created local actor (dev convenience only).
 async fn build_api_auth(
     ws: &Workspace,
@@ -1191,16 +1328,90 @@ async fn build_api_auth(
             },
         )));
     }
+    Ok(std::sync::Arc::new(parse_auth_specs(specs)?))
+}
+
+/// Parse `--auth-token TOKEN=ACTOR_ID[:SESSION_ID]` specs into a token map.
+///
+/// Split out of [`build_api_auth`] so it is testable without a workspace: this is
+/// argument parsing that decides who a request is attributed to, which makes it
+/// exactly the part worth pinning.
+fn parse_auth_specs(specs: &[String]) -> Result<origofs_sdk::api::BearerAuth> {
     let mut bearer = origofs_sdk::api::BearerAuth::new();
     for spec in specs {
-        let (token, who) = spec.split_once('=').ok_or_else(|| {
+        // Split from the *right*. The actor/session half never contains `=`, but
+        // the token half routinely does — base64 pads with it, and a bearer token
+        // is very often base64. Splitting on the first `=` made any such token
+        // unusable, with an error blaming the actor id.
+        let (token, who) = spec.rsplit_once('=').ok_or_else(|| {
             anyhow::anyhow!("bad --auth-token {spec:?}; expected TOKEN=ACTOR_ID[:SESSION_ID]")
         })?;
+        if token.is_empty() {
+            anyhow::bail!("bad --auth-token {spec:?}: the token is empty");
+        }
         let (actor, session) = match who.split_once(':') {
-            Some((a, s)) => (a.parse()?, Some(s.parse()?)),
-            None => (who.parse()?, None),
+            Some((a, s)) => (
+                a.parse().with_context(|| format!("actor id in {spec:?}"))?,
+                Some(
+                    s.parse()
+                        .with_context(|| format!("session id in {spec:?}"))?,
+                ),
+            ),
+            None => (
+                who.parse()
+                    .with_context(|| format!("actor id in {spec:?}"))?,
+                None,
+            ),
         };
         bearer = bearer.with_token(token.to_string(), actor, session);
     }
-    Ok(std::sync::Arc::new(bearer))
+    Ok(bearer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--auth-token` decides which actor a request's writes are attributed to, so
+    /// its parsing is worth pinning. The binary had no unit tests at all — 1,200
+    /// lines including this and the `--config` backend selection — and the Docker
+    /// job only exercised the happy path through `serve`.
+    #[test]
+    fn auth_token_specs_parse() {
+        let ok = parse_auth_specs(&[
+            "tok-a=7".to_string(),
+            "tok-b=9:42".to_string(),
+            // A base64 token ends in `=` padding, so the split has to be on the
+            // *last* separator — the actor half never contains one.
+            "dG9rZW4=:=11".to_string(),
+            "cGFk==11".to_string(),
+        ])
+        .expect("valid specs");
+        assert!(!ok.is_empty());
+    }
+
+    #[test]
+    fn auth_token_specs_reject_malformed_input() {
+        let bad = [
+            "no-equals-sign",   // missing the separator entirely
+            "=7",               // empty token
+            "tok=",             // no actor id
+            "tok=notanumber",   // actor id is not an integer
+            "tok=7:notanumber", // session id is not an integer
+            "tok=7:",           // empty session id
+        ];
+        for spec in bad {
+            assert!(
+                parse_auth_specs(&[spec.to_string()]).is_err(),
+                "{spec:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_spec_list_yields_an_empty_map() {
+        // The empty case is what routes `build_api_auth` into its loopback-only
+        // dev path, so it must stay distinguishable from "tokens configured".
+        assert!(parse_auth_specs(&[]).expect("no specs").is_empty());
+    }
 }

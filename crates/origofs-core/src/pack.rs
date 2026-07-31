@@ -14,6 +14,29 @@
 //! storage: small index local, big packed data remote — the layout restic, borg,
 //! and git packfiles use.
 //!
+//! # What batching actually buys, and where it stops
+//!
+//! Batching is **within a write, not across writes**, and it is worth being precise
+//! about that because the difference is large.
+//!
+//! Every write ends with a durability barrier: content must be durable before the
+//! metadata that references it commits, so `Fs::store_body` and `Fs::write_reader`
+//! call [`ContentStore::flush`] — which here means [`PackStore::seal`] — before
+//! their transaction. So:
+//!
+//! * **One large file is the good case.** A 40 MiB body chunks into hundreds of
+//!   pieces and seals into a handful of packs: hundreds of PUTs become a few. This
+//!   is the case the layout is for, and it works.
+//! * **Many small files is the floor.** Ten thousand 2 KiB files are ten thousand
+//!   writes, each with its own barrier, so each seals its own pack — roughly one
+//!   PUT per file, not one per 4 MiB. Packing is not helping there.
+//!
+//! Nothing can be batched across that boundary without weakening the barrier,
+//! which is what makes a crash recoverable. If a bulk-import workload needs
+//! cross-write batching, the way to get it is fewer, larger writes (stream one
+//! archive through `write_reader` rather than writing each member), not a laxer
+//! barrier.
+//!
 //! A pack is `chunk₀ ‖ chunk₁ ‖ … ‖ trailer ‖ trailer_len(u32) ‖ ORGP ‖ version`,
 //! where the trailer lists `(chunk_hash, len)` in order so [`PackStore::repack`]
 //! can see a pack's full membership and reclaim dead space (deleted chunks) by
@@ -126,6 +149,12 @@ impl PackStore {
             }
         }
         if dedup && self.index.has(&key).await? {
+            // Deduplicated onto a chunk that is already packed. Its liveness for
+            // GC is its *index entry's* age (see `list_with_age`), so refresh
+            // that entry — otherwise a sweep can reclaim the pack holding a chunk
+            // this write is about to reference. The index refresh is itself
+            // age-gated, so a hit on recently-written content costs nothing.
+            self.index.touch(&key).await?;
             return Ok(());
         }
         let full = {
@@ -159,19 +188,43 @@ impl PackStore {
         };
 
         // body ‖ trailer ‖ trailer_len ‖ ORGP ‖ version
+        //
+        // `PackLoc` addresses a chunk with a `u32` offset and `u32` length, and
+        // these three casts used to be bare `as`. Past 4 GiB they wrapped
+        // *silently*: the pack was written, an index entry with a nonsense offset
+        // was committed, and a later `get` issued a ranged read at the wrong place
+        // — returning wrong bytes or a short read, with nothing to indicate which.
+        //
+        // Reachable despite the 4 MiB default target, because `stage` inserts
+        // before it seals: any single `put` larger than the target gets a pack of
+        // its own. The manifest of a ~7.5 TiB file is such a put. `with_target`
+        // also takes an unbounded size.
+        //
+        // The read side was already careful — `parse_trailer` uses `checked_add`
+        // with a comment about hostile trailers. This is the same asymmetry as
+        // `Manifest::encode`: guarded coming in, unguarded going out.
+        let too_large = |what: &str, n: usize| {
+            OrigoFSError::TooLarge(format!(
+                "pack {what} is {n} bytes, past the u32 the pack index can address \
+                 ({} max); lower the pack target or store this object unpacked",
+                u32::MAX
+            ))
+        };
         let mut buf = Vec::new();
         let mut locs: Vec<(Hash, u32, u32)> = Vec::with_capacity(order.len());
         for (h, b) in order.iter().zip(&chunks) {
-            let offset = buf.len() as u32;
+            let offset = u32::try_from(buf.len()).map_err(|_| too_large("offset", buf.len()))?;
+            let len = u32::try_from(b.len()).map_err(|_| too_large("chunk", b.len()))?;
             buf.extend_from_slice(b);
-            locs.push((*h, offset, b.len() as u32));
+            locs.push((*h, offset, len));
         }
         let body_len = buf.len();
         for (h, _, len) in &locs {
             buf.extend_from_slice(h.as_bytes());
             buf.extend_from_slice(&len.to_le_bytes());
         }
-        let trailer_len = (buf.len() - body_len) as u32;
+        let trailer = buf.len() - body_len;
+        let trailer_len = u32::try_from(trailer).map_err(|_| too_large("trailer", trailer))?;
         buf.extend_from_slice(&trailer_len.to_le_bytes());
         buf.extend_from_slice(&format::PACK.header());
 
@@ -421,6 +474,16 @@ impl ContentStore for PackStore {
             out.push((*h, Some(0)));
         }
         Ok(out)
+    }
+
+    /// A chunk's recency is its index entry's, matching `list_with_age`. A chunk
+    /// still buffered in the open pack already reports age 0, so there is nothing
+    /// to refresh for it.
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        if self.pending.lock().resident.contains_key(hash) {
+            return Ok(());
+        }
+        self.index.touch(hash).await
     }
 
     async fn ping(&self) -> Result<()> {

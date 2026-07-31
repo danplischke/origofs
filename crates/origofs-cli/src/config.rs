@@ -39,8 +39,12 @@ pub struct Config {
     content: Content,
 }
 
+// `deny_unknown_fields` on every level, not just the outer `Config`. A
+// misspelled key that parses and is silently dropped is the worst outcome
+// here: the daemon starts, reports no error, and runs against the *default*
+// backend while the operator's file says otherwise.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "backend", rename_all = "lowercase")]
+#[serde(tag = "backend", rename_all = "lowercase", deny_unknown_fields)]
 enum Metadata {
     /// SQLite (solo/offline). `path` defaults to `<workspace>/meta.db`.
     Sqlite { path: Option<PathBuf> },
@@ -55,7 +59,7 @@ impl Default for Metadata {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "backend", rename_all = "lowercase")]
+#[serde(tag = "backend", rename_all = "lowercase", deny_unknown_fields)]
 enum Content {
     /// A local sharded directory. `path` defaults to `<workspace>/cas`.
     Local { path: Option<PathBuf> },
@@ -72,6 +76,7 @@ impl Default for Content {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct S3Content {
     bucket: String,
     region: String,
@@ -94,6 +99,7 @@ struct S3Content {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GcsContent {
     bucket: String,
     #[serde(default)]
@@ -104,6 +110,10 @@ struct GcsContent {
     application_credentials: Option<String>,
     #[serde(default)]
     prefix: Option<String>,
+    /// Allow a plaintext (`http://`) endpoint — for a local GCS emulator only.
+    /// Real GCS is always https, so leave this unset in production.
+    #[serde(default)]
+    allow_http: bool,
     #[serde(default)]
     packed: bool,
     #[serde(default)]
@@ -132,6 +142,7 @@ impl GcsContent {
             service_account_key: self.service_account_key.clone(),
             application_credentials: self.application_credentials.clone(),
             prefix: self.prefix.clone(),
+            allow_http: self.allow_http,
         }
     }
 }
@@ -251,5 +262,115 @@ impl Config {
             }
         };
         Ok(ws)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--config` is what points the shipped daemons at Postgres and an object
+    /// store, so a parsing slip silently changes which backend production runs on.
+    /// This file had no tests; the Docker job only exercises the compose file's
+    /// one configuration.
+    fn parse(toml_src: &str) -> Result<Config> {
+        toml::from_str(toml_src).map_err(Into::into)
+    }
+
+    #[test]
+    fn an_empty_config_is_the_local_default() {
+        // `origofs --config empty.toml` must behave like no config at all, because
+        // every field has a documented default.
+        let c = parse("").expect("empty config");
+        assert!(matches!(c.metadata, Metadata::Sqlite { path: None }));
+        assert!(matches!(c.content, Content::Local { path: None }));
+    }
+
+    #[test]
+    fn the_documented_example_parses() {
+        // The exact block from this module's own doc comment. A doc example that
+        // does not parse is worse than none.
+        let c = parse(
+            r#"
+            [metadata]
+            backend = "postgres"
+            dsn = "host=db.internal user=origofs dbname=origofs"
+
+            [content]
+            backend = "s3"
+            bucket = "origofs-content"
+            region = "us-east-1"
+            packed = true
+            "#,
+        )
+        .expect("the documented example");
+        match c.metadata {
+            Metadata::Postgres { dsn } => assert!(dsn.contains("db.internal")),
+            other => panic!("expected postgres, got {other:?}"),
+        }
+        match c.content {
+            Content::S3(s3) => {
+                assert_eq!(s3.bucket, "origofs-content");
+                assert_eq!(s3.region, "us-east-1");
+                assert!(s3.packed);
+            }
+            other => panic!("expected s3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_shipped_example_config_parses() {
+        // `deploy/config.example.toml` is what an operator copies. If it stops
+        // parsing, the first person to find out is them.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/config.example.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+
+        // The file documents several alternatives with most commented out; each
+        // uncommented `[metadata]`/`[content]` pair must be a valid config.
+        parse(&text).unwrap_or_else(|e| panic!("{} does not parse: {e}", path.display()));
+    }
+
+    #[test]
+    fn an_unknown_backend_is_rejected() {
+        assert!(parse("[metadata]\nbackend = \"mysql\"").is_err());
+        assert!(parse("[content]\nbackend = \"azure\"").is_err());
+    }
+
+    #[test]
+    fn a_typo_is_rejected_rather_than_ignored() {
+        // `deny_unknown_fields` is the point: a misspelled key that parsed and was
+        // silently dropped would hand someone the *default* backend while their
+        // config said otherwise.
+        assert!(
+            parse("[metadata]\nbackend = \"postgres\"\ndns = \"host=x\"").is_err(),
+            "a misspelled `dsn` must not be silently ignored"
+        );
+        assert!(
+            parse("[content]\nbackend = \"local\"\npth = \"/tmp/cas\"").is_err(),
+            "a misspelled `path` must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn postgres_requires_a_dsn() {
+        assert!(
+            parse("[metadata]\nbackend = \"postgres\"").is_err(),
+            "postgres with no dsn has nothing to connect to"
+        );
+    }
+
+    #[test]
+    fn load_reports_the_offending_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.toml");
+        std::fs::write(&path, "[metadata]\nbackend = \"nope\"").unwrap();
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("broken.toml"), "unhelpful error: {err}");
+
+        let missing = dir.path().join("absent.toml");
+        let err = Config::load(&missing).unwrap_err().to_string();
+        assert!(err.contains("absent.toml"), "unhelpful error: {err}");
     }
 }

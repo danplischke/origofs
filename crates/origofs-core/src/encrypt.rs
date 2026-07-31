@@ -164,8 +164,21 @@ impl ContentStore for EncryptedStore {
     }
 
     async fn get_range(&self, hash: &Hash, off: u64, len: u64) -> Result<Bytes> {
-        // AEAD authenticates the whole object, so decrypt then slice. origofs objects
-        // are chunk-sized (<= a few hundred KB), so this stays cheap.
+        // AEAD authenticates the whole object, so a ranged read is not possible
+        // without decrypting all of it: the tag covers the ciphertext, and a
+        // partial decrypt cannot be authenticated. Decrypt, then slice.
+        //
+        // Cheap for *chunks*, which is the overwhelming majority of reads and are
+        // capped at `MAX_CHUNK` (256 KiB). It is not cheap for the two object kinds
+        // that are not chunks: a `PackStore` pack (4 MiB by default) and a manifest
+        // (36 bytes per chunk, so ~59 MB for a 100 GiB file). A ranged read of
+        // either decrypts the whole object.
+        //
+        // The comment here used to assert all objects were "chunk-sized (<= a few
+        // hundred KB)", which was simply false for those two. Left as-is rather
+        // than "fixed" because there is no fix that preserves authentication —
+        // the honest answer is that encryption and packing compose with a real
+        // cost, and `docs/LIMITS.md` says so.
         let full = self.get(hash).await?;
         let start = (off as usize).min(full.len());
         let end = start.saturating_add(len as usize).min(full.len());
@@ -182,6 +195,14 @@ impl ContentStore for EncryptedStore {
 
     async fn list_with_age(&self) -> Result<Vec<(Hash, Option<u64>)>> {
         self.inner.list_with_age().await
+    }
+
+    /// Forwarded, like `list_with_age`. A decorator that reports the inner
+    /// store's ages must forward the refresh that keeps those ages honest,
+    /// or a deduplicating write through this layer stays invisible to the
+    /// sweep's grace period (`ContentStore::touch`).
+    async fn touch(&self, hash: &Hash) -> Result<()> {
+        self.inner.touch(hash).await
     }
 
     /// Forwarded **unencrypted**, and necessarily so: the salt stored here is what

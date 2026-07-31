@@ -834,7 +834,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             Some(h) => h.to_hex(),
             None => self
                 .content
-                .put(&crate::chunk::Manifest::default().encode())
+                .put(&crate::chunk::Manifest::default().encode()?)
                 .await?
                 .to_hex(),
         })

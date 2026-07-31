@@ -23,7 +23,7 @@ use crate::metadata::{MetaTxn, MetadataStore};
 use crate::migrations::MIGRATIONS;
 use crate::suggest::{Suggestion, SuggestionInit, SuggestionKind, SuggestionStatus};
 use crate::types::{DirEntry, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit};
-use crate::util::now_secs;
+use crate::util::{blocking_section, now_secs};
 use async_trait::async_trait;
 use parking_lot::{ArcMutexGuard, Mutex, MutexGuard, RawMutex};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -31,34 +31,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 const DIR_MODE: i64 = 0o040755;
-
-/// Run a synchronous SQLite section without stalling the async runtime.
-///
-/// rusqlite blocks — on the connection mutex, on `busy_timeout` waits, and on the
-/// WAL fsync a commit ends with. Run bare on a multi-thread runtime, each of
-/// those takes a worker thread out of service for its duration, so a handful of
-/// concurrent metadata callers can starve every other task in the process.
-/// [`tokio::task::block_in_place`] hands the worker's queued tasks to another
-/// worker first, so blocking here costs a thread rather than a share of the
-/// runtime's throughput.
-///
-/// `spawn_blocking` would be the other option, but it requires a `'static +
-/// Send` closure, which would mean copying every borrowed argument (and the
-/// transaction's owned connection guard) across the boundary on every call.
-/// `block_in_place` gives the same scheduler cooperation while letting these
-/// bodies keep borrowing.
-///
-/// It panics on a `current_thread` runtime, where there is no other worker to
-/// hand work to, so the flavor is checked and the closure runs inline there —
-/// which is exactly what a single-threaded runtime would do anyway. The check
-/// also covers being called from a `spawn_blocking` task, from a plain thread
-/// with an entered handle, and from no runtime at all.
-fn blocking_section<T>(f: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
-        _ => f(),
-    }
-}
 
 /// How many inode numbers one batched `get_inodes` query binds. SQLite's
 /// `SQLITE_MAX_VARIABLE_NUMBER` is 999 on builds before 3.32, so the IN-list is
@@ -1449,10 +1421,20 @@ impl MetaTxn for SqliteTxn {
 
     async fn set_content(&mut self, ino: Ino, content: Option<Hash>, size: u64) -> Result<()> {
         blocking_section(move || {
-            self.conn().execute(
+            let n = self.conn().execute(
                 "UPDATE inode SET content_hash = ?1, size = ?2, mtime = ?3, ctime = ?3 WHERE ino = ?4",
                 params![content.map(|h| h.to_hex()), size as i64, now_secs(), ino],
             )?;
+            // Zero rows means the inode is gone. `write_reader` resolves the inode
+            // *before* a stream that can run for minutes, so a path unlinked in the
+            // meantime lands here — and discarding the count reported that write as
+            // durable while the bytes went nowhere. Reachable from `vfs_write` and
+            // `write_body` for the same reason.
+            if n == 0 {
+                return Err(OrigoFSError::NotFound(format!(
+                    "inode {ino} was removed before its content could be written"
+                )));
+            }
             Ok(())
         })
     }
@@ -1734,6 +1716,17 @@ impl MetaTxn for SqliteTxn {
         blocking_section(move || {
             let guard = self.guard.take().expect("transaction already finished");
             guard.execute_batch("COMMIT")?;
+            Ok(())
+        })
+    }
+
+    async fn rollback(mut self: Box<Self>) -> Result<()> {
+        blocking_section(move || {
+            let guard = self.guard.take().expect("transaction already finished");
+            guard.execute_batch("ROLLBACK")?;
+            // Taking the guard also releases the connection lock here rather than
+            // in `Drop`, so a caller that rolls back and immediately re-reads is
+            // not waiting on its own dropped transaction.
             Ok(())
         })
     }

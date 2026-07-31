@@ -20,8 +20,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Exercise the Postgres (multi-writer / production) metadata backend. Without
-    # ORIGOFS_PG_TEST_URL the PG-gated suites (postgres.rs, concurrency.rs,
-    # subscribe.rs) self-skip and only the SQLite path is tested.
+    # ORIGOFS_PG_TEST_URL every PG leg self-skips and only the SQLite path is
+    # tested — including the dual-backend invariant suites (atomicity.rs) and
+    # `pg_object_store.rs`, which covers the Postgres + object-store composition
+    # the `open_pg_gcs`/`open_pg_s3` constructors build. That pairing had no test
+    # at all, which is how a `gc()` that could never acquire its lease on Postgres
+    # shipped.
     env:
       ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
     services:
@@ -68,6 +72,12 @@ jobs:
           # features of origofs-sdk. `--workspace` builds their code via the CLI's
           # `full`, but lint the surface modules + their gated tests explicitly too.
           cargo clippy -p origofs-sdk --features full --all-targets -- -D warnings
+          # The fuzz crate is deliberately outside the workspace (cargo-fuzz needs
+          # its own nightly + sanitizer flags), so nothing above compiles it — a
+          # signature change in origofs-core breaks it invisibly until the Fuzz job
+          # gets there, minutes later and behind a sanitizer build. A plain stable
+          # `check` costs seconds and reports it as an ordinary type error.
+          cargo check --manifest-path crates/origofs-core/fuzz/Cargo.toml
 
       # Postgres tests self-skip without ORIGOFS_PG_TEST_URL; the S3/GCS integration
       # tests are #[ignore]d; and the FUSE / NFS / overlayfs tests self-skip when
@@ -177,6 +187,102 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  # Feature-combination coverage. `--workspace` unifies features across the graph,
+  # and origofs-cli/-py pull `full,metrics,coedit` — so every existing invocation
+  # builds the *maximal* set, and the repeatedly-stated promise that "a default
+  # build pulls none of the surface dependencies" was never actually verified.
+  # Neither was the reverse: a `cfg` that only compiles when a sibling feature
+  # happens to be on would ship undetected.
+  #
+  # `cargo hack --feature-powerset --depth 2` checks every pair, which is where
+  # these bugs live (a constructor needing *both* postgres and object-store, a
+  # weak dependency like `axum?/ws`). `check` only — this is about whether the
+  # combinations compile, and the behavioural tests live in the jobs above.
+  features:
+    name: Feature combinations (cargo-hack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
+
+      # origofs-py is a pyo3 extension; the workspace needs an interpreter to link.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The engine's own backend features (postgres / object-store / encryption)
+      # plus coedit and metrics. `--depth 2` keeps this to pairs rather than the
+      # full 2^5.
+      - name: origofs-core feature powerset
+        run: cargo hack check -p origofs-core --feature-powerset --depth 2
+
+      # The access surfaces are default-off features here, and `--each-feature`
+      # covers the single-feature builds `--features full` never exercises: an
+      # `api`-only or `nfs`-only build has to work on its own.
+      - name: origofs-sdk feature powerset
+        run: cargo hack check -p origofs-sdk --feature-powerset --depth 2
+
+      # The claim this is really here to defend: with no features, none of the
+      # surface or backend dependencies are in the tree at all.
+      # `--edges normal` matters: dev-dependencies pull several of these in for the
+      # test suite (nfsserve, tokio-postgres, yrs), and those are not what the
+      # promise is about — it is about what a *consumer* links.
+      - name: A minimal origofs-sdk build links none of the optional trees
+        run: |
+          cargo tree -p origofs-sdk --no-default-features --edges normal --prefix none \
+            | sort -u > /tmp/minimal.txt
+          failed=0
+          for dep in axum fuser nfsserve object_store tokio-postgres deadpool-postgres \
+                     rustls argon2 chacha20poly1305 yrs; do
+            if grep -q "^$dep " /tmp/minimal.txt; then
+              echo "::error::$dep is linked by a --no-default-features origofs-sdk build"
+              failed=1
+            fi
+          done
+          test "$failed" = 0
+          echo "confirmed: $(wc -l < /tmp/minimal.txt) normal dependencies, none of them optional trees"
+
+  # The FUSE mount surface, which had **zero** executed coverage.
+  #
+  # All five tests in `fuse_mount.rs` gate on `mountable()` — root plus an openable
+  # `/dev/fuse` — and a stock GitHub runner is neither, so they always skipped.
+  # `fuse.rs` is the largest single surface module and README lists FUSE as a
+  # first-class interface, so "the tests exist" was doing a lot of unearned work.
+  #
+  # A job container runs as root and, given `--device /dev/fuse` plus `SYS_ADMIN`,
+  # can actually mount. The tests are unchanged; they just finally run.
+  fuse:
+    name: FUSE mount surface
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: rust:1.88-bookworm
+      # `--device` exposes the FUSE char device; SYS_ADMIN is what `mount(2)`
+      # needs; apparmor:unconfined stops the host profile blocking the mount.
+      options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install fuse3
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends fuse3 libfuse3-dev pkg-config
+
+      # Fail loudly rather than skipping: a silent skip here is precisely the
+      # failure mode this job exists to end.
+      - name: The mount preconditions really are satisfied
+        run: |
+          test "$(id -u)" = 0 || { echo "::error::not root"; exit 1; }
+          test -c /dev/fuse   || { echo "::error::/dev/fuse missing"; exit 1; }
+          echo "root + /dev/fuse present; fuse_mount.rs will not self-skip"
+
+      - name: Run the FUSE mount suite
+        run: cargo test -p origofs-sdk --features full --test fuse_mount -- --nocapture
 
   # B4 (#70): supply-chain gate. RUSTSEC advisories, the license allow-list, and
   # source pinning from deny.toml. Reads Cargo metadata only — no workspace
@@ -369,6 +475,16 @@ jobs:
             sqlalchemy alembic "psycopg[binary]" mypy
           maturin develop
           pytest -q tests
+
+      # The example apps ship their own test suites and neither was ever executed:
+      # the run above is scoped to `crates/origofs-py/tests`, and codecov.yml
+      # ignores `examples/**`. README points readers at both, so they can rot
+      # silently — and an example that no longer runs is worse than none.
+      - name: Example app test suites
+        working-directory: crates/origofs-py
+        run: |
+          . .venv/bin/activate
+          pytest -q ../../examples/fs-consumer ../../examples/web/server
 
       # Type-check the test suite against python/origofs/__init__.pyi (the hand
       # -maintained stub for the compiled _origofs extension). This is what

@@ -427,3 +427,94 @@ async fn run_live_streams_changes_to_origofs() {
     );
     assert_eq!(ws.blame("/new.txt").await.unwrap()[0].actor.id, agent);
 }
+
+/// A sandboxed deletion must be attributed, not just applied.
+///
+/// Only file *writes* went through `write_as`; deletions, directory creation, and
+/// symlinks imported through the unattributed engine methods. So
+/// `origofs sandbox --actor N -- rm -rf src/` recorded nothing about who removed
+/// the tree — no blame, no edit-op, no audit row — in a system whose whole premise
+/// is that every change is attributable. `imports_delta_with_attribution` above
+/// asserts the file is *gone*, never who removed it, which is why this went
+/// unnoticed.
+#[tokio::test]
+async fn a_sandboxed_deletion_is_attributed() {
+    if !overlay_supported() {
+        eprintln!("skipping: unprivileged overlayfs unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ws = workspace(dir.path()).await;
+    ws.write("/doomed.txt", b"bye\n").await.unwrap();
+    let agent = ws.create_agent("deleter", "m", None).await.unwrap();
+
+    let out = run(
+        &ws,
+        RunOpts {
+            actor: Some(agent),
+            discard: false,
+            work_root: dir.path().join("sbx"),
+            isolate: false,
+        },
+        &[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "rm doomed.txt".into(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert!(out.imported);
+    assert!(
+        ws.stat("/doomed.txt").await.is_err(),
+        "the file is still there"
+    );
+
+    // The deletion is on the record, against this agent.
+    let ops = ws.edit_ops(agent, None).await.unwrap();
+    assert!(
+        ops.iter().any(|o| o.path == "/doomed.txt"),
+        "the sandboxed deletion of /doomed.txt was imported with no edit-op, so \
+         nothing records who removed it. Recorded ops: {:?}",
+        ops.iter().map(|o| (&o.path, &o.op)).collect::<Vec<_>>()
+    );
+}
+
+/// A sandboxed directory creation is attributed too.
+#[tokio::test]
+async fn a_sandboxed_mkdir_is_attributed() {
+    if !overlay_supported() {
+        eprintln!("skipping: unprivileged overlayfs unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ws = workspace(dir.path()).await;
+    let agent = ws.create_agent("maker", "m", None).await.unwrap();
+
+    let out = run(
+        &ws,
+        RunOpts {
+            actor: Some(agent),
+            discard: false,
+            work_root: dir.path().join("sbx"),
+            isolate: false,
+        },
+        &[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "mkdir -p sub/deeper; echo hi > sub/deeper/f.txt".into(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.exit_code, 0);
+
+    assert_eq!(&ws.read("/sub/deeper/f.txt").await.unwrap()[..], b"hi\n");
+    let ops = ws.edit_ops(agent, None).await.unwrap();
+    assert!(
+        ops.iter().any(|o| o.path == "/sub/deeper/f.txt"),
+        "the write was not attributed: {:?}",
+        ops.iter().map(|o| &o.path).collect::<Vec<_>>()
+    );
+}

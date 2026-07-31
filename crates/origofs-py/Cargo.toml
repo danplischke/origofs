@@ -2,9 +2,12 @@
 name = "origofs-py"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Python bindings for origofs (agent filesystem)"
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 # The extension is imported as `origofs._origofs` (mixed layout: pure-Python `origofs`

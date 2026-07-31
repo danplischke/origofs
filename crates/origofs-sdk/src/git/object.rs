@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 /// A git object-id hash function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ObjectFormat {
     /// 160-bit SHA-1 ids — compatible with GitHub and today's git hosts.
     Sha1,

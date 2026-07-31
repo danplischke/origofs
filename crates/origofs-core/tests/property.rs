@@ -107,7 +107,7 @@ proptest! {
     /// `decode(encode(m)) == m` for every consistent manifest.
     #[test]
     fn manifest_roundtrips(m in arb_manifest()) {
-        let back = Manifest::decode(&m.encode()).expect("a consistent manifest must decode");
+        let back = Manifest::decode(&m.encode().unwrap()).expect("a consistent manifest must decode");
         prop_assert_eq!(back, m);
     }
 
@@ -121,7 +121,7 @@ proptest! {
         let total: u64 = chunks.iter().map(|c| c.len as u64).sum();
         prop_assume!(bogus != total);
         let lying = Manifest { size: bogus, chunks };
-        prop_assert!(Manifest::decode(&lying.encode()).is_err());
+        prop_assert!(Manifest::decode(&lying.encode().unwrap()).is_err());
     }
 
     /// `decode(encode(t)) == t` for arbitrary trees.

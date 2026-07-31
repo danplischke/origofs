@@ -27,7 +27,8 @@ async fn commit_bytes(store: &MemStore, message: &str) -> Vec<u8> {
                     len: 2,
                 }],
             }
-            .encode(),
+            .encode()
+            .unwrap(),
         )
         .await
         .unwrap();

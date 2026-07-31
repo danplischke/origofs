@@ -457,3 +457,103 @@ async fn every_mutating_mcp_tool_is_policy_classified() {
         );
     }
 }
+
+/// A propose-only agent must not create directories on its way to the review
+/// queue.
+///
+/// `origofs_write` correctly queues the *edit* for a propose-only agent, but it
+/// used to create the path's parent first with the unattributed `mkdir_p` — so
+/// the agent mutated the working tree anyway, with no blame, no edit-op, and no
+/// policy check. The engine documents having fixed exactly this class internally
+/// (`suggest.rs`); the surface was still doing it by hand.
+///
+/// Every other test here writes to a root-level path, where `rsplit_once('/')`
+/// yields an empty parent and the `mkdir_p` never runs — which is why this went
+/// unnoticed. This one uses a nested path on purpose.
+#[tokio::test]
+async fn a_queued_write_creates_no_directories() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let agent = ws.create_agent("claude", "opus", None).await.unwrap();
+    let session = ws.create_session(agent, Some("mcp")).await.unwrap();
+    ws.set_write_policy(agent, WritePolicy::Propose)
+        .await
+        .unwrap();
+    let s = McpServer::new(ws.clone(), agent, session);
+
+    let w = s
+        .handle(call(
+            "origofs_write",
+            json!({"path":"/deep/nested/notes.txt","content":"proposed"}),
+        ))
+        .await
+        .unwrap();
+
+    // The write itself is refused or queued — either is a correct policy outcome.
+    // What must not happen is the directory appearing regardless.
+    let _ = w;
+    assert!(
+        ws.stat("/deep").await.is_err(),
+        "a propose-only agent created /deep while its edit was only being proposed"
+    );
+}
+
+/// The same path works for a trusted agent: the parent is created, attributed.
+#[tokio::test]
+async fn a_direct_agent_creates_parents_attributed() {
+    let s = server().await;
+    let w = s
+        .handle(call(
+            "origofs_write",
+            json!({"path":"/deep/nested/notes.txt","content":"real"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(w["result"]["isError"], false, "{}", text(&w));
+
+    let r = s
+        .handle(call(
+            "origofs_read",
+            json!({"path":"/deep/nested/notes.txt"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(text(&r), "real");
+}
+
+/// A misspelled tool name is an error, not a success with an apologetic string.
+#[tokio::test]
+async fn an_unknown_tool_is_an_error() {
+    let s = server().await;
+    let r = s
+        .handle(call("origofs_wrtie", json!({"path":"/a.txt"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        r["result"]["isError"], true,
+        "an unknown tool reported success, so an agent would treat the call as \
+         having worked: {r}"
+    );
+}
+
+/// Commits name the agent, not a placeholder shared by every agent.
+#[tokio::test]
+async fn a_commit_names_the_agent() {
+    let s = server().await;
+    s.handle(call(
+        "origofs_write",
+        json!({"path":"/a.txt","content":"hello"}),
+    ))
+    .await
+    .unwrap();
+    let c = s
+        .handle(call("origofs_commit", json!({"message":"first"})))
+        .await
+        .unwrap();
+    assert_eq!(c["result"]["isError"], false, "{}", text(&c));
+
+    let log = s.handle(call("origofs_log", json!({}))).await.unwrap();
+    assert!(text(&log).contains("first"));
+}

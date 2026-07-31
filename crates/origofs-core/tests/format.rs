@@ -118,7 +118,11 @@ fn fixture_refs() -> RefSnapshot {
 #[test]
 fn v1_encodings_are_frozen() {
     for (name, actual, golden) in [
-        ("manifest", fixture_manifest().encode(), MANIFEST_V1),
+        (
+            "manifest",
+            fixture_manifest().encode().unwrap(),
+            MANIFEST_V1,
+        ),
         ("tree", fixture_tree().encode(), TREE_V1),
         ("commit", fixture_commit().encode(), COMMIT_V1),
         ("refs", fixture_refs().encode(), REFS_V1),
@@ -137,7 +141,11 @@ fn v1_encodings_are_frozen() {
 #[test]
 fn v1_addresses_are_frozen() {
     for (name, actual, golden) in [
-        ("manifest", fixture_manifest().encode(), MANIFEST_V1_HASH),
+        (
+            "manifest",
+            fixture_manifest().encode().unwrap(),
+            MANIFEST_V1_HASH,
+        ),
         ("tree", fixture_tree().encode(), TREE_V1_HASH),
         ("commit", fixture_commit().encode(), COMMIT_V1_HASH),
         ("refs", fixture_refs().encode(), REFS_V1_HASH),

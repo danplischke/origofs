@@ -26,6 +26,11 @@ use crate::metadata::MetadataStore;
 use crate::types::Hash;
 
 /// The outcome of a policy-governed write (see [`Fs::write_or_propose`]).
+// Deliberately NOT `#[non_exhaustive]`. This is an *outcome* enum: its whole
+// purpose is to make the caller handle each case, so a new variant should be a
+// compile error at every call site. `non_exhaustive` would force a wildcard arm
+// that silently swallows it instead — the opposite of the intent. Adding a
+// variant here is a breaking change on purpose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteOutcome {
     /// The actor writes directly; the edit landed in the working tree.
@@ -50,6 +55,7 @@ pub enum WriteOutcome {
 ///   conflict and must not be rejected — the byte-suggestion staleness guard would
 ///   false-reject it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SuggestionKind {
     /// A whole-file body (the classic path).
     #[default]
@@ -77,6 +83,7 @@ impl SuggestionKind {
 
 /// The lifecycle state of a suggestion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SuggestionStatus {
     /// Awaiting review.
     Pending,
@@ -206,7 +213,13 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     /// route through here. Checkout, merge materialization and
     /// [`accept_suggestion`](Self::accept_suggestion) applying an approved edit are
     /// all system actions with no requesting actor to police.
-    pub(crate) async fn ensure_may_write(&self, ctx: WriteCtx, op: &str) -> Result<()> {
+    /// Refuse `op` for an actor whose [`WritePolicy`](crate::WritePolicy) is
+    /// `Propose` (§6). `pub` so a *surface* can gate an administrative operation
+    /// that has no attributed engine variant of its own — registering an actor,
+    /// for instance, mutates the identity registry rather than the working tree,
+    /// so there is nothing to attribute, but it still must not be open to an
+    /// actor the operator has restricted.
+    pub async fn ensure_may_write(&self, ctx: WriteCtx, op: &str) -> Result<()> {
         match self.write_policy_of(ctx.actor).await? {
             WritePolicy::Direct => Ok(()),
             WritePolicy::Propose => Err(OrigoFSError::Denied(format!(
@@ -313,7 +326,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             // accept.
             None => Some(
                 self.content
-                    .put(&crate::chunk::Manifest::default().encode())
+                    .put(&crate::chunk::Manifest::default().encode()?)
                     .await?
                     .to_hex(),
             ),
@@ -542,14 +555,31 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             SuggestionKind::Crdt => return Err(crdt_needs_feature(s.id)),
         }
 
-        self.meta
+        // `resolve_suggestion` is a compare-and-set on `status = 'pending'`, and its
+        // answer matters. Discarding it meant a *lost* CAS still reported success:
+        // the dangerous shape is an accept racing a reject, where the reject claims
+        // the row, the accept applies the proposed bytes anyway, and the caller is
+        // told the acceptance worked while the suggestion reads "rejected". The
+        // write has already landed by this point — that is inherent to applying
+        // before resolving — so this cannot be undone here, but it must not be
+        // silent.
+        if !self
+            .meta
             .resolve_suggestion(
                 id,
                 SuggestionStatus::Accepted,
                 Some(approver.actor),
                 self.now_secs(),
             )
-            .await?;
+            .await?
+        {
+            let now = self.meta.get_suggestion(id).await?;
+            let state = now.as_ref().map(|s| s.status.as_str()).unwrap_or("deleted");
+            return Err(OrigoFSError::Conflict(format!(
+                "suggestion #{id} was resolved as {state} by another reviewer while                  this acceptance was being applied; {} now holds the proposed                  content and should be reviewed directly",
+                s.path
+            )));
+        }
         self.record_event(EventInit {
             actor_id: Some(approver.actor),
             session_id: approver.session,
@@ -700,14 +730,25 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             self.ensure_may_write(approver, "reject others' suggestions")
                 .await?;
         }
-        self.meta
+        // Same CAS, same reason it must be checked — a reject that lost to a
+        // concurrent accept previously reported success while the proposed bytes
+        // were being written to the working tree.
+        if !self
+            .meta
             .resolve_suggestion(
                 id,
                 SuggestionStatus::Rejected,
                 Some(approver.actor),
                 self.now_secs(),
             )
-            .await?;
+            .await?
+        {
+            let now = self.meta.get_suggestion(id).await?;
+            let state = now.as_ref().map(|s| s.status.as_str()).unwrap_or("deleted");
+            return Err(OrigoFSError::Conflict(format!(
+                "suggestion #{id} was already resolved as {state} by another reviewer"
+            )));
+        }
         self.record_event(EventInit {
             actor_id: Some(approver.actor),
             session_id: approver.session,

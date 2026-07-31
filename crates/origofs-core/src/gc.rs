@@ -28,6 +28,19 @@
 //! overlapping, since a sweep is destructive and running it twice at once doubles
 //! the exposure for no benefit.
 //!
+//! **The age gate has a second half, and it is not optional.** `put` is
+//! deduplicating: it returns early when the content is already stored, and an
+//! object that already exists does not get a fresh timestamp. So the gate as
+//! described above protects only *newly written* bytes. A writer that dedups onto
+//! an old, currently-unreferenced object — reverting a file, shared boilerplate,
+//! checking out an older commit — gets `Ok(hash)` for content this sweep is about
+//! to reclaim, and the commit that follows references a hash that no longer
+//! exists. Every backend therefore refreshes an object's recency on the dedup path
+//! ([`ContentStore::touch`]), gated at
+//! [`DEDUP_REFRESH_AFTER_SECS`](crate::content::DEDUP_REFRESH_AFTER_SECS) so the common case
+//! stays free. [`Fs::gc_with_grace`] rejects a grace below
+//! that floor, because the band between the two is precisely where the race lives.
+//!
 //! This is not a substitute for running GC when the workspace is calm — it is what
 //! makes doing so on a *live, shared* workspace safe, which is the only option in
 //! a workspace agents are always writing to.
@@ -50,15 +63,29 @@ use std::collections::HashSet;
 /// being generous is only that garbage lingers one extra cycle.
 pub const DEFAULT_GC_GRACE_SECS: u64 = 600;
 
-/// Key of the advisory lease that serializes collections. Not a valid path — no
-/// user `lock` can collide with it, because `validate_component` rejects the NUL.
-const GC_LEASE_KEY: &str = "\0gc-lease";
+/// Key of the advisory lease that serializes collections.
+///
+/// Not a valid path, so no user `lock` can collide with it: every workspace path
+/// is absolute, and [`Fs::lock`](Fs::lock) refuses one that is not.
+///
+/// It used to be `"\0gc-lease"`, relying on `validate_component` rejecting NUL.
+/// That reasoning held for *paths*, but the key is stored in a `text` column and
+/// **Postgres cannot store a NUL byte in one** — so `acquire_lock` failed with
+/// `invalid byte sequence for encoding "UTF8": 0x00` and garbage collection was
+/// broken outright on the production metadata backend. Every GC test was
+/// SQLite-only, so nothing noticed.
+const GC_LEASE_KEY: &str = "origofs:gc-lease";
 
 /// How long a GC lease is honored before another collection may take it. Bounds
 /// how long a crashed collector blocks the next one.
 const GC_LEASE_SECS: i64 = 3600;
 
 /// What a GC pass reclaimed.
+/// `#[non_exhaustive]`: callers read this, they never construct it, so adding a
+/// counter should not be a breaking change. (Config structs like `S3Config` are
+/// deliberately left constructible — a caller has to be able to build those, and
+/// `..Default::default()` already absorbs new fields there.)
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GcStats {
     /// Distinct objects kept because they were reachable.
@@ -90,7 +117,32 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// committing — see the sweep below for why. `0` restores the old
     /// reachability-only behaviour and is unsafe with any concurrent writer; it
     /// exists for tests and for a genuinely quiesced store.
+    ///
+    /// Any other value below [`DEDUP_REFRESH_AFTER_SECS`](crate::content::DEDUP_REFRESH_AFTER_SECS)
+    /// is **rejected** rather
+    /// than honoured. The age gate has two halves: the sweep skips young objects,
+    /// and a deduplicating `put` refreshes an object that has gone stale
+    /// ([`ContentStore::touch`]). That refresh only
+    /// fires past `DEDUP_REFRESH_AFTER_SECS`, so a grace shorter than it leaves a
+    /// band where an object is old enough to sweep but not old enough to have been
+    /// refreshed — the exact race the gate exists to close. A caller asking for
+    /// that band has asked for something that cannot be delivered safely, and
+    /// silently widening it would hide the problem; `0` remains available as an
+    /// explicit, documented opt-out.
     pub async fn gc_with_grace(&self, grace_secs: u64) -> Result<GcStats> {
+        if grace_secs > 0 && grace_secs < crate::content::DEDUP_REFRESH_AFTER_SECS {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "gc grace of {grace_secs}s is below the {}s dedup-refresh floor: a sweep with \
+                 this grace can reclaim content a concurrent write has just deduplicated onto. \
+                 Use at least {}s, or 0 to sweep a quiesced store with no age gate at all.",
+                crate::content::DEDUP_REFRESH_AFTER_SECS,
+                crate::content::DEDUP_REFRESH_AFTER_SECS,
+            )));
+        }
+        self.gc_with_grace_unchecked(grace_secs).await
+    }
+
+    async fn gc_with_grace_unchecked(&self, grace_secs: u64) -> Result<GcStats> {
         // One collection at a time. Nothing guarded this before: two `gc()` calls
         // would interleave a mark against the other's sweep. The lease is the
         // existing advisory-lock table under a key no path can be, and it expires

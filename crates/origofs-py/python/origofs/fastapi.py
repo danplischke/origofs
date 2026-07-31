@@ -36,6 +36,10 @@ Requires FastAPI: ``pip install "origofs[fastapi]"``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import mimetypes
+import os
+import tempfile
 import uuid
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union
 
@@ -51,6 +55,7 @@ try:
         WebSocket,
         WebSocketDisconnect,
     )
+    from fastapi import Request
     from fastapi.responses import PlainTextResponse, StreamingResponse
     from pydantic import BaseModel, Field
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -277,12 +282,24 @@ class _Rooms:
         self._lock = asyncio.Lock()
         # This worker's id, tagged on every published op to skip our own echo.
         self._origin = uuid.uuid4().hex
-        self._relay = bool(getattr(ws, "is_postgres", lambda: False)())
+        # Resolved lazily, not here. `build_router` is legitimately called before a
+        # workspace exists — the documented pattern for an app that opens its
+        # workspace in an async lifespan is to wire the router once at import time
+        # against a proxy, so the routes are stable while the workspace is swapped
+        # underneath. Probing the backend in `__init__` broke exactly that: it
+        # forced the proxy to resolve before the lifespan had run.
+        # (`examples/web/server/app.py` does this, and its test suite could not even
+        # be collected — which nothing noticed, because that suite was never run.)
+        self._relay: Optional[bool] = None
         self._drain_task: Optional["asyncio.Task[None]"] = None
 
     def ensure_relay(self) -> None:
         """Start the cross-worker drain task once (a no-op without Postgres, or
-        after the first call). Called on the first socket, in async context."""
+        after the first call). Called on the first socket, in async context —
+        which is also the first point at which the workspace is guaranteed live,
+        so the backend probe happens here."""
+        if self._relay is None:
+            self._relay = bool(getattr(self._ws, "is_postgres", lambda: False)())
         if self._relay and self._drain_task is None:
             self._drain_task = asyncio.create_task(self._drain())
 
@@ -369,6 +386,27 @@ class _Rooms:
 # --- router factory ---------------------------------------------------------
 
 
+# Request bodies up to this size are handled in memory; larger ones spill to a
+# temp file and take the streaming write path. Chosen well under the Rust API's
+# 64 MiB default body cap so an ordinary document write never touches disk, while
+# a genuinely large upload never has to be resident.
+SPOOL_MAX = 8 * 1024 * 1024
+
+
+def _content_type(path: str) -> str:
+    """Guess a media type from the path, defaulting to ``application/octet-stream``.
+
+    Both range-aware responses below used to hardcode ``application/octet-stream``,
+    so a browser downloaded a video instead of playing it however well the ``Range``
+    handling worked. Python has ``mimetypes`` in the standard library, so unlike the
+    Rust surface (which keeps a deliberate small table) there is nothing to
+    hand-maintain here.
+    """
+    guessed, _ = mimetypes.guess_type(path)
+    return guessed or "application/octet-stream"
+
+
+
 def build_router(
     ws: Any,
     *,
@@ -432,7 +470,7 @@ def build_router(
             return Response(
                 content=bytes(data),
                 status_code=206,
-                media_type="application/octet-stream",
+                media_type=_content_type(p),
                 headers={
                     "Content-Range": f"bytes {start}-{end}/{size}",
                     "Accept-Ranges": "bytes",
@@ -462,22 +500,86 @@ def build_router(
 
         return StreamingResponse(
             chunks(),
-            media_type="application/octet-stream",
+            media_type=_content_type(p),
             headers={"Content-Length": str(size), "Accept-Ranges": "bytes"},
         )
 
     @router.put("/files/{path:path}")
-    async def write_file(path: str, body: bytes = Body(default=b""), ctx: Any = Depends(authn)):
+    async def write_file(request: Request, path: str, ctx: Any = Depends(authn)):
+        """Write a file, streaming the request body.
+
+        This used to take ``body: bytes``, so the whole upload sat in memory before
+        a single byte was chunked — asymmetric with the ``GET`` beside it, which has
+        always streamed and honoured ``Range``.
+
+        Bodies up to ``SPOOL_MAX`` stay in memory, so the common small write pays
+        nothing. Past that the body spills to a named temp file which is handed to
+        ``write_path_as``, streaming it into the workspace without the bytes ever
+        crossing back into Python. (A named file rather than
+        ``SpooledTemporaryFile``: on Unix that rolls over to an *unlinked* file, so
+        there is no path to hand across.)
+        """
         p = _abs(path)
         parent, _, _ = p.rpartition("/")
         if parent:  # create intermediate dirs, like the Rust HTTP API does
             await _run(ws.mkdir_p(parent))
-        # Governed by the principal's write policy: a direct actor writes straight
-        # through; a propose-only actor's edit is queued for review instead.
-        outcome = await _run(ws.write_or_propose(ctx, p, body, None))
-        if outcome.wrote:
-            return {"path": p, "written": len(body)}
-        return {"path": p, "proposed": outcome.suggestion_id}
+
+        # A propose-only actor's edit is queued for review, and a suggestion holds
+        # the proposed bytes — so that path buffers whatever its size. Fine by
+        # construction: nobody reviews a multi-gigabyte diff. Deciding up front
+        # keeps the write policy behaving identically either side of SPOOL_MAX.
+        # `getattr` because this router is deliberately duck-typed against a
+        # workspace-like object (that is how it is tested without the compiled
+        # extension), the same way the co-editing rooms probe `is_postgres`.
+        #
+        # Defaulting to True when absent is safe: the buffered branch below goes
+        # through `write_or_propose`, which enforces the policy itself. Only the
+        # streaming branch relies on this check, and it is reached solely on a real
+        # workspace — which has the method.
+        # Awaited directly, *not* through `_run`: `_run` maps `PermissionError` to
+        # a 409 for the caller, which is right for a real request but would swallow
+        # the answer this probe exists to get.
+        may_write_directly = True
+        probe = getattr(ws, "ensure_may_write", None)
+        if probe is not None:
+            try:
+                await probe(ctx, "write a file")
+            except PermissionError:
+                may_write_directly = False
+
+        buf = bytearray()
+        spill = None
+        spill_path = None
+        size = 0
+        try:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if spill is not None:
+                    spill.write(chunk)
+                    continue
+                buf.extend(chunk)
+                # Only spill once we know we can use the streaming path.
+                if len(buf) > SPOOL_MAX and may_write_directly:
+                    spill = tempfile.NamedTemporaryFile(delete=False)
+                    spill_path = spill.name
+                    spill.write(buf)
+                    buf = bytearray()
+            if spill is not None:
+                spill.close()
+                await _run(ws.write_path_as(ctx, p, spill_path))
+                return {"path": p, "written": size}
+
+            body = bytes(buf)
+            outcome = await _run(ws.write_or_propose(ctx, p, body, None))
+            if outcome.wrote:
+                return {"path": p, "written": size}
+            return {"path": p, "proposed": outcome.suggestion_id}
+        finally:
+            if spill is not None and not spill.closed:
+                spill.close()
+            if spill_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(spill_path)
 
     @router.delete("/files/{path:path}")
     async def remove_file(path: str, _ctx: Any = Depends(authn)):

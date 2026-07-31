@@ -44,9 +44,11 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 #[cfg(feature = "coedit")]
@@ -210,8 +212,28 @@ pub struct ApiOptions {
     /// browser client on another origin needs its origin listed here.
     pub cors_origins: Vec<String>,
     /// Maximum request-body size in bytes for uploads (`PUT /v1/files/…`).
-    /// Defaults to 1 GiB.
+    ///
+    /// Defaults to 64 MiB. `PUT` buffers the whole body in memory before writing
+    /// (reads stream, writes do not), so this is a direct bound on per-request
+    /// allocation — with the old 1 GiB default, a handful of concurrent maximum
+    /// uploads was enough to exhaust the process. Raise it deliberately if large
+    /// single-request uploads are part of the workload.
     pub max_body_bytes: usize,
+    /// How long a single request may run before it is abandoned with `408`.
+    ///
+    /// Defaults to 60 seconds. Without a timeout, one wedged metadata query or a
+    /// slow-loris client pins a connection and its task indefinitely, and enough
+    /// of them stall the server without anything looking like an error. `None`
+    /// disables it, for a deployment that genuinely has unbounded operations and
+    /// its own upstream deadline.
+    pub request_timeout: Option<Duration>,
+    /// Maximum number of requests processed concurrently; the rest queue.
+    ///
+    /// Defaults to 512. This is the backpressure valve: every accepted request
+    /// costs memory (up to `max_body_bytes` for an upload) and a metadata
+    /// connection, so an unbounded accept loop converts a traffic spike into an
+    /// out-of-memory kill rather than into latency. `None` disables the limit.
+    pub max_concurrent_requests: Option<usize>,
 }
 
 impl Default for ApiOptions {
@@ -219,7 +241,9 @@ impl Default for ApiOptions {
         Self {
             gate_reads: false,
             cors_origins: Vec::new(),
-            max_body_bytes: 1 << 30,
+            max_body_bytes: 64 << 20,
+            request_timeout: Some(Duration::from_secs(60)),
+            max_concurrent_requests: Some(512),
         }
     }
 }
@@ -266,6 +290,7 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
         .route("/suggestions/{id}/accept", post(accept_suggestion))
         .route("/suggestions/{id}/reject", post(reject_suggestion))
         .route("/actors", post(create_actor))
+        .route("/revert-session", post(revert_session))
         .route("/sessions", post(create_session));
     if options.gate_reads {
         // Require a valid credential for every data route, reads included.
@@ -302,17 +327,80 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
     let app = app.with_state(state);
     // Cross-cutting middleware (outermost first): an `x-request-id` set on the
     // request and echoed on the response, a tracing span per request, a
-    // request-body size cap, and CORS for browser clients. CORS sits innermost so
-    // it wraps the router's plain body (it requires a `Default` response body,
-    // which the trace layer's wrapped body is not).
+    // concurrency cap, a per-request deadline, a request-body size cap, and CORS
+    // for browser clients. CORS sits innermost so it wraps the router's plain body
+    // (it requires a `Default` response body, which the trace layer's wrapped body
+    // is not).
+    //
+    // The concurrency limit is outside the timeout on purpose: queued requests
+    // should have their deadline start when they begin *executing*, not while they
+    // are waiting for a slot, or a burst would time out everything behind it.
     app.layer(
         ServiceBuilder::new()
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(TraceLayer::new_for_http())
+            .option_layer(
+                options
+                    .max_concurrent_requests
+                    .map(tower::limit::ConcurrencyLimitLayer::new),
+            )
+            // `408 Request Timeout` rather than tower-http's legacy `500`: this is
+            // a deadline the server imposed, not an internal failure, and the
+            // distinction is what tells a client the request may be safe to retry.
+            .option_layer(
+                options
+                    .request_timeout
+                    .map(|d| TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, d)),
+            )
             .layer(DefaultBodyLimit::max(options.max_body_bytes))
+            // A bare 413 says nothing about what the limit is or how to change it,
+            // which makes a first encounter with it needlessly opaque. Replacing
+            // the body costs one comparison on the error path only.
+            .layer(axum::middleware::from_fn(explain_body_limit(
+                options.max_body_bytes,
+            )))
             .layer(cors_layer(&options)),
     )
+}
+
+/// Replace an empty `413 Payload Too Large` with one that names the limit and the
+/// knob that changes it.
+///
+/// `DefaultBodyLimit` rejects with a bare status and no body. A caller hitting it
+/// otherwise has to go read the source to learn both that 64 MiB is the default
+/// and that `ApiOptions::max_body_bytes` (via `serve_with`) is how to raise it.
+fn explain_body_limit(
+    limit: usize,
+) -> impl Clone
++ Send
++ Sync
++ 'static
++ Fn(
+    axum::extract::Request,
+    axum::middleware::Next,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    move |req: axum::extract::Request, next: axum::middleware::Next| {
+        Box::pin(async move {
+            let resp = next.run(req).await;
+            if resp.status() != StatusCode::PAYLOAD_TOO_LARGE {
+                return resp;
+            }
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "error": format!(
+                        "request body exceeds the {limit} byte limit. Raise \
+                         ApiOptions::max_body_bytes and serve with \
+                         api::serve_with, or stream the file in instead"
+                    ),
+                    "code": "body_too_large",
+                    "limit_bytes": limit,
+                })),
+            )
+                .into_response()
+        })
+    }
 }
 
 /// Build the CORS layer from the configured origins. Empty means no cross-origin
@@ -359,6 +447,23 @@ pub async fn serve(
     serve_until(ws, addr, auth, crate::shutdown_signal()).await
 }
 
+/// [`serve`] with explicit [`ApiOptions`].
+///
+/// `serve`/`serve_until` build the router with defaults, which left `ApiOptions`
+/// public but unreachable from the only entry point that also provides the
+/// graceful drain: configuring anything meant calling [`router_with`] and running
+/// your own `axum::serve`, throwing the drain away. Read gating, CORS origins,
+/// body size, timeout, and the concurrency cap are all things a deployment needs
+/// to set without giving up shutdown behaviour.
+pub async fn serve_with(
+    ws: Shared,
+    addr: SocketAddr,
+    auth: Arc<dyn Authenticator>,
+    options: ApiOptions,
+) -> std::io::Result<()> {
+    serve_until_with(ws, addr, auth, options, crate::shutdown_signal()).await
+}
+
 /// [`serve`], stopping when `shutdown` resolves and then **draining**: the
 /// listener closes to new connections while requests already in flight run to
 /// completion.
@@ -379,8 +484,19 @@ pub async fn serve_until(
     auth: Arc<dyn Authenticator>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    serve_until_with(ws, addr, auth, ApiOptions::default(), shutdown).await
+}
+
+/// [`serve_until`] with explicit [`ApiOptions`]. See [`serve_with`].
+pub async fn serve_until_with(
+    ws: Shared,
+    addr: SocketAddr,
+    auth: Arc<dyn Authenticator>,
+    options: ApiOptions,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(ws, auth))
+    axum::serve(listener, router_with(ws, auth, options))
         .with_graceful_shutdown(async move {
             shutdown.await;
             tracing::info!("shutdown signal received; draining in-flight requests");
@@ -398,6 +514,31 @@ fn abspath(p: &str) -> String {
 }
 
 // --- error mapping ----------------------------------------------------------
+
+/// The message an error is allowed to show a client.
+///
+/// Most `OrigoFSError` variants are *about the request* — a path that isn't
+/// there, a name that isn't valid, a policy that refused — and their `Display` is
+/// exactly what the caller needs. [`Backend`](crate::OrigoFSError::Backend) is
+/// not: its `Display` interpolates the driver error verbatim, which for
+/// tokio-postgres or rusqlite means SQL text, table and column names, constraint
+/// names, and connection or file paths. Returning that over HTTP hands an
+/// unauthenticated caller (reads are open by default) a description of the
+/// schema and the deployment.
+///
+/// So a backend failure gets a fixed message plus the stable machine `code` and
+/// `class` the envelope already carries — enough for a client to decide whether
+/// to retry — while the real cause goes to the log, where the operator can
+/// correlate it by request id.
+fn client_message(e: &crate::OrigoFSError) -> String {
+    match e {
+        crate::OrigoFSError::Backend { origin, class, .. } => {
+            tracing::error!(error = %e, %origin, %class, "backend error");
+            format!("{origin} backend error ({class}); see server logs")
+        }
+        other => other.to_string(),
+    }
+}
 
 /// An HTTP error: either a mapped [`crate::OrigoFSError`] or an explicit status
 /// (e.g. `401` from the [`Auth`] extractor).
@@ -447,7 +588,7 @@ impl IntoResponse for ApiError {
                     e if e.retryable() => StatusCode::SERVICE_UNAVAILABLE,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
-                (status, e.code(), e.to_string(), e.retryable())
+                (status, e.code(), client_message(&e), e.retryable())
             }
         };
         // Machine-readable envelope: a stable `code` a client can branch on, the
@@ -479,14 +620,28 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// Readiness: probe the backing stores. `200` when both answer, `503` (with the
-/// per-store detail) when either is unreachable — so a load balancer or a k8s
-/// readiness probe pulls this instance out of rotation until its database and
-/// content store recover, instead of routing requests it cannot serve.
+/// Readiness: probe the backing stores. `200` when both answer, `503` when either
+/// is unreachable — so a load balancer or a k8s readiness probe pulls this
+/// instance out of rotation until its database and content store recover, instead
+/// of routing requests it cannot serve.
+///
+/// **The response says only which store is unhealthy, never why.** This endpoint
+/// sits at the root, outside `/v1`, so it is not covered by `gate_reads` and is
+/// unauthenticated by design — a probe should not need a credential. It used to
+/// echo the raw probe error, which for a metadata failure is a driver message
+/// carrying the DSN host, database name, and connection details. A prober needs
+/// `ready: false` and which half is down; the operator needs the cause, and gets
+/// it from the log.
 async fn readyz(State(ws): State<Shared>) -> Response {
     let report = ws.ready().await;
+    if let Some(err) = &report.metadata {
+        tracing::error!(error = %err, store = "metadata", "readiness probe failed");
+    }
+    if let Some(err) = &report.content {
+        tracing::error!(error = %err, store = "content", "readiness probe failed");
+    }
     let store = |probe: &Option<String>| match probe {
-        Some(err) => json!({ "ok": false, "error": err }),
+        Some(_) => json!({ "ok": false }),
         None => json!({ "ok": true }),
     };
     let body = json!({
@@ -587,16 +742,181 @@ fn method_label(m: &axum::http::Method) -> &'static str {
     }
 }
 
-async fn read_file(State(ws): State<Shared>, Path(path): Path<String>) -> ApiResult<Response> {
+/// Guess a `Content-Type` from a path's extension.
+///
+/// Deliberately a small closed table rather than a `mime_guess` dependency: this
+/// exists so a browser can *play* media served from a workspace instead of
+/// downloading it, and the set that matters for that is short. Anything unknown
+/// stays `application/octet-stream`, which is the safe answer — a wrong type is
+/// worse than a generic one, and for an unknown extension the browser's sniffing
+/// is better informed than a guess here would be.
+fn content_type_for(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        // Video — the reason `Range` support below matters.
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        // Audio.
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        // Images.
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "heic" => "image/heic",
+        // Documents and text.
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "txt" | "md" | "log" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Parse a single-range `Range: bytes=…` header against a known size.
+///
+/// Returns `None` when there is no header or it is one this server chooses not to
+/// honour — RFC 9110 explicitly permits ignoring a `Range` and returning the whole
+/// representation, which is the right answer for a multi-range request rather than
+/// implementing `multipart/byteranges` for a case no media player uses.
+///
+/// `Some(Err(()))` is unsatisfiable: a range wholly past the end, which must be a
+/// `416` rather than an empty `206`.
+#[allow(clippy::type_complexity)]
+fn parse_range(headers: &HeaderMap, size: u64) -> Option<std::result::Result<(u64, u64), ()>> {
+    let raw = headers.get(axum::http::header::RANGE)?.to_str().ok()?;
+    let spec = raw.strip_prefix("bytes=")?.trim();
+    if spec.contains(',') {
+        return None; // multi-range: serve the whole thing instead
+    }
+    let (start, end) = spec.split_once('-')?;
+    let (start, end) = (start.trim(), end.trim());
+
+    let (first, last) = match (start.is_empty(), end.is_empty()) {
+        // `bytes=-N`: the final N bytes. N == 0 is unsatisfiable by definition.
+        (true, false) => {
+            let n: u64 = end.parse().ok()?;
+            if n == 0 {
+                return Some(Err(()));
+            }
+            (size.saturating_sub(n), size.saturating_sub(1))
+        }
+        // `bytes=N-`: from N to the end.
+        (false, true) => (start.parse().ok()?, size.saturating_sub(1)),
+        // `bytes=N-M`, clamped to the end (a too-large M is legal, not an error).
+        (false, false) => {
+            let f: u64 = start.parse().ok()?;
+            let l: u64 = end.parse().ok()?;
+            (f, l.min(size.saturating_sub(1)))
+        }
+        (true, true) => return None,
+    };
+
+    if size == 0 || first >= size || first > last {
+        return Some(Err(()));
+    }
+    Some(Ok((first, last)))
+}
+
+async fn read_file(
+    State(ws): State<Shared>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     // Stream the body so an arbitrarily large file is never buffered server-side.
-    // `read_stream` resolves and validates first, so a missing file (or a
-    // directory) is still a clean error here, before any bytes are streamed.
-    let stream = ws.read_stream(&abspath(&path)).await?;
-    Ok((
-        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        Body::from_stream(CountedRead::new(stream)),
-    )
-        .into_response())
+    // `open_for_range` resolves and validates first, so a missing file (or a
+    // directory) is still a clean error here, before any bytes are streamed — and
+    // it yields the size, which `Content-Length`, `Content-Range` and `416` all
+    // need before the first byte.
+    let p = abspath(&path);
+    let (manifest, size) = ws.open_for_range(&p).await?;
+    let ctype = content_type_for(&p);
+
+    // Parsed before the empty-file branch below: a range against a zero-length
+    // representation is unsatisfiable, so it is a 416 rather than an empty 200 —
+    // and an early return for "no manifest" would otherwise skip range handling
+    // entirely.
+    let range = parse_range(&headers, size);
+
+    let Some(manifest) = manifest else {
+        // Empty file: no manifest object exists, so there is nothing to stream.
+        if matches!(range, Some(Err(()))) {
+            return Ok((
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(axum::http::header::CONTENT_RANGE, "bytes */0".to_string())],
+            )
+                .into_response());
+        }
+        return Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, ctype.to_string()),
+                (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
+                (axum::http::header::CONTENT_LENGTH, "0".to_string()),
+            ],
+            Body::empty(),
+        )
+            .into_response());
+    };
+
+    match range {
+        // Unsatisfiable: RFC 9110 requires the 416 to carry the true size, which is
+        // how a client discovers it asked past the end.
+        Some(Err(())) => Ok((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(axum::http::header::CONTENT_RANGE, format!("bytes */{size}"))],
+        )
+            .into_response()),
+        // A partial response. Streamed, not buffered: a player may legally ask for
+        // `bytes=0-`, and materializing that would defeat streaming entirely.
+        Some(Ok((first, last))) => {
+            let len = last - first + 1;
+            let stream = ws.read_range_stream(manifest, first, len);
+            Ok((
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (axum::http::header::CONTENT_TYPE, ctype.to_string()),
+                    (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
+                    (axum::http::header::CONTENT_LENGTH, len.to_string()),
+                    (
+                        axum::http::header::CONTENT_RANGE,
+                        format!("bytes {first}-{last}/{size}"),
+                    ),
+                ],
+                Body::from_stream(CountedRead::new(stream)),
+            )
+                .into_response())
+        }
+        // Whole file. `Accept-Ranges` advertises that seeking is available at all —
+        // without it a browser will not offer to scrub a video, however well the
+        // range handling above works.
+        None => {
+            let stream = ws.read_range_stream(manifest, 0, size);
+            Ok((
+                [
+                    (axum::http::header::CONTENT_TYPE, ctype.to_string()),
+                    (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
+                    (axum::http::header::CONTENT_LENGTH, size.to_string()),
+                ],
+                Body::from_stream(CountedRead::new(stream)),
+            )
+                .into_response())
+        }
+    }
 }
 
 /// Counts a streamed read for metrics without buffering it: the only state is a
@@ -713,8 +1033,14 @@ async fn list_dir(
     list_path(&ws, &abspath(&path)).await
 }
 
+/// `POST /v1/dirs` — the root directory.
+///
+/// The root always exists, so there is nothing to create and nothing to
+/// attribute; this exists only so the collection URL is not a 405 next to
+/// `POST /v1/dirs/{path}`. Says so rather than claiming it created something.
+/// Listed in `NO_ACTOR_NEEDED` in `tests/api_write_policy.rs`.
 async fn make_root(State(_ws): State<Shared>, _auth: Auth) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(json!({ "created": "/" })))
+    Ok(Json(json!({ "path": "/", "created": false })))
 }
 
 async fn make_dir(
@@ -1059,20 +1385,59 @@ struct BranchReq {
 
 async fn create_branch(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Json(req): Json<BranchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    ws.create_branch(&req.name).await?;
+    ws.create_branch_as(principal.write_ctx(), &req.name)
+        .await?;
     Ok(Json(json!({ "created": req.name })))
 }
 
+/// Switching branches rematerializes the whole working tree, discarding every
+/// uncommitted edit — so it goes through the attributed, policy-gated variant.
+/// Taking only `_auth` here meant a propose-only token, held by an actor
+/// deliberately barred from overwriting one file, could destroy the workspace.
 async fn checkout(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Json(req): Json<BranchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    ws.checkout(&req.name).await?;
+    ws.checkout_as(principal.write_ctx(), &req.name).await?;
     Ok(Json(json!({ "branch": req.name })))
+}
+
+/// The body of `POST /v1/revert-session`.
+#[derive(Deserialize)]
+struct RevertReq {
+    actor: i64,
+    session: i64,
+}
+
+/// Undo exactly the lines one actor authored in one session, across every file
+/// that session touched, leaving other actors' edits intact.
+///
+/// This is the feature the README leads with — "can I undo just the agent's
+/// work?" — and it existed only in the Rust SDK: no CLI subcommand, no HTTP route,
+/// no MCP tool, no Python binding. Well-tested core logic, simply unexposed.
+///
+/// Gated, and the actor being reverted comes from the *body* on purpose: this is a
+/// review action performed *on* someone else's work, so the target is not the
+/// caller. The caller's own identity still has to clear the write policy — a
+/// propose-only actor cannot revert anyone, including itself.
+async fn revert_session(
+    State(ws): State<Shared>,
+    Auth(principal): Auth,
+    Json(req): Json<RevertReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    ws.ensure_may_write(principal.write_ctx(), "revert a session")
+        .await?;
+    let files_changed = ws.revert_session(req.actor, req.session).await?;
+    Ok(Json(json!({
+        "actor": req.actor,
+        "session": req.session,
+        "files_changed": files_changed,
+        "reverted_by": principal.actor,
+    })))
 }
 
 // --- attribution ------------------------------------------------------------
@@ -1262,11 +1627,20 @@ struct ActorReq {
     controller: Option<i64>,
 }
 
+/// Register a new actor.
+///
+/// Gated, not merely authenticated. This mutates the identity registry rather
+/// than the working tree, so there is no attributed variant to call — but leaving
+/// it open to any valid credential let a propose-only actor, one the operator had
+/// deliberately restricted, mint unbounded rows in the very table attribution is
+/// resolved against.
 async fn create_actor(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Json(req): Json<ActorReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    ws.ensure_may_write(principal.write_ctx(), "register actors")
+        .await?;
     let id = if req.agent {
         ws.create_agent(
             &req.name,
@@ -1280,18 +1654,29 @@ async fn create_actor(
     Ok(Json(json!({ "id": id })))
 }
 
+/// The body of `POST /v1/sessions`. It carries **no** actor: the session belongs
+/// to whoever the credential resolves to, server-side.
 #[derive(Deserialize)]
 struct SessionReq {
-    actor: i64,
     #[serde(default)]
     client: Option<String>,
 }
 
+/// Open a session for the *authenticated* actor.
+///
+/// This used to read `actor` out of the request body, which is the one place the
+/// surface broke origofs's central rule that the server never trusts a
+/// client-named actor. Writes were never forgeable through it — they attribute
+/// from the token's principal, not from a client-supplied session — but any valid
+/// credential could mint unbounded session rows belonging to *other* actors,
+/// polluting the very audit trail sessions exist to provide.
 async fn create_session(
     State(ws): State<Shared>,
-    _auth: Auth,
+    Auth(principal): Auth,
     Json(req): Json<SessionReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let id = ws.create_session(req.actor, req.client.as_deref()).await?;
-    Ok(Json(json!({ "id": id })))
+    let id = ws
+        .create_session(principal.actor, req.client.as_deref())
+        .await?;
+    Ok(Json(json!({ "id": id, "actor": principal.actor })))
 }

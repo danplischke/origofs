@@ -37,6 +37,11 @@ pub struct Conflict {
 }
 
 /// The result of a merge.
+// Deliberately NOT `#[non_exhaustive]`. This is an *outcome* enum: its whole
+// purpose is to make the caller handle each case, so a new variant should be a
+// compile error at every call site. `non_exhaustive` would force a wildcard arm
+// that silently swallows it instead — the opposite of the intent. Adding a
+// variant here is a breaking change on purpose.
 #[derive(Clone, Debug)]
 pub enum MergeOutcome {
     /// `theirs` is already reachable from HEAD; nothing to do.
@@ -58,6 +63,35 @@ struct FileMerge {
 
 fn entry_map(tree: &Tree) -> HashMap<&str, &TreeEntry> {
     tree.entries.iter().map(|e| (e.name.as_str(), e)).collect()
+}
+
+/// Reject a lock path that could collide with an internal lease, or that the
+/// metadata store cannot represent.
+///
+/// `lock`/`unlock` take a caller-supplied string and pass it straight to the
+/// store — unlike every other path-taking operation, which walks through
+/// `validate_component`. Two things follow from that, and both were live:
+///
+/// * A NUL byte reaches a `text` column, and **Postgres rejects it** with
+///   `invalid byte sequence for encoding "UTF8"`. That is a hard error from a
+///   caller-controlled string, on the production backend only.
+/// * Internal leases live in the same table (`gc.rs`'s `GC_LEASE_KEY`), so
+///   without a rule separating them, a caller could take or release one.
+///
+/// Requiring an absolute path fixes both: it is what a real workspace path always
+/// is, and it is what the internal keys deliberately are not.
+fn validate_lock_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        return Err(OrigoFSError::InvalidPath(format!(
+            "lock path must be absolute: {path:?}"
+        )));
+    }
+    if path.contains('\0') {
+        return Err(OrigoFSError::InvalidPath(format!(
+            "lock path contains a NUL byte: {path:?}"
+        )));
+    }
+    Ok(())
 }
 
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
@@ -164,7 +198,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     pub(crate) async fn read_body(&self, mhash: &Hash) -> Result<Vec<u8>> {
         let manifest = self.load_manifest(mhash).await?;
-        let mut buf = Vec::with_capacity(manifest.size as usize);
+        // Capped hint, not `size`: see `Manifest::capacity_hint`.
+        let mut buf = Vec::with_capacity(manifest.capacity_hint());
         for c in &manifest.chunks {
             buf.extend_from_slice(&self.content.get(&c.hash).await?);
         }
@@ -174,7 +209,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     async fn write_body(&self, data: &[u8]) -> Result<Hash> {
         match self.store_body(data).await? {
             (Some(h), _) => Ok(h),
-            (None, _) => self.content.put(&Manifest::default().encode()).await,
+            (None, _) => self.content.put(&Manifest::default().encode()?).await,
         }
     }
 
@@ -286,7 +321,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
             self.replace_working_tree_in(&mut *txn, &plan).await?;
             txn.commit().await?;
-            self.mirror_refs().await?;
+            self.mirror_refs_post_commit().await?;
             return Ok((MergeOutcome::FastForward(theirs), stale));
         }
 
@@ -337,7 +372,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
             self.replace_working_tree_in(&mut *txn, &plan).await?;
             txn.commit().await?;
-            self.mirror_refs().await?;
+            self.mirror_refs_post_commit().await?;
             Ok((MergeOutcome::Merged(commit_hash), stale))
         } else {
             // Conflicts: reflect the merge (with markers) and record MERGE_HEAD;
@@ -360,7 +395,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
             txn.set_ref(MERGE_HEAD, &theirs.to_hex()).await?;
             txn.commit().await?;
-            self.mirror_refs().await?;
+            self.mirror_refs_post_commit().await?;
             Ok((MergeOutcome::Conflicts(conflicts), stale))
         }
     }
@@ -599,11 +634,13 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Acquire an exclusive lock on `path` for `owner`; `false` if already held.
     pub async fn lock(&self, path: &str, owner: &str) -> Result<bool> {
+        validate_lock_path(path)?;
         self.meta.acquire_lock(path, owner, self.now_secs()).await
     }
 
     /// Release `owner`'s lock on `path`.
     pub async fn unlock(&self, path: &str, owner: &str) -> Result<bool> {
+        validate_lock_path(path)?;
         self.meta.release_lock(path, owner).await
     }
 

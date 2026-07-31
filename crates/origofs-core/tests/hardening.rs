@@ -49,7 +49,7 @@ fn manifest_with_lying_size_is_rejected() {
         }],
     };
     // round-trips fine
-    assert_eq!(Manifest::decode(&honest.encode()).unwrap(), honest);
+    assert_eq!(Manifest::decode(&honest.encode().unwrap()).unwrap(), honest);
 
     // same chunks, but a wildly inflated size field
     let liar = Manifest {
@@ -57,7 +57,7 @@ fn manifest_with_lying_size_is_rejected() {
         chunks: honest.chunks.clone(),
     };
     assert!(matches!(
-        Manifest::decode(&liar.encode()),
+        Manifest::decode(&liar.encode().unwrap()),
         Err(OrigoFSError::Corrupt(_))
     ));
 }

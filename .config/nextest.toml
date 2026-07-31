@@ -34,6 +34,15 @@ retries = 0
 #
 #     grep -rln ORIGOFS_PG_TEST_URL crates/*/tests/
 #
+# That grep is the authority, and it has already caught three omissions:
+# `atomicity` and `pg_object_store` (both of which call DROP SCHEMA themselves)
+# and `sandbox`. They ran outside the mutex and reset the schema under whatever
+# else was running, which surfaced as `migration_paths` failing with a bare
+# "db error" while building its v1 fixture. Note that none of the three has a
+# test name containing "postgres", so the `test(/postgres/)` net below did not
+# catch them either — `atomicity` runs every test against both backends via
+# `both_backends`, and `pg_object_store` names its tests after what they assert.
+#
 # The `test(/postgres/)` clause is a safety net, not a substitute: it catches a
 # newly-added test that follows the `*_postgres` / `postgres_*` naming
 # convention even if its binary is missing below. A PG test named otherwise in a
@@ -45,10 +54,11 @@ filter = '''
         binary(postgres) | binary(collab) | binary(coedit_relay)
       | binary(coedit_live) | binary(coedit_suggest)
       | binary(migration_paths) | binary(resync) | binary(suggest_superseded)
+      | binary(atomicity) | binary(pg_object_store)
     ))
   | (package(origofs-sdk) & (
         binary(api_coedit_cluster) | binary(multi_workspace) | binary(subscribe)
-      | binary(fuse_mount)
+      | binary(fuse_mount) | binary(sandbox)
     ))
 '''
 test-group = 'postgres'
