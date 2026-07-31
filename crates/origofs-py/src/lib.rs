@@ -432,6 +432,7 @@ impl S3Config {
         session_token = None,
         prefix = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         bucket: String,
         region: String,
