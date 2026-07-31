@@ -37,6 +37,9 @@ pub struct S3Config {
     pub allow_http: bool,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+    /// STS session token, required alongside temporary credentials (AWS SSO /
+    /// SAML federation). Leave unset for long-lived keys or anonymous access.
+    pub session_token: Option<String>,
     /// Key prefix for stored objects (default `objects`).
     pub prefix: Option<String>,
 }
@@ -55,6 +58,10 @@ impl std::fmt::Debug for S3Config {
             .field(
                 "secret_access_key",
                 &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
             )
             .field("prefix", &self.prefix)
             .finish()
@@ -194,6 +201,9 @@ impl ObjectContentStore {
         }
         if let (Some(k), Some(s)) = (&cfg.access_key_id, &cfg.secret_access_key) {
             builder = builder.with_access_key_id(k).with_secret_access_key(s);
+        }
+        if let Some(t) = &cfg.session_token {
+            builder = builder.with_token(t);
         }
         let store = builder.build().map_err(OrigoFSError::from)?;
         let prefix = cfg.prefix.clone().unwrap_or_else(|| "objects".to_string());

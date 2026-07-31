@@ -40,7 +40,8 @@ class S3Config:
     """Connection settings for an S3-compatible object store (S3/R2/MinIO, or GCS
     via its S3-interop XML API). For GCS, set ``endpoint`` to
     ``https://storage.googleapis.com`` and pass GCS HMAC interop keys; for native
-    GCS auth use :class:`GcsConfig` instead."""
+    GCS auth use :class:`GcsConfig` instead. Set ``session_token`` alongside the
+    key pair for temporary credentials (AWS SSO / SAML federation)."""
     def __init__(
         self,
         bucket: str,
@@ -49,6 +50,7 @@ class S3Config:
         allow_http: bool = False,
         access_key_id: Optional[str] = None,
         secret_access_key: Optional[str] = None,
+        session_token: Optional[str] = None,
         prefix: Optional[str] = None,
     ) -> None: ...
 
