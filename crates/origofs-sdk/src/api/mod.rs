@@ -354,8 +354,53 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
                     .map(|d| TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, d)),
             )
             .layer(DefaultBodyLimit::max(options.max_body_bytes))
+            // A bare 413 says nothing about what the limit is or how to change it,
+            // which makes a first encounter with it needlessly opaque. Replacing
+            // the body costs one comparison on the error path only.
+            .layer(axum::middleware::from_fn(explain_body_limit(
+                options.max_body_bytes,
+            )))
             .layer(cors_layer(&options)),
     )
+}
+
+/// Replace an empty `413 Payload Too Large` with one that names the limit and the
+/// knob that changes it.
+///
+/// `DefaultBodyLimit` rejects with a bare status and no body. A caller hitting it
+/// otherwise has to go read the source to learn both that 64 MiB is the default
+/// and that `ApiOptions::max_body_bytes` (via `serve_with`) is how to raise it.
+fn explain_body_limit(
+    limit: usize,
+) -> impl Clone
++ Send
++ Sync
++ 'static
++ Fn(
+    axum::extract::Request,
+    axum::middleware::Next,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    move |req: axum::extract::Request, next: axum::middleware::Next| {
+        Box::pin(async move {
+            let resp = next.run(req).await;
+            if resp.status() != StatusCode::PAYLOAD_TOO_LARGE {
+                return resp;
+            }
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "error": format!(
+                        "request body exceeds the {limit} byte limit. Raise \
+                         ApiOptions::max_body_bytes and serve with \
+                         api::serve_with, or stream the file in instead"
+                    ),
+                    "code": "body_too_large",
+                    "limit_bytes": limit,
+                })),
+            )
+                .into_response()
+        })
+    }
 }
 
 /// Build the CORS layer from the configured origins. Empty means no cross-origin

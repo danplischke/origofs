@@ -159,6 +159,11 @@ let bytes = ws.read("/notes/a.txt").await?;
 let spans = ws.blame("/notes/a.txt").await?;               // who wrote which bytes
 ```
 
+Large files stream on the write side too: `write_reader_as` (Rust) and
+`write_path_as` (Python) chunk incrementally *and* record blame, so attribution no
+longer costs you the ability to write a file larger than memory. See
+[`docs/LIMITS.md`](docs/LIMITS.md).
+
 Python mirrors this API with `await` on every call — see [Python](#python). The
 binding covers the workspace, versioning, merge, attribution, suggestions, the
 change feed, multi-workspace, maintenance (`gc`/`flush`/`repack`/

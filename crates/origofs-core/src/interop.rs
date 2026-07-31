@@ -42,7 +42,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub async fn store_blob_bytes(&self, data: &[u8]) -> Result<Hash> {
         match self.store_body(data).await? {
             (Some(h), _) => Ok(h),
-            (None, _) => self.content.put(&Manifest::default().encode()).await,
+            (None, _) => self.content.put(&Manifest::default().encode()?).await,
         }
     }
 

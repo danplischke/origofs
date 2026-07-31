@@ -326,7 +326,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             // accept.
             None => Some(
                 self.content
-                    .put(&crate::chunk::Manifest::default().encode())
+                    .put(&crate::chunk::Manifest::default().encode()?)
                     .await?
                     .to_hex(),
             ),

@@ -716,6 +716,111 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         )))
     }
 
+    /// Write a file by **streaming** from a blocking reader, attributed to `ctx`.
+    ///
+    /// The attributed counterpart of [`Fs::write_reader`](crate::Fs::write_reader),
+    /// and the only way to write a file larger than memory while still recording
+    /// who wrote it. Until this existed, streaming and attribution were mutually
+    /// exclusive: `write_reader` was the sole streaming path and it is
+    /// unattributed, so the moment a caller supplied an actor — the entire premise
+    /// of origofs — the whole body had to be resident. That is why
+    /// `origofs write --from big.bin` streamed but `--actor 7` did not.
+    ///
+    /// Subject to the §6 write policy: a propose-only actor is refused with
+    /// [`OrigoFSError::Denied`]. There is deliberately no propose-shaped variant —
+    /// a suggestion records proposed bytes as a *content hash*, so `suggest`
+    /// already streams by construction and queuing a multi-gigabyte proposal for
+    /// human review is not a meaningful operation.
+    ///
+    /// # Blame differs from `write_as`, on purpose
+    ///
+    /// [`write_as`](Self::write_as) computes byte-range authorship by diffing
+    /// against the previous body, which it holds in memory. A streaming write
+    /// cannot: not having the body resident is the whole point. So this attributes
+    /// the **entire file** to `ctx` as a single span.
+    ///
+    /// That is the honest answer rather than a compromise — a streamed write *is* a
+    /// wholesale replacement, so "this actor wrote all of it" is exactly true. But
+    /// it means streaming a file that previously had mixed authorship discards the
+    /// per-line history the buffered path would have preserved. Use `write_as` when
+    /// the file fits in memory and its line-level provenance matters; use this when
+    /// it does not fit, or when the write genuinely replaces everything.
+    ///
+    /// Unlike `write_as`, this is **unconditional**: there is no compare-and-set
+    /// against the content the blame was derived from, because it was not derived
+    /// from any prior content. A concurrent writer's bytes are replaced, and the
+    /// `edit_op` records the `pre_hash` that was actually overwritten.
+    pub async fn write_reader_as<R>(&self, ctx: WriteCtx, path: &str, reader: R) -> Result<()>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        self.ensure_may_write(ctx, "write a file").await?;
+
+        let (parent, name) = self.resolve_parent(path).await?;
+        self.ensure_dir(parent).await?;
+
+        // Stream the body into content first. Content is durable and idempotent
+        // (content-addressed) when this returns, so the metadata commit below can
+        // retry a create race without touching the reader again — which matters
+        // here more than anywhere, since the reader may be a network socket or a
+        // multi-gigabyte file that cannot be replayed.
+        let (mhash, size) = self.stream_body(path, reader).await?;
+
+        // Whole-file authorship — see the note above.
+        let blame = BlameMap::from_spans(&[(ctx.actor, ctx.sid(), size)]);
+        let encoded = blame.encode();
+
+        for _ in 0..crate::engine::CREATE_RETRIES {
+            let existing = self.lookup_file(parent, name, path).await?;
+            // Read the prior content hash for the op-log's `pre_hash`. Only the
+            // hash — not the bytes — so this stays O(1) in file size.
+            let pre_hash = match existing {
+                Some(ino) => self.meta.get_inode(ino).await?.and_then(|i| i.content),
+                None => None,
+            };
+
+            let mut tx = self.meta.begin().await?;
+            let ino = match existing {
+                Some(ino) => ino,
+                None => match Self::create_file_in(tx.as_mut(), parent, name).await {
+                    Ok(ino) => ino,
+                    Err(OrigoFSError::AlreadyExists(_)) => {
+                        tx.rollback().await?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                },
+            };
+            // Blame is keyed by the new content version; an empty file has neither.
+            if let Some(h) = mhash {
+                tx.set_blob_blame(&h, &encoded).await?;
+            }
+            tx.set_content(ino, mhash, size).await?;
+            tx.append_edit_op(EditOpInit {
+                session_id: ctx.session,
+                actor_id: ctx.actor,
+                tool_call_id: ctx.tool_call,
+                ino,
+                path: path.to_string(),
+                op: "write".to_string(),
+                byte_start: 0,
+                // `size` is a `u64` and the column is a `BIGINT`; a file past
+                // `i64::MAX` (8 EiB) is unreachable, but saturate rather than wrap
+                // so the op-log can never record a negative length.
+                byte_len: i64::try_from(size).unwrap_or(i64::MAX),
+                pre_hash: pre_hash.map(|h| h.to_hex()),
+                post_hash: mhash.map(|h| h.to_hex()),
+                ts: self.now_secs(),
+            })
+            .await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        Err(OrigoFSError::Conflict(format!(
+            "{path}: too many concurrent creators"
+        )))
+    }
+
     // --- attributed namespace mutations (issue #78) -----------------------
     //
     // The raw `remove`/`rename`/`mkdir_p`/`symlink` on `Fs` take no `WriteCtx`:

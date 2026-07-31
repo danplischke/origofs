@@ -235,6 +235,34 @@ impl ObjectContentStore {
         Ok(Self::new(Arc::new(store), prefix))
     }
 
+    /// The largest object a single PUT can carry.
+    ///
+    /// There is no multipart upload here — by design: chunks are capped at
+    /// `MAX_CHUNK` (256 KiB), so batching (`PackStore`) is the answer to
+    /// per-request cost rather than multipart (`docs/DESIGN.md` §4a). The one
+    /// object that can approach a provider limit is a **manifest**, at 36 bytes
+    /// per chunk: a ~7.5 TiB file has a 4 GiB manifest, and a ~9 TiB file exceeds
+    /// S3's and GCS's 5 GiB single-request ceiling.
+    ///
+    /// Without this check that arrives as a raw provider error partway through a
+    /// long upload, after minutes of transfer, saying nothing about which origofs
+    /// object is at fault. 5 GiB is the common floor across S3 and GCS.
+    const MAX_SINGLE_PUT: usize = 5 * 1024 * 1024 * 1024;
+
+    fn check_put_size(bytes: &[u8]) -> Result<()> {
+        if bytes.len() > Self::MAX_SINGLE_PUT {
+            return Err(OrigoFSError::TooLarge(format!(
+                "object is {} bytes, past the {} byte single-PUT limit and this \
+                 backend does not use multipart. Only a manifest reaches this size \
+                 (~36 bytes per chunk), so the underlying file is on the order of \
+                 9 TiB; split it, or raise the chunk size to shrink the manifest",
+                bytes.len(),
+                Self::MAX_SINGLE_PUT
+            )));
+        }
+        Ok(())
+    }
+
     fn path_for(&self, hash: &Hash) -> OsPath {
         let hex = hash.to_hex();
         OsPath::from(format!("{}/{}/{}", self.prefix, &hex[0..2], &hex[2..]))
@@ -290,6 +318,7 @@ impl ObjectContentStore {
 #[async_trait]
 impl ContentStore for ObjectContentStore {
     async fn put(&self, bytes: &[u8]) -> Result<Hash> {
+        Self::check_put_size(bytes)?;
         let hash = Hash::of(bytes);
         let path = self.path_for(&hash);
         // Idempotent: content-addressed, so an existing object is identical.
@@ -310,6 +339,7 @@ impl ContentStore for ObjectContentStore {
     }
 
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        Self::check_put_size(bytes)?;
         let path = self.path_for(key);
         if let Ok(meta) = self.store.head(&path).await {
             if Self::refresh_needed(&meta) {

@@ -505,30 +505,52 @@ async fn main() -> Result<()> {
                     let file = std::fs::File::open(p)?;
                     ws.write_reader(&path, file).await?;
                 }
-                // Attributed write: read into memory, record blame + an edit-op.
+                // Attributed write. `--actor` used to force `std::fs::read` of the
+                // whole file — streaming and attribution were mutually exclusive
+                // until `write_reader_as` — so a large file could be written only
+                // by giving up the attribution that is the point of this system.
                 (from, Some(actor)) => {
-                    let data = match from {
-                        Some(p) => std::fs::read(p)?,
-                        None => {
-                            let mut buf = Vec::new();
-                            std::io::stdin().read_to_end(&mut buf)?;
-                            buf
-                        }
-                    };
                     let session = ws.create_session(actor, Some("cli")).await?;
-                    // `write_or_propose`, not `write_as`: the raw attributed write
-                    // is exempt from the §6 policy by construction, so `origofs
-                    // policy <actor> propose` had no effect on `origofs write` —
-                    // the CLI ignored the gate its own subcommand sets.
-                    match ws
-                        .write_or_propose(WriteCtx::session(actor, session), &path, &data, None)
-                        .await?
-                    {
-                        origofs_sdk::WriteOutcome::Wrote => {}
-                        origofs_sdk::WriteOutcome::Proposed(suggestion_id) => {
-                            println!(
-                                "actor {actor} is propose-only: queued suggestion #{suggestion_id} for {path} (pending review)"
-                            );
+                    let ctx = WriteCtx::session(actor, session);
+
+                    // A propose-only actor's edit is queued for review, and a
+                    // suggestion needs the bytes — so that path buffers, whatever
+                    // the source. That is fine by construction: nobody reviews a
+                    // multi-gigabyte diff. Deciding here rather than letting
+                    // `write_reader_as` refuse keeps `origofs policy <actor>
+                    // propose` behaving identically with and without `--from`.
+                    let may_write_directly = ws.ensure_may_write(ctx, "write a file").await.is_ok();
+
+                    match (from, may_write_directly) {
+                        // The good case: stream straight from the file.
+                        (Some(p), true) => {
+                            let file = std::fs::File::open(p)?;
+                            ws.write_reader_as(ctx, &path, file).await?;
+                        }
+                        // Buffered: stdin has no length to stream against here, and
+                        // a propose-only write has to hold the proposed bytes.
+                        (from, _) => {
+                            let data = match from {
+                                Some(p) => std::fs::read(p)?,
+                                None => {
+                                    let mut buf = Vec::new();
+                                    std::io::stdin().read_to_end(&mut buf)?;
+                                    buf
+                                }
+                            };
+                            // `write_or_propose`, not `write_as`: the raw attributed
+                            // write is exempt from the §6 policy by construction, so
+                            // `origofs policy <actor> propose` had no effect on
+                            // `origofs write` — the CLI ignored the gate its own
+                            // subcommand sets.
+                            match ws.write_or_propose(ctx, &path, &data, None).await? {
+                                origofs_sdk::WriteOutcome::Wrote => {}
+                                origofs_sdk::WriteOutcome::Proposed(suggestion_id) => {
+                                    println!(
+                                        "actor {actor} is propose-only: queued suggestion #{suggestion_id} for {path} (pending review)"
+                                    );
+                                }
+                            }
                         }
                     }
                 }

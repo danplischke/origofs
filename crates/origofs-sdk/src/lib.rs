@@ -522,6 +522,10 @@ impl Workspace {
     }
 
     /// Write a file by streaming from a blocking reader (for large files).
+    ///
+    /// **Unattributed.** Prefer [`write_reader_as`](Self::write_reader_as) wherever
+    /// an actor is known: this records no blame, no edit-op, and is exempt from the
+    /// write policy.
     pub async fn write_reader<R: std::io::Read + Send + 'static>(
         &self,
         path: &str,
@@ -529,6 +533,27 @@ impl Workspace {
     ) -> Result<()> {
         self.fs.write_reader(path, reader).await?;
         self.emit("write", path, None, None, None).await;
+        Ok(())
+    }
+
+    /// Write a file by streaming from a blocking reader, **attributed** to `ctx`.
+    ///
+    /// The way to write a file larger than memory without giving up attribution.
+    /// Subject to the write policy (a propose-only actor is refused), and blame
+    /// covers the whole file rather than being diffed line-by-line against the
+    /// previous body — a streamed write is a wholesale replacement, and the
+    /// previous body is exactly what is not resident. See
+    /// [`Fs::write_reader_as`](origofs_core::Fs::write_reader_as).
+    #[tracing::instrument(skip(self, reader), fields(path = %path, actor = ctx.actor))]
+    pub async fn write_reader_as<R: std::io::Read + Send + 'static>(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        reader: R,
+    ) -> Result<()> {
+        self.fs.write_reader_as(ctx, path, reader).await?;
+        self.emit("write", path, None, Some(ctx.actor), ctx.session)
+            .await;
         Ok(())
     }
 

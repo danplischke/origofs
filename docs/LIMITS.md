@@ -1,0 +1,102 @@
+# File sizes and limits
+
+There is **no hard file-size limit** in the engine. `Manifest.size` is a `u64`, the
+inode `size` column is a `BIGINT`, and content objects are *chunks* (≤ 256 KiB) —
+never whole files — so no object-store per-object limit is reachable from file
+content.
+
+What exists instead are practical ceilings, and one rule that decides which you
+hit: **stream, or buffer.**
+
+## Stream or buffer
+
+| Path | Behaviour |
+|---|---|
+| `write_reader_as` / Python `write_path_as` | **streams**, attributed |
+| `write_reader` / Python `write_path` | **streams**, unattributed |
+| `read_stream`, `read_to_writer`, Python `read_to_path` | **streams** |
+| `read_range`, `vfs_read`, Python `read_range` | **chunk-scoped** — fetches only the covering chunks |
+| HTTP `GET /v1/files/*`, `fastapi` `GET /files/{path}` | **streams**, honours `Range` |
+| `fastapi` `PUT /files/{path}` | streams past 8 MiB (`SPOOL_MAX`) |
+| `write`, `write_as`, `write_or_propose`, Python `write`/`write_as` | whole body resident |
+| `read`, Python `read` | whole body resident |
+| HTTP `PUT /v1/files/*` | whole body resident, capped |
+| MCP `origofs_write` / `origofs_read` | whole body, as a JSON string |
+| FUSE / NFS `write`, `truncate` | **whole file** resident, per `write(2)` |
+
+A buffered write of an N-byte file holds roughly 2N (`write_as` also loads the
+previous body to diff against it). From Python it was ~3N, because pyo3 copies the
+`bytes` object into a Rust `Vec` — which is why `write_path_as` exists.
+
+## Where it actually breaks, in order
+
+| Threshold | What happens | Configurable |
+|---|---|---|
+| **64 MiB** | HTTP `PUT` → `413` naming the limit | `ApiOptions::max_body_bytes`, via `serve_with` |
+| **16 MiB** | a co-editing WebSocket frame is rejected | `MAX_COEDIT_FRAME` |
+| **256 MiB** | `git import` rejects an object | `ORIGOFS_GIT_MAX_OBJECT_BYTES` |
+| **RAM** | any buffered path above | — |
+| **~1 GB** | `blob_blame.runs` hits the SQLite/Postgres `TEXT` limit | — |
+| **~5 GiB** | a single object exceeds the S3/GCS single-PUT ceiling → `TooLarge` | — |
+| **64–256 TiB** | a manifest exceeds the format's `u32` chunk count → `TooLarge` | — |
+
+The last three are guards, not silent failures. They used to be: `Manifest::encode`
+and `PackLoc::encode` both cast to `u32` with a bare `as` and wrapped, corrupting
+the object at write time and only surfacing it on the next read. Every one of them
+had a careful *decode*-side guard — the format layer reasoned hard about hostile
+input coming in and not at all about honest data going out.
+
+## The manifest is the real ceiling
+
+A manifest is `36 bytes × chunk count`, held whole in memory *and* stored as one
+object:
+
+| File | Chunks (64 KiB average) | Manifest |
+|---|---|---|
+| 1 GiB | 16 K | ~0.6 MB |
+| 10 GiB | 164 K | ~5.9 MB |
+| 100 GiB | 1.6 M | ~59 MB |
+| 1 TiB | 16.8 M | ~604 MB |
+
+About 0.055% of file size. Comfortable to ~100 GiB. Past ~1 TiB the manifest is
+itself a multi-hundred-megabyte allocation and a single PUT of that size, and
+around 9 TiB it exceeds the object store's single-request ceiling. Even the
+streaming paths accumulate this — they stream the *body*, not the manifest.
+
+## Guidance
+
+**Write large files with `write_path_as`** (Python) or `write_reader_as` (Rust).
+Attribution costs nothing extra: blame and the edit-op are recorded either way.
+
+Note that a streamed write attributes the **whole file** to the writer, rather than
+diffing line-by-line against the previous body the way `write_as` does — not having
+that body resident is the point. A streamed write *is* a wholesale replacement, so
+this is exactly right for a file being replaced, and lossy for one being edited.
+Use `write_as` when the file fits in memory and its line-level provenance matters.
+
+**Read large files with `read_range` or `read_to_path`.** `read` materializes the
+whole body.
+
+**Prefer fewer, larger writes on a metered object store.** `PackStore` batches
+chunks *within* a write, not across writes — each write ends with a durability
+barrier that seals the open pack. Ten thousand small files are ten thousand PUTs
+whatever the pack target. Streaming one archive through `write_reader_as` beats
+writing its members individually by far more than any pack tuning will.
+
+**Do not rewrite large files through a FUSE/NFS mount.** `vfs_write` is a
+read-modify-write of the *entire* file per `write(2)`, retried up to 16 times under
+contention, and the kernel issues those in 128 KiB pages. Rewriting a 1 GiB file
+through a mount is quadratic in allocation and hashing. Mounts are for browsing and
+editing human-scale files; use the SDK or the HTTP API for bulk data.
+
+**Encryption and packing compose with a real cost.** `EncryptedStore::get_range`
+must decrypt a whole object before slicing — AEAD authenticates the whole
+ciphertext, so a partial decrypt cannot be authenticated. That is cheap for chunks
+(≤ 256 KiB) and not cheap for a pack (4 MiB default) or a large manifest. A ranged
+read on an encrypted packed store pays for it.
+
+**Blame has its own ceiling.** `blob_blame.runs` is a `TEXT` column holding one run
+per contiguous same-author span — roughly one per line for multi-author text — and
+it is rewritten on every attributed write. A very large multi-author text file
+approaches the ~1 GB column limit. This is the one place file size touches the
+metadata database.

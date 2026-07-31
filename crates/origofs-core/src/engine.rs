@@ -543,7 +543,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             size: data.len() as u64,
             chunks,
         };
-        let mhash = self.content.put(&manifest.encode()).await?;
+        let mhash = self.content.put(&manifest.encode()?).await?;
         // Durability barrier (C4): make the content durable before the metadata
         // commit that will reference it. For LocalCasStore each `put` already
         // fsynced; for PackStore this seals the open pack so a crash can't lose
@@ -603,16 +603,24 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         )))
     }
 
-    /// Write a file by streaming from a blocking reader, chunking incrementally so
-    /// large files never need to be fully resident. Creates the file if needed.
-    pub async fn write_reader<R>(&self, path: &str, reader: R) -> Result<()>
+    /// Stream a reader into the content store, returning `(manifest, size)`.
+    ///
+    /// The streaming half of a large write, shared by [`write_reader`](Self::write_reader)
+    /// and [`write_reader_as`](Self::write_reader_as). It stores content and
+    /// nothing else: no inode is resolved, no metadata is touched, so the caller
+    /// owns the create-race and attribution decisions. Content is
+    /// content-addressed and therefore idempotent, which is what lets the caller
+    /// retry its metadata commit without re-reading the stream — and is why this
+    /// is split out rather than duplicated.
+    ///
+    /// Memory is bounded by the channel depth (8 chunks, so <= 2 MiB at
+    /// `MAX_CHUNK`) plus the accumulating `Vec<ChunkRef>` — 36 bytes per chunk,
+    /// about 0.055% of the file at the average chunk size. That manifest is the
+    /// real ceiling on file size; see `docs/LIMITS.md`.
+    pub(crate) async fn stream_body<R>(&self, path: &str, reader: R) -> Result<(Option<Hash>, u64)>
     where
         R: std::io::Read + Send + 'static,
     {
-        let (parent, name) = self.resolve_parent(path).await?;
-        self.ensure_dir(parent).await?;
-        let existing = self.lookup_file(parent, name, path).await?;
-
         // Chunk on the blocking pool; deliver one chunk at a time to the async side.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<std::result::Result<Vec<u8>, String>>(8);
         let handle = tokio::task::spawn_blocking(move || {
@@ -661,21 +669,59 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             None
         } else {
             let manifest = Manifest { size, chunks };
-            Some(self.content.put(&manifest.encode()).await?)
+            Some(self.content.put(&manifest.encode()?).await?)
         };
         // Durability barrier (C4): seal/flush content before metadata references it.
         self.content.flush().await?;
+        Ok((mhash, size))
+    }
+
+    /// Write a file by streaming from a blocking reader, chunking incrementally so
+    /// large files never need to be fully resident. Creates the file if needed.
+    ///
+    /// **Unattributed** — records no blame and no edit-op, and is exempt from the
+    /// §6 write policy by construction. Prefer
+    /// [`write_reader_as`](Self::write_reader_as) wherever an actor is known;
+    /// this exists for internal machinery and for genuinely actor-less imports.
+    pub async fn write_reader<R>(&self, path: &str, reader: R) -> Result<()>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let (parent, name) = self.resolve_parent(path).await?;
+        self.ensure_dir(parent).await?;
+
+        let (mhash, size) = self.stream_body(path, reader).await?;
+
         // Commit the metadata atomically — the txn spans only this fast final
         // step, not the whole stream, so a large upload doesn't hold the write
         // lock while chunking.
-        let mut txn = self.meta.begin().await?;
-        let ino = match existing {
-            Some(ino) => ino,
-            None => Self::create_file_in(txn.as_mut(), parent, name).await?,
-        };
-        txn.set_content(ino, mhash, size).await?;
-        txn.commit().await?;
-        Ok(())
+        //
+        // The lookup is inside the retry loop, and deliberately after the stream:
+        // a concurrent writer can create the same new path while we were reading,
+        // and the content is content-addressed (so already durable and idempotent)
+        // by the time we get here. Retrying costs a metadata round trip, not a
+        // re-read of the body.
+        for _ in 0..CREATE_RETRIES {
+            let existing = self.lookup_file(parent, name, path).await?;
+            let mut txn = self.meta.begin().await?;
+            let ino = match existing {
+                Some(ino) => ino,
+                None => match Self::create_file_in(txn.as_mut(), parent, name).await {
+                    Ok(ino) => ino,
+                    Err(OrigoFSError::AlreadyExists(_)) => {
+                        txn.rollback().await?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                },
+            };
+            txn.set_content(ino, mhash, size).await?;
+            txn.commit().await?;
+            return Ok(());
+        }
+        Err(OrigoFSError::Conflict(format!(
+            "{path}: too many concurrent creators"
+        )))
     }
 
     /// Read the entire contents of a file.

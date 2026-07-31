@@ -283,6 +283,16 @@ pub(crate) struct TokenQuery {
 }
 
 /// `GET /coedit/{*path}` — upgrade to a y-sync WebSocket for live co-editing.
+/// Cap on a single inbound y-sync frame.
+///
+/// The co-editing socket is outside `DefaultBodyLimit`'s reach (that layer only
+/// sees buffering extractors), so without this the route had no size bound of any
+/// kind while every other write path had one. 16 MiB is generous for a CRDT update
+/// over a text document — an initial `SyncStep2` carrying a large document's whole
+/// state is the biggest legitimate frame — and bounds what one socket can make the
+/// server allocate.
+const MAX_COEDIT_FRAME: usize = 16 * 1024 * 1024;
+
 pub(crate) async fn coedit_ws(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -302,7 +312,15 @@ pub(crate) async fn coedit_ws(
     };
     let path = abspath(&path);
     let coord = state.coedit.clone();
-    upgrade.on_upgrade(move |socket| serve_socket(coord, principal.write_ctx(), path, socket))
+    // `DefaultBodyLimit` does not apply to WebSocket frames, so `ApiOptions::
+    // max_body_bytes` silently did not govern this route at all — the one hole in
+    // the request budget. A y-sync frame is a CRDT update for a text document;
+    // `MAX_COEDIT_FRAME` is far above any legitimate one and far below what an
+    // unbounded frame could allocate.
+    upgrade
+        .max_message_size(MAX_COEDIT_FRAME)
+        .max_frame_size(MAX_COEDIT_FRAME)
+        .on_upgrade(move |socket| serve_socket(coord, principal.write_ctx(), path, socket))
 }
 
 /// Authenticate a WebSocket upgrade: the real upgrade headers first (programmatic

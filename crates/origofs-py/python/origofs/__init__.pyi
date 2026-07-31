@@ -216,6 +216,22 @@ class Workspace:
     async def read_range(self, path: str, off: int, len: int) -> bytes: ...
     async def write(self, path: str, data: bytes) -> None: ...
     async def write_as(self, ctx: WriteCtx, path: str, data: bytes) -> None: ...
+
+    # --- streaming: the way to write a file larger than memory ---------------
+    # `write`/`write_as` take a bytes object and copy it into Rust, so an N-byte
+    # write holds ~3N transiently. These open the file in Rust — no bytes cross
+    # into Python — so resident memory is bounded regardless of file size.
+    #
+    # `write_path_as` is subject to the write policy (PermissionError for a
+    # propose-only actor) and attributes the WHOLE file to the actor rather than
+    # diffing against the previous body: a streamed write is a wholesale replace,
+    # and not holding the previous body is the point. Use `write_as` when the file
+    # fits in memory and its line-level provenance matters.
+    async def write_path_as(self, ctx: WriteCtx, path: str, src_path: str) -> None: ...
+    async def write_path(self, path: str, src_path: str) -> None: ...
+    # Returns the number of bytes written. `read` materializes the whole body;
+    # this streams, and `read_range` already fetches only the covering chunks.
+    async def read_to_path(self, path: str, dest_path: str) -> int: ...
     # Governed by the actor's write policy: a direct actor writes; a propose-only
     # actor's edit is queued as a suggestion (`WriteOutcome.suggestion_id`).
     async def write_or_propose(

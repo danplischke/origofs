@@ -188,19 +188,43 @@ impl PackStore {
         };
 
         // body ‖ trailer ‖ trailer_len ‖ ORGP ‖ version
+        //
+        // `PackLoc` addresses a chunk with a `u32` offset and `u32` length, and
+        // these three casts used to be bare `as`. Past 4 GiB they wrapped
+        // *silently*: the pack was written, an index entry with a nonsense offset
+        // was committed, and a later `get` issued a ranged read at the wrong place
+        // — returning wrong bytes or a short read, with nothing to indicate which.
+        //
+        // Reachable despite the 4 MiB default target, because `stage` inserts
+        // before it seals: any single `put` larger than the target gets a pack of
+        // its own. The manifest of a ~7.5 TiB file is such a put. `with_target`
+        // also takes an unbounded size.
+        //
+        // The read side was already careful — `parse_trailer` uses `checked_add`
+        // with a comment about hostile trailers. This is the same asymmetry as
+        // `Manifest::encode`: guarded coming in, unguarded going out.
+        let too_large = |what: &str, n: usize| {
+            OrigoFSError::TooLarge(format!(
+                "pack {what} is {n} bytes, past the u32 the pack index can address \
+                 ({} max); lower the pack target or store this object unpacked",
+                u32::MAX
+            ))
+        };
         let mut buf = Vec::new();
         let mut locs: Vec<(Hash, u32, u32)> = Vec::with_capacity(order.len());
         for (h, b) in order.iter().zip(&chunks) {
-            let offset = buf.len() as u32;
+            let offset = u32::try_from(buf.len()).map_err(|_| too_large("offset", buf.len()))?;
+            let len = u32::try_from(b.len()).map_err(|_| too_large("chunk", b.len()))?;
             buf.extend_from_slice(b);
-            locs.push((*h, offset, b.len() as u32));
+            locs.push((*h, offset, len));
         }
         let body_len = buf.len();
         for (h, _, len) in &locs {
             buf.extend_from_slice(h.as_bytes());
             buf.extend_from_slice(&len.to_le_bytes());
         }
-        let trailer_len = (buf.len() - body_len) as u32;
+        let trailer = buf.len() - body_len;
+        let trailer_len = u32::try_from(trailer).map_err(|_| too_large("trailer", trailer))?;
         buf.extend_from_slice(&trailer_len.to_le_bytes());
         buf.extend_from_slice(&format::PACK.header());
 

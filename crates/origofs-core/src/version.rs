@@ -302,7 +302,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 FileKind::File => {
                     let h = match inode.content {
                         Some(h) => h,
-                        None => self.content.put(&Manifest::default().encode()).await?,
+                        None => self.content.put(&Manifest::default().encode()?).await?,
                     };
                     (TreeKind::File, h)
                 }
@@ -671,7 +671,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                         .ok_or_else(|| OrigoFSError::NotFound(path.clone()))?;
                     let h = match inode.content {
                         Some(h) => h,
-                        None => Hash::of(&Manifest::default().encode()),
+                        None => Hash::of(&Manifest::default().encode()?),
                     };
                     map.insert(path, h);
                 }

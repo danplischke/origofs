@@ -7,6 +7,46 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
+### Added — arbitrary file sizes
+
+- **`write_reader_as`: attributed streaming writes.** Streaming and attribution
+  were mutually exclusive: `write_reader` was the only streaming write and it is
+  unattributed, so supplying an actor — the entire premise of origofs — forced the
+  whole body resident. `origofs write --from big.bin` streamed; adding `--actor 7`
+  did not. Subject to the write policy, and blame covers the whole file rather
+  than being diffed against a previous body that is deliberately not resident.
+- Python `write_path_as` / `write_path` / `read_to_path`. Neither `write_reader`
+  nor `read_stream` had ever been bound, and `write`/`write_as` take a `bytes`
+  object that pyo3 copies into Rust — about 3x the file transiently — so the
+  effective ceiling from Python was available memory. Measured: a 287 MiB
+  attributed write went from 312 MB peak RSS to 27 MB.
+- `origofs write --from FILE --actor N` streams. A propose-only actor still
+  buffers, because a queued suggestion holds the proposed bytes; deciding that up
+  front keeps `origofs policy <actor> propose` behaving identically with and
+  without `--from`.
+- `origofs.fastapi`'s `PUT /files/{path}` streams the request body, spilling past
+  8 MiB to a temp file handed to `write_path_as`. It took `body: bytes`, so the
+  whole upload sat in memory — asymmetric with the `GET` beside it, which has
+  always streamed and honoured `Range`.
+- `docs/LIMITS.md`: where the ceilings actually are, and which paths stream.
+
+### Fixed — silent overflow at the encode boundary
+
+Three `as u32` casts wrapped silently past their range, corrupting an object at
+*write* time and surfacing only on the next read. Each had a careful *decode*-side
+guard — the format layer reasoned hard about hostile input coming in and not at all
+about honest data going out. All three now return `TooLarge`.
+
+- `Manifest::encode`'s chunk count (wraps at 64 TiB).
+- `PackLoc`'s pack offset, staged-blob length, and trailer length (wrap at 4 GiB —
+  reachable, because `stage` seals *after* inserting, so any single `put` larger
+  than the pack target gets a pack of its own, and a ~7.5 TiB file's manifest is
+  such a put).
+- `ObjectContentStore` has no multipart upload by design (chunks are ≤ 256 KiB;
+  packing is the answer to per-request cost). Only a manifest can approach the
+  S3/GCS 5 GiB single-request ceiling, and it now fails locally with a message
+  naming the cause rather than as a raw provider error partway through.
+
 ### Fixed — Postgres + object storage
 
 - **Garbage collection could never run on Postgres.** The lease serializing
@@ -119,6 +159,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 - Python: `open_gcs_encrypted` and `open_pg_gcs_encrypted`, so encryption at rest
   is available on the GCS pairing as well as the S3 one.
 - `allow_http` on `GcsConfig` across Rust, Python, and the `--config` TOML.
+- The co-editing WebSocket now caps frames at 16 MiB. `DefaultBodyLimit` does not
+  apply to WebSocket frames, so `ApiOptions::max_body_bytes` silently did not
+  govern `/v1/coedit/*` — the one hole in the request budget.
+- `413` responses name the limit and the setting that changes it, instead of an
+  empty body.
+- Python's `io_err` maps `NotFound`/`PermissionDenied`/etc. to the matching
+  builtin exception rather than flattening everything to `OSError`, and is no
+  longer `#[cfg(unix)]` — the streaming bindings touch the filesystem on every
+  platform.
 
 ### Changed
 

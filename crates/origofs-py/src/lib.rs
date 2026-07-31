@@ -58,9 +58,28 @@ fn to_pyerr(e: origofs_sdk::OrigoFSError) -> PyErr {
     }
 }
 
-#[cfg(unix)]
+/// Map a host I/O error onto the closest Python exception.
+///
+/// No longer `#[cfg(unix)]`: it used to serve only the FUSE/NFS mount helpers, but
+/// the streaming bindings (`write_path`, `read_to_path`) touch the local
+/// filesystem on every platform, and gating it would have broken the Windows
+/// build the moment they were added.
+///
+/// The kind is mapped rather than flattened to a bare `OSError`, because
+/// `FileNotFoundError`/`PermissionError` are what a caller actually writes
+/// `except` for — and both are `OSError` subclasses, so nothing that caught the
+/// old shape stops working.
 fn io_err(e: std::io::Error) -> PyErr {
-    PyOSError::new_err(e.to_string())
+    use std::io::ErrorKind;
+    let msg = e.to_string();
+    match e.kind() {
+        ErrorKind::NotFound => PyFileNotFoundError::new_err(msg),
+        ErrorKind::PermissionDenied => PyPermissionError::new_err(msg),
+        ErrorKind::AlreadyExists => PyFileExistsError::new_err(msg),
+        ErrorKind::IsADirectory => PyIsADirectoryError::new_err(msg),
+        ErrorKind::NotADirectory => PyNotADirectoryError::new_err(msg),
+        _ => PyOSError::new_err(msg),
+    }
 }
 
 /// Error for a mount/serve operation that isn't available off Unix (no FUSE/NFS).
@@ -1250,6 +1269,91 @@ impl Workspace {
         future_into_py(py, async move {
             ws.write(&path, &data).await.map_err(to_pyerr)?;
             Ok(())
+        })
+    }
+
+    /// Stream a file from `src_path` into the workspace at `path`, **attributed**
+    /// to `ctx`.
+    ///
+    /// The way to write a file larger than memory. `write`/`write_as` take a
+    /// `bytes` object and copy it into Rust, so a write of an N-byte payload holds
+    /// roughly 3N transiently (the Python object, the copy, the chunker's
+    /// buffers). This opens the file in Rust and streams it: no bytes cross into
+    /// Python at all, and resident memory is bounded regardless of file size.
+    ///
+    /// Subject to the write policy — a propose-only actor gets `PermissionError`.
+    /// Blame covers the whole file rather than being diffed against the previous
+    /// body: a streamed write is a wholesale replacement, and not holding the
+    /// previous body is the entire point. Use `write_as` when the file fits in
+    /// memory *and* its line-level provenance matters.
+    ///
+    /// ```python
+    /// await ws.write_path_as(ctx, "/dataset.parquet", "/tmp/dataset.parquet")
+    /// ```
+    fn write_path_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        src_path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            // Opened on the blocking pool: `File::open` hits the filesystem, and
+            // this runs on the same runtime that serves the rest of the process.
+            let file = tokio::task::spawn_blocking(move || std::fs::File::open(&src_path))
+                .await
+                .map_err(|e| PyOSError::new_err(format!("opening the source file panicked: {e}")))?
+                .map_err(io_err)?;
+            ws.write_reader_as(c, &path, file).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Stream a file from `src_path` into the workspace at `path`, unattributed.
+    ///
+    /// The counterpart of [`write_path_as`] for genuinely actor-less imports.
+    /// Records no blame and no edit-op, and is exempt from the write policy —
+    /// prefer `write_path_as` wherever an actor is known.
+    fn write_path<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        src_path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let file = tokio::task::spawn_blocking(move || std::fs::File::open(&src_path))
+                .await
+                .map_err(|e| PyOSError::new_err(format!("opening the source file panicked: {e}")))?
+                .map_err(io_err)?;
+            ws.write_reader(&path, file).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Stream a workspace file out to `dest_path` on the local filesystem.
+    ///
+    /// The read counterpart: `read` returns the whole body as a `bytes` object
+    /// (two full copies — the reassembly buffer and the Python object), so it is
+    /// bounded by memory. This streams chunk by chunk and is not.
+    ///
+    /// For a partial read, `read_range` already fetches only the covering chunks.
+    fn read_to_path<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        dest_path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            // `read_to_writer` drives an async writer, so this is `tokio::fs`
+            // rather than `std::fs` — the write side stays off the runtime thread
+            // without a manual `spawn_blocking` per chunk.
+            let file = tokio::fs::File::create(&dest_path).await.map_err(io_err)?;
+            let written = ws.read_to_writer(&path, file).await.map_err(to_pyerr)?;
+            Ok(written)
         })
     }
 

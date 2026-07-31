@@ -70,8 +70,8 @@ And note what packing actually buys: batching happens *within* a write, not acro
 writes, because each write's content must be durable before its metadata commits.
 One large file becomes a handful of PUTs — the case it is for. Ten thousand small
 files are still ten thousand writes and roughly ten thousand PUTs. If you are bulk
-importing, fewer and larger writes (stream an archive through `write_reader`)
-matter far more than `packed`.
+importing, fewer and larger writes (stream an archive through
+`write_reader_as`, which keeps attribution) matter far more than `packed`.
 
 ## Garbage collection
 
@@ -156,6 +156,14 @@ Two options that do work:
   ORIGOFS_GCS_TEST_SERVICE_ACCOUNT_PATH=/path/to/key.json \
     cargo test -p origofs-core --test content_backends gcs_backend -- --ignored
   ```
+
+## File sizes
+
+No hard limit, but the paths that stream and the paths that buffer differ, and on a
+metered object store the difference shows up on the bill as well as in memory. See
+[`LIMITS.md`](LIMITS.md). The short version for this pairing: write large files with
+`write_path_as` (Python) or `write_reader_as` (Rust), read them with `read_range` or
+`read_to_path`, prefer fewer larger writes, and don't move bulk data through a mount.
 
 ## Readiness
 
