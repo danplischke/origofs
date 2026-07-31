@@ -88,6 +88,9 @@ struct S3Content {
     access_key_id: Option<String>,
     #[serde(default)]
     secret_access_key: Option<String>,
+    /// STS session token for temporary credentials (AWS SSO / SAML federation).
+    #[serde(default)]
+    session_token: Option<String>,
     #[serde(default)]
     prefix: Option<String>,
     /// Batch chunks into pack objects (recommended for object storage); the
@@ -129,6 +132,7 @@ impl S3Content {
             allow_http: self.allow_http,
             access_key_id: self.access_key_id.clone(),
             secret_access_key: self.secret_access_key.clone(),
+            session_token: self.session_token.clone(),
             prefix: self.prefix.clone(),
         }
     }

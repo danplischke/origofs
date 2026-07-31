@@ -81,6 +81,7 @@ fn s3_cfg_from_env(prefix: String) -> S3Config {
         allow_http: true,
         access_key_id: std::env::var("ORIGOFS_S3_TEST_ACCESS_KEY_ID").ok(),
         secret_access_key: std::env::var("ORIGOFS_S3_TEST_SECRET_ACCESS_KEY").ok(),
+        session_token: std::env::var("ORIGOFS_S3_TEST_SESSION_TOKEN").ok(),
         prefix: Some(prefix),
     }
 }

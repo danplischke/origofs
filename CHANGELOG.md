@@ -7,6 +7,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
+### Added — object storage
+
+- **`S3Config` accepts a `session_token`.** The S3 builder set only the access
+  key and secret, so temporary credentials — the kind AWS SSO / SAML federation
+  and any `AssumeRole` flow hand out — could not be used: their key pair is only
+  valid when the STS session token travels with every request, and there was
+  nowhere to put it. Added an optional `session_token` (forwarded to the object
+  store via `with_token`, redacted in `Debug`), plumbed through the Python
+  binding (`S3Config(..., session_token=...)`) and the CLI content config
+  (`session_token`, or `ORIGOFS_S3_TEST_SESSION_TOKEN` in the gated tests). Omit
+  it for long-lived keys or anonymous access — behaviour is unchanged.
+
 ### Added — media
 
 - **Chunk uploads run concurrently.** They were stored one at a time —

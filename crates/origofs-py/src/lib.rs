@@ -408,10 +408,11 @@ impl Subscription {
 ///
 /// When `access_key_id` / `secret_access_key` are omitted, credentials fall back
 /// to the **AWS** default chain (`AWS_*` env vars, EC2/ECS instance role) — that
-/// is AWS-only and does nothing on GCP. To use GCS over this S3 path, set
-/// `endpoint="https://storage.googleapis.com"` and supply GCS **HMAC** interop
-/// keys. For native GCS auth (service account / ADC / workload identity) use
-/// `GcsConfig` + `Workspace.open_gcs` instead.
+/// is AWS-only and does nothing on GCP. Set `session_token` alongside the key pair
+/// for temporary credentials (AWS SSO / SAML federation). To use GCS over this S3
+/// path, set `endpoint="https://storage.googleapis.com"` and supply GCS **HMAC**
+/// interop keys. For native GCS auth (service account / ADC / workload identity)
+/// use `GcsConfig` + `Workspace.open_gcs` instead.
 #[pyclass(frozen, from_py_object)]
 #[derive(Clone)]
 struct S3Config {
@@ -428,6 +429,7 @@ impl S3Config {
         allow_http = false,
         access_key_id = None,
         secret_access_key = None,
+        session_token = None,
         prefix = None,
     ))]
     fn new(
@@ -437,6 +439,7 @@ impl S3Config {
         allow_http: bool,
         access_key_id: Option<String>,
         secret_access_key: Option<String>,
+        session_token: Option<String>,
         prefix: Option<String>,
     ) -> Self {
         Self {
@@ -447,6 +450,7 @@ impl S3Config {
                 allow_http,
                 access_key_id,
                 secret_access_key,
+                session_token,
                 prefix,
             },
         }
