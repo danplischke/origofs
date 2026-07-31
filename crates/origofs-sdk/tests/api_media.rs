@@ -7,6 +7,7 @@
 //! download cannot resume, and the browser downloads the file rather than playing
 //! it. The Python router (`origofs.fastapi`) had honoured `Range` from the start;
 //! the Rust surface it mirrors did not.
+#![cfg(feature = "api")]
 
 use axum::Router;
 use axum::body::Body;

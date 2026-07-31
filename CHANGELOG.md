@@ -26,6 +26,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 - `Content-Type` is guessed from the extension on both HTTP surfaces — a small
   closed table in Rust, `mimetypes` in Python — defaulting to
   `application/octet-stream`.
+- The chunker's hand-off queue is as deep as the upload window. At the old fixed
+  depth of 8 a 16-wide window could never fill, silently halving the concurrency
+  it advertised.
 - `Fs::read_range_stream` / `read_range_stream_owned`: a ranged read that streams
   and trims the boundary chunks, rather than materializing the range like
   `read_range`.

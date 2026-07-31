@@ -72,6 +72,12 @@ jobs:
           # features of origofs-sdk. `--workspace` builds their code via the CLI's
           # `full`, but lint the surface modules + their gated tests explicitly too.
           cargo clippy -p origofs-sdk --features full --all-targets -- -D warnings
+          # The fuzz crate is deliberately outside the workspace (cargo-fuzz needs
+          # its own nightly + sanitizer flags), so nothing above compiles it — a
+          # signature change in origofs-core breaks it invisibly until the Fuzz job
+          # gets there, minutes later and behind a sanitizer build. A plain stable
+          # `check` costs seconds and reports it as an ordinary type error.
+          cargo check --manifest-path crates/origofs-core/fuzz/Cargo.toml
 
       # Postgres tests self-skip without ORIGOFS_PG_TEST_URL; the S3/GCS integration
       # tests are #[ignore]d; and the FUSE / NFS / overlayfs tests self-skip when

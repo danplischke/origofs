@@ -75,6 +75,12 @@ impl ContentStore for Slow {
     }
 }
 
+/// A stand-in round trip, deliberately well above what chunking costs in a debug
+/// build. At 5ms the two were comparable and the measured ratio tracked the
+/// chunker, not the upload window — which is what made the first version of this
+/// test pass locally at 3.1x and fail CI against a 2x threshold.
+const PUT_LATENCY: Duration = Duration::from_millis(25);
+
 /// Incompressible, like encoded media: chunk boundaries are effectively random and
 /// nothing deduplicates, which is the case that produces the most objects.
 fn media(len: usize) -> Vec<u8> {
@@ -99,7 +105,7 @@ async fn fs_with(store: Arc<Slow>) -> Fs<Arc<dyn MetadataStore>, Arc<Slow>> {
 /// A buffered write overlaps its uploads, and the result is byte-identical.
 #[tokio::test]
 async fn a_buffered_write_uploads_concurrently() {
-    let store = Arc::new(Slow::new(Duration::from_millis(5)));
+    let store = Arc::new(Slow::new(PUT_LATENCY));
     let fs = fs_with(store.clone()).await;
     let body = media(4 * 1024 * 1024);
 
@@ -114,12 +120,19 @@ async fn a_buffered_write_uploads_concurrently() {
         "uploads were sequential: {objects} objects, peak concurrency {peak}"
     );
 
-    // Sequential would be ~objects x 5ms. Assert comfortably below that: the point
-    // is overlap, not a precise speedup, and CI machines vary.
-    let sequential = Duration::from_millis(5) * objects as u32;
+    // Sequential would be ~objects x 5ms. Assert a speedup *floor* well below the
+    // window size: the claim is "these overlap", not a wall-clock budget, and a
+    // shared CI runner cannot honour a tight one. 4x is far above the ~1.8x a
+    // non-overlapping implementation reaches and far below the ~16x of a healthy
+    // window, so it fails the regression without tracking runner speed.
+    let sequential = PUT_LATENCY * objects as u32;
+    let speedup = sequential.as_secs_f64() / elapsed.as_secs_f64();
+    println!(
+        "buffered: {objects} objects, {elapsed:?} vs ~{sequential:?} sequential ({speedup:.1}x)"
+    );
     assert!(
-        elapsed < sequential / 2,
-        "took {elapsed:?}; sequential would be ~{sequential:?} for {objects} objects"
+        speedup > 4.0,
+        "only {speedup:.1}x faster than sequential ({elapsed:?} vs ~{sequential:?} for {objects} objects)"
     );
 
     // Concurrency must not reorder the file.
@@ -129,7 +142,7 @@ async fn a_buffered_write_uploads_concurrently() {
 /// The streaming write does the same, and still records attribution.
 #[tokio::test]
 async fn a_streaming_write_uploads_concurrently() {
-    let store = Arc::new(Slow::new(Duration::from_millis(5)));
+    let store = Arc::new(Slow::new(PUT_LATENCY));
     let fs = fs_with(store.clone()).await;
     let agent = fs.create_agent("claude", "opus", None).await.unwrap();
     let session = fs.create_session(agent, Some("t")).await.unwrap();
@@ -148,10 +161,19 @@ async fn a_streaming_write_uploads_concurrently() {
     let peak = store.peak.load(Ordering::SeqCst);
     let objects = store.inner.list().await.unwrap().len();
     assert!(peak > 1, "streaming uploads were sequential (peak {peak})");
-    let sequential = Duration::from_millis(5) * objects as u32;
+    let sequential = PUT_LATENCY * objects as u32;
+    let speedup = sequential.as_secs_f64() / elapsed.as_secs_f64();
+    println!(
+        "streaming: {objects} objects, {elapsed:?} vs ~{sequential:?} sequential ({speedup:.1}x)"
+    );
+    // The regression this guards is specific: pushing into a `FuturesOrdered` from
+    // a `recv()` loop overlaps only between receives and reaches ~1.8x, which the
+    // old `< sequential / 2` threshold happened to sit right on top of — it failed
+    // on CI and passed locally. 4x separates the two implementations cleanly.
     assert!(
-        elapsed < sequential / 2,
-        "took {elapsed:?}; sequential would be ~{sequential:?}"
+        speedup > 4.0,
+        "only {speedup:.1}x faster than sequential ({elapsed:?} vs ~{sequential:?}); \
+         uploads are not overlapping while the chunker runs"
     );
 
     assert_eq!(fs.read("/clip.mp4").await.unwrap(), body);

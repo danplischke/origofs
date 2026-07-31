@@ -13,9 +13,14 @@ use origofs_core::Manifest;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(m) = Manifest::decode(data) {
+        // `encode` is fallible since it grew an overflow guard on the chunk count.
+        // Anything that *decoded* is inside that guard by construction — the count
+        // came from a `u32` — so a failure here is itself a bug worth catching.
+        let encoded = m
+            .encode()
+            .expect("a manifest that decoded must re-encode: encode rejected its own input");
         assert_eq!(
-            m.encode(),
-            data,
+            encoded, data,
             "manifest decode∘encode must round-trip exactly"
         );
     }

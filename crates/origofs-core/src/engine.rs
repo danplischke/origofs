@@ -646,16 +646,22 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// retry its metadata commit without re-reading the stream — and is why this
     /// is split out rather than duplicated.
     ///
-    /// Memory is bounded by the channel depth (8 chunks, so <= 2 MiB at
-    /// `MAX_CHUNK`) plus the accumulating `Vec<ChunkRef>` — 36 bytes per chunk,
-    /// about 0.055% of the file at the average chunk size. That manifest is the
-    /// real ceiling on file size; see `docs/LIMITS.md`.
+    /// Memory is bounded by the channel depth plus the in-flight upload window —
+    /// both `upload_concurrency()`, so <= 2 x 16 x `MAX_CHUNK` (8 MiB) at the
+    /// default — plus the accumulating `Vec<ChunkRef>`: 36 bytes per chunk, about
+    /// 0.055% of the file at the average chunk size. That manifest is the real
+    /// ceiling on file size; see `docs/LIMITS.md`.
     pub(crate) async fn stream_body<R>(&self, path: &str, reader: R) -> Result<(Option<Hash>, u64)>
     where
         R: std::io::Read + Send + 'static,
     {
-        // Chunk on the blocking pool; deliver one chunk at a time to the async side.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<std::result::Result<Vec<u8>, String>>(8);
+        // Chunk on the blocking pool, delivering to the async side over a queue as
+        // deep as the upload window. Shallower and the window starves: `buffered(16)`
+        // cannot hold 16 puts in flight if only 8 chunks are ever available to it,
+        // which silently capped the effective concurrency at the old depth of 8.
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Vec<u8>, String>>(
+            upload_concurrency(),
+        );
         let handle = tokio::task::spawn_blocking(move || {
             for item in fastcdc::v2020::StreamCDC::new(reader, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
                 match item {
@@ -672,34 +678,32 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
         });
 
-        // Same bounded-concurrency window as `store_body`, but fed by the chunker
-        // instead of a precomputed list: receive a chunk, launch its upload, and
-        // only wait once the window is full. `FuturesOrdered` yields completions in
-        // submission order, so the manifest stays in byte order.
-        let mut chunks = Vec::new();
-        let mut size: u64 = 0;
-        let window = upload_concurrency();
-        let mut inflight = futures::stream::FuturesOrdered::new();
-        while let Some(item) = rx.recv().await {
+        // Same bounded-concurrency window as `store_body`, fed by the chunker
+        // rather than a precomputed list.
+        //
+        // This must be one combinator over a *stream*, not a `recv()` loop that
+        // pushes into a `FuturesOrdered`: an in-flight upload only makes progress
+        // while something polls it, and a loop awaiting `rx.recv()` polls nothing
+        // else. That shape overlapped only during the brief windows between
+        // receives, yielding ~1.8x where the window should give ~16x — the first
+        // version of this did exactly that, and `upload_concurrency.rs` caught it.
+        // `buffered` polls the source and every in-flight put in the same poll, and
+        // yields in submission order so the manifest stays in byte order.
+        let chunks: Vec<ChunkRef> = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
+        .map(|item| async move {
             let data = item.map_err(OrigoFSError::Content)?;
-            size += data.len() as u64;
             let len = data.len() as u32;
-            inflight.push_back(async move {
-                self.content
-                    .put(&data)
-                    .await
-                    .map(|hash| ChunkRef { hash, len })
-            });
-            if inflight.len() >= window {
-                // Exactly one, so the window stays full rather than draining.
-                if let Some(done) = inflight.next().await {
-                    chunks.push(done?);
-                }
-            }
-        }
-        while let Some(done) = inflight.next().await {
-            chunks.push(done?);
-        }
+            self.content
+                .put(&data)
+                .await
+                .map(|hash| ChunkRef { hash, len })
+        })
+        .buffered(upload_concurrency())
+        .try_collect()
+        .await?;
+        let size: u64 = chunks.iter().map(|c| c.len as u64).sum();
         // The `JoinError` matters and must not be discarded. `StreamCDC`'s own
         // errors arrive through the channel as `Err`, but a *panic* — most
         // plausibly from a caller-supplied `Read` impl — drops the sender instead:
