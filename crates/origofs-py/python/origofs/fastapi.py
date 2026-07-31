@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import mimetypes
 import os
 import tempfile
 import uuid
@@ -392,6 +393,20 @@ class _Rooms:
 SPOOL_MAX = 8 * 1024 * 1024
 
 
+def _content_type(path: str) -> str:
+    """Guess a media type from the path, defaulting to ``application/octet-stream``.
+
+    Both range-aware responses below used to hardcode ``application/octet-stream``,
+    so a browser downloaded a video instead of playing it however well the ``Range``
+    handling worked. Python has ``mimetypes`` in the standard library, so unlike the
+    Rust surface (which keeps a deliberate small table) there is nothing to
+    hand-maintain here.
+    """
+    guessed, _ = mimetypes.guess_type(path)
+    return guessed or "application/octet-stream"
+
+
+
 def build_router(
     ws: Any,
     *,
@@ -455,7 +470,7 @@ def build_router(
             return Response(
                 content=bytes(data),
                 status_code=206,
-                media_type="application/octet-stream",
+                media_type=_content_type(p),
                 headers={
                     "Content-Range": f"bytes {start}-{end}/{size}",
                     "Accept-Ranges": "bytes",
@@ -485,7 +500,7 @@ def build_router(
 
         return StreamingResponse(
             chunks(),
-            media_type="application/octet-stream",
+            media_type=_content_type(p),
             headers={"Content-Length": str(size), "Accept-Ranges": "bytes"},
         )
 

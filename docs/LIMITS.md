@@ -63,6 +63,35 @@ itself a multi-hundred-megabyte allocation and a single PUT of that size, and
 around 9 TiB it exceeds the object store's single-request ceiling. Even the
 streaming paths accumulate this — they stream the *body*, not the manifest.
 
+## Media
+
+Media is the workload that stresses all of this at once: large, incompressible, and
+read by seeking rather than sequentially. Three things follow.
+
+**It does not deduplicate.** Encoded media is already compressed, so content-defined
+chunking finds no shared boundaries — two encodes of the same source share nothing,
+and a re-encode shares nothing with the original. Dedup is why chunking is cheap for
+text and near-useless for media, so budget storage at full size and plan to run
+`gc()` rather than hoping dedup absorbs churn.
+
+**One gigabyte becomes ~13,700 objects.** At the 64 KiB average chunk size, that is
+the object count in your bucket per GiB of media. Uploads run concurrently
+(`ORIGOFS_UPLOAD_CONCURRENCY`, default 16), which is what keeps this from being
+~13,700 sequential round trips — about seven minutes per GiB at a 30 ms RTT before
+that window existed. Raise it for a high-latency bucket. `packed` also helps here in
+a way it does not for many small files: one large write batches into few large PUTs,
+which is exactly the case packing is for.
+
+**Serving works, and needs `Range`.** `GET /v1/files/*` (Rust) and
+`GET /files/{path}` (`origofs.fastapi`) both send `Accept-Ranges: bytes`, a guessed
+`Content-Type`, a `Content-Length`, and answer a single-range request with `206` /
+`416`. A `<video>` element can seek, and a download can resume. Ranged responses
+stream — a player asking `bytes=0-` gets the whole file without the server
+materializing it.
+
+Blame on media is file-level (a single span), because `diff_spans` only applies to
+text. That is the right answer for a binary: a re-encode is a new file, not an edit.
+
 ## Guidance
 
 **Write large files with `write_path_as`** (Python) or `write_reader_as` (Rust).

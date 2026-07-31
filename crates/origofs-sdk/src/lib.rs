@@ -37,6 +37,8 @@ pub use origofs_core::{COEDIT_SIDECAR_DIR, CoeditDoc};
 #[cfg(all(feature = "coedit", feature = "postgres"))]
 pub use origofs_core::{CoeditRelayNote, CoeditRelaySub};
 pub use origofs_core::{ContentStore, LocalCasStore, MetadataStore, SqliteMetadataStore};
+// The chunk manifest, needed by callers doing ranged streaming reads.
+pub use origofs_core::Manifest;
 #[cfg(feature = "postgres")]
 pub use origofs_core::{EventSubscription, PostgresMetadataStore};
 #[cfg(feature = "object-store")]
@@ -571,6 +573,31 @@ impl Workspace {
     /// into a spawned task or an HTTP response body.
     pub async fn read_stream(&self, path: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
         self.fs.read_stream_owned(path).await
+    }
+
+    /// Open a file for a ranged read: the manifest to stream from, and its size.
+    ///
+    /// The size is what a `Content-Length`, a `Content-Range`, or a `416` all need
+    /// *before* any bytes are read, so returning it here lets a surface answer a
+    /// `Range` request in one metadata round trip.
+    pub async fn open_for_range(&self, path: &str) -> Result<(Option<Manifest>, u64)> {
+        self.fs.open_for_range(path).await
+    }
+
+    /// Stream the byte range `[off, off+len)` of a file, fetching only the chunks
+    /// that cover it and trimming the boundary chunks.
+    ///
+    /// The streaming counterpart of [`read_range`](Self::read_range), which
+    /// materializes the range. Use this to serve media: a player may request a
+    /// range of any size — including `bytes=0-` for the whole file — and buffering
+    /// that would defeat the point of streaming reads.
+    pub fn read_range_stream(
+        &self,
+        manifest: Manifest,
+        off: u64,
+        len: u64,
+    ) -> BoxStream<'static, Result<Bytes>> {
+        self.fs.read_range_stream_owned(manifest, off, len)
     }
 
     /// Stream a file's body into an async writer without ever materializing it

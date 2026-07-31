@@ -7,6 +7,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
+### Added — media
+
+- **Chunk uploads run concurrently.** They were stored one at a time —
+  `put().await` in a loop — so a write cost one round trip per chunk. Invisible on
+  a local store and dominant on object storage: content-defined chunking turns
+  1 GiB of incompressible data into ~13,700 chunks, so at a 30 ms RTT a single
+  gigabyte was about seven minutes of pure latency with the link nearly idle.
+  Bounded window (`ORIGOFS_UPLOAD_CONCURRENCY`, default 16), ordered, so the
+  manifest stays in byte order.
+- **`GET /v1/files/*` supports `Range`.** The Rust HTTP API had no range handling,
+  no `Accept-Ranges`, and no `Content-Length`, and served everything as
+  `application/octet-stream` — so a `<video>` could not seek, a download could not
+  resume, and a browser downloaded media instead of playing it. The Python router
+  had honoured `Range` from the start; the surface it mirrors did not. Single-range
+  `206`/`416` per RFC 9110, streamed rather than buffered (a player may legally ask
+  for `bytes=0-`).
+- `Content-Type` is guessed from the extension on both HTTP surfaces — a small
+  closed table in Rust, `mimetypes` in Python — defaulting to
+  `application/octet-stream`.
+- `Fs::read_range_stream` / `read_range_stream_owned`: a ranged read that streams
+  and trims the boundary chunks, rather than materializing the range like
+  `read_range`.
+
 ### Added — arbitrary file sizes
 
 - **`write_reader_as`: attributed streaming writes.** Streaming and attribution

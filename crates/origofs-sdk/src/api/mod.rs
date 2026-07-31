@@ -742,16 +742,181 @@ fn method_label(m: &axum::http::Method) -> &'static str {
     }
 }
 
-async fn read_file(State(ws): State<Shared>, Path(path): Path<String>) -> ApiResult<Response> {
+/// Guess a `Content-Type` from a path's extension.
+///
+/// Deliberately a small closed table rather than a `mime_guess` dependency: this
+/// exists so a browser can *play* media served from a workspace instead of
+/// downloading it, and the set that matters for that is short. Anything unknown
+/// stays `application/octet-stream`, which is the safe answer — a wrong type is
+/// worse than a generic one, and for an unknown extension the browser's sniffing
+/// is better informed than a guess here would be.
+fn content_type_for(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        // Video — the reason `Range` support below matters.
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        // Audio.
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        // Images.
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "heic" => "image/heic",
+        // Documents and text.
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "txt" | "md" | "log" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Parse a single-range `Range: bytes=…` header against a known size.
+///
+/// Returns `None` when there is no header or it is one this server chooses not to
+/// honour — RFC 9110 explicitly permits ignoring a `Range` and returning the whole
+/// representation, which is the right answer for a multi-range request rather than
+/// implementing `multipart/byteranges` for a case no media player uses.
+///
+/// `Some(Err(()))` is unsatisfiable: a range wholly past the end, which must be a
+/// `416` rather than an empty `206`.
+#[allow(clippy::type_complexity)]
+fn parse_range(headers: &HeaderMap, size: u64) -> Option<std::result::Result<(u64, u64), ()>> {
+    let raw = headers.get(axum::http::header::RANGE)?.to_str().ok()?;
+    let spec = raw.strip_prefix("bytes=")?.trim();
+    if spec.contains(',') {
+        return None; // multi-range: serve the whole thing instead
+    }
+    let (start, end) = spec.split_once('-')?;
+    let (start, end) = (start.trim(), end.trim());
+
+    let (first, last) = match (start.is_empty(), end.is_empty()) {
+        // `bytes=-N`: the final N bytes. N == 0 is unsatisfiable by definition.
+        (true, false) => {
+            let n: u64 = end.parse().ok()?;
+            if n == 0 {
+                return Some(Err(()));
+            }
+            (size.saturating_sub(n), size.saturating_sub(1))
+        }
+        // `bytes=N-`: from N to the end.
+        (false, true) => (start.parse().ok()?, size.saturating_sub(1)),
+        // `bytes=N-M`, clamped to the end (a too-large M is legal, not an error).
+        (false, false) => {
+            let f: u64 = start.parse().ok()?;
+            let l: u64 = end.parse().ok()?;
+            (f, l.min(size.saturating_sub(1)))
+        }
+        (true, true) => return None,
+    };
+
+    if size == 0 || first >= size || first > last {
+        return Some(Err(()));
+    }
+    Some(Ok((first, last)))
+}
+
+async fn read_file(
+    State(ws): State<Shared>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     // Stream the body so an arbitrarily large file is never buffered server-side.
-    // `read_stream` resolves and validates first, so a missing file (or a
-    // directory) is still a clean error here, before any bytes are streamed.
-    let stream = ws.read_stream(&abspath(&path)).await?;
-    Ok((
-        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        Body::from_stream(CountedRead::new(stream)),
-    )
-        .into_response())
+    // `open_for_range` resolves and validates first, so a missing file (or a
+    // directory) is still a clean error here, before any bytes are streamed — and
+    // it yields the size, which `Content-Length`, `Content-Range` and `416` all
+    // need before the first byte.
+    let p = abspath(&path);
+    let (manifest, size) = ws.open_for_range(&p).await?;
+    let ctype = content_type_for(&p);
+
+    // Parsed before the empty-file branch below: a range against a zero-length
+    // representation is unsatisfiable, so it is a 416 rather than an empty 200 —
+    // and an early return for "no manifest" would otherwise skip range handling
+    // entirely.
+    let range = parse_range(&headers, size);
+
+    let Some(manifest) = manifest else {
+        // Empty file: no manifest object exists, so there is nothing to stream.
+        if matches!(range, Some(Err(()))) {
+            return Ok((
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(axum::http::header::CONTENT_RANGE, "bytes */0".to_string())],
+            )
+                .into_response());
+        }
+        return Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, ctype.to_string()),
+                (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
+                (axum::http::header::CONTENT_LENGTH, "0".to_string()),
+            ],
+            Body::empty(),
+        )
+            .into_response());
+    };
+
+    match range {
+        // Unsatisfiable: RFC 9110 requires the 416 to carry the true size, which is
+        // how a client discovers it asked past the end.
+        Some(Err(())) => Ok((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(axum::http::header::CONTENT_RANGE, format!("bytes */{size}"))],
+        )
+            .into_response()),
+        // A partial response. Streamed, not buffered: a player may legally ask for
+        // `bytes=0-`, and materializing that would defeat streaming entirely.
+        Some(Ok((first, last))) => {
+            let len = last - first + 1;
+            let stream = ws.read_range_stream(manifest, first, len);
+            Ok((
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (axum::http::header::CONTENT_TYPE, ctype.to_string()),
+                    (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
+                    (axum::http::header::CONTENT_LENGTH, len.to_string()),
+                    (
+                        axum::http::header::CONTENT_RANGE,
+                        format!("bytes {first}-{last}/{size}"),
+                    ),
+                ],
+                Body::from_stream(CountedRead::new(stream)),
+            )
+                .into_response())
+        }
+        // Whole file. `Accept-Ranges` advertises that seeking is available at all —
+        // without it a browser will not offer to scrub a video, however well the
+        // range handling above works.
+        None => {
+            let stream = ws.read_range_stream(manifest, 0, size);
+            Ok((
+                [
+                    (axum::http::header::CONTENT_TYPE, ctype.to_string()),
+                    (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
+                    (axum::http::header::CONTENT_LENGTH, size.to_string()),
+                ],
+                Body::from_stream(CountedRead::new(stream)),
+            )
+                .into_response())
+        }
+    }
 }
 
 /// Counts a streamed read for metrics without buffering it: the only state is a
