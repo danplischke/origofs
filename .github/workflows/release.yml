@@ -151,6 +151,10 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # A tag with a pre-release suffix (`v0.1.0-rc.1`) is marked as such, so
+          # it doesn't show as the repository's latest release and `pip` won't
+          # install it without `--pre`. GitHub does not infer this from semver.
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   # Publish to PyPI via Trusted Publishing (OIDC — no API token in secrets).
   #
