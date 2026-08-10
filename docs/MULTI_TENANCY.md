@@ -150,6 +150,22 @@ run one `Workspace` per tenant, each with its own DSN/path and content location.
 The concept below turns that into a first-class, single-process, safe-by-default
 capability, and defines the sharing options for density.
 
+**Landed since this was written (issue #93):** the *path-scoped* shape — many
+tenants in one workspace, separated by path prefix — is now serviceable from the
+Python surface. `origofs.fastapi.build_router(ws, authn=…, root="/tenants/acme")`
+resolves every caller-supplied path under `root`, filters the listing routes
+(`/status`, `/diff`, `/events`, `/presence`, `/suggestions`) to it, answers `404`
+for an id-addressed suggestion outside it, and refuses the operations no filter
+can narrow (commit, branches, checkout, the commit log). `root` may also be a
+dependency, so one router scopes itself per request from a verified credential —
+which is the invariant above, applied to the path prefix.
+
+This is **not** the isolation model of §5: it is one metadata store and one
+content store, so it inherits every hazard of sharing them, and a bug in the
+router is a cross-tenant bug. It is the density end of the menu with a usable
+front door, not a boundary. The Rust HTTP API has the same workspace-global
+routes and no equivalent yet.
+
 ---
 
 ## 3. Control plane vs. data plane

@@ -684,6 +684,22 @@ the change feed, presence, actors/sessions, and the
 [co-editing](#live-co-editing-crdt) WebSocket at `/coedit/{path}` (long-lived
 rooms are created once per router, not per request).
 
+One workspace can hold many tenants under scoped paths. Pass `root=` — fixed, or
+a dependency resolving it per request — and the router scopes itself:
+
+```python
+app.include_router(build_router(ws, authn=authn, root="/tenants/acme"))
+```
+
+A caller then asks for `/files/notes.md` and gets `/tenants/acme/notes.md`; there
+is no representable request for another tenant's file, because the root is
+prepended rather than compared against. Listing routes (`/status`, `/diff`,
+`/events`, `/presence`, `/suggestions`) are filtered to the root, and the
+id-addressed suggestion routes answer `404` outside it — `404`, not `403`, so a
+caller can't probe which ids exist. Operations no filter can narrow — commit,
+branches, checkout, and the commit log — are refused with `403`; mount an
+unscoped router for the operator surface that needs them.
+
 Every mutating route depends on `authn` and hands its `WriteCtx` straight to an
 **attributed** workspace call — the request body never names an actor, so a
 client can't forge attribution, and the caller's write policy is enforced by the

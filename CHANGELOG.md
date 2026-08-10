@@ -257,6 +257,31 @@ about honest data going out. All three now return `TooLarge`.
   documented answer and keeps working, but a URL is the worst place for a
   credential: it lands in access logs, proxy logs and `Referer`-adjacent tooling
   by default, where a subprotocol value does not.
+- **`origofs.fastapi.build_router` takes a `root=`, so a multi-tenant host can
+  actually use it** (#93). A host putting many tenants in one workspace could
+  authorise the path-carrying routes — its dependency reads
+  `request.path_params["path"]` — but had nothing to authorise the
+  workspace-global ones against: `/log`, `/status`, `/diff`, `/events`,
+  `/presence`, `/branches`, `/suggestions`, and the id-addressed suggestion
+  routes, where a workspace-global id was itself enough to read, accept or reject
+  somebody else's proposal. The only safe move was to refuse all of them and
+  re-implement blame and suggestion review in front of the SDK.
+
+  `root` is a fixed path (mount one router per tenant) or a dependency resolving
+  one from the request (one router that scopes itself). Every caller-supplied
+  path resolves *under* it, so there is no representable request for another
+  tenant's file; listing routes are filtered to it; and the id-addressed
+  suggestion routes answer `404` outside it — `404` rather than `403` so a caller
+  cannot walk the id space to learn what other tenants have open. Operations no
+  filter can narrow — commit, branches, checkout, and the commit log, a shared
+  history whose messages and authors belong to everybody — are refused with
+  `403`. Actors and sessions stay workspace-wide, because identity is store-wide
+  in origofs by design and a tenant-scoped actor would be a fiction. Without
+  `root` nothing changes.
+
+  **The Rust HTTP API has the same workspace-global routes and the same gap.**
+  This fixes the surface the issue was filed against; the shape is unsolved
+  there.
 - **Live co-editing rooms are checkpointed on a cadence, not only on last
   leave.** A room's CRDT lives in process memory, and its only path to durable
   storage was the last socket disconnecting — but a browser tab left open on a

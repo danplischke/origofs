@@ -39,6 +39,12 @@ directly — rename, mkdir, commit, branch, checkout, registering actors — is
 refused with ``403``. Namespace mutations carry an actor too, so "who deleted
 this file" has an answer.
 
+For **many tenants in one workspace**, pass ``root=`` — a fixed path, or a
+dependency that resolves one from the request. Every caller-supplied path then
+resolves under it, the listing routes are filtered to it, and the operations no
+filter can narrow (commit, branches, checkout, the commit log) are refused
+rather than acting workspace-wide. See :func:`build_router`.
+
 Requires FastAPI: ``pip install "origofs[fastapi]"``.
 """
 from __future__ import annotations
@@ -188,6 +194,93 @@ async def _run(awaitable: Awaitable[Any]) -> Any:
 
 def _abs(path: str) -> str:
     return path if path.startswith("/") else "/" + path
+
+
+# --- tenant scoping (issue #93) ---------------------------------------------
+#
+# A host that puts many tenants in one workspace — the documented "one workspace,
+# scoped paths" shape — could authorise the path-carrying routes (its dependency
+# reads `request.path_params["path"]`) but had nothing to authorise the
+# workspace-global ones against: `GET /log`, `/status`, `/diff`, `/events`,
+# `/presence`, `/branches`, `/suggestions`, and the id-addressed suggestion
+# routes. Suggestion ids are workspace-global, so knowing an id was enough. The
+# only safe move was to refuse all of them and re-implement blame and suggestion
+# review in front of the SDK.
+#
+# `root` fixes that at the router: every path resolves *under* the root, and the
+# global routes are filtered to it or refused. A host mounts one router per
+# tenant, or passes a dependency that resolves the root from the request.
+
+
+def _norm_root(root: str) -> str:
+    """A root as the scope helpers want it: absolute, no trailing slash."""
+    r = _abs(root.strip()).rstrip("/")
+    return r
+
+
+def _under(root: str, path: Optional[str]) -> bool:
+    """Whether `path` is the root itself or sits beneath it.
+
+    Directory-boundary matching, not `startswith`: `/tenant-a` must not cover
+    `/tenant-abc`, which is precisely the neighbour a scope exists to exclude.
+    A `None` path is *not* under any root — a record that names no path (an
+    idle presence row) tells a scoped reader something about a tenant it cannot
+    see, so it is filtered out rather than let through.
+    """
+    if path is None:
+        return False
+    if not root:
+        return True  # the empty root is the whole workspace
+    return path == root or path.startswith(root + "/")
+
+
+def _scoped(root: str, path: str) -> str:
+    """Resolve a caller-supplied path inside `root`.
+
+    The caller's path is always relative to the root, so a client cannot address
+    anything outside its tenant by asking for one — there is no representable
+    request for `/other-tenant/secrets`, because the root is prepended rather
+    than compared against.
+
+    A `..` component is refused outright. `validate_component` in the engine
+    already refuses to *store* one, but that is a different guarantee: it stops a
+    poisoned name being persisted, not a path being resolved out of its scope
+    here.
+    """
+    p = _abs(path)
+    if any(part == ".." for part in p.split("/")):
+        raise HTTPException(status_code=400, detail="path may not contain '..'")
+    if not root:
+        return p
+    return root if p == "/" else root + p
+
+
+def _require_in_scope(root: str, path: Optional[str]) -> None:
+    """Refuse a record that is outside the scope, as a **404**.
+
+    Not a 403: a scoped caller must not be able to tell "this suggestion exists
+    but belongs to someone else" from "no such suggestion". The status is the
+    same one it would get for an id that never existed.
+    """
+    if not _under(root, path):
+        raise HTTPException(status_code=404, detail="not found")
+
+
+def _unscopable(what: str) -> "HTTPException":
+    """The refusal for an operation that has no per-tenant meaning.
+
+    Commits, branches and checkout act on the whole working tree — a checkout
+    rematerializes *every* tenant's files — and the commit log is a shared
+    history whose messages and authors belong to everybody. There is no filter
+    that makes them tenant-scoped, so a scoped router refuses them rather than
+    pretending. Mount an unscoped router (no `root`) for the operator surface
+    that legitimately needs them.
+    """
+    return HTTPException(
+        status_code=403,
+        detail=f"{what} acts on the whole workspace and is unavailable on a "
+               f"path-scoped router (built with root=…)",
+    )
 
 
 _STREAM_CHUNK = 1 << 20  # 1 MiB per read_range() call when streaming a full file
@@ -587,6 +680,7 @@ def build_router(
     *,
     authn: AuthnDep,
     reader: Optional[AuthnDep] = None,
+    root: Optional[Union[str, AuthnDep]] = None,
     checkpoint: Optional["CheckpointPolicy"] = None,
     **router_kwargs: Any,
 ) -> "APIRouter":
@@ -608,6 +702,35 @@ def build_router(
     reader:
         Optional dependency gating read-only routes. Its return value is
         ignored; raise to reject. Omit to leave reads open.
+    root:
+        Scope every route to one subtree, for a host that puts many tenants in
+        one workspace (issue #93). Either a fixed path — mount one router per
+        tenant — or a dependency resolving it from the request, for a single
+        router that scopes itself::
+
+            app.include_router(build_router(ws, authn=authn, root="/tenants/acme"),
+                               prefix="/acme")
+
+            async def tenant_root(request: Request) -> str:
+                return f"/tenants/{await my_auth.tenant_of(request)}"
+            app.include_router(build_router(ws, authn=authn, root=tenant_root))
+
+        Every caller-supplied path is then resolved *under* the root, so
+        `/notes.md` means `/tenants/acme/notes.md` and there is no representable
+        request for another tenant's file. Listing routes (`/status`, `/diff`,
+        `/events`, `/presence`, `/suggestions`) are filtered to the root, and the
+        id-addressed suggestion routes answer `404` for a suggestion outside it —
+        `404` rather than `403` so a caller cannot probe which ids exist.
+
+        Operations that act on the **whole** working tree are refused with `403`
+        rather than filtered, because no filter makes them tenant-scoped: commit,
+        branches, checkout, and the commit log (a shared history whose messages
+        and authors belong to everybody). Mount an unscoped router for the
+        operator surface that needs them.
+
+        Actors and sessions stay available and workspace-wide by design —
+        identity is store-wide in origofs (see `docs/MULTI_TENANCY.md`), not per
+        workspace, so scoping them here would be a fiction.
     checkpoint:
         When live co-editing rooms are written back to durable storage. Defaults
         to checkpointing 5 seconds after a room goes quiet and at least every 60
@@ -630,11 +753,41 @@ def build_router(
     else:
         _read_gate = reader  # type: ignore[assignment]
 
+    # The scope every path resolves under. Normalized once for a fixed root;
+    # resolved per request when it's a dependency. `""` means unscoped, which is
+    # what every helper treats as "the whole workspace" — so the unscoped router
+    # runs the identical code path rather than a second one nobody exercises.
+    scoped = root is not None
+    if root is None:
+        async def _root() -> str:
+            return ""
+    elif isinstance(root, str):
+        _fixed = _norm_root(root)
+
+        async def _root() -> str:
+            return _fixed
+    else:
+        _resolver = root
+
+        async def _root(resolved: Any = Depends(root)) -> str:  # type: ignore[misc]
+            if not isinstance(resolved, str) or not resolved.strip():
+                raise HTTPException(
+                    status_code=500,
+                    detail="the `root` dependency must return a non-empty path",
+                )
+            return _norm_root(resolved)
+
+        del _resolver
+
     # --- files --------------------------------------------------------------
 
     @router.get("/files/{path:path}", dependencies=[Depends(_read_gate)])
-    async def read_file(path: str, range: Optional[str] = Header(default=None)):
-        p = _abs(path)
+    async def read_file(
+        path: str,
+        range: Optional[str] = Header(default=None),
+        root: str = Depends(_root),
+    ):
+        p = _scoped(root, path)
         # stat() first so a missing file or a directory is a clean error BEFORE
         # any bytes are sent -- once a StreamingResponse has started, the status
         # code can't change (this is the same guarantee the Rust HTTP API's
@@ -686,7 +839,12 @@ def build_router(
         )
 
     @router.put("/files/{path:path}")
-    async def write_file(request: Request, path: str, ctx: Any = Depends(authn)):
+    async def write_file(
+        request: Request,
+        path: str,
+        ctx: Any = Depends(authn),
+        root: str = Depends(_root),
+    ):
         """Write a file, streaming the request body.
 
         This used to take ``body: bytes``, so the whole upload sat in memory before
@@ -700,7 +858,7 @@ def build_router(
         ``SpooledTemporaryFile``: on Unix that rolls over to an *unlinked* file, so
         there is no path to hand across.)
         """
-        p = _abs(path)
+        p = _scoped(root, path)
 
         # A propose-only actor's edit is queued for review, and a suggestion holds
         # the proposed bytes — so that path buffers whatever its size. Fine by
@@ -776,7 +934,9 @@ def build_router(
                     os.unlink(spill_path)
 
     @router.delete("/files/{path:path}")
-    async def remove_file(path: str, ctx: Any = Depends(authn)):
+    async def remove_file(
+        path: str, ctx: Any = Depends(authn), root: str = Depends(_root)
+    ):
         """Delete a file, governed by the caller's write policy.
 
         A propose-only actor's delete is **queued for review**, not applied —
@@ -785,7 +945,7 @@ def build_router(
         longer (issue #78). Mirrors ``DELETE /v1/files`` on the Rust HTTP API,
         response shape included.
         """
-        p = _abs(path)
+        p = _scoped(root, path)
         outcome = await _run(ws.remove_or_propose(ctx, p, f"delete {p}"))
         if outcome.wrote:
             return {"removed": p}
@@ -794,33 +954,41 @@ def build_router(
     # --- directories --------------------------------------------------------
 
     @router.get("/dirs/{path:path}", dependencies=[Depends(_read_gate)])
-    async def list_dir(path: str):
-        return await _run(ws.ls(_abs(path)))
+    async def list_dir(path: str, root: str = Depends(_root)):
+        return await _run(ws.ls(_scoped(root, path)))
 
     @router.post("/dirs/{path:path}")
-    async def make_dir(path: str, ctx: Any = Depends(authn)):
-        await _run(ws.mkdir_as(ctx, _abs(path)))
+    async def make_dir(
+        path: str, ctx: Any = Depends(authn), root: str = Depends(_root)
+    ):
+        await _run(ws.mkdir_as(ctx, _scoped(root, path)))
         return {"created": _abs(path)}
 
     @router.get("/stat/{path:path}", dependencies=[Depends(_read_gate)])
-    async def stat(path: str):
-        return await _run(ws.stat(_abs(path)))
+    async def stat(path: str, root: str = Depends(_root)):
+        return await _run(ws.stat(_scoped(root, path)))
 
     @router.post("/rename")
-    async def rename(req: _Rename, ctx: Any = Depends(authn)):
-        await _run(ws.rename_as(ctx, _abs(req.from_), _abs(req.to)))
+    async def rename(
+        req: _Rename, ctx: Any = Depends(authn), root: str = Depends(_root)
+    ):
+        # Both ends resolve under the root, so a rename can never move a file
+        # across tenants in either direction.
+        await _run(ws.rename_as(ctx, _scoped(root, req.from_), _scoped(root, req.to)))
         return {"from": _abs(req.from_), "to": _abs(req.to)}
 
     # --- attribution --------------------------------------------------------
 
     @router.get("/blame/{path:path}", dependencies=[Depends(_read_gate)])
-    async def blame(path: str):
-        return await _run(ws.blame(_abs(path)))
+    async def blame(path: str, root: str = Depends(_root)):
+        return await _run(ws.blame(_scoped(root, path)))
 
     # --- versioning ---------------------------------------------------------
 
     @router.post("/commit")
-    async def commit(req: _Commit, ctx: Any = Depends(authn)):
+    async def commit(
+        req: _Commit, ctx: Any = Depends(authn), root: str = Depends(_root)
+    ):
         """Commit the working tree, attributed to the authenticated caller.
 
         ``req.author`` is the *git-level* author string that lands on the commit
@@ -829,39 +997,60 @@ def build_router(
         client-named ``author`` can no longer be the only identity on a mutating
         route.
         """
+        if root:
+            raise _unscopable("commit")
         return {"hash": await _run(ws.commit_as(ctx, req.author, req.message))}
 
     @router.get("/log", dependencies=[Depends(_read_gate)])
-    async def log():
+    async def log(root: str = Depends(_root)):
+        # A shared history: every tenant's commit messages and authors are in it,
+        # and there is no per-path view of a commit list to filter down to.
+        if root:
+            raise _unscopable("the commit log")
         return await _run(ws.log())
 
     @router.get("/status", dependencies=[Depends(_read_gate)])
-    async def status():
-        return await _run(ws.status())
+    async def status(root: str = Depends(_root)):
+        entries = await _run(ws.status())
+        return [e for e in entries if _under(root, e.get("path"))]
 
     @router.get("/diff", dependencies=[Depends(_read_gate)])
-    async def diff(from_: str = Query(..., alias="from"), to: str = Query(...)):
-        return await _run(ws.diff(from_, to))
+    async def diff(
+        from_: str = Query(..., alias="from"),
+        to: str = Query(...),
+        root: str = Depends(_root),
+    ):
+        entries = await _run(ws.diff(from_, to))
+        return [e for e in entries if _under(root, e.get("path"))]
 
     @router.get("/diff/file", response_class=PlainTextResponse, dependencies=[Depends(_read_gate)])
     async def diff_file(
         path: str = Query(...),
         from_: str = Query(..., alias="from"),
         to: str = Query(...),
+        root: str = Depends(_root),
     ):
-        return await _run(ws.diff_file(from_, to, _abs(path)))
+        return await _run(ws.diff_file(from_, to, _scoped(root, path)))
 
     @router.get("/branches", dependencies=[Depends(_read_gate)])
-    async def branches():
+    async def branches(root: str = Depends(_root)):
+        if root:
+            raise _unscopable("branches")
         return await _run(ws.branches())
 
     @router.post("/branches")
-    async def create_branch(req: _Name, ctx: Any = Depends(authn)):
+    async def create_branch(
+        req: _Name, ctx: Any = Depends(authn), root: str = Depends(_root)
+    ):
+        if root:
+            raise _unscopable("creating a branch")
         await _run(ws.create_branch_as(ctx, req.name))
         return {"branch": req.name}
 
     @router.post("/checkout")
-    async def checkout(req: _Name, ctx: Any = Depends(authn)):
+    async def checkout(
+        req: _Name, ctx: Any = Depends(authn), root: str = Depends(_root)
+    ):
         """Switch branches, rematerializing the whole working tree.
 
         Attributed and policy-gated for the reason the Rust API gives: a checkout
@@ -869,8 +1058,25 @@ def build_router(
         token — held by an actor deliberately barred from overwriting a single
         file — destroy the workspace.
         """
+        # Rematerializing "the whole working tree" means every tenant's files,
+        # so this is the sharpest example of an operation a scope cannot narrow.
+        if root:
+            raise _unscopable("checkout")
         await _run(ws.checkout_as(ctx, req.name))
         return {"branch": req.name}
+
+    async def _in_scope_suggestion(sid: int, root: str) -> None:
+        """Refuse an id-addressed suggestion route outside the scope.
+
+        Suggestion ids are workspace-global, so on an unscoped router knowing an
+        id is enough to read, accept or reject somebody else's proposal. Answers
+        `404` — the same as an id that never existed — so a caller cannot walk the
+        id space to learn which suggestions other tenants have open.
+        """
+        if not root:
+            return
+        row = await _run(ws.get_suggestion(sid))
+        _require_in_scope(root, row.get("path") if row else None)
 
     # --- agent-suggestion review queue --------------------------------------
 
@@ -881,44 +1087,61 @@ def build_router(
         summary: Optional[str] = Query(default=None),
         delete: bool = Query(default=False),
         ctx: Any = Depends(authn),
+        root: str = Depends(_root),
     ):
+        p = _scoped(root, path)
         if delete:
-            return {"id": await _run(ws.suggest_delete(ctx, _abs(path), summary))}
-        return {"id": await _run(ws.suggest(ctx, _abs(path), body, summary))}
+            return {"id": await _run(ws.suggest_delete(ctx, p, summary))}
+        return {"id": await _run(ws.suggest(ctx, p, body, summary))}
 
     @router.get("/suggestions", dependencies=[Depends(_read_gate)])
     async def list_suggestions(
         status: Optional[str] = Query(default=None),
         path: Optional[str] = Query(default=None),
+        root: str = Depends(_root),
     ):
-        return await _run(ws.list_suggestions(status, path))
+        # Filtering after the fact rather than trusting the `path` filter: a
+        # caller can simply omit it, and omitting it used to return every
+        # tenant's queue.
+        rows = await _run(
+            ws.list_suggestions(status, _scoped(root, path) if path else None)
+        )
+        return [r for r in rows if _under(root, r.get("path"))]
 
     @router.get("/suggestions/{sid}/diff", response_class=PlainTextResponse,
                 dependencies=[Depends(_read_gate)])
-    async def suggestion_diff(sid: int):
+    async def suggestion_diff(sid: int, root: str = Depends(_root)):
+        await _in_scope_suggestion(sid, root)
         return await _run(ws.suggestion_diff(sid))
 
     @router.post("/suggestions/{sid}/accept")
-    async def accept(sid: int, ctx: Any = Depends(authn)):
+    async def accept(sid: int, ctx: Any = Depends(authn), root: str = Depends(_root)):
+        await _in_scope_suggestion(sid, root)
         await _run(ws.accept_suggestion(sid, ctx))
         return {"accepted": sid}
 
     @router.post("/suggestions/{sid}/reject")
-    async def reject(sid: int, ctx: Any = Depends(authn)):
+    async def reject(sid: int, ctx: Any = Depends(authn), root: str = Depends(_root)):
+        await _in_scope_suggestion(sid, root)
         await _run(ws.reject_suggestion(sid, ctx))
         return {"rejected": sid}
 
     # --- live collaboration -------------------------------------------------
 
     @router.get("/events", dependencies=[Depends(_read_gate)])
-    async def events(since: int = Query(default=0)):
-        return await _run(ws.watch(since))
+    async def events(since: int = Query(default=0), root: str = Depends(_root)):
+        evs = await _run(ws.watch(since))
+        return [e for e in evs if _under(root, e.get("path"))]
 
     @router.get("/presence", dependencies=[Depends(_read_gate)])
-    async def presence(window: int = Query(default=60)):
-        return await _run(ws.presence(window))
+    async def presence(window: int = Query(default=60), root: str = Depends(_root)):
+        rows = await _run(ws.presence(window))
+        # A row whose `path` is None names no file, so it says "somebody is
+        # active" without saying where — which is exactly the cross-tenant leak
+        # this scope exists to close. `_under` treats None as out of scope.
+        return [r for r in rows if _under(root, r.get("path"))]
 
-    async def _heartbeat(req: Optional[_Touch], ctx: Any) -> dict:
+    async def _heartbeat(req: Optional[_Touch], ctx: Any, root: str) -> dict:
         """Heartbeat the authenticated caller's presence. Mirrors the Rust HTTP
         API's ``POST /v1/presence``: the body is optional and only ever carries a
         `path`; the actor and session come from the credential.
@@ -936,19 +1159,27 @@ def build_router(
                        "and present a session-bound credential to heartbeat presence",
             )
         raw = (req.path or "").strip() if req is not None else ""
-        path = _abs(raw) if raw else None
+        # Scoped like every other path a caller supplies, so a heartbeat cannot
+        # advertise this session as working inside another tenant.
+        path = _scoped(root, raw) if raw else None
         await _run(ws.touch(ctx.actor_id, ctx.session_id, path))
         return {"session_id": ctx.session_id, "actor_id": ctx.actor_id, "path": path}
 
     @router.post("/presence")
-    async def heartbeat_presence(req: Optional[_Touch] = None, ctx: Any = Depends(authn)):
-        return await _heartbeat(req, ctx)
+    async def heartbeat_presence(
+        req: Optional[_Touch] = None,
+        ctx: Any = Depends(authn),
+        root: str = Depends(_root),
+    ):
+        return await _heartbeat(req, ctx, root)
 
     # The original spelling of the same heartbeat, kept so existing clients keep
     # working; `POST /presence` is the one that matches the Rust HTTP API.
     @router.post("/presence/touch")
-    async def touch(req: _Touch, ctx: Any = Depends(authn)):
-        await _heartbeat(req, ctx)
+    async def touch(
+        req: _Touch, ctx: Any = Depends(authn), root: str = Depends(_root)
+    ):
+        await _heartbeat(req, ctx, root)
         return {"ok": True}
 
     # --- actors + sessions ---------------------------------------------------
@@ -956,6 +1187,13 @@ def build_router(
     # caller mints new actor/session identities (e.g. a trusted backend
     # provisioning an actor for a newly-signed-up user) -- not public
     # self-registration.
+    #
+    # Deliberately NOT scoped by `root`. Identity is store-wide in origofs, not
+    # per workspace (`docs/MULTI_TENANCY.md`: "actor/session/tool_calls stay
+    # store-wide"), so a tenant-scoped actor would be a fiction the engine does
+    # not implement. These routes stay available on a scoped router and mint
+    # workspace-wide identities; a host that wants per-tenant identity owns that
+    # mapping itself, which is the same place it resolves `root` from.
 
     @router.post("/actors")
     async def create_actor(req: _CreateActor, ctx: Any = Depends(authn)):
@@ -996,7 +1234,12 @@ def build_router(
     # --- live co-editing (Yjs y-sync) ---------------------------------------
 
     @router.websocket("/coedit/{path:path}")
-    async def coedit(websocket: WebSocket, path: str, ctx: Any = Depends(authn)) -> None:
+    async def coedit(
+        websocket: WebSocket,
+        path: str,
+        ctx: Any = Depends(authn),
+        root: str = Depends(_root),
+    ) -> None:
         """Live co-editing over the Yjs y-sync binary protocol.
 
         Authentication reuses ``authn`` — the same dependency as every mutating
@@ -1024,7 +1267,7 @@ def build_router(
         unit — it is exactly "what this person typed in this sitting", which is
         what ``revert_session`` undoes.
         """
-        p = _abs(path)
+        p = _scoped(root, path)
         # A browser that proposes subprotocols fails the handshake unless the
         # server selects one of them, so echo the marker back when it was offered.
         # Only ever the marker -- never the token beside it.
