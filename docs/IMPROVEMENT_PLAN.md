@@ -31,7 +31,7 @@ Nine issues are open. The picture they paint is out of date in both directions:
 | #96 | abi3 wheels to PyPI | **Done** — `release.yml`; PyPI publish awaits setup |
 | #95 | TypedDict stubs | **Done** — 24 `TypedDict`s + a runtime parity test |
 | #94 | `revert_session` path scope | **Done** — `path_prefix` at all four layers |
-| #93 | fastapi multi-tenant authorisation | Open. 14 workspace-global routes (the `409`→`403` half is done) |
+| #93 | fastapi multi-tenant authorisation | **Done** — `root=` scoping; the Rust API's copy of the gap is open |
 | #98 | Co-edit WS credential + session | **Done** — subprotocol auth + session per connection |
 | #97 | Co-edit interval checkpointing | **Done** — `CheckpointPolicy` + `checkpointed_at` |
 | #92 | Structured (XmlFragment) co-edit doc | Open. `coedit.rs:75` is a single flat `TextRef` |
@@ -252,8 +252,8 @@ P0  Python router write-policy bypass + 403 (#99)  ← DONE
 P1  PyPI wheels + changelog (#96)                  ← DONE (tag + PyPI setup left to the owner)
 P2  TypedDict stubs (#95) · revert_session scope (#94) · WS session (#98)  ← DONE
 P3  Interval checkpointing (#97)                   ← DONE
-P4  Multi-tenant authorisation (#93)               ← next
-P5  Structured co-editing (#92)
+P4  Multi-tenant authorisation (#93)               ← DONE (Python; Rust API unsolved)
+P5  Structured co-editing (#92)                    ← next; needs a design decision first
 ```
 
 **Where P1 stands.** The workflow is in place and every leg builds; what remains
