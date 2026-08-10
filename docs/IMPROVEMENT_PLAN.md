@@ -33,7 +33,7 @@ Nine issues are open. The picture they paint is out of date in both directions:
 | #94 | `revert_session` path scope | **Done** — `path_prefix` at all four layers |
 | #93 | fastapi multi-tenant authorisation | Open. 14 workspace-global routes (the `409`→`403` half is done) |
 | #98 | Co-edit WS credential + session | **Done** — subprotocol auth + session per connection |
-| #97 | Co-edit interval checkpointing | Open. `_Rooms.leave` is the only checkpoint |
+| #97 | Co-edit interval checkpointing | **Done** — `CheckpointPolicy` + `checkpointed_at` |
 | #92 | Structured (XmlFragment) co-edit doc | Open. `coedit.rs:75` is a single flat `TextRef` |
 
 ### #78 — closed, with one carve-out
@@ -251,8 +251,8 @@ integrator.
 P0  Python router write-policy bypass + 403 (#99)  ← DONE
 P1  PyPI wheels + changelog (#96)                  ← DONE (tag + PyPI setup left to the owner)
 P2  TypedDict stubs (#95) · revert_session scope (#94) · WS session (#98)  ← DONE
-P3  Interval checkpointing (#97)                   ← next
-P4  Multi-tenant authorisation (#93)
+P3  Interval checkpointing (#97)                   ← DONE
+P4  Multi-tenant authorisation (#93)               ← next
 P5  Structured co-editing (#92)
 ```
 
