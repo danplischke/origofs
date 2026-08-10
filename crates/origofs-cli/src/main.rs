@@ -935,10 +935,10 @@ async fn main() -> Result<()> {
             cmd,
         } => {
             if isolate {
-                if !origofs_sdk::sandbox::bwrap_available() {
-                    anyhow::bail!(
-                        "--isolate needs bubblewrap (`bwrap`) on PATH (>= 0.8.0, for overlay support)"
-                    );
+                // Surface the specific reason (absent / too old / built without
+                // overlays), not a blanket "needs bwrap on PATH".
+                if let Some(gap) = origofs_sdk::sandbox::bwrap_gap() {
+                    anyhow::bail!("--isolate is unavailable: {gap}");
                 }
             } else if !origofs_sdk::sandbox::overlay_supported() {
                 anyhow::bail!(
@@ -957,7 +957,7 @@ async fn main() -> Result<()> {
                      security boundary. The command runs with your privileges and can read \
                      and modify anything you can, including this workspace's meta.db and \
                      cas. Run only code you trust, or pass --isolate for a real filesystem \
-                     boundary (needs bwrap >= 0.8.0)."
+                     boundary (needs a non-setuid bwrap >= 0.11.0, for --overlay support)."
                 );
             }
             let tmp = cli
@@ -988,10 +988,10 @@ async fn main() -> Result<()> {
             cmd,
         } => {
             if isolate {
-                if !origofs_sdk::sandbox::bwrap_available() {
-                    anyhow::bail!(
-                        "--isolate needs bubblewrap (`bwrap`) on PATH (>= 0.8.0, for overlay support)"
-                    );
+                // Surface the specific reason (absent / too old / built without
+                // overlays), not a blanket "needs bwrap on PATH".
+                if let Some(gap) = origofs_sdk::sandbox::bwrap_gap() {
+                    anyhow::bail!("--isolate is unavailable: {gap}");
                 }
             } else if !origofs_sdk::sandbox::overlay_supported() {
                 anyhow::bail!(
@@ -1010,7 +1010,7 @@ async fn main() -> Result<()> {
                      security boundary. The command runs with your privileges and can read \
                      and modify anything you can, including this workspace's meta.db and \
                      cas. Run only code you trust, or pass --isolate for a real filesystem \
-                     boundary (needs bwrap >= 0.8.0)."
+                     boundary (needs a non-setuid bwrap >= 0.11.0, for --overlay support)."
                 );
             }
             let tmp = cli

@@ -1,11 +1,13 @@
 //! Sandbox end-to-end: run a real command over an isolated CoW view, then import
 //! its delta (create / modify / delete) back into origofs with attribution.
 //!
-//! Self-skips where unprivileged overlayfs isn't available.
+//! Self-skips where unprivileged overlayfs isn't available. The isolated
+//! (bubblewrap) cases at the foot of the file skip too, unless
+//! `ORIGOFS_REQUIRE_BWRAP` is set — then a missing bubblewrap fails the run.
 #![cfg(feature = "sandbox")]
 
 use origofs_sdk::sandbox::{
-    LiveSync, RunOpts, import_upper, is_opaque_dir, overlay_supported, run,
+    LiveSync, RunOpts, bwrap_gap, import_upper, is_opaque_dir, overlay_supported, run,
 };
 use origofs_sdk::{ActorKind, Workspace};
 
@@ -517,4 +519,252 @@ async fn a_sandboxed_mkdir_is_attributed() {
         "the write was not attributed: {:?}",
         ops.iter().map(|o| &o.path).collect::<Vec<_>>()
     );
+}
+
+// --- isolated runs (`isolate: true`, bubblewrap) -----------------------------
+//
+// `--isolate` is the flag that separates "edit capture, run only trusted code"
+// from "a real filesystem boundary for untrusted code", and nothing here ever
+// took that branch: every case above passes `isolate: false`. The unit test in
+// `src/sandbox.rs` pins the argv we hand bubblewrap, which is not the same as
+// observing that the boundary holds. These do execute bwrap. (Issue #103.)
+
+/// Whether an isolated run can be exercised on this machine.
+///
+/// Honours `ORIGOFS_REQUIRE_BWRAP`: where the preconditions are supposed to hold
+/// (CI), a missing or overlay-less bubblewrap is a **failure**, not a skip — a
+/// silent skip is precisely the failure mode these tests exist to end, and it is
+/// what let a wrong version floor sit here undetected. Note that a plain
+/// `apt-get install bubblewrap` is *not* enough: Ubuntu 24.04 ships 0.9.0, which
+/// predates `--overlay`.
+fn isolation_testable() -> bool {
+    match bwrap_gap() {
+        None => true,
+        Some(gap) => {
+            assert!(
+                std::env::var_os("ORIGOFS_REQUIRE_BWRAP").is_none(),
+                "ORIGOFS_REQUIRE_BWRAP is set, so isolated runs must be exercisable here — but {gap}"
+            );
+            eprintln!("skipping: {gap}");
+            false
+        }
+    }
+}
+
+/// A workspace somewhere bubblewrap does not mount into the sandbox.
+///
+/// Deliberately **not** the default temp dir: the sandbox mounts a fresh
+/// `--tmpfs /tmp`, so a workspace under `/tmp` would be hidden by that rather
+/// than by the boundary being tested, and the test would still pass if every
+/// bind-mount rule were dropped. `$HOME` is where a real workspace lives and is
+/// bound nowhere, so it is the honest place to assert from.
+fn workspace_dir_outside_tmp() -> tempfile::TempDir {
+    match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        Some(home) if home.is_dir() => tempfile::tempdir_in(home),
+        _ => tempfile::tempdir(),
+    }
+    .expect("temp dir")
+}
+
+/// The isolated path must capture and import a delta exactly like the plain one:
+/// isolation changes where the command runs, not what origofs records.
+#[tokio::test]
+async fn isolated_run_imports_delta_with_attribution() {
+    if !isolation_testable() {
+        return;
+    }
+    let dir = workspace_dir_outside_tmp();
+    let ws = workspace(dir.path()).await;
+    ws.write("/keep.txt", b"original\n").await.unwrap();
+    ws.write("/gone.txt", b"delete me\n").await.unwrap();
+    let agent = ws
+        .create_agent("isolated-builder", "m", None)
+        .await
+        .unwrap();
+
+    let cmd = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "echo modified >> keep.txt; echo created > new.txt; rm gone.txt".to_string(),
+    ];
+    let out = run(
+        &ws,
+        RunOpts {
+            actor: Some(agent),
+            discard: false,
+            work_root: dir.path().join("sbx"),
+            isolate: true,
+        },
+        &cmd,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.exit_code, 0, "isolated command failed");
+    assert!(out.imported);
+
+    assert_eq!(
+        &ws.read("/keep.txt").await.unwrap()[..],
+        b"original\nmodified\n"
+    );
+    assert_eq!(&ws.read("/new.txt").await.unwrap()[..], b"created\n");
+    assert!(ws.stat("/gone.txt").await.is_err(), "gone.txt was deleted");
+
+    let blame = ws.blame("/new.txt").await.unwrap();
+    assert_eq!(blame[0].actor.id, agent);
+    assert_eq!(blame[0].actor.kind, ActorKind::Agent);
+}
+
+/// The claim `--isolate` exists to make: the host filesystem is **absent**.
+///
+/// The sandboxed command reports what it can reach into a file in the overlay,
+/// which comes back through the ordinary import — so the boundary is observed
+/// from inside, by the untrusted side, rather than assumed from the argv.
+#[tokio::test]
+async fn isolated_run_hides_the_host_filesystem_and_environment() {
+    if !isolation_testable() {
+        return;
+    }
+    let dir = workspace_dir_outside_tmp();
+    let ws = workspace(dir.path()).await;
+    ws.write("/bait.txt", b"in the workspace\n").await.unwrap();
+    let agent = ws.create_agent("prober", "m", None).await.unwrap();
+
+    let meta = dir.path().join("meta.db");
+    let cas = dir.path().join("cas");
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    assert!(meta.exists(), "the workspace really is on disk at {meta:?}");
+
+    // Each probe prints VISIBLE only if it can actually reach the thing. The
+    // environment probes print the inherited value, so a leak shows up verbatim.
+    let script = format!(
+        "{{ \
+           echo \"meta:$(test -e '{meta}' && echo VISIBLE || echo hidden)\"; \
+           echo \"cas:$(test -d '{cas}' && echo VISIBLE || echo hidden)\"; \
+           echo \"home:$(test -d '{home}' && echo VISIBLE || echo hidden)\"; \
+           echo \"homes:$(test -d /home && echo VISIBLE || echo hidden)\"; \
+           echo \"cargo:${{CARGO_MANIFEST_DIR:-unset}}\"; \
+           echo \"bait:$(cat bait.txt)\"; \
+         }} > probe.txt",
+        meta = meta.display(),
+        cas = cas.display(),
+        home = home,
+    );
+    let out = run(
+        &ws,
+        RunOpts {
+            actor: Some(agent),
+            discard: false,
+            work_root: dir.path().join("sbx"),
+            isolate: true,
+        },
+        &["/bin/sh".to_string(), "-c".to_string(), script],
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.exit_code, 0, "probe command failed");
+
+    let report = String::from_utf8(ws.read("/probe.txt").await.unwrap().to_vec()).unwrap();
+
+    // The workspace the sandbox is a view *of* is not reachable as a filesystem:
+    // untrusted code can neither read the metadata DB nor tamper with the content
+    // store behind origofs's back.
+    assert!(
+        report.contains("meta:hidden"),
+        "the workspace's meta.db was reachable from inside the sandbox:\n{report}"
+    );
+    assert!(
+        report.contains("cas:hidden"),
+        "the content store was reachable from inside the sandbox:\n{report}"
+    );
+    // Home directories — credentials, SSH keys, cloud config — are absent.
+    assert!(
+        report.contains("home:hidden") && report.contains("homes:hidden"),
+        "a home directory was reachable from inside the sandbox:\n{report}"
+    );
+    // The environment is cleared, not merely stripped of ORIGOFS_ENCRYPTION_KEY.
+    // Cargo sets CARGO_MANIFEST_DIR for this test process, so it stands in for
+    // every AWS_SECRET_ACCESS_KEY / DATABASE_URL a real parent would carry.
+    assert!(
+        report.contains("cargo:unset"),
+        "the parent's environment leaked into the sandbox:\n{report}"
+    );
+    // ...and the sandbox is still a working *view* of the workspace, not an empty
+    // room: hiding everything would pass the assertions above for the wrong reason.
+    assert!(
+        report.contains("bait:in the workspace"),
+        "the workspace content was not visible to the command:\n{report}"
+    );
+}
+
+/// `discard` must hold on the isolated path too — the delta is captured either
+/// way, so nothing about isolation should make a discarded run leak into origofs.
+#[tokio::test]
+async fn isolated_discard_leaves_workspace_untouched() {
+    if !isolation_testable() {
+        return;
+    }
+    let dir = workspace_dir_outside_tmp();
+    let ws = workspace(dir.path()).await;
+    ws.write("/f.txt", b"before\n").await.unwrap();
+
+    let out = run(
+        &ws,
+        RunOpts {
+            actor: None,
+            discard: true,
+            work_root: dir.path().join("sbx"),
+            isolate: true,
+        },
+        &[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo clobbered > f.txt; echo junk > extra.txt".to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert!(!out.imported);
+
+    assert_eq!(&ws.read("/f.txt").await.unwrap()[..], b"before\n");
+    assert!(ws.stat("/extra.txt").await.is_err());
+}
+
+/// An isolated run must fail loudly where it cannot be provided, rather than
+/// silently falling back to the unisolated overlay — the caller asked for a
+/// boundary, and quietly not giving them one is the worst available outcome.
+#[tokio::test]
+async fn isolation_refuses_rather_than_downgrading_when_unavailable() {
+    let Some(gap) = bwrap_gap() else {
+        return; // bubblewrap is usable here; nothing to refuse.
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ws = workspace(dir.path()).await;
+    ws.write("/f.txt", b"before\n").await.unwrap();
+
+    let err = run(
+        &ws,
+        RunOpts {
+            actor: None,
+            discard: false,
+            work_root: dir.path().join("sbx"),
+            isolate: true,
+        },
+        &[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo x > f.txt".into(),
+        ],
+    )
+    .await
+    .expect_err("an isolated run must not succeed without isolation");
+
+    // The error names the actual reason, so the operator can fix it.
+    let text = err.to_string();
+    assert!(
+        text.contains(&gap.to_string()),
+        "error should explain the gap, got: {text}"
+    );
+    // And nothing ran: the workspace is untouched.
+    assert_eq!(&ws.read("/f.txt").await.unwrap()[..], b"before\n");
 }

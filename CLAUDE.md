@@ -221,7 +221,7 @@ Each is a module under `crates/origofs-sdk/src/`, gated by the matching feature
   reachable (incl. this workspace's `meta.db`/`cas`), with no network namespace or
   seccomp, and origofs only strips `ORIGOFS_ENCRYPTION_KEY` from the env. **Not a security
   boundary; run only trusted code.** Passing **`--isolate`** (`RunOpts::isolate` /
-  `LiveOpts::isolate`; needs `bwrap` ≥ 0.8.0, gated by `bwrap_available()`) runs
+  `LiveOpts::isolate`; needs a non-setuid `bwrap` ≥ 0.11.0 — where `--overlay` landed; capability is probed by `bwrap_gap()`/`bwrap_available()`, not inferred from the version) runs
   the command under bubblewrap in a fresh tmpfs root that hides the host filesystem
   (`meta.db`/`cas`, home dir, credentials) — a real **filesystem** boundary for
   untrusted code. It is deliberately *only* filesystem isolation: the network
