@@ -633,10 +633,14 @@ the change feed, presence, actors/sessions, and the
 [co-editing](#live-co-editing-crdt) WebSocket at `/coedit/{path}` (long-lived
 rooms are created once per router, not per request).
 
-Every mutating route depends on `authn` and hands its `WriteCtx` straight to the
-workspace — the request body never names an actor, so a client can't forge
-attribution, and a propose-only actor's `PUT` lands in the review queue instead
-of the working tree. Reads are open by default: pass `reader=<dependency>` to
+Every mutating route depends on `authn` and hands its `WriteCtx` straight to an
+**attributed** workspace call — the request body never names an actor, so a
+client can't forge attribution, and the caller's write policy is enforced by the
+engine rather than route by route. A propose-only actor's `PUT` or `DELETE`
+lands in the review queue instead of the working tree; rename, mkdir, commit,
+branch, checkout and registering actors are refused with `403`. Namespace
+mutations carry an actor too, so "who deleted this file" has an answer.
+Reads are open by default: pass `reader=<dependency>` to
 gate them, or `dependencies=[…]` (forwarded to `APIRouter`, along with `tags`
 and the rest) to gate everything. `GET /files/{path}` streams rather than
 buffering a whole file, and honors a single-range `Range` header (`206`/`416`),

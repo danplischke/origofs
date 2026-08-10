@@ -31,6 +31,14 @@ authenticated principal, and a client cannot forge attribution by naming an
 actor id in the request. Read routes are open by default; pass ``reader`` (any
 dependency) to gate them too.
 
+Attribution is not decoration: every mutating route calls an **attributed**
+workspace method, so the caller's :class:`~origofs.WritePolicy` governs it in the
+engine. A propose-only actor's write or delete is queued as a suggestion for
+review (``{"path": …, "proposed": <id>}``); everything else it may not do
+directly — rename, mkdir, commit, branch, checkout, registering actors — is
+refused with ``403``. Namespace mutations carry an actor too, so "who deleted
+this file" has an answer.
+
 Requires FastAPI: ``pip install "origofs[fastapi]"``.
 """
 from __future__ import annotations
@@ -111,7 +119,9 @@ class _CreateActor(BaseModel):
 
 
 class _CreateSession(BaseModel):
-    actor: int
+    """The body of ``POST /sessions``. It carries **no** actor: the session
+    belongs to whoever the credential resolves to, resolved server-side."""
+
     client: Optional[str] = None
 
 
@@ -153,6 +163,14 @@ async def _run(awaitable: Awaitable[Any]) -> Any:
         raise HTTPException(status_code=409, detail=str(e))
     except NotADirectoryError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except PermissionError as e:
+        # A write-policy refusal: a propose-only actor reaching for an operation
+        # it may not land directly. An authorization outcome, so `403` -- not the
+        # `409` it used to collapse into via the OSError arm below, which is
+        # already carrying stale-base semantics for suggestion accepts.
+        #
+        # Must precede OSError: PermissionError is a subclass of it.
+        raise HTTPException(status_code=403, detail=str(e))
     except OSError as e:
         # A non-empty directory (rmdir or a rename onto one) is the one origofs
         # error the Rust binding maps to a plain OSError rather than one of the
@@ -520,9 +538,6 @@ def build_router(
         there is no path to hand across.)
         """
         p = _abs(path)
-        parent, _, _ = p.rpartition("/")
-        if parent:  # create intermediate dirs, like the Rust HTTP API does
-            await _run(ws.mkdir_p(parent))
 
         # A propose-only actor's edit is queued for review, and a suggestion holds
         # the proposed bytes — so that path buffers whatever its size. Fine by
@@ -546,6 +561,22 @@ def build_router(
                 await probe(ctx, "write a file")
             except PermissionError:
                 may_write_directly = False
+
+        # Missing parents are created only *after* the policy decision, so a queued
+        # suggestion leaves the working tree untouched -- the same ordering the
+        # engine uses inside `write_or_propose`, and the property
+        # `tests/mcp.rs::a_queued_write_creates_no_directories` pins on the MCP
+        # surface. Attributed, so the directory carries an actor like any other
+        # namespace mutation.
+        #
+        # Only the streaming branch below strictly needs this (`write_reader_as`
+        # resolves an existing parent rather than creating one); the buffered
+        # branch's `write_or_propose` creates parents itself. Doing it once here
+        # keeps both branches identical from the caller's side.
+        if may_write_directly:
+            parent, _, _ = p.rpartition("/")
+            if parent:
+                await _run(ws.mkdir_as(ctx, parent))
 
         buf = bytearray()
         spill = None
@@ -582,9 +613,20 @@ def build_router(
                     os.unlink(spill_path)
 
     @router.delete("/files/{path:path}")
-    async def remove_file(path: str, _ctx: Any = Depends(authn)):
-        await _run(ws.remove(_abs(path)))
-        return {"removed": _abs(path)}
+    async def remove_file(path: str, ctx: Any = Depends(authn)):
+        """Delete a file, governed by the caller's write policy.
+
+        A propose-only actor's delete is **queued for review**, not applied —
+        otherwise it could destroy a file it was refused permission to overwrite,
+        which is the exact hop the ``PUT`` gate would only have made one step
+        longer (issue #78). Mirrors ``DELETE /v1/files`` on the Rust HTTP API,
+        response shape included.
+        """
+        p = _abs(path)
+        outcome = await _run(ws.remove_or_propose(ctx, p, f"delete {p}"))
+        if outcome.wrote:
+            return {"removed": p}
+        return {"path": p, "proposed": outcome.suggestion_id}
 
     # --- directories --------------------------------------------------------
 
@@ -593,8 +635,8 @@ def build_router(
         return await _run(ws.ls(_abs(path)))
 
     @router.post("/dirs/{path:path}")
-    async def make_dir(path: str, _ctx: Any = Depends(authn)):
-        await _run(ws.mkdir_p(_abs(path)))
+    async def make_dir(path: str, ctx: Any = Depends(authn)):
+        await _run(ws.mkdir_as(ctx, _abs(path)))
         return {"created": _abs(path)}
 
     @router.get("/stat/{path:path}", dependencies=[Depends(_read_gate)])
@@ -602,8 +644,8 @@ def build_router(
         return await _run(ws.stat(_abs(path)))
 
     @router.post("/rename")
-    async def rename(req: _Rename, _ctx: Any = Depends(authn)):
-        await _run(ws.rename(_abs(req.from_), _abs(req.to)))
+    async def rename(req: _Rename, ctx: Any = Depends(authn)):
+        await _run(ws.rename_as(ctx, _abs(req.from_), _abs(req.to)))
         return {"from": _abs(req.from_), "to": _abs(req.to)}
 
     # --- attribution --------------------------------------------------------
@@ -615,8 +657,16 @@ def build_router(
     # --- versioning ---------------------------------------------------------
 
     @router.post("/commit")
-    async def commit(req: _Commit, _ctx: Any = Depends(authn)):
-        return {"hash": await _run(ws.commit(req.author, req.message))}
+    async def commit(req: _Commit, ctx: Any = Depends(authn)):
+        """Commit the working tree, attributed to the authenticated caller.
+
+        ``req.author`` is the *git-level* author string that lands on the commit
+        object; the authenticated ctx is what the policy gate and the audit log
+        see. Binding both means a propose-only actor can no longer commit — and a
+        client-named ``author`` can no longer be the only identity on a mutating
+        route.
+        """
+        return {"hash": await _run(ws.commit_as(ctx, req.author, req.message))}
 
     @router.get("/log", dependencies=[Depends(_read_gate)])
     async def log():
@@ -643,13 +693,20 @@ def build_router(
         return await _run(ws.branches())
 
     @router.post("/branches")
-    async def create_branch(req: _Name, _ctx: Any = Depends(authn)):
-        await _run(ws.create_branch(req.name))
+    async def create_branch(req: _Name, ctx: Any = Depends(authn)):
+        await _run(ws.create_branch_as(ctx, req.name))
         return {"branch": req.name}
 
     @router.post("/checkout")
-    async def checkout(req: _Name, _ctx: Any = Depends(authn)):
-        await _run(ws.checkout(req.name))
+    async def checkout(req: _Name, ctx: Any = Depends(authn)):
+        """Switch branches, rematerializing the whole working tree.
+
+        Attributed and policy-gated for the reason the Rust API gives: a checkout
+        discards every uncommitted edit, so an unattributed one let a propose-only
+        token — held by an actor deliberately barred from overwriting a single
+        file — destroy the workspace.
+        """
+        await _run(ws.checkout_as(ctx, req.name))
         return {"branch": req.name}
 
     # --- agent-suggestion review queue --------------------------------------
@@ -735,11 +792,17 @@ def build_router(
     # Gated by `authn` like every other mutating route: an already-authenticated
     # caller mints new actor/session identities (e.g. a trusted backend
     # provisioning an actor for a newly-signed-up user) -- not public
-    # self-registration. `authn`'s own return value is unused here, same as
-    # `make_dir`/`create_branch` above.
+    # self-registration.
 
     @router.post("/actors")
-    async def create_actor(req: _CreateActor, _ctx: Any = Depends(authn)):
+    async def create_actor(req: _CreateActor, ctx: Any = Depends(authn)):
+        # Registering actors is an administrative mutation, so it answers to the
+        # caller's write policy too -- a propose-only actor may not mint identities
+        # (matching `create_actor` on the Rust HTTP API). `getattr` because this
+        # router is deliberately duck-typed against a workspace-like object.
+        probe = getattr(ws, "ensure_may_write", None)
+        if probe is not None:
+            await _run(probe(ctx, "register actors"))
         if req.agent:
             # `is not None`, not `or`: an explicit empty-string model should be
             # preserved (matches the Rust API's `req.model.as_deref().unwrap_or(…)`,
@@ -751,8 +814,21 @@ def build_router(
         return {"id": actor_id}
 
     @router.post("/sessions")
-    async def create_session(req: _CreateSession, _ctx: Any = Depends(authn)):
-        return {"id": await _run(ws.create_session(req.actor, req.client))}
+    async def create_session(
+        req: Optional[_CreateSession] = None, ctx: Any = Depends(authn)
+    ):
+        """Open a session **for the authenticated caller**.
+
+        The body carries no actor, exactly like ``POST /v1/sessions`` on the Rust
+        HTTP API: a session belongs to whoever the credential resolves to. It used
+        to take ``actor`` from the request, which let an authenticated caller mint
+        a session belonging to somebody else — and a host whose ``authn`` trusts a
+        client-presented session id would then attribute that actor's edits to it.
+        Identity is resolved server-side or not at all.
+        """
+        client = req.client if req is not None else None
+        sid = await _run(ws.create_session(ctx.actor_id, client))
+        return {"id": sid, "actor": ctx.actor_id}
 
     # --- live co-editing (Yjs y-sync) ---------------------------------------
 
