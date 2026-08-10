@@ -284,6 +284,55 @@ jobs:
       - name: Run the FUSE mount suite
         run: cargo test -p origofs-sdk --features full --test fuse_mount -- --nocapture
 
+  # The isolated sandbox (`origofs sandbox --isolate`), which had **zero** executed
+  # coverage (#103). Every case in sandbox.rs passed `isolate: false`, so the one
+  # thing origofs presents as an actual security boundary was asserted only by a
+  # unit test over the argv we hand bubblewrap — never by running it.
+  #
+  # `apt-get install bubblewrap` does NOT enable this: the `--overlay` options
+  # landed in bubblewrap 0.11.0, and ubuntu-latest (24.04) ships 0.9.0. That gap
+  # is the whole reason the feature was broken on every current LTS distro while
+  # looking fine. So build 0.11.0 — a small C project, well under a minute — and
+  # run the suite against it.
+  sandbox-isolate:
+    name: Sandbox isolation (bubblewrap)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build bubblewrap 0.11.0 (overlay support)
+        env:
+          BWRAP_VERSION: 0.11.0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends meson ninja-build libcap-dev pkg-config
+          curl -fsSL -o bwrap.tar.xz \
+            "https://github.com/containers/bubblewrap/releases/download/v${BWRAP_VERSION}/bubblewrap-${BWRAP_VERSION}.tar.xz"
+          tar xf bwrap.tar.xz
+          cd "bubblewrap-${BWRAP_VERSION}"
+          meson setup _build --prefix=/usr/local -Dselinux=disabled -Dman=disabled -Dtests=false
+          ninja -C _build
+          sudo ninja -C _build install
+
+      # Fail loudly rather than skipping, exactly as the `fuse` job does: a silent
+      # skip here is the failure mode this job exists to end.
+      - name: The isolation preconditions really are satisfied
+        run: |
+          bwrap --version
+          bwrap --help | grep -q -- --overlay-src || {
+            echo "::error::this bubblewrap has no --overlay-src; the suite would skip"; exit 1; }
+          echo "bubblewrap with overlay support present; the isolated tests will not self-skip"
+
+      # ORIGOFS_REQUIRE_BWRAP turns a would-be skip into a failure, so this job
+      # cannot silently go back to testing nothing.
+      - name: Run the sandbox suite
+        env:
+          ORIGOFS_REQUIRE_BWRAP: "1"
+        run: cargo test -p origofs-sdk --features sandbox --test sandbox -- --nocapture
+
   # B4 (#70): supply-chain gate. RUSTSEC advisories, the license allow-list, and
   # source pinning from deny.toml. Reads Cargo metadata only — no workspace
   # build — so it's fast and independent of the test jobs.
@@ -471,10 +520,19 @@ jobs:
           # dev-only (not a runtime dep of origofs). None of these are needed to
           # build/use origofs itself -- they're here so every test file (and the
           # type-check below) can actually import what it needs.
+          #
+          # llama-index-core and markitdown back the `llamaindex`/`markitdown`
+          # extras. They were missing, so the four tests in test_rag.py guarded on
+          # them skipped on EVERY run and origofs/llamaindex.py (201 lines) had
+          # never been imported by a test that executed (#104). Every extra
+          # declared in pyproject.toml belongs on this line; tests/
+          # test_optional_extras.py fails if one is missing, rather than letting it
+          # go back to skipping silently.
           pip install maturin pytest fastapi httpx fsspec universal_pathlib \
-            sqlalchemy alembic "psycopg[binary]" mypy
+            sqlalchemy alembic "psycopg[binary]" mypy \
+            "llama-index-core>=0.11" markitdown
           maturin develop
-          pytest -q tests
+          ORIGOFS_REQUIRE_EXTRAS=1 pytest -q tests
 
       # The example apps ship their own test suites and neither was ever executed:
       # the run above is scoped to `crates/origofs-py/tests`, and codecov.yml

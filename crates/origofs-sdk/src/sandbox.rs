@@ -28,7 +28,9 @@
 //!
 //! **Isolated (`isolate: true`, `origofs sandbox --isolate`) — a real filesystem
 //! boundary.** Runs the command under [bubblewrap](https://github.com/containers/bubblewrap)
-//! ([`bwrap_available`]): a fresh namespace whose root is a tmpfs with only the
+//! ([`bwrap_available`], with the reason in [`bwrap_gap`]; needs a non-setuid
+//! bwrap >= 0.11.0, where the `--overlay` options were added — note that Ubuntu
+//! 24.04 and Debian 12 both ship older ones): a fresh namespace whose root is a tmpfs with only the
 //! host toolchain bind-mounted **read-only** and the copy-on-write overlay as the
 //! working dir. The rest of the host filesystem — `meta.db`/`cas`, the home dir,
 //! credential files — is simply absent, so untrusted code can't read or tamper
@@ -275,11 +277,11 @@ fn sandbox_command(
     cmd: &[String],
 ) -> Result<tokio::process::Command> {
     if isolate {
-        if !bwrap_available() {
-            bail!(
-                "isolated run requested but bubblewrap (`bwrap`) is not available on PATH; \
-                 install bubblewrap >= 0.8.0 (for overlay support), or run without isolation"
-            );
+        // Report *which* of the three ways bubblewrap can be unusable applies, so
+        // the operator gets something actionable instead of a blanket "not
+        // available on PATH" that is wrong in two of the three cases.
+        if let Some(gap) = bwrap_gap() {
+            bail!("isolated run requested but {gap}");
         }
         Ok(bwrap_command(lower, upper, work, cmd))
     } else {
@@ -287,37 +289,105 @@ fn sandbox_command(
     }
 }
 
-/// Whether bubblewrap (`bwrap`) is on PATH for an isolated run. Overlay support
-/// additionally needs bwrap >= 0.8.0; an older bwrap fails the run loudly rather
-/// than silently dropping the boundary.
+/// Why bubblewrap can't give us an isolated run here. Returned by [`bwrap_gap`]
+/// so the failure can be reported as something the operator can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BwrapGap {
+    /// `bwrap` isn't on PATH, wouldn't execute, or printed an unparseable version.
+    Missing,
+    /// Present but older than [`MIN_BWRAP_VERSION`], so it has no `--overlay`.
+    TooOld { found: (u32, u32, u32) },
+    /// New enough by version, but this build has no `--overlay` family. Upstream
+    /// disables it for setuid installs, and distributions patch it out.
+    NoOverlay { found: (u32, u32, u32) },
+}
+
+impl std::fmt::Display for BwrapGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (maj, min, patch) = MIN_BWRAP_VERSION;
+        match self {
+            Self::Missing => write!(
+                f,
+                "bubblewrap (`bwrap`) is not available on PATH; install bubblewrap >= \
+                 {maj}.{min}.{patch} (for overlay support), or run without isolation"
+            ),
+            Self::TooOld { found: (a, b, c) } => write!(
+                f,
+                "bubblewrap {a}.{b}.{c} is older than {maj}.{min}.{patch}, which is where the \
+                 `--overlay` options this needs were added; without them there is no \
+                 copy-on-write layer to capture a delta from. Upgrade bubblewrap, or run \
+                 without isolation"
+            ),
+            Self::NoOverlay { found: (a, b, c) } => write!(
+                f,
+                "bubblewrap {a}.{b}.{c} on this system was built without the `--overlay` \
+                 options (they are absent from its `--help`), so there is no copy-on-write \
+                 layer to capture a delta from. Upstream disables overlays for setuid \
+                 installs; install a non-setuid bubblewrap >= {maj}.{min}.{patch}, or run \
+                 without isolation"
+            ),
+        }
+    }
+}
+
+/// Whether bubblewrap (`bwrap`) can actually provide an isolated run here.
+/// See [`bwrap_gap`] for *why* it can't, when it can't.
 pub fn bwrap_available() -> bool {
+    bwrap_gap().is_none()
+}
+
+/// What stops an isolated run on this system, or `None` if nothing does.
+///
+/// **Capability is probed, not inferred from the version.** The version alone was
+/// never sufficient and the floor it checked was wrong besides:
+///
+/// * The `--overlay` family landed in bubblewrap **0.11.0**, not 0.8.0 as this
+///   previously claimed. Ubuntu 24.04 LTS ships 0.9.0 and Debian 12 ships 0.8.0,
+///   so on both — i.e. on most machines and on `ubuntu-latest` — the old check
+///   passed and the run then died on `bwrap: Unknown option --overlay-src`. It
+///   failed closed, but told the operator nothing, which is exactly what checking
+///   the version was supposed to prevent.
+/// * Even at 0.11.0+ the options are absent from a **setuid** install, so no
+///   version floor can imply they are present.
+///
+/// So the version is checked to give a precise message for a genuinely old
+/// bubblewrap, and then the option itself is looked for in `--help`.
+pub fn bwrap_gap() -> Option<BwrapGap> {
     let Ok(out) = std::process::Command::new("bwrap")
         .arg("--version")
         .output()
     else {
-        return false;
+        return Some(BwrapGap::Missing);
     };
     if !out.status.success() {
-        return false;
+        return Some(BwrapGap::Missing);
     }
-    // The version really is checked, not just the exit status. This function's own
-    // doc, the `sandbox_command` error text, the CLI's messages and CLAUDE.md all
-    // said `>= 0.8.0` was "gated by `bwrap_available()`" — and it wasn't. An older
-    // bwrap passed the gate and then died on `--overlay: unknown option`, which
-    // fails closed but tells the operator nothing about why. Checking here turns
-    // that into "your bwrap is too old" at the point the decision is made.
-    let text = String::from_utf8_lossy(&out.stdout);
-    match parse_bwrap_version(&text) {
-        Some(v) => v >= MIN_BWRAP_VERSION,
-        // Unparseable output from something calling itself bwrap: treat as
-        // unusable rather than assume it is new enough.
-        None => false,
+    // Unparseable output from something calling itself bwrap: treat as unusable
+    // rather than assume it is new enough. (`?` would be wrong here — `None` from
+    // this function means "nothing stops an isolated run".)
+    let Some(found) = parse_bwrap_version(&String::from_utf8_lossy(&out.stdout)) else {
+        return Some(BwrapGap::Missing);
+    };
+    if found < MIN_BWRAP_VERSION {
+        return Some(BwrapGap::TooOld { found });
     }
+    let help = std::process::Command::new("bwrap").arg("--help").output();
+    let has_overlay = help.is_ok_and(|h| {
+        let text =
+            String::from_utf8_lossy(&h.stdout).into_owned() + &String::from_utf8_lossy(&h.stderr);
+        text.contains(BWRAP_OVERLAY_SRC)
+    });
+    (!has_overlay).then_some(BwrapGap::NoOverlay { found })
 }
 
-/// The oldest bubblewrap whose `--overlay` this uses. Overlay mounts landed in
-/// 0.8.0; without them there is no copy-on-write layer to capture a delta from.
-const MIN_BWRAP_VERSION: (u32, u32, u32) = (0, 8, 0);
+/// The oldest bubblewrap that has the `--overlay` options this uses. They were
+/// added in 0.11.0; without them there is no copy-on-write layer to capture a
+/// delta from.
+const MIN_BWRAP_VERSION: (u32, u32, u32) = (0, 11, 0);
+
+/// The option whose presence in `--help` is what [`bwrap_gap`] treats as proof
+/// that this build actually has overlay support.
+const BWRAP_OVERLAY_SRC: &str = "--overlay-src";
 
 /// Parse `bwrap --version` output ("bubblewrap 0.11.0") into a comparable triple.
 /// A missing patch component reads as 0, so "bubblewrap 0.8" is 0.8.0.
@@ -890,8 +960,9 @@ mod tests {
 
     // The isolated runner's argv must set up a real filesystem boundary: a COW
     // overlay with delta capture, a read-only host toolchain, fresh namespaces,
-    // and the user command after `--`. (bwrap can't be executed in CI, so we pin
-    // the command construction instead.)
+    // and the user command after `--`. This pins what we *ask* bubblewrap for;
+    // that the boundary actually holds is asserted end-to-end in
+    // `tests/sandbox.rs` (`isolated_*`), which really does execute bwrap.
     #[test]
     fn bwrap_command_builds_an_isolated_overlay_argv() {
         let cmd = vec!["echo".to_string(), "hi".to_string()];
@@ -939,5 +1010,73 @@ mod tests {
         // The user command comes last, after the `--` separator, unmodified.
         let sep = args.iter().position(|a| a == "--").expect("`--` separator");
         assert_eq!(&args[sep + 1..], &["echo".to_string(), "hi".to_string()]);
+    }
+
+    /// The flag [`bwrap_gap`] looks for in `--help` must be one the runner
+    /// actually passes. If `bwrap_command` were changed to a different overlay
+    /// spelling, the probe would keep answering about an option we no longer use
+    /// and the gate would be meaningless.
+    #[test]
+    fn the_probed_option_is_the_one_the_runner_passes() {
+        let c = bwrap_command(
+            Path::new("/w/lower"),
+            Path::new("/w/upper"),
+            Path::new("/w/work"),
+            &["true".to_string()],
+        );
+        assert!(
+            c.as_std()
+                .get_args()
+                .any(|a| a == OsStr::new(BWRAP_OVERLAY_SRC)),
+            "capability probe checks for {BWRAP_OVERLAY_SRC}, which the runner must pass"
+        );
+    }
+
+    /// Pin the floor at the release that actually introduced `--overlay`.
+    ///
+    /// This was 0.8.0 and wrong: the options landed in **0.11.0**. The practical
+    /// effect of the old value is what makes it worth a test — the two versions
+    /// below are what current LTS distributions ship, and both sailed through the
+    /// old gate only to die on `bwrap: Unknown option --overlay-src`.
+    #[test]
+    fn the_version_floor_is_where_overlay_support_actually_landed() {
+        assert_eq!(MIN_BWRAP_VERSION, (0, 11, 0));
+        for (distro, v) in [
+            ("Debian 12", (0, 8, 0)),
+            ("Ubuntu 24.04 LTS", (0, 9, 0)),
+            ("Ubuntu 25.04", (0, 10, 0)),
+        ] {
+            assert!(
+                v < MIN_BWRAP_VERSION,
+                "{distro} ships bwrap {v:?}, which has no --overlay and must not pass the gate"
+            );
+        }
+        assert!((0, 11, 0) >= MIN_BWRAP_VERSION);
+    }
+
+    /// A version new enough is *not* sufficient — a setuid install of 0.11+ has no
+    /// `--overlay` — so the gap check must not stop at the version comparison.
+    /// Whichever way this machine's bubblewrap falls, the verdict has to agree
+    /// with whether `--help` really offers the option.
+    #[test]
+    fn capability_is_probed_rather_than_inferred_from_the_version() {
+        let Ok(help) = std::process::Command::new("bwrap").arg("--help").output() else {
+            return; // no bwrap here; `Missing` is covered by the type's Display
+        };
+        let text = String::from_utf8_lossy(&help.stdout).into_owned()
+            + &String::from_utf8_lossy(&help.stderr);
+        let offers_overlay = text.contains(BWRAP_OVERLAY_SRC);
+        match bwrap_gap() {
+            None => assert!(
+                offers_overlay,
+                "reported usable, but --help has no {BWRAP_OVERLAY_SRC}"
+            ),
+            Some(BwrapGap::NoOverlay { .. }) => assert!(
+                !offers_overlay,
+                "reported as lacking overlays, but --help offers {BWRAP_OVERLAY_SRC}"
+            ),
+            // Missing/TooOld are about the binary itself, not the option set.
+            Some(_) => {}
+        }
     }
 }

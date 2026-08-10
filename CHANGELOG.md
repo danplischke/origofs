@@ -7,7 +7,42 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`sandbox --isolate` did not work on any current LTS distribution.** The
+  bubblewrap gate accepted `>= 0.8.0`, but the `--overlay` options it depends on
+  landed in **0.11.0**. Ubuntu 24.04 ships 0.9.0 and Debian 12 ships 0.8.0, so on
+  both the check passed and the run then died on `bwrap: Unknown option
+  --overlay-src` — failing closed, but telling the operator nothing, which is
+  exactly what adding a version check was meant to prevent. The floor is now
+  0.11.0, and **capability is probed rather than inferred from the version**,
+  because no version implies it: upstream omits the overlay options from setuid
+  installs. A new `sandbox::bwrap_gap()` reports which of the three cases applies
+  (absent / too old / built without overlays) and both the SDK error and the CLI's
+  `--isolate` preflight now say so instead of a blanket "not available on PATH".
+  Found because `--isolate` had never been executed by a test (#103).
+
+### Added — testing
+
+- **The isolated sandbox is exercised end-to-end.** Every case in
+  `crates/origofs-sdk/tests/sandbox.rs` passed `isolate: false`, so the one thing
+  origofs presents as a real security boundary was covered only by a unit test over
+  the argv handed to bubblewrap. Four tests now run under bubblewrap and assert the
+  boundary from *inside*: the workspace's `meta.db` and content store are
+  unreachable, home directories are absent, the parent environment does not leak,
+  the workspace content is still visible (so the assertions can't pass by the
+  sandbox simply being empty), and an isolated run refuses rather than silently
+  downgrading where bubblewrap can't provide isolation. A `sandbox-isolate` CI job
+  builds bubblewrap 0.11.0 — `apt-get install bubblewrap` is *not* enough on
+  `ubuntu-latest` — and sets `ORIGOFS_REQUIRE_BWRAP=1` so a missing bubblewrap
+  fails the job instead of skipping it. (#103)
+- **The `llamaindex` and `markitdown` integrations are actually run.** Their tests
+  guard on `pytest.importorskip`, and neither package was in the `python` CI job's
+  install line — so four tests in `test_rag.py` skipped on every run and
+  `origofs/llamaindex.py` (201 lines) had never been imported by a test that
+  executed. Both are installed now, and `tests/test_optional_extras.py` keeps it
+  that way: it fails if the extras declared in `pyproject.toml` drift from what CI
+  installs, so a new integration cannot arrive already unexercised. (#104)
 
 ## [0.1.0] — 2026-08-10
 

@@ -23,7 +23,7 @@ seccomp: the entire host filesystem stays reachable by absolute path, including
 the workspace's own `meta.db` and `cas/`. The command inherits your environment
 apart from `ORIGOFS_ENCRYPTION_KEY`. **Run only code you trust.**
 
-With `--isolate` (needs `bwrap` >= 0.8.0) the command runs under bubblewrap in a
+With `--isolate` (needs `bwrap` >= 0.11.0, non-setuid — that is where the `--overlay` options it relies on were added) the command runs under bubblewrap in a
 fresh tmpfs root: the host filesystem is absent, the environment is cleared to
 `PATH`/`HOME`/`TMPDIR`, and `--new-session` detaches the controlling terminal.
 This is a **filesystem** boundary. The network namespace is left shared on
