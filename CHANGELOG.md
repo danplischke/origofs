@@ -249,6 +249,20 @@ about honest data going out. All three now return `TooLarge`.
   body, `paths` in the response), CLI (`--path-prefix`), and Python.
 - `POST /v1/revert-session` had no test at all, on a route that deletes other
   people's work. It has three now.
+- **A co-editing credential can ride `Sec-WebSocket-Protocol`** —
+  `new WebSocket(url, ["origofs", token])`, the one header a browser can set on
+  an upgrade — on both the Rust HTTP API and the FastAPI router. The server
+  echoes back only the `origofs` marker, which the handshake requires and which
+  a client that offered no subprotocol must not receive. `?token=` was the
+  documented answer and keeps working, but a URL is the worst place for a
+  credential: it lands in access logs, proxy logs and `Referer`-adjacent tooling
+  by default, where a subprotocol value does not.
+- **A co-editing connection is bound to a session**, opened for it when the
+  credential names only an actor. Such a connection stamped its edits
+  `(actor, session=None)`, which `revert_session` can never undo — the feature
+  the op-log exists for, missing on the surface that produces the most edits,
+  since every keystroke is one. One session per connection is the natural unit:
+  exactly what one person typed in one sitting.
 - **The Python stubs type what they return.** 31 methods returned
   `dict[str, Any]`/`list[dict[str, Any]]`, with the keys described only in a
   neighbouring comment — so a caller had to guess whether `span["actor"]` was an

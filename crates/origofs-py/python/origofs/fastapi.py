@@ -221,6 +221,35 @@ def _parse_range(range_header: Optional[str], size: int) -> Optional[tuple]:
     return start, min(end, size - 1)
 
 
+# The subprotocol a browser client offers to carry its credential:
+# `new WebSocket(url, ["origofs", token])`. The server echoes back this marker
+# (never the token) as the selected protocol.
+_COEDIT_SUBPROTOCOL = "origofs"
+
+
+async def _session_bound(ws: Any, ctx: Any) -> Any:
+    """`ctx` with a session guaranteed, opening one if it has none.
+
+    A ``WriteCtx.actor(...)`` stamps edits ``(actor, session=None)``, and
+    ``revert_session`` needs a session — so a live-editing connection built that
+    way produces edits that can never be undone as a unit, on the surface that
+    produces the most edits (issue #98). A credential that *does* name a session
+    is left alone: the host has already said what unit of work this is.
+
+    Falls back to the original ctx if the workspace-like object has no
+    ``create_session`` (this router is deliberately duck-typed for testing).
+    """
+    if getattr(ctx, "session_id", None) is not None:
+        return ctx
+    factory = getattr(ws, "create_session", None)
+    if factory is None:
+        return ctx
+    import origofs  # deferred: the router imports without the compiled extension
+
+    session = await _run(factory(ctx.actor_id, "coedit"))
+    return origofs.WriteCtx.session(ctx.actor_id, session)
+
+
 async def _safe_close(websocket: WebSocket, code: int, reason: str) -> None:
     """Close a websocket, tolerating one that's already gone (the peer
     disconnected concurrently, racing this same close) instead of letting
@@ -838,12 +867,40 @@ def build_router(
 
         Authentication reuses ``authn`` — the same dependency as every mutating
         route — so it resolves the socket to the actor its edits are attributed to.
-        Since browsers can't set headers on a WebSocket, have ``authn`` read a
-        ``?token=`` query param (it can, like any FastAPI dependency); content is
-        attributed server-side regardless of what the client's bytes claim.
+        Content is attributed server-side regardless of what the client's bytes
+        claim.
+
+        **Where a browser puts the credential.** It can't set headers on an
+        upgrade, so there are two options and they are not equal:
+
+        * ``Sec-WebSocket-Protocol`` — the one header a browser *can* set, via
+          ``new WebSocket(url, ["origofs", token])``. Read it in ``authn`` with
+          ``sec_websocket_protocol: str = Header(None)`` and take the second
+          entry. This router echoes ``origofs`` back as the selected subprotocol
+          automatically (below), which the handshake requires.
+        * ``?token=`` — works, and stays supported, but a URL is the worst place
+          for a credential: it lands in access logs, proxy logs, and
+          ``Referer``-adjacent tooling by default.
+
+        Same-origin hosts can also just use cookies, which *are* sent on upgrades.
+
+        **Sessions.** Live edits are only revertible as a unit if the connection
+        has a session, so if ``authn`` returns a bare ``WriteCtx.actor(...)`` this
+        opens one for the connection. One session per connection is the natural
+        unit — it is exactly "what this person typed in this sitting", which is
+        what ``revert_session`` undoes.
         """
         p = _abs(path)
-        await websocket.accept()
+        # A browser that proposes subprotocols fails the handshake unless the
+        # server selects one of them, so echo the marker back when it was offered.
+        # Only ever the marker -- never the token beside it.
+        offered = websocket.scope.get("subprotocols") or []
+        chosen = _COEDIT_SUBPROTOCOL if _COEDIT_SUBPROTOCOL in offered else None
+        await websocket.accept(subprotocol=chosen)
+
+        # Bind a session to the connection if the credential didn't carry one,
+        # so `revert_session` can undo this sitting's edits (see the docstring).
+        ctx = await _session_bound(ws, ctx)
         rooms.ensure_relay()  # idempotent; starts the cross-worker drain on first use
         conn = _Conn(websocket)
         room = await rooms.join(p, ctx, conn)

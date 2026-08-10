@@ -143,3 +143,144 @@ async fn loop_until_blamed(ws: &Workspace) -> Vec<origofs_sdk::BlameRange> {
     }
     panic!("blame never populated — checkpoint on last-leave did not run");
 }
+
+// --- credential transport and per-connection sessions (#98) -----------------
+
+// A browser cannot set headers on a WebSocket upgrade, so the documented answer
+// was `?token=`. That works, but a URL is the worst place for a credential: it
+// lands in access logs, proxy logs, and Referer-adjacent tooling by default.
+// `Sec-WebSocket-Protocol` is the one header a browser *can* set.
+#[tokio::test]
+async fn a_credential_can_ride_the_websocket_subprotocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alice = ws.create_human("alice", None).await.unwrap();
+    let alice_s = ws.create_session(alice, Some("web")).await.unwrap();
+    let auth = BearerAuth::new().with_token("tok-alice", alice, Some(alice_s));
+    let ws = Arc::new(ws);
+
+    let app = router(ws.clone(), Arc::new(auth));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // No `?token=` anywhere in the URL — the credential is in the subprotocol
+    // list, exactly as `new WebSocket(url, ["origofs", token])` sends it.
+    let req = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(format!("ws://{addr}/v1/coedit/doc.md"))
+        .header("host", addr.to_string())
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-protocol", "origofs, tok-alice")
+        .body(())
+        .unwrap();
+    let (mut a, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+
+    // The server must echo the marker back, or a browser fails the handshake --
+    // and it must echo only the marker, never the token beside it.
+    let selected = resp
+        .headers()
+        .get("sec-websocket-protocol")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(selected.as_deref(), Some("origofs"));
+
+    let aware = Awareness::new(Doc::new());
+    pump(&mut a, &aware).await;
+    let update = {
+        let text = aware.doc().get_or_insert_text("content");
+        let mut txn = aware.doc().transact_mut();
+        text.insert(&mut txn, 0, "typed over a subprotocol");
+        txn.encode_update_v1()
+    };
+    a.send(Ws::Binary(frame(&[Y::Sync(SyncMessage::Update(update))])))
+        .await
+        .unwrap();
+    a.send(Ws::Close(None)).await.ok();
+
+    let blame = loop_until_blamed(&ws).await;
+    assert_eq!(blame[0].actor.id, alice);
+    assert_eq!(blame[0].session, Some(alice_s));
+}
+
+#[tokio::test]
+async fn a_bogus_subprotocol_credential_is_still_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alice = ws.create_human("alice", None).await.unwrap();
+    let auth = BearerAuth::new().with_token("tok-alice", alice, None);
+
+    let app = router(Arc::new(ws), Arc::new(auth));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let req = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(format!("ws://{addr}/v1/coedit/doc.md"))
+        .header("host", addr.to_string())
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-protocol", "origofs, not-a-real-token")
+        .body(())
+        .unwrap();
+    assert!(
+        tokio_tungstenite::connect_async(req).await.is_err(),
+        "an unknown token in the subprotocol must not authenticate"
+    );
+}
+
+// A connection whose credential names only an actor used to produce edits stamped
+// `(actor, session=None)` -- which `revert_session` can never undo, on the surface
+// that generates more edits than any other. The room opens a session for it.
+#[tokio::test]
+async fn a_session_less_credential_gets_a_session_for_the_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alice = ws.create_human("alice", None).await.unwrap();
+    // Bound to an actor and *no* session -- `WriteCtx::actor(..)`, the shape the
+    // issue is about.
+    let auth = BearerAuth::new().with_token("tok-alice", alice, None);
+    let ws = Arc::new(ws);
+
+    let app = router(ws.clone(), Arc::new(auth));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (mut a, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/v1/coedit/doc.md?token=tok-alice"))
+            .await
+            .unwrap();
+    let aware = Awareness::new(Doc::new());
+    pump(&mut a, &aware).await;
+    let update = {
+        let text = aware.doc().get_or_insert_text("content");
+        let mut txn = aware.doc().transact_mut();
+        text.insert(&mut txn, 0, "live edits are revertible");
+        txn.encode_update_v1()
+    };
+    a.send(Ws::Binary(frame(&[Y::Sync(SyncMessage::Update(update))])))
+        .await
+        .unwrap();
+    a.send(Ws::Close(None)).await.ok();
+
+    let blame = loop_until_blamed(&ws).await;
+    assert_eq!(blame[0].actor.id, alice);
+    let session = blame[0]
+        .session
+        .expect("a live edit must carry a session, or it can never be reverted");
+
+    // The point of having one: the edit can be undone as a unit.
+    let changed = ws.revert_session(alice, session, None).await.unwrap();
+    assert_eq!(changed, vec!["/doc.md".to_string()]);
+    assert_eq!(&ws.read("/doc.md").await.unwrap()[..], b"");
+}

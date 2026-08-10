@@ -542,7 +542,7 @@ fn client_message(e: &crate::OrigoFSError) -> String {
 
 /// An HTTP error: either a mapped [`crate::OrigoFSError`] or an explicit status
 /// (e.g. `401` from the [`Auth`] extractor).
-enum ApiError {
+pub(super) enum ApiError {
     OrigoFS(crate::OrigoFSError),
     Status(StatusCode, String),
 }

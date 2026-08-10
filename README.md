@@ -450,6 +450,20 @@ once (behind a load balancer), a Postgres `LISTEN/NOTIFY` relay fans each update
 out so every worker's replica converges. The co-editing endpoint is served as a
 WebSocket at `GET /coedit/{path}` by both the HTTP API and the FastAPI router.
 
+A browser can't set headers on a WebSocket upgrade, so the credential rides in
+the one header it *can* set — the subprotocol list:
+
+```js
+new WebSocket(`wss://host/v1/coedit/notes.md`, ["origofs", token])
+```
+
+The server echoes back `origofs` (never the token) and authenticates it through
+the same hook as every other route. A `?token=` query param also works and stays
+supported, but a URL is the worst place for a credential — it lands in access and
+proxy logs by default. Each connection is bound to a **session**, opened for it
+if the credential didn't name one, so a sitting's live edits can be undone as a
+unit with `revert_session`.
+
 While a document is open, its stored bytes are the last **checkpoint** — real,
 fully attributed, but possibly behind what people are typing. origofs records that
 as a per-path **live marker**, and the rule is to *surface* the staleness, never to

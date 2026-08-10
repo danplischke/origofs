@@ -11,11 +11,14 @@
 //! checkpointed into the byte-range blame index and evicted.
 //!
 //! Identity is resolved exactly as everywhere else — server-side, never trusted
-//! from the client. Because browsers can't set headers on a WebSocket, the token
-//! may ride in a `?token=` query param; it is authenticated through the same
-//! [`Authenticator`](super::Authenticator) as every other route. Content a socket
-//! contributes is attributed to *its* principal by the engine, no matter what the
-//! bytes claim.
+//! from the client, and through the same [`Authenticator`](super::Authenticator)
+//! as every other route. Because browsers can't set headers on a WebSocket
+//! upgrade, the credential may instead ride in `Sec-WebSocket-Protocol`
+//! (`new WebSocket(url, ["origofs", token])` — the one header a browser *can*
+//! set) or, less well, in a `?token=` query param. Content a socket contributes
+//! is attributed to *its* principal by the engine, no matter what the bytes
+//! claim, and a connection whose credential names no session gets one opened for
+//! it so its edits are revertible as a unit.
 //!
 //! **Multiple workers.** The registry is per-process, so two sockets editing one
 //! document on *different* workers would drift. When the workspace is
@@ -277,10 +280,18 @@ async fn relay_drain(
 }
 
 /// The `?token=` query for browser WebSocket clients that can't set headers.
+///
+/// Kept working, but no longer the only option for a browser — see
+/// [`authenticate_ws`] for why `Sec-WebSocket-Protocol` is the better one.
 #[derive(Deserialize)]
 pub(crate) struct TokenQuery {
     token: Option<String>,
 }
+
+/// The subprotocol a browser client offers to carry its credential:
+/// `Sec-WebSocket-Protocol: origofs, <token>`. The server echoes back `origofs`
+/// (never the token) as the selected protocol.
+const AUTH_SUBPROTOCOL: &str = "origofs";
 
 /// `GET /coedit/{*path}` — upgrade to a y-sync WebSocket for live co-editing.
 /// Cap on a single inbound y-sync frame.
@@ -310,6 +321,16 @@ pub(crate) async fn coedit_ws(
                 .into_response();
         }
     };
+    // A connection with no session produces edits `revert_session` can never undo
+    // — on the surface that generates *more* edits than any other, since every
+    // keystroke is one. So open a session for the connection when the credential
+    // didn't bind one. One session per connection is the only sensible unit here:
+    // it is exactly the span of "what this person typed in this sitting", which is
+    // what a reviewer wants to undo (#98).
+    let ctx = match session_bound_ctx(&state, &principal).await {
+        Ok(ctx) => ctx,
+        Err(e) => return super::ApiError::OrigoFS(e).into_response(),
+    };
     let path = abspath(&path);
     let coord = state.coedit.clone();
     // `DefaultBodyLimit` does not apply to WebSocket frames, so `ApiOptions::
@@ -320,13 +341,26 @@ pub(crate) async fn coedit_ws(
     upgrade
         .max_message_size(MAX_COEDIT_FRAME)
         .max_frame_size(MAX_COEDIT_FRAME)
-        .on_upgrade(move |socket| serve_socket(coord, principal.write_ctx(), path, socket))
+        // Echo `origofs` back as the selected subprotocol when the client offered
+        // it. A browser fails the handshake if it proposes protocols and the
+        // server names none of them, so the credential-carrying form only works
+        // with this. Only the marker is ever echoed — never the token beside it.
+        .protocols([AUTH_SUBPROTOCOL])
+        .on_upgrade(move |socket| serve_socket(coord, ctx, path, socket))
 }
 
-/// Authenticate a WebSocket upgrade: the real upgrade headers first (programmatic
-/// clients, cookies), then — for browsers that can't set headers — a `?token=`
-/// query param synthesized as a `Bearer` credential and run through the same
-/// [`Authenticator`](super::Authenticator).
+/// Authenticate a WebSocket upgrade, in the order a client should prefer.
+///
+/// 1. **The real upgrade headers** — programmatic clients and same-origin cookies.
+/// 2. **`Sec-WebSocket-Protocol: origofs, <token>`** — the one header a *browser*
+///    can set on an upgrade. This is the recommended browser path.
+/// 3. **`?token=`** — kept working, because it was the documented answer, but it
+///    is the worst place for a credential: URLs land in access logs, proxy logs,
+///    and `Referer`-adjacent tooling by default, while a subprotocol value does
+///    not (#98).
+///
+/// All three synthesize a `Bearer` credential and run through the same
+/// [`Authenticator`](super::Authenticator), so a host writes its auth once.
 async fn authenticate_ws(
     state: &AppState,
     headers: &HeaderMap,
@@ -335,13 +369,58 @@ async fn authenticate_ws(
     if let Some(p) = state.auth.authenticate(headers).await {
         return Some(p);
     }
-    let token = token?;
+    if let Some(t) = subprotocol_token(headers)
+        && let Some(p) = authenticate_token(state, &t).await
+    {
+        return Some(p);
+    }
+    authenticate_token(state, token?).await
+}
+
+/// Run a bare token through the host's [`Authenticator`] by synthesizing the
+/// `Authorization: Bearer …` header it already knows how to read.
+async fn authenticate_token(state: &AppState, token: &str) -> Option<super::Principal> {
     let mut synth = HeaderMap::new();
     synth.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {token}")).ok()?,
     );
     state.auth.authenticate(&synth).await
+}
+
+/// The credential offered as a WebSocket subprotocol, i.e. the first entry after
+/// `origofs` in `Sec-WebSocket-Protocol: origofs, <token>`.
+///
+/// Returns `None` unless the list actually leads with our marker, so an unrelated
+/// subprotocol negotiation is never mistaken for a credential.
+fn subprotocol_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("sec-websocket-protocol")?.to_str().ok()?;
+    let mut parts = raw.split(',').map(str::trim).filter(|s| !s.is_empty());
+    if parts.next()? != AUTH_SUBPROTOCOL {
+        return None;
+    }
+    parts.next().map(str::to_string)
+}
+
+/// The [`WriteCtx`] a socket's edits are attributed to, with a session guaranteed.
+///
+/// A credential that binds a session is used as-is — the host has said what unit
+/// of work this is. A bare actor credential gets a fresh session opened for the
+/// connection, because the alternative is edits stamped `(actor, None)`, which
+/// `revert_session` can never undo. That is the feature the op-log exists for,
+/// missing on the surface that produces the most edits (#98).
+async fn session_bound_ctx(
+    state: &AppState,
+    principal: &super::Principal,
+) -> Result<WriteCtx, OrigoFSError> {
+    if let Some(s) = principal.session {
+        return Ok(WriteCtx::session(principal.actor, s));
+    }
+    let session = state
+        .ws
+        .create_session(principal.actor, Some("coedit"))
+        .await?;
+    Ok(WriteCtx::session(principal.actor, session))
 }
 
 /// Drive one connected socket: greet it, then pump y-sync frames both ways —

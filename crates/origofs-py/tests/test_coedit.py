@@ -20,7 +20,7 @@ import pytest
 import origofs
 from origofs.fastapi import build_router
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.testclient import TestClient
 
 # One event loop for the synchronous test to drive the async client doc + reads;
@@ -256,3 +256,120 @@ def test_suggest_coedit_update_takes_raw_yjs_blobs():
     # than becoming a review row nobody can apply.
     with pytest.raises(ValueError):
         _run(lambda: ws.suggest_coedit_update(ctx, "/doc.md", base_sv, b"", None))
+
+
+# --- credential transport and per-connection sessions (#98) ------------------
+
+
+def _app_with_subprotocol_auth():
+    """An app whose `authn` reads the credential out of `Sec-WebSocket-Protocol`
+    -- the one header a browser *can* set on an upgrade, and the reason the router
+    has to echo the marker back."""
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    tokens = {"alice-token": origofs.WriteCtx.session(alice, alice_s)}
+
+    async def authn(sec_websocket_protocol: str = Header(default="")) -> origofs.WriteCtx:
+        # `new WebSocket(url, ["origofs", token])` arrives as "origofs, <token>".
+        parts = [p.strip() for p in sec_websocket_protocol.split(",") if p.strip()]
+        resolved = tokens.get(parts[1]) if len(parts) > 1 and parts[0] == "origofs" else None
+        if resolved is None:
+            raise HTTPException(status_code=401, detail="bad token")
+        return resolved
+
+    app = FastAPI()
+    app.include_router(build_router(ws, authn=authn))
+    return app, ws, alice, alice_s
+
+
+def test_a_credential_can_ride_the_websocket_subprotocol():
+    app, ws, alice, alice_s = _app_with_subprotocol_auth()
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+    client = origofs.CoeditDoc()
+    _run(lambda: client.insert(ctx, 0, "typed over a subprotocol"))  # 24 bytes
+
+    with TestClient(app) as tc:
+        # No ?token= in the URL at all -- the credential is in the subprotocol
+        # list, and the server has to select "origofs" or a browser would fail
+        # the handshake.
+        with tc.websocket_connect(
+            "/coedit/doc.md", subprotocols=["origofs", "alice-token"]
+        ) as sock:
+            assert sock.accepted_subprotocol == "origofs"
+            greeting = sock.receive_bytes()  # server -> client: SyncStep1
+            answer = _run(lambda: client.handle_sync(ctx, greeting))
+            sock.send_bytes(answer.reply)
+            time.sleep(0.1)  # let the server apply the frame before we close
+
+        blame = []
+        for _ in range(60):
+            try:
+                blame = _run(lambda: ws.blame("/doc.md"))
+            except FileNotFoundError:
+                blame = []
+            if blame:
+                break
+            time.sleep(0.05)
+
+    assert blame, "checkpoint on last-leave never populated blame"
+    assert blame[0]["actor"]["id"] == alice
+    assert blame[0]["session"] == alice_s
+
+
+def test_a_socket_offering_no_subprotocol_still_connects():
+    # The echo must be conditional: selecting a protocol the client never offered
+    # is itself a handshake failure.
+    app, _ws, _alice, _alice_s = _app_with_alice()
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            assert sock.accepted_subprotocol is None
+            sock.receive_bytes()
+
+
+def test_a_session_less_credential_gets_a_session_for_the_connection():
+    # A `WriteCtx.actor(...)` connection used to stamp edits (actor, session=None),
+    # which `revert_session` can never undo -- on the surface that produces the
+    # most edits.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+
+    async def authn(token: str = Query(...)) -> origofs.WriteCtx:
+        if token != "alice-token":
+            raise HTTPException(status_code=401, detail="bad token")
+        return origofs.WriteCtx.actor(alice)  # deliberately session-less
+
+    app = FastAPI()
+    app.include_router(build_router(ws, authn=authn))
+
+    ctx = origofs.WriteCtx.actor(alice)
+    client = origofs.CoeditDoc()
+    _run(lambda: client.insert(ctx, 0, "live edits are revertible"))
+
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            greeting = sock.receive_bytes()
+            answer = _run(lambda: client.handle_sync(ctx, greeting))
+            sock.send_bytes(answer.reply)
+            time.sleep(0.1)
+
+        blame = []
+        for _ in range(60):
+            try:
+                blame = _run(lambda: ws.blame("/doc.md"))
+            except FileNotFoundError:
+                blame = []
+            if blame:
+                break
+            time.sleep(0.05)
+
+    assert blame, "checkpoint on last-leave never populated blame"
+    session = blame[0]["session"]
+    assert session is not None, "a live edit must carry a session, or it can never be reverted"
+
+    # The point of having one.
+    changed = _run(lambda: ws.revert_session(alice, session))
+    assert changed == ["/doc.md"]
+    assert bytes(_run(lambda: ws.read("/doc.md"))) == b""
