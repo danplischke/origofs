@@ -284,7 +284,7 @@ every file the agent touched in that session and removes exactly the lines it
 authored, leaving surrounding human edits in place:
 
 ```rust
-let files_changed = ws.revert_session(agent_id, session_id).await?;
+let changed: Vec<String> = ws.revert_session(agent_id, session_id, None).await?;
 ```
 
 Reachable from every surface:
@@ -294,12 +294,27 @@ origofs revert-session --actor 7 --session 42 --by 1   # --by is checked against
 ```
 
 ```python
-files_changed = await ws.revert_session(agent_id, session_id)
+changed = await ws.revert_session(agent_id, session_id)
 ```
 
 ```http
 POST /v1/revert-session   {"actor": 7, "session": 42}
 ```
+
+It returns the paths it changed, not just a count, so a caller can invalidate
+exactly the caches that went stale. Pass a **path scope** to bound the blast
+radius — what a multi-tenant host needs, since an "undo the agent's work" button
+lives in one tenant's UI while the session it reverts may have written anywhere:
+
+```python
+changed = await ws.revert_session(agent_id, session_id, path_prefix="/tenant-a")
+```
+
+The prefix matches on directory boundaries, so `/tenant-a` covers
+`/tenant-a/notes.txt` and never `/tenant-abc/notes.txt`. Scoping inside the call
+is also what makes it safe: pre-flighting with `edit_ops` and then reverting
+reads the session's reach and acts on it in two steps, so a write landing in
+between is reverted without ever having been checked.
 
 ## Versioning
 

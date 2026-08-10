@@ -342,10 +342,35 @@ async def test_revert_session_removes_only_that_actors_lines():
     assert bytes(await ws.read("/doc.md")) == b"human line\nagent line\n"
 
     changed = await ws.revert_session(agent, a_sess)
-    assert changed == 1
+    assert changed == ["/doc.md"]
     body = bytes(await ws.read("/doc.md"))
     assert b"human line" in body, "the human's line was collateral damage"
     assert b"agent line" not in body, "the agent's line survived the revert"
+
+
+@asyncio_test
+async def test_revert_session_can_be_scoped_to_one_tenants_subtree():
+    # Issue #94: one workspace, tenant-scoped paths. An "undo this agent's work"
+    # button lives in one tenant's UI, but the session may have written anywhere.
+    ws = await workspace()
+    agent = await ws.create_agent("claude", "opus", None)
+    sess = await ws.create_session(agent, "mcp")
+    ctx = origofs.WriteCtx.session(agent, sess)
+
+    for path in ("/tenant-a/doc.md", "/tenant-b/doc.md", "/tenant-abc/doc.md"):
+        await ws.mkdir_p(path.rsplit("/", 1)[0])
+        await ws.write_as(ctx, path, b"agent line\n")
+
+    changed = await ws.revert_session(agent, sess, path_prefix="/tenant-a")
+    assert changed == ["/tenant-a/doc.md"]
+
+    assert bytes(await ws.read("/tenant-a/doc.md")) == b""
+    # Neither the other tenant nor the one whose name merely starts the same way.
+    assert bytes(await ws.read("/tenant-b/doc.md")) == b"agent line\n"
+    assert bytes(await ws.read("/tenant-abc/doc.md")) == b"agent line\n"
+
+    with pytest.raises(ValueError):
+        await ws.revert_session(agent, sess, path_prefix="tenant-a")
 
 
 @asyncio_test

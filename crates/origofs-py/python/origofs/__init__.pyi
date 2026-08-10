@@ -2,11 +2,281 @@
 
 Every I/O method is async (returns an awaitable) so it composes with FastAPI's
 `async def` handlers. Structured results are plain ``dict``/``list`` objects,
-directly JSON-serializable.
+directly JSON-serializable — and typed, as the ``TypedDict``\\s below, so a caller
+gets completion and a renamed key fails type-checking instead of surfacing as a
+``KeyError`` in production.
+
+The records are **total**: every key is always present. A value that can be
+absent is typed ``Optional[...]`` and comes back as ``None``, never missing — the
+extension's dict builders set every key unconditionally. So
+``span["session"] is None`` is the check, not ``"session" in span``.
 """
 from __future__ import annotations
 import sys
-from typing import Any, Awaitable, NoReturn, Optional
+from typing import Any, Awaitable, Literal, NoReturn, Optional, TypedDict
+
+# --- record shapes ----------------------------------------------------------
+#
+# One TypedDict per dict the extension returns, mirroring the builders in
+# `crates/origofs-py/src/lib.rs`. Closed string sets are `Literal`, so a typo in a
+# comparison is caught rather than silently never matching.
+
+ActorKind = Literal["human", "agent", "system"]
+FileKind = Literal["file", "dir", "symlink"]
+DiffStatus = Literal["added", "modified", "deleted"]
+SuggestionKind = Literal["bytes", "crdt"]
+SuggestionStatus = Literal["pending", "accepted", "rejected", "superseded"]
+
+
+class ActorRecord(TypedDict):
+    """An actor, as returned by ``actor``/``list_actors`` and inlined in blame."""
+
+    id: int
+    kind: ActorKind
+    display_name: str
+    auth_subject: Optional[str]
+    agent_model: Optional[str]
+    agent_vendor: Optional[str]
+    controller_actor_id: Optional[int]
+    created_at: int
+
+
+class BlameSpan(TypedDict):
+    """One authored run of a file.
+
+    ``byte_start``/``byte_end`` are the ground truth the design blames by;
+    ``line_start``/``line_end`` are derived, for line-oriented views. ``actor`` is
+    the **full record inlined**, not an id — there is no second lookup to do.
+    """
+
+    byte_start: int
+    byte_end: int
+    line_start: int
+    line_end: int
+    session: Optional[int]
+    actor: ActorRecord
+
+
+class PassageRecord(TypedDict):
+    """A retrieval passage with its provenance (see ``passages``)."""
+
+    path: str
+    byte_start: int
+    byte_end: int
+    hash: str
+    # `None` unless the request asked for text; decoded as UTF-8, lossily.
+    text: Optional[str]
+    blame: list[BlameSpan]
+
+
+class SuggestionRecord(TypedDict):
+    """A row in the review queue (``list_suggestions``/``get_suggestion``).
+
+    ``path`` is always present — a reviewer UI can check the suggestion belongs to
+    the document under review without guessing. ``kind`` decides what
+    ``base_hash``/``proposed_hash`` address and how ``accept`` applies them.
+    A ``proposed_hash`` of ``None`` on a ``bytes`` suggestion is a proposed
+    *deletion*.
+    """
+
+    id: int
+    actor_id: int
+    session_id: Optional[int]
+    branch: Optional[str]
+    path: str
+    base_hash: Optional[str]
+    proposed_hash: Optional[str]
+    summary: Optional[str]
+    kind: SuggestionKind
+    status: SuggestionStatus
+    created_ts: int
+    resolved_ts: Optional[int]
+    resolved_by: Optional[int]
+
+
+class SuggestionContent(TypedDict):
+    """The bytes behind a suggestion (``suggestion_content``)."""
+
+    base: Optional[bytes]
+    proposed: Optional[bytes]
+
+
+class EditOp(TypedDict):
+    """One append-only op-log entry — the ground truth blame is materialized from."""
+
+    id: int
+    actor_id: int
+    session_id: Optional[int]
+    path: str
+    op: str
+    byte_start: int
+    byte_len: int
+    pre_hash: Optional[str]
+    post_hash: Optional[str]
+    ts: int
+
+
+class StatResult(TypedDict):
+    """An inode (``stat``). ``content`` is the manifest hash, ``None`` for a dir."""
+
+    ino: int
+    kind: FileKind
+    mode: int
+    nlink: int
+    size: int
+    content: Optional[str]
+    mtime: int
+    ctime: int
+
+
+class DirEntry(TypedDict):
+    """One entry of a directory listing (``ls``)."""
+
+    name: str
+    ino: int
+    kind: FileKind
+
+
+class CommitRecord(TypedDict):
+    """A commit in the history (``log``). ``parents`` has two entries for a merge."""
+
+    hash: str
+    author: str
+    message: str
+    timestamp: int
+    parents: list[str]
+
+
+class DiffEntry(TypedDict):
+    """A changed path (``diff``, and ``status`` against the working tree)."""
+
+    path: str
+    status: DiffStatus
+
+
+class BranchRecord(TypedDict):
+    """A branch and the commit it points at (``branches``)."""
+
+    name: str
+    hash: str
+
+
+class EventRecord(TypedDict):
+    """One entry of the change feed (``watch``, ``Subscription.recv``)."""
+
+    seq: int
+    actor_id: Optional[int]
+    session_id: Optional[int]
+    kind: str
+    path: str
+    detail: Optional[str]
+    ts: int
+    branch: Optional[str]
+
+
+class PresenceRecord(TypedDict):
+    """Who is working where (``presence``). Keyed by session, not actor."""
+
+    session_id: int
+    actor_id: int
+    display_name: str
+    kind: ActorKind
+    path: Optional[str]
+    last_seen: int
+
+
+class LiveMarker(TypedDict):
+    """A path with an open CRDT document, so its durable bytes are a checkpoint
+    that may lag what people are typing (``live_doc``/``live_paths``).
+
+    ``content_hash`` is the file's address **as of the last checkpoint**, so an
+    out-of-band write is exactly "the file's current address differs from this".
+    ``since`` is when the document was opened.
+    """
+
+    path: str
+    session_id: Optional[int]
+    actor_id: int
+    content_hash: Optional[str]
+    since: int
+
+
+class ConflictRecord(TypedDict):
+    """An unresolved merge conflict (``conflicts``)."""
+
+    path: str
+    kind: str
+
+
+class LockRecord(TypedDict):
+    """An advisory path lock (``locks``)."""
+
+    path: str
+    owner: str
+    acquired_at: int
+
+
+class MergeResult(TypedDict):
+    """The outcome of ``merge``. ``commit`` is ``None`` unless a commit was made;
+    ``conflicts`` is non-empty only when the merge stopped on them."""
+
+    outcome: Literal["already_up_to_date", "fast_forward", "merged", "conflicts"]
+    commit: Optional[str]
+    conflicts: list[ConflictRecord]
+
+
+class GcReport(TypedDict):
+    """What a mark-and-sweep collection did (``gc``/``gc_with_grace``)."""
+
+    reachable: int
+    deleted: int
+    bytes_freed: int
+    skipped_young: int
+    skipped_undated: int
+
+
+class RebuildReport(TypedDict):
+    """What ``rebuild``/``scan`` found in the content store.
+
+    ``unsupported`` counts objects written by a newer origofs than this build can
+    decode; ``scan`` only reports them, ``rebuild`` raises rather than restoring a
+    truncated history. ``branches`` is a list of ``(name, commit_hex)`` pairs.
+    """
+
+    objects_scanned: int
+    corrupt: int
+    commits_found: int
+    used_mirror: bool
+    branches: list[tuple[str, str]]
+    checked_out: Optional[str]
+    dirs: int
+    files: int
+    symlinks: int
+    unsupported: int
+    unsupported_kinds: list[str]
+
+
+class SchemaVersion(TypedDict):
+    """The metadata schema this workspace is on (``schema_version``)."""
+
+    current: int
+    latest: int
+    up_to_date: bool
+
+
+# What `migrate` did; `migrated` is False when it was already current. Declared
+# functionally rather than as a class because `from` is a reserved word and so
+# cannot be written as a class-body annotation.
+MigrateReport = TypedDict("MigrateReport", {"from": int, "to": int, "migrated": bool})
+
+
+class ReadyReport(TypedDict):
+    """Backend health (``ready``). Each store is ``None`` when healthy, or a
+    message when it is not."""
+
+    ready: bool
+    metadata: Optional[str]
+    content: Optional[str]
 
 class OrigoFSError(Exception):
     """Base origofs error (raised for errors without a more specific mapping)."""
@@ -83,7 +353,7 @@ if sys.platform == "linux":
 
 class Subscription:
     """A push subscription to the change feed (Postgres LISTEN/NOTIFY)."""
-    async def recv(self) -> list[dict[str, Any]]: ...
+    async def recv(self) -> list[EventRecord]: ...
 
 class CoeditSyncReply:
     """The routing for one processed y-sync payload (see ``CoeditDoc.handle_sync``)."""
@@ -243,44 +513,44 @@ class Workspace:
     ) -> WriteOutcome: ...
     async def set_write_policy(self, actor_id: int, policy: str) -> None: ...
     async def mkdir_p(self, path: str) -> None: ...
-    async def ls(self, path: str) -> list[dict[str, Any]]: ...
-    async def stat(self, path: str) -> dict[str, Any]: ...
+    async def ls(self, path: str) -> list[DirEntry]: ...
+    async def stat(self, path: str) -> StatResult: ...
     async def remove(self, path: str) -> None: ...
     async def rename(self, from_: str, to: str) -> None: ...
 
     # --- versioning ---
     async def commit(self, author: str, message: str) -> str: ...
-    async def log(self) -> list[dict[str, Any]]: ...
-    async def status(self) -> list[dict[str, Any]]: ...
-    async def diff(self, from_: str, to: str) -> list[dict[str, Any]]: ...
+    async def log(self) -> list[CommitRecord]: ...
+    async def status(self) -> list[DiffEntry]: ...
+    async def diff(self, from_: str, to: str) -> list[DiffEntry]: ...
     async def diff_file(self, from_: str, to: str, path: str) -> str: ...
     async def create_branch(self, name: str) -> None: ...
     async def checkout(self, name: str) -> None: ...
-    async def branches(self) -> list[dict[str, Any]]: ...
+    async def branches(self) -> list[BranchRecord]: ...
     async def current_branch(self) -> Optional[str]: ...
 
     # --- disaster recovery (rebuild metadata from the content store) ---
-    async def rebuild(self) -> dict[str, Any]: ...
-    async def scan(self) -> dict[str, Any]: ...
+    async def rebuild(self) -> RebuildReport: ...
+    async def scan(self) -> RebuildReport: ...
 
     # --- schema / migrations ---
     # origofs migrates its own metadata schema forward automatically on open; these
     # expose that for introspection/operator control. Forward-only, idempotent.
-    async def schema_version(self) -> dict[str, Any]: ...  # {current, latest, up_to_date}
-    async def migrate(self) -> dict[str, Any]: ...  # {from, to, migrated}
+    async def schema_version(self) -> SchemaVersion: ...
+    async def migrate(self) -> MigrateReport: ...
 
     # --- attribution ---
     async def create_human(self, name: str, auth_subject: Optional[str] = None) -> int: ...
     async def create_agent(self, name: str, model: str, controller: Optional[int] = None) -> int: ...
-    async def actor_by_subject(self, subject: str) -> Optional[dict[str, Any]]: ...
-    async def actor(self, id: int) -> Optional[dict[str, Any]]: ...  # resolve an actor_id
-    async def list_actors(self) -> list[dict[str, Any]]: ...  # every actor, oldest first
+    async def actor_by_subject(self, subject: str) -> Optional[ActorRecord]: ...
+    async def actor(self, id: int) -> Optional[ActorRecord]: ...  # resolve an actor_id
+    async def list_actors(self) -> list[ActorRecord]: ...  # every actor, oldest first
     async def find_or_create_human(self, auth_subject: str, display_name: str) -> int: ...
     async def find_or_create_agent(self, auth_subject: str, display_name: str, model: str, controller: Optional[int] = None) -> int: ...
     async def create_session(self, actor_id: int, client: Optional[str] = None) -> int: ...
     # Each blame span is a dict with `byte_start`/`byte_end` (the ground-truth byte
     # range), the derived `line_start`/`line_end`, `session`, and `actor`.
-    async def blame(self, path: str) -> list[dict[str, Any]]: ...
+    async def blame(self, path: str) -> list[BlameSpan]: ...
     # Extract retrieval passages from the working tree (technology-agnostic RAG).
     # Each dict carries `path`, `byte_start`/`byte_end`, a content-address `hash`
     # (dedup / incremental key), `text`, and per-passage `blame`. `segmentation` is
@@ -295,7 +565,7 @@ class Workspace:
         with_text: bool = True,
         with_blame: bool = True,
         max_file_bytes: int = 0,
-    ) -> list[dict[str, Any]]: ...
+    ) -> list[PassageRecord]: ...
 
     # --- live co-editing (M8) ---
     # `open_coedit` also marks the path *live* (see `live_doc`); `end_coedit`
@@ -323,10 +593,10 @@ class Workspace:
     # These surface that; they never block, fail, or force a checkpoint. Each
     # marker is a dict with `path`, `session_id`, `actor_id`, `content_hash`
     # (the file's address as of the last checkpoint) and `since`.
-    async def live_doc(self, path: str) -> Optional[dict[str, Any]]: ...
-    async def live_paths(self) -> list[dict[str, Any]]: ...
+    async def live_doc(self, path: str) -> Optional[LiveMarker]: ...
+    async def live_paths(self) -> list[LiveMarker]: ...
     # `read` plus that marker: (bytes, live | None).
-    async def read_live(self, path: str) -> tuple[bytes, Optional[dict[str, Any]]]: ...
+    async def read_live(self, path: str) -> tuple[bytes, Optional[LiveMarker]]: ...
     # Cross-worker relay (Postgres-backed workspaces). `is_postgres` gates it.
     def is_postgres(self) -> bool: ...
     async def coedit_relay_init(self) -> None: ...
@@ -335,9 +605,9 @@ class Workspace:
     async def coedit_subscribe(self) -> CoeditRelaySub: ...
 
     # --- live collaboration ---
-    async def watch(self, after_seq: int = 0) -> list[dict[str, Any]]: ...
+    async def watch(self, after_seq: int = 0) -> list[EventRecord]: ...
     async def subscribe(self, after_seq: int = 0, branch: Optional[str] = None) -> Subscription: ...
-    async def presence(self, window_secs: int = 60) -> list[dict[str, Any]]: ...
+    async def presence(self, window_secs: int = 60) -> list[PresenceRecord]: ...
     async def touch(self, actor_id: int, session_id: int, path: Optional[str] = None) -> None: ...
 
     # --- agent-suggestion review queue ---
@@ -346,10 +616,10 @@ class Workspace:
     # stale byte proposal is retired as `"superseded"` rather than left pending.
     async def suggest(self, ctx: WriteCtx, path: str, data: bytes, summary: Optional[str] = None) -> int: ...
     async def suggest_delete(self, ctx: WriteCtx, path: str, summary: Optional[str] = None) -> int: ...
-    async def list_suggestions(self, status: Optional[str] = None, path: Optional[str] = None) -> list[dict[str, Any]]: ...
-    async def get_suggestion(self, id: int) -> Optional[dict[str, Any]]: ...
+    async def list_suggestions(self, status: Optional[str] = None, path: Optional[str] = None) -> list[SuggestionRecord]: ...
+    async def get_suggestion(self, id: int) -> Optional[SuggestionRecord]: ...
     async def suggestion_diff(self, id: int) -> str: ...
-    async def suggestion_content(self, id: int) -> dict[str, Any]: ...  # {base, proposed}
+    async def suggestion_content(self, id: int) -> SuggestionContent: ...
     async def accept_suggestion(self, id: int, approver: WriteCtx) -> None: ...
     async def reject_suggestion(self, id: int, approver: WriteCtx) -> None: ...
 
@@ -394,8 +664,8 @@ class Workspace:
     # `gc` returns {reachable, deleted, bytes_freed, skipped_young,
     # skipped_undated}. Safe alongside writers; a packed store needs `repack`
     # afterwards for the space to actually come back.
-    async def gc(self) -> dict[str, Any]: ...
-    async def gc_with_grace(self, grace_secs: int) -> dict[str, Any]: ...
+    async def gc(self) -> GcReport: ...
+    async def gc_with_grace(self, grace_secs: int) -> GcReport: ...
     async def flush(self) -> None: ...
     async def repack(self) -> int: ...
     # The metadata DB is the half nothing can reconstruct: blame, the audit log,
@@ -404,31 +674,41 @@ class Workspace:
     async def reap_presence(self, grace_secs: int) -> int: ...
     async def supersede_stale_suggestions(self, path: str) -> int: ...
     # {ready, metadata, content} — each store None when healthy. Mirrors /readyz.
-    async def ready(self) -> dict[str, Any]: ...
+    async def ready(self) -> ReadyReport: ...
 
     # ── versioning: merge and mode ───────────────────────────────────────────
     # merge_branch returns {outcome, commit, conflicts}; `outcome` is one of
     # "already_up_to_date" | "fast_forward" | "merged" | "conflicts".
     async def merge_branch(
         self, branch: str, author: str, message: Optional[str] = None
-    ) -> dict[str, Any]: ...
-    async def conflicts(self) -> list[dict[str, Any]]: ...
+    ) -> MergeResult: ...
+    async def conflicts(self) -> list[ConflictRecord]: ...
     async def versioning_mode(self) -> str: ...
     async def set_versioning_mode(self, mode: str) -> None: ...
 
     # ── locks ────────────────────────────────────────────────────────────────
     async def lock(self, path: str, owner: str) -> bool: ...
     async def unlock(self, path: str, owner: str) -> bool: ...
-    async def locks(self) -> list[dict[str, Any]]: ...
+    async def locks(self) -> list[LockRecord]: ...
 
     # ── attribution: the op-log and session revert ───────────────────────────
     # Remove exactly the lines an actor authored in one session, across every file
     # that session touched, leaving other actors' edits intact. Returns the number
     # of files changed.
-    async def revert_session(self, actor_id: int, session_id: int) -> int: ...
+    async def revert_session(
+        self, actor_id: int, session_id: int, path_prefix: Optional[str] = None
+    ) -> list[str]:
+        """Remove exactly the lines ``actor_id`` authored in ``session_id``,
+        across every file that session touched, and return the paths changed.
+
+        ``path_prefix`` bounds the revert to one subtree, matched on directory
+        boundaries — ``/tenant-a`` covers ``/tenant-a/notes.txt`` and never
+        ``/tenant-abc/notes.txt``. Omit it to revert everywhere the session
+        wrote."""
+        ...
     async def edit_ops(
         self, actor_id: int, session_id: Optional[int] = None
-    ) -> list[dict[str, Any]]: ...
+    ) -> list[EditOp]: ...
 
     if sys.platform == "linux":
         def mount(self, mountpoint: str) -> Mount: ...

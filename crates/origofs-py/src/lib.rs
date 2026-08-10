@@ -2912,16 +2912,30 @@ impl Workspace {
 
     /// Remove exactly the lines an actor authored in one session, across every
     /// file that session touched, leaving other actors' edits intact. Returns the
-    /// number of files changed.
+    /// list of paths changed.
+    ///
+    /// `path_prefix` bounds the revert to one subtree, matched on directory
+    /// boundaries — `/tenant-a` covers `/tenant-a/notes.txt` and never
+    /// `/tenant-abc/notes.txt`. A multi-tenant host needs it: an "undo this
+    /// agent's work" button lives in one tenant's UI, and an unscoped revert
+    /// would follow the session wherever else it wrote. Filtering here rather
+    /// than pre-flighting with `edit_ops` also closes the window where a write
+    /// lands between the check and the revert.
+    ///
+    /// ```python
+    /// changed = await ws.revert_session(agent, session, path_prefix="/tenant-a")
+    /// ```
+    #[pyo3(signature = (actor_id, session_id, path_prefix = None))]
     fn revert_session<'py>(
         &self,
         py: Python<'py>,
         actor_id: i64,
         session_id: i64,
+        path_prefix: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            ws.revert_session(actor_id, session_id)
+            ws.revert_session(actor_id, session_id, path_prefix.as_deref())
                 .await
                 .map_err(to_pyerr)
         })

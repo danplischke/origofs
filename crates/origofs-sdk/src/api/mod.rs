@@ -1411,6 +1411,11 @@ async fn checkout(
 struct RevertReq {
     actor: i64,
     session: i64,
+    /// Optional subtree to bound the revert to, matched on directory boundaries
+    /// (`/tenant-a` covers `/tenant-a/notes.txt`, never `/tenant-abc/notes.txt`).
+    /// Omit to revert everywhere the session wrote.
+    #[serde(default)]
+    path_prefix: Option<String>,
 }
 
 /// Undo exactly the lines one actor authored in one session, across every file
@@ -1431,11 +1436,16 @@ async fn revert_session(
 ) -> ApiResult<Json<serde_json::Value>> {
     ws.ensure_may_write(principal.write_ctx(), "revert a session")
         .await?;
-    let files_changed = ws.revert_session(req.actor, req.session).await?;
+    let paths = ws
+        .revert_session(req.actor, req.session, req.path_prefix.as_deref())
+        .await?;
     Ok(Json(json!({
         "actor": req.actor,
         "session": req.session,
-        "files_changed": files_changed,
+        "files_changed": paths.len(),
+        // Which paths, not just how many: a caller that caches per path can now
+        // invalidate exactly what changed instead of dropping everything.
+        "paths": paths,
         "reverted_by": principal.actor,
     })))
 }

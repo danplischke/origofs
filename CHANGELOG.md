@@ -236,6 +236,28 @@ about honest data going out. All three now return `TooLarge`.
   `PUBLISH_TO_PYPI` repository variable is set.
 - PyPI-facing package metadata: the README as the long description, project URLs,
   and classifiers.
+- **`revert_session` takes a `path_prefix`, and returns the paths it changed**
+  rather than a count. In a multi-tenant workspace — one workspace, tenant-scoped
+  paths — an "undo this agent's work" button lives in *one* tenant's UI, but the
+  session it reverts may have written anywhere, and an unscoped revert followed
+  it there silently. The prefix matches on directory boundaries, so `/tenant-a`
+  covers `/tenant-a/notes.txt` and never `/tenant-abc/notes.txt`. Filtering
+  inside the call is the point: the documented workaround — pre-flight with
+  `edit_ops`, check the paths, then revert — reads the session's reach and acts
+  on it in two calls, so a write landing in between is reverted without ever
+  having been checked. Across the engine, SDK, HTTP API (`path_prefix` in the
+  body, `paths` in the response), CLI (`--path-prefix`), and Python.
+- `POST /v1/revert-session` had no test at all, on a route that deletes other
+  people's work. It has three now.
+- **The Python stubs type what they return.** 31 methods returned
+  `dict[str, Any]`/`list[dict[str, Any]]`, with the keys described only in a
+  neighbouring comment — so a caller had to guess whether `span["actor"]` was an
+  id or an inline record (it is a record), and whether a timestamp was
+  `created_at` or `created_ts` (both exist, on different records). 24 `TypedDict`s
+  now describe every record, with `Literal` unions for the closed string sets.
+  A runtime test drives a real workspace and compares each record's keys to its
+  declaration, so the stub cannot drift from the extension the way a comment
+  can — and a new record must be exercised or explicitly excused.
 
 ### Changed
 

@@ -226,6 +226,11 @@ enum Cmd {
         /// The actor performing the revert; checked against the write policy.
         #[arg(long)]
         by: Option<i64>,
+        /// Bound the revert to this subtree, matched on directory boundaries
+        /// (`/tenant-a` covers `/tenant-a/notes.txt`, never `/tenant-abc/...`).
+        /// Omit to revert everywhere the session wrote.
+        #[arg(long)]
+        path_prefix: Option<String>,
     },
     /// Run a command over a copy-on-write view of the workspace, then import what
     /// it changed as an attributed commit (or `--discard`). By default this is an
@@ -887,7 +892,12 @@ async fn main() -> Result<()> {
             ws.set_write_policy(actor, p).await?;
             println!("actor #{actor} write policy set to {}", p.as_str());
         }
-        Cmd::RevertSession { actor, session, by } => {
+        Cmd::RevertSession {
+            actor,
+            session,
+            by,
+            path_prefix,
+        } => {
             // A revert is performed *on* someone else's work, so the target comes
             // from `--actor` while `--by` is the reviewer doing it. When `--by` is
             // given its write policy is checked, so a propose-only actor cannot
@@ -897,8 +907,16 @@ async fn main() -> Result<()> {
                 ws.ensure_may_write(WriteCtx::session(by, s), "revert a session")
                     .await?;
             }
-            let changed = ws.revert_session(actor, session).await?;
-            println!("reverted actor {actor} session {session}: {changed} file(s) changed");
+            let changed = ws
+                .revert_session(actor, session, path_prefix.as_deref())
+                .await?;
+            println!(
+                "reverted actor {actor} session {session}: {} file(s) changed",
+                changed.len()
+            );
+            for p in &changed {
+                println!("  {p}");
+            }
         }
         Cmd::Blame { path } => {
             for r in ws.blame(&path).await? {

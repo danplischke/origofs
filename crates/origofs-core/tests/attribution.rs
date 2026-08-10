@@ -120,12 +120,93 @@ async fn revert_session_removes_only_that_actors_lines() {
     );
 
     // Revert everything the agent wrote in its session.
-    let changed = fs.revert_session(claude, s_claude).await.unwrap();
-    assert_eq!(changed, 1);
+    let changed = fs.revert_session(claude, s_claude, None).await.unwrap();
+    assert_eq!(changed, vec!["/doc".to_string()]);
     assert_eq!(&fs.read("/doc").await.unwrap()[..], b"human-1\nhuman-2\n");
     let b = fs.blame("/doc").await.unwrap();
     assert_eq!(b.len(), 1);
     assert_eq!(b[0].actor.id, alice);
+}
+
+// Issue #94: in a multi-tenant workspace an "undo this agent's work" button lives
+// in *one* tenant's UI, but the session it reverts may have written anywhere. The
+// scope bounds the blast radius to a subtree — and does it inside the call, so
+// there is no window between reading the session's reach and acting on it.
+#[tokio::test]
+async fn a_path_prefix_bounds_the_revert_to_one_subtree() {
+    let fs = fixture().await;
+    let agent = fs.create_agent("claude", "m", None).await.unwrap();
+    let s = fs.create_session(agent, None).await.unwrap();
+    let ctx = WriteCtx::session(agent, s);
+
+    // The same session writes in two tenants, and in a third whose name merely
+    // *starts with* the first tenant's — the case a naive `starts_with` gets wrong.
+    for p in [
+        "/tenant-a/notes.txt",
+        "/tenant-b/notes.txt",
+        "/tenant-abc/notes.txt",
+    ] {
+        fs.mkdir_p(p.rsplit_once('/').unwrap().0).await.unwrap();
+        fs.write_as(ctx, p, b"agent wrote this\n").await.unwrap();
+    }
+
+    let changed = fs
+        .revert_session(agent, s, Some("/tenant-a"))
+        .await
+        .unwrap();
+    assert_eq!(changed, vec!["/tenant-a/notes.txt".to_string()]);
+
+    // Only the scoped tenant lost the agent's line.
+    assert_eq!(&fs.read("/tenant-a/notes.txt").await.unwrap()[..], b"");
+    assert_eq!(
+        &fs.read("/tenant-b/notes.txt").await.unwrap()[..],
+        b"agent wrote this\n"
+    );
+    // The sibling sharing a textual prefix is untouched — this is the assertion
+    // the whole `PathScope` type exists for.
+    assert_eq!(
+        &fs.read("/tenant-abc/notes.txt").await.unwrap()[..],
+        b"agent wrote this\n"
+    );
+
+    // A second, unscoped revert still reaches the rest.
+    let changed = fs.revert_session(agent, s, None).await.unwrap();
+    assert_eq!(
+        changed,
+        vec![
+            "/tenant-b/notes.txt".to_string(),
+            "/tenant-abc/notes.txt".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_trailing_slash_and_the_root_prefix_behave_sensibly() {
+    let fs = fixture().await;
+    let agent = fs.create_agent("claude", "m", None).await.unwrap();
+    let s = fs.create_session(agent, None).await.unwrap();
+    let ctx = WriteCtx::session(agent, s);
+
+    fs.mkdir_p("/t").await.unwrap();
+    fs.write_as(ctx, "/t/a.txt", b"x\n").await.unwrap();
+    fs.write_as(ctx, "/top.txt", b"y\n").await.unwrap();
+
+    // A trailing slash means the same thing as none.
+    assert_eq!(
+        fs.revert_session(agent, s, Some("/t/")).await.unwrap(),
+        vec!["/t/a.txt".to_string()]
+    );
+    // `/t` must not have swallowed `/top.txt`.
+    assert_eq!(&fs.read("/top.txt").await.unwrap()[..], b"y\n");
+
+    // The root prefix covers everything, like passing None.
+    assert_eq!(
+        fs.revert_session(agent, s, Some("/")).await.unwrap(),
+        vec!["/top.txt".to_string()]
+    );
+
+    // A relative prefix is a caller error, not a silent no-op.
+    assert!(fs.revert_session(agent, s, Some("t")).await.is_err());
 }
 
 #[tokio::test]
@@ -708,7 +789,7 @@ async fn revert_session_removes_exactly_that_actors_lines_under_interleaving() {
         }
 
         // Reverting the agent's session must strip exactly its lines.
-        fs.revert_session(agent, sa).await.unwrap();
+        fs.revert_session(agent, sa, None).await.unwrap();
 
         // Oracle: only the human's lines survive, in their original order.
         let expected: Vec<(String, bool)> = lines
