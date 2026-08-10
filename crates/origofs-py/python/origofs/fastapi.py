@@ -48,6 +48,7 @@ import contextlib
 import mimetypes
 import os
 import tempfile
+import time
 import uuid
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union
 
@@ -78,7 +79,7 @@ if TYPE_CHECKING:  # import only for type checkers; the module loads without the
 # It may be sync or async and may declare its own FastAPI dependencies/params.
 AuthnDep = Callable[..., Union["Any", Awaitable["Any"]]]
 
-__all__ = ["build_router"]
+__all__ = ["build_router", "CheckpointPolicy"]
 
 
 # --- request bodies ---------------------------------------------------------
@@ -275,15 +276,87 @@ class _Conn:
         self.out: "asyncio.Queue[bytes]" = asyncio.Queue()
 
 
+class CheckpointPolicy:
+    """When a live co-editing room's document is written back to durable storage.
+
+    A room's CRDT lives in process memory. Without a policy it reaches durable
+    storage only when the **last socket leaves** — and a browser tab left open on
+    a document is an open room, so "last leave" can be hours away. Until then
+    ``read``/``read_range`` serve the last checkpoint and blame carries only the
+    runs folded in at that point; the live marker says the bytes may lag, which is
+    the right primitive, but over a long session "may lag" stops being useful. And
+    if the worker dies in between — a deploy, an OOM — the un-checkpointed part of
+    the session is gone from the durable side. On Postgres the relay table bounds
+    that exposure to its replay window; on SQLite the relay is off entirely, so the
+    exposure is the whole session (issue #97).
+
+    The two triggers answer different questions, so both exist:
+
+    * ``idle_after`` bounds how long a *finished* burst of typing sits un-durable;
+    * ``max_interval`` bounds a *continuous* session, which idle alone never would
+      because every keystroke resets it.
+
+    Set either to ``None`` to disable that trigger; disable both for the old
+    checkpoint-on-last-leave-only behaviour.
+    """
+
+    __slots__ = ("idle_after", "max_interval", "tick")
+
+    def __init__(
+        self,
+        idle_after: Optional[float] = 5.0,
+        max_interval: Optional[float] = 60.0,
+        tick: float = 1.0,
+    ) -> None:
+        self.idle_after = idle_after
+        self.max_interval = max_interval
+        # How often to look for due rooms, and therefore the granularity of both
+        # triggers -- no point setting it finer than the smaller of them.
+        self.tick = tick
+
+    @property
+    def armed(self) -> bool:
+        return self.idle_after is not None or self.max_interval is not None
+
+
 class _Room:
     """One live document shared by every socket editing it: the attributed CRDT
     plus the set of connected sockets to fan edits out to."""
 
-    __slots__ = ("doc", "conns")
+    __slots__ = ("doc", "conns", "ctx", "last_edit", "last_checkpoint", "dirty")
 
-    def __init__(self, doc: "origofs.CoeditDoc") -> None:
+    def __init__(self, doc: "origofs.CoeditDoc", ctx: Any) -> None:
         self.doc: "origofs.CoeditDoc" = doc
         self.conns: set[_Conn] = set()
+        # The newest joiner's context: a periodic checkpoint has no connection of
+        # its own to borrow an identity from, and this is the same one the final
+        # checkpoint on last leave uses. It only names the op-log entry and
+        # backstops a span the CRDT left unattributed -- every real run keeps the
+        # author stamped on it when it was typed.
+        self.ctx = ctx
+        now = time.monotonic()
+        self.last_edit = now
+        # A fresh room counts as just-checkpointed: its content came *from* the
+        # durable blob, so the interval trigger measures from now rather than
+        # firing immediately on a room nobody has typed into.
+        self.last_checkpoint = now
+        self.dirty = False
+
+    def touch_edit(self) -> None:
+        """Record that an edit landed, so the sweeper knows there is something to
+        checkpoint and when the room last went quiet."""
+        self.last_edit = time.monotonic()
+        self.dirty = True
+
+    def is_due(self, policy: CheckpointPolicy, now: float) -> bool:
+        if not self.dirty:
+            return False
+        idle_due = policy.idle_after is not None and now - self.last_edit >= policy.idle_after
+        interval_due = (
+            policy.max_interval is not None
+            and now - self.last_checkpoint >= policy.max_interval
+        )
+        return idle_due or interval_due
 
     def fanout(self, sender: Optional[_Conn], frame: bytes) -> None:
         """Queue `frame` for every connection except `sender` (pass ``None`` to
@@ -323,10 +396,12 @@ class _Rooms:
     stays durable through the shared workspace's checkpoints.
     """
 
-    def __init__(self, ws: Any) -> None:
+    def __init__(self, ws: Any, policy: Optional[CheckpointPolicy] = None) -> None:
         self._ws = ws
         self._rooms: dict[str, _Room] = {}
         self._lock = asyncio.Lock()
+        self._policy = policy if policy is not None else CheckpointPolicy()
+        self._sweeper_task: Optional["asyncio.Task[None]"] = None
         # This worker's id, tagged on every published op to skip our own echo.
         self._origin = uuid.uuid4().hex
         # Resolved lazily, not here. `build_router` is legitimately called before a
@@ -349,6 +424,56 @@ class _Rooms:
             self._relay = bool(getattr(self._ws, "is_postgres", lambda: False)())
         if self._relay and self._drain_task is None:
             self._drain_task = asyncio.create_task(self._drain())
+
+    def ensure_sweeper(self) -> None:
+        """Start periodic checkpointing once (a no-op when no trigger is armed, or
+        after the first call). Called on the first socket, in async context.
+
+        Driven here rather than left to the host on purpose: a host has no signal
+        about room activity -- it cannot see when a document went quiet -- so
+        "call checkpoint_coedit on a timer" is both more work and strictly worse,
+        since it writes idle rooms and misses busy ones."""
+        if self._policy.armed and self._sweeper_task is None:
+            self._sweeper_task = asyncio.create_task(self._sweep())
+
+    async def _sweep(self) -> None:
+        """Checkpoint due rooms forever, on the policy's tick."""
+        while True:
+            await asyncio.sleep(self._policy.tick)
+            try:
+                await self.checkpoint_due()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A sweeper that dies takes durability with it and says nothing,
+                # so it survives anything one round can raise.
+                pass
+
+    async def checkpoint_due(self) -> None:
+        """Checkpoint every room the policy says is due, leaving them live.
+
+        The registry lock is taken only to pick the due rooms and released before
+        any I/O, so a checkpoint on a slow store never blocks a join or a leave.
+        """
+        now = time.monotonic()
+        async with self._lock:
+            due = [
+                (path, room)
+                for path, room in self._rooms.items()
+                if room.is_due(self._policy, now)
+            ]
+        for path, room in due:
+            # Clear `dirty` *before* the write, so an edit landing during it marks
+            # the room dirty again and gets its own checkpoint. The other order
+            # would swallow that edit until the next one arrived.
+            room.dirty = False
+            room.last_checkpoint = now
+            try:
+                await self._ws.checkpoint_coedit(room.ctx, path, room.doc)
+            except Exception:
+                # Put it back in the queue rather than waiting for the next edit:
+                # a failed checkpoint means these bytes are still not durable.
+                room.dirty = True
 
     async def _drain(self) -> None:
         """Apply peers' published deltas to the rooms this worker hosts and fan
@@ -399,8 +524,11 @@ class _Rooms:
                             await doc.apply_relayed(note.delta)
                     except Exception:
                         pass
-                room = _Room(doc)
+                room = _Room(doc, ctx)
                 self._rooms[path] = room
+            else:
+                # The newest joiner is who a background checkpoint runs as.
+                room.ctx = ctx
             room.conns.add(conn)
             return room
 
@@ -459,6 +587,7 @@ def build_router(
     *,
     authn: AuthnDep,
     reader: Optional[AuthnDep] = None,
+    checkpoint: Optional["CheckpointPolicy"] = None,
     **router_kwargs: Any,
 ) -> "APIRouter":
     """Build an :class:`~fastapi.APIRouter` serving ``ws``.
@@ -479,6 +608,11 @@ def build_router(
     reader:
         Optional dependency gating read-only routes. Its return value is
         ignored; raise to reject. Omit to leave reads open.
+    checkpoint:
+        When live co-editing rooms are written back to durable storage. Defaults
+        to checkpointing 5 seconds after a room goes quiet and at least every 60
+        seconds while it stays busy — see :class:`CheckpointPolicy`, which also
+        explains what the durability window is without it.
     **router_kwargs:
         Forwarded to :class:`~fastapi.APIRouter` (``prefix``, ``tags``,
         router-wide ``dependencies=[...]``, …).
@@ -486,7 +620,7 @@ def build_router(
     router = APIRouter(**router_kwargs)
 
     # Shared, long-lived co-editing rooms — created once here, not per request.
-    rooms = _Rooms(ws)
+    rooms = _Rooms(ws, checkpoint)
 
     # Read-route gate: a dependency whose value we don't use. When no `reader`
     # is given, a no-op keeps the signature uniform.
@@ -902,6 +1036,7 @@ def build_router(
         # so `revert_session` can undo this sitting's edits (see the docstring).
         ctx = await _session_bound(ws, ctx)
         rooms.ensure_relay()  # idempotent; starts the cross-worker drain on first use
+        rooms.ensure_sweeper()  # idempotent; starts periodic checkpointing (#97)
         conn = _Conn(websocket)
         room = await rooms.join(p, ctx, conn)
 
@@ -937,6 +1072,10 @@ def build_router(
                 if reply.reply:
                     conn.out.put_nowait(reply.reply)
                 if reply.broadcast:
+                    # A frame worth broadcasting is a frame that changed the
+                    # document, which is exactly what makes the room due for a
+                    # checkpoint.
+                    room.touch_edit()
                     room.fanout(conn, reply.broadcast)  # local sockets
                     await rooms.publish(p, reply.broadcast)  # peer workers
         except WebSocketDisconnect:

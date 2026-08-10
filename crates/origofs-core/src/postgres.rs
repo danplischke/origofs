@@ -1641,18 +1641,25 @@ impl MetadataStore for PostgresMetadataStore {
         actor_id: i64,
         content_hash: Option<&str>,
         at: i64,
+        checkpointed_at: Option<i64>,
     ) -> Result<()> {
         let c = self.client().await?;
         // `since` is deliberately not in the DO UPDATE list: re-marking an
         // already-live path (a second joiner, a checkpoint) keeps when it first
         // went live.
+        //
+        // `checkpointed_at` uses COALESCE so a re-mark that is *not* a checkpoint
+        // (EXCLUDED value NULL) keeps the previous stamp rather than erasing it —
+        // the row must never claim a checkpoint that didn't happen, nor forget one
+        // that did.
         c.execute(
-            "INSERT INTO live_doc(workspace_id, path, session_id, actor_id, content_hash, since)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO live_doc(workspace_id, path, session_id, actor_id, content_hash, since, checkpointed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (workspace_id, path) DO UPDATE SET
                  session_id = EXCLUDED.session_id,
                  actor_id = EXCLUDED.actor_id,
-                 content_hash = EXCLUDED.content_hash",
+                 content_hash = EXCLUDED.content_hash,
+                 checkpointed_at = COALESCE(EXCLUDED.checkpointed_at, live_doc.checkpointed_at)",
             &[
                 &self.workspace_id,
                 &path,
@@ -1660,6 +1667,7 @@ impl MetadataStore for PostgresMetadataStore {
                 &actor_id,
                 &content_hash,
                 &at,
+                &checkpointed_at,
             ],
         )
         .await?;
@@ -1670,7 +1678,7 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let row = c
             .query_opt(
-                "SELECT path, session_id, actor_id, content_hash, since
+                "SELECT path, session_id, actor_id, content_hash, since, checkpointed_at
                  FROM live_doc WHERE workspace_id = $1 AND path = $2",
                 &[&self.workspace_id, &path],
             )
@@ -1682,7 +1690,7 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let rows = c
             .query(
-                "SELECT path, session_id, actor_id, content_hash, since
+                "SELECT path, session_id, actor_id, content_hash, since, checkpointed_at
                  FROM live_doc WHERE workspace_id = $1 ORDER BY path",
                 &[&self.workspace_id],
             )
@@ -2208,6 +2216,7 @@ fn row_to_live_doc(r: &Row) -> LiveDoc {
         actor_id: r.get(2),
         content_hash: r.get(3),
         since: r.get(4),
+        checkpointed_at: r.get(5),
     }
 }
 

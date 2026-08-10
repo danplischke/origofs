@@ -257,6 +257,27 @@ about honest data going out. All three now return `TooLarge`.
   documented answer and keeps working, but a URL is the worst place for a
   credential: it lands in access logs, proxy logs and `Referer`-adjacent tooling
   by default, where a subprotocol value does not.
+- **Live co-editing rooms are checkpointed on a cadence, not only on last
+  leave.** A room's CRDT lives in process memory, and its only path to durable
+  storage was the last socket disconnecting — but a browser tab left open on a
+  document *is* an open room, so that could be hours. Until then `read` served
+  the last checkpoint and blame carried only the runs folded in at that point,
+  and a worker dying in between lost the rest of the session from the durable
+  side (bounded by the relay's replay window on Postgres, unbounded on SQLite,
+  where the relay is off). A new `CheckpointPolicy` — on `ApiOptions` in Rust and
+  `build_router(checkpoint=…)` in Python — checkpoints a room 5 seconds after it
+  goes quiet and at least every 60 seconds while it stays busy. Two triggers
+  because they answer different questions: idle bounds a *finished* burst of
+  typing, interval bounds a *continuous* session, which idle alone never would
+  since every keystroke resets it. Driven inside the SDK rather than left to each
+  host, which has no signal about room activity — "call `checkpoint_all` on a
+  timer" writes idle rooms and misses busy ones. Disable both triggers for the
+  previous behaviour.
+- **`live_doc` reports `checkpointed_at`** (schema V16), so a reader learns not
+  just *that* the bytes may lag an open editor but by how much — "last saved 3
+  minutes ago" instead of "this may be stale". Distinct from `since`, which is
+  when the path first went live and deliberately never moves; `None` for a path
+  that is live but has never been checkpointed.
 - **A co-editing connection is bound to a session**, opened for it when the
   credential names only an actor. Such a connection stamped its edits
   `(actor, session=None)`, which `revert_session` can never undo — the feature

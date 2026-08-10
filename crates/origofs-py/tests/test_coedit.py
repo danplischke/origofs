@@ -18,7 +18,7 @@ import time
 import pytest
 
 import origofs
-from origofs.fastapi import build_router
+from origofs.fastapi import CheckpointPolicy, build_router
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.testclient import TestClient
@@ -373,3 +373,138 @@ def test_a_session_less_credential_gets_a_session_for_the_connection():
     changed = _run(lambda: ws.revert_session(alice, session))
     assert changed == ["/doc.md"]
     assert bytes(_run(lambda: ws.read("/doc.md"))) == b""
+
+
+# --- periodic checkpointing (#97) -------------------------------------------
+
+
+def test_an_idle_room_is_checkpointed_without_anyone_disconnecting():
+    # A room's CRDT lives in memory and used to reach durable storage only when
+    # its last socket left. A browser tab left open on a document *is* an open
+    # room, so that could be hours -- and a worker dying in between lost
+    # everything since the last checkpoint.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+
+    async def authn(token: str = Query(...)) -> origofs.WriteCtx:
+        if token != "alice-token":
+            raise HTTPException(status_code=401, detail="bad token")
+        return ctx
+
+    app = FastAPI()
+    app.include_router(
+        build_router(
+            ws,
+            authn=authn,
+            # Short timings so the test doesn't wait out the defaults.
+            checkpoint=CheckpointPolicy(idle_after=0.05, max_interval=None, tick=0.02),
+        )
+    )
+
+    client = origofs.CoeditDoc()
+    _run(lambda: client.insert(ctx, 0, "durable before I disconnect"))
+
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            greeting = sock.receive_bytes()
+            answer = _run(lambda: client.handle_sync(ctx, greeting))
+            sock.send_bytes(answer.reply)
+
+            # The socket stays OPEN throughout -- that is the whole point.
+            body = b""
+            for _ in range(60):
+                time.sleep(0.05)
+                try:
+                    body = bytes(_run(lambda: ws.read("/doc.md")))
+                except FileNotFoundError:
+                    body = b""
+                if body:
+                    break
+
+            assert body == b"durable before I disconnect", (
+                "an idle room was never checkpointed while its socket stayed open"
+            )
+
+            # And the marker says *when*, so a UI can render "last saved N ago"
+            # rather than only "this may be stale".
+            live = _run(lambda: ws.live_doc("/doc.md"))
+            assert live is not None and live["checkpointed_at"] is not None
+
+
+def test_a_room_with_no_edits_is_not_rewritten():
+    # The sweeper must not churn: an untouched room has nothing to crystallize,
+    # and writing it anyway would put an op-log entry and a blame rewrite behind
+    # every tick of every open document.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+
+    async def authn(token: str = Query(...)) -> origofs.WriteCtx:
+        return ctx
+
+    app = FastAPI()
+    app.include_router(
+        build_router(
+            ws,
+            authn=authn,
+            checkpoint=CheckpointPolicy(idle_after=0.01, max_interval=0.01, tick=0.01),
+        )
+    )
+
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            sock.receive_bytes()
+            time.sleep(0.3)  # many sweeper ticks, nobody typing
+            ops = _run(lambda: ws.edit_ops(alice, alice_s))
+            assert ops == [], f"the sweeper wrote {len(ops)} op-log entries for an idle room"
+
+
+def test_checkpointing_can_be_turned_off():
+    # An embedder that drives checkpoints itself can disable both triggers, which
+    # restores the checkpoint-on-last-leave-only behaviour.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+
+    async def authn(token: str = Query(...)) -> origofs.WriteCtx:
+        return ctx
+
+    app = FastAPI()
+    app.include_router(
+        build_router(
+            ws,
+            authn=authn,
+            checkpoint=CheckpointPolicy(idle_after=None, max_interval=None),
+        )
+    )
+
+    client = origofs.CoeditDoc()
+    _run(lambda: client.insert(ctx, 0, "only on last leave"))
+
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            greeting = sock.receive_bytes()
+            answer = _run(lambda: client.handle_sync(ctx, greeting))
+            sock.send_bytes(answer.reply)
+            time.sleep(0.3)
+            with pytest.raises(FileNotFoundError):
+                _run(lambda: ws.read("/doc.md"))
+
+        # ...and the last-leave checkpoint still lands it.
+        body = b""
+        for _ in range(60):
+            try:
+                body = bytes(_run(lambda: ws.read("/doc.md")))
+            except FileNotFoundError:
+                body = b""
+            if body:
+                break
+            time.sleep(0.05)
+    assert body == b"only on last leave"

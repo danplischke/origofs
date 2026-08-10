@@ -191,7 +191,9 @@ class LiveMarker(TypedDict):
 
     ``content_hash`` is the file's address **as of the last checkpoint**, so an
     out-of-band write is exactly "the file's current address differs from this".
-    ``since`` is when the document was opened.
+    ``since`` is when the document was opened; ``checkpointed_at`` is when the
+    durable bytes were last written, which is the one that answers "how stale
+    might this be" (``None`` if it has never been checkpointed).
     """
 
     path: str
@@ -199,6 +201,7 @@ class LiveMarker(TypedDict):
     actor_id: int
     content_hash: Optional[str]
     since: int
+    checkpointed_at: Optional[int]
 
 
 class ConflictRecord(TypedDict):

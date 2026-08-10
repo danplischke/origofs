@@ -156,6 +156,20 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V15,
         postgres: V15,
     },
+    // V16 — `live_doc.checkpointed_at` (issue #97): *when* the durable bytes were
+    // last crystallized, as distinct from `since`, which is when the path first
+    // went live and deliberately never moves. A reader could previously learn only
+    // *that* the bytes may lag an open editor, never by how much — and "may lag"
+    // over a long editing session is a very different statement at 3 seconds than
+    // at 3 hours. With this a UI can say "last saved 3 minutes ago", and an
+    // operator can see whether periodic checkpointing is actually running.
+    // Nullable: a path that is live but has never been checkpointed has no answer,
+    // and `NULL` is that answer rather than a lie like 0 or `since`.
+    Migration {
+        version: 16,
+        sqlite: V16_SQLITE,
+        postgres: V16_POSTGRES,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -351,6 +365,12 @@ CREATE TABLE IF NOT EXISTS live_doc(
     PRIMARY KEY(workspace_id, path)
 );
 ";
+
+// V16 — when the live document was last checkpointed (see the migration entry
+// above). Nullable, so an existing live row reads "never checkpointed" rather than
+// claiming a time it doesn't have.
+const V16_SQLITE: &str = "ALTER TABLE live_doc ADD COLUMN checkpointed_at BIGINT;";
+const V16_POSTGRES: &str = "ALTER TABLE live_doc ADD COLUMN IF NOT EXISTS checkpointed_at BIGINT;";
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS`; the migration runner tolerates a
 // re-applied ADD COLUMN (duplicate-column) so a re-run is idempotent. Postgres

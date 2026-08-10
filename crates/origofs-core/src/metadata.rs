@@ -301,6 +301,11 @@ pub trait MetadataStore: Send + Sync {
     /// Upsert the live-document marker for `path` (see [`LiveDoc`]). `since` is
     /// only set when the row is created, so re-marking an already-live path keeps
     /// the time it first went live.
+    ///
+    /// `checkpointed_at` is `Some` only when this call *follows a checkpoint* —
+    /// then it records when the durable bytes were crystallized. `None` leaves any
+    /// previous stamp alone, so merely re-marking a path (a second joiner) never
+    /// claims a checkpoint that did not happen.
     async fn set_live_doc(
         &self,
         path: &str,
@@ -308,6 +313,7 @@ pub trait MetadataStore: Send + Sync {
         actor_id: i64,
         content_hash: Option<&str>,
         at: i64,
+        checkpointed_at: Option<i64>,
     ) -> Result<()>;
     /// The live marker for `path`, if it has one.
     async fn get_live_doc(&self, path: &str) -> Result<Option<LiveDoc>>;
@@ -693,9 +699,17 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
         actor_id: i64,
         content_hash: Option<&str>,
         at: i64,
+        checkpointed_at: Option<i64>,
     ) -> Result<()> {
         (**self)
-            .set_live_doc(path, session_id, actor_id, content_hash, at)
+            .set_live_doc(
+                path,
+                session_id,
+                actor_id,
+                content_hash,
+                at,
+                checkpointed_at,
+            )
             .await
     }
     async fn get_live_doc(&self, path: &str) -> Result<Option<LiveDoc>> {

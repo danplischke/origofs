@@ -284,3 +284,194 @@ async fn a_session_less_credential_gets_a_session_for_the_connection() {
     assert_eq!(changed, vec!["/doc.md".to_string()]);
     assert_eq!(&ws.read("/doc.md").await.unwrap()[..], b"");
 }
+
+// --- periodic checkpointing (#97) -------------------------------------------
+
+// A room's CRDT lives in memory and used to reach durable storage only when its
+// last socket left. A browser tab left open on a document *is* an open room, so
+// that could be hours -- and a worker dying in between lost everything since the
+// last checkpoint. These drive the policy with short timings so the test doesn't
+// have to wait out the defaults.
+#[tokio::test]
+async fn an_idle_room_is_checkpointed_without_anyone_disconnecting() {
+    use origofs_sdk::api::{ApiOptions, CheckpointPolicy, router_with};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alice = ws.create_human("alice", None).await.unwrap();
+    let alice_s = ws.create_session(alice, Some("web")).await.unwrap();
+    let auth = BearerAuth::new().with_token("tok-alice", alice, Some(alice_s));
+    let ws = Arc::new(ws);
+
+    let options = ApiOptions {
+        checkpoint: CheckpointPolicy {
+            idle_after: Some(Duration::from_millis(50)),
+            max_interval: None,
+            tick: Duration::from_millis(20),
+        },
+        ..Default::default()
+    };
+    let app = router_with(ws.clone(), Arc::new(auth), options);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (mut a, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/v1/coedit/doc.md?token=tok-alice"))
+            .await
+            .unwrap();
+    let aware = Awareness::new(Doc::new());
+    pump(&mut a, &aware).await;
+    let update = {
+        let text = aware.doc().get_or_insert_text("content");
+        let mut txn = aware.doc().transact_mut();
+        text.insert(&mut txn, 0, "durable before I disconnect");
+        txn.encode_update_v1()
+    };
+    a.send(Ws::Binary(frame(&[Y::Sync(SyncMessage::Update(update))])))
+        .await
+        .unwrap();
+
+    // The socket stays OPEN throughout -- this is the whole point.
+    let mut landed = None;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Ok(b) = ws.read("/doc.md").await
+            && !b.is_empty()
+        {
+            landed = Some(b);
+            break;
+        }
+    }
+    assert_eq!(
+        landed.as_deref(),
+        Some(&b"durable before I disconnect"[..]),
+        "an idle room was never checkpointed while its socket stayed open"
+    );
+
+    // And the marker says when, so a UI can render "last saved N ago" instead of
+    // only "this may be stale".
+    let live = ws.live_doc("/doc.md").await.unwrap().expect("still live");
+    assert!(
+        live.checkpointed_at.is_some(),
+        "the live marker records that the path is live but not when it was saved"
+    );
+    drop(a);
+}
+
+#[tokio::test]
+async fn continuous_editing_is_checkpointed_on_the_interval() {
+    use origofs_sdk::api::{ApiOptions, CheckpointPolicy, router_with};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alice = ws.create_human("alice", None).await.unwrap();
+    let alice_s = ws.create_session(alice, Some("web")).await.unwrap();
+    let auth = BearerAuth::new().with_token("tok-alice", alice, Some(alice_s));
+    let ws = Arc::new(ws);
+
+    // Idle is disabled, so only the interval trigger can fire -- and a client that
+    // keeps typing would reset an idle timer forever, which is exactly why the
+    // interval trigger exists.
+    let options = ApiOptions {
+        checkpoint: CheckpointPolicy {
+            idle_after: None,
+            max_interval: Some(Duration::from_millis(100)),
+            tick: Duration::from_millis(20),
+        },
+        ..Default::default()
+    };
+    let app = router_with(ws.clone(), Arc::new(auth), options);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (mut a, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/v1/coedit/doc.md?token=tok-alice"))
+            .await
+            .unwrap();
+    let aware = Awareness::new(Doc::new());
+    pump(&mut a, &aware).await;
+
+    // Type continuously, never pausing long enough for an idle timer.
+    let mut landed = false;
+    for i in 0..40 {
+        let update = {
+            let text = aware.doc().get_or_insert_text("content");
+            let mut txn = aware.doc().transact_mut();
+            text.insert(&mut txn, 0, "x");
+            txn.encode_update_v1()
+        };
+        a.send(Ws::Binary(frame(&[Y::Sync(SyncMessage::Update(update))])))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if i > 4
+            && let Ok(b) = ws.read("/doc.md").await
+            && !b.is_empty()
+        {
+            landed = true;
+            break;
+        }
+    }
+    assert!(
+        landed,
+        "a continuously-edited room never reached durable storage"
+    );
+    drop(a);
+}
+
+#[tokio::test]
+async fn a_room_with_no_edits_is_not_rewritten() {
+    // The sweeper must not churn: an untouched room has nothing to crystallize,
+    // and writing it anyway would put an op-log entry and a blame rewrite behind
+    // every tick of every open document.
+    use origofs_sdk::api::{ApiOptions, CheckpointPolicy, router_with};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alice = ws.create_human("alice", None).await.unwrap();
+    let alice_s = ws.create_session(alice, Some("web")).await.unwrap();
+    let auth = BearerAuth::new().with_token("tok-alice", alice, Some(alice_s));
+    let ws = Arc::new(ws);
+
+    let options = ApiOptions {
+        checkpoint: CheckpointPolicy {
+            idle_after: Some(Duration::from_millis(10)),
+            max_interval: Some(Duration::from_millis(10)),
+            tick: Duration::from_millis(10),
+        },
+        ..Default::default()
+    };
+    let app = router_with(ws.clone(), Arc::new(auth), options);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (mut a, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/v1/coedit/doc.md?token=tok-alice"))
+            .await
+            .unwrap();
+    let aware = Awareness::new(Doc::new());
+    pump(&mut a, &aware).await;
+
+    // Many sweeper ticks pass with nobody typing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let ops = ws.edit_ops(alice, Some(alice_s)).await.unwrap();
+    assert!(
+        ops.is_empty(),
+        "the sweeper wrote {} op-log entries for a room nobody edited",
+        ops.len()
+    );
+    drop(a);
+}

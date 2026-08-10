@@ -269,6 +269,11 @@ fn live_doc_dict(py: Python<'_>, l: &LiveDoc) -> PyResult<Py<PyAny>> {
     // is exactly "the file's current address differs from this".
     d.set_item("content_hash", l.content_hash.clone())?;
     d.set_item("since", l.since)?;
+    // When the durable bytes were last crystallized, as distinct from `since`
+    // (when the path first went live, which never moves). `None` for a path that
+    // is live but has never been checkpointed -- so a UI can say "last saved 3
+    // minutes ago" instead of only "this may be stale" (#97).
+    d.set_item("checkpointed_at", l.checkpointed_at)?;
     Ok(d.into_any().unbind())
 }
 

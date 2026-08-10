@@ -475,6 +475,28 @@ if live.is_some() { /* these bytes may lag an open editor */ }
 for doc in ws.live_paths().await? { … }                 // everything open right now
 ```
 
+**How far behind, and for how long.** A room's CRDT lives in the server's memory,
+so the durable bytes are only as fresh as the last checkpoint. By default a room
+is checkpointed **5 seconds after it goes quiet** and **at least every 60 seconds**
+while it stays busy — so the window a crash could lose is bounded by that, not by
+how long someone leaves a tab open. Both triggers are configurable (and can be
+turned off, for an embedder driving checkpoints itself):
+
+```rust
+use origofs_sdk::api::{ApiOptions, CheckpointPolicy};
+let options = ApiOptions {
+    checkpoint: CheckpointPolicy { idle_after: Some(Duration::from_secs(2)), ..Default::default() },
+    ..Default::default()
+};
+```
+
+```python
+build_router(ws, authn=authn, checkpoint=CheckpointPolicy(idle_after=2.0))
+```
+
+The live marker carries `checkpointed_at`, so a UI can show "last saved 3 minutes
+ago" rather than only "this may be stale".
+
 `read` keeps its contract unchanged and always answers; a reader is simply told
 whether the answer may be behind. Nothing forces a checkpoint on a reader's
 behalf — a read must not write, a checkpoint needs an actor to attribute it to,

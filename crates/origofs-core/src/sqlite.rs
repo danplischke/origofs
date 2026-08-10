@@ -1231,26 +1231,34 @@ impl MetadataStore for SqliteMetadataStore {
         actor_id: i64,
         content_hash: Option<&str>,
         at: i64,
+        checkpointed_at: Option<i64>,
     ) -> Result<()> {
         blocking_section(move || {
             let conn = self.lock();
             // `since` is deliberately not in the DO UPDATE list: re-marking an
             // already-live path (a second joiner, a checkpoint) keeps when it first
             // went live.
+            //
+            // `checkpointed_at` uses COALESCE so a re-mark that is *not* a
+            // checkpoint (excluded value NULL) keeps the previous stamp rather than
+            // erasing it — the row must never claim a checkpoint that didn't
+            // happen, nor forget one that did.
             conn.execute(
-                "INSERT INTO live_doc(workspace_id, path, session_id, actor_id, content_hash, since)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO live_doc(workspace_id, path, session_id, actor_id, content_hash, since, checkpointed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(workspace_id, path) DO UPDATE SET
                      session_id = excluded.session_id,
                      actor_id = excluded.actor_id,
-                     content_hash = excluded.content_hash",
+                     content_hash = excluded.content_hash,
+                     checkpointed_at = COALESCE(excluded.checkpointed_at, live_doc.checkpointed_at)",
                 params![
                     self.workspace_id,
                     path,
                     session_id,
                     actor_id,
                     content_hash,
-                    at
+                    at,
+                    checkpointed_at
                 ],
             )?;
             Ok(())
@@ -1261,7 +1269,7 @@ impl MetadataStore for SqliteMetadataStore {
         blocking_section(move || {
             let conn = self.lock();
             conn.query_row(
-                "SELECT path, session_id, actor_id, content_hash, since
+                "SELECT path, session_id, actor_id, content_hash, since, checkpointed_at
                  FROM live_doc WHERE workspace_id = ?1 AND path = ?2",
                 params![self.workspace_id, path],
                 row_to_live_doc,
@@ -1275,7 +1283,7 @@ impl MetadataStore for SqliteMetadataStore {
         blocking_section(move || {
             let conn = self.lock();
             let mut stmt = conn.prepare(
-                "SELECT path, session_id, actor_id, content_hash, since
+                "SELECT path, session_id, actor_id, content_hash, since, checkpointed_at
                  FROM live_doc WHERE workspace_id = ?1 ORDER BY path",
             )?;
             let rows = stmt.query_map(params![self.workspace_id], row_to_live_doc)?;
@@ -1750,6 +1758,7 @@ fn row_to_live_doc(r: &rusqlite::Row) -> rusqlite::Result<LiveDoc> {
         actor_id: r.get(2)?,
         content_hash: r.get(3)?,
         since: r.get(4)?,
+        checkpointed_at: r.get(5)?,
     })
 }
 

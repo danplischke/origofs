@@ -54,7 +54,7 @@ use tower_http::trace::TraceLayer;
 #[cfg(feature = "coedit")]
 mod coedit;
 #[cfg(feature = "coedit")]
-pub use coedit::Coordinator;
+pub use coedit::{CheckpointPolicy, Coordinator};
 
 /// Install the closure that `GET /metrics` renders (Prometheus text format).
 ///
@@ -234,6 +234,18 @@ pub struct ApiOptions {
     /// connection, so an unbounded accept loop converts a traffic spike into an
     /// out-of-memory kill rather than into latency. `None` disables the limit.
     pub max_concurrent_requests: Option<usize>,
+    /// When live co-editing rooms are written back to durable storage.
+    ///
+    /// A room's CRDT lives in memory; without periodic checkpointing it reaches
+    /// storage only when its last socket leaves, and a browser tab left open on a
+    /// document is an open room. The default checkpoints 5 seconds after a room
+    /// goes quiet and at least every 60 seconds while it stays busy — see
+    /// [`CheckpointPolicy`].
+    ///
+    /// Present only with the `coedit` feature, since without it there are no
+    /// rooms to checkpoint and the type does not exist.
+    #[cfg(feature = "coedit")]
+    pub checkpoint: CheckpointPolicy,
 }
 
 impl Default for ApiOptions {
@@ -244,6 +256,8 @@ impl Default for ApiOptions {
             max_body_bytes: 64 << 20,
             request_timeout: Some(Duration::from_secs(60)),
             max_concurrent_requests: Some(512),
+            #[cfg(feature = "coedit")]
+            checkpoint: CheckpointPolicy::default(),
         }
     }
 }
@@ -259,7 +273,7 @@ pub fn router(ws: Shared, auth: Arc<dyn Authenticator>) -> Router {
 pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions) -> Router {
     let state = AppState {
         #[cfg(feature = "coedit")]
-        coedit: Coordinator::new(ws.clone()),
+        coedit: Coordinator::new(ws.clone()).with_checkpoint_policy(options.checkpoint),
         ws,
         auth,
     };
