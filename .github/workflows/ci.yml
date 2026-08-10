@@ -569,7 +569,20 @@ jobs:
       # `cargo bench` would also start the lib's libtest harness, which rejects
       # criterion's `--output-format` flag.
       - name: Run benchmarks
-        run: cargo bench -p origofs-core --bench engine -- --output-format bencher | tee output.txt
+        run: |
+          cargo bench -p origofs-core --bench engine -- --output-format bencher | tee raw.txt
+          # Criterion prints `Criterion.rs ERROR: ... base/sample.json ... No such
+          # file` on **stdout**, mid-line, whenever `target/criterion` carries no
+          # saved baseline — i.e. whenever the Rust cache didn't happen to bring
+          # one over. That splits `test NAME ... bench: N ns/iter` across two
+          # lines, github-action-benchmark then parses zero results, and the job
+          # fails with "No benchmark result was found" — on a run where the
+          # benchmarks themselves were fine. It made this job pass or fail on
+          # cache warmth rather than on anything in the diff.
+          #
+          # It is diagnostic noise in a machine-read stream, so strip it and
+          # rejoin the line. A run with no such notice passes through unchanged.
+          perl -0pe 's/ \.\.\. Criterion\.rs ERROR:[^\n]*\n/ ... /g' raw.txt > output.txt
 
       # Restore the rolling benchmark history so the action has something to diff
       # against. A per-run key with a shared prefix means each run saves a fresh
