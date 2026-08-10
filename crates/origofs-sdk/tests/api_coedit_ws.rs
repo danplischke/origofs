@@ -336,9 +336,25 @@ async fn an_idle_room_is_checkpointed_without_anyone_disconnecting() {
         .unwrap();
 
     // The socket stays OPEN throughout -- this is the whole point.
+    //
+    // Wait for the LAST step of a checkpoint, not the first. `checkpoint_coedit`
+    // writes the file, then the sidecar blob, then stamps `checkpointed_at`;
+    // breaking as soon as `read` returns bytes can catch the middle of that
+    // sequence, and the marker assertion below then fails on a checkpoint that
+    // was merely still in progress. Polling the stamp makes the observation
+    // ordered rather than racing the writer.
     let mut landed = None;
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let stamped = ws
+            .live_doc("/doc.md")
+            .await
+            .unwrap()
+            .and_then(|l| l.checkpointed_at)
+            .is_some();
+        if !stamped {
+            continue;
+        }
         if let Ok(b) = ws.read("/doc.md").await
             && !b.is_empty()
         {

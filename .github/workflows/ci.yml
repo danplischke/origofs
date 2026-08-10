@@ -317,14 +317,40 @@ jobs:
           ninja -C _build
           sudo ninja -C _build install
 
+      # Ubuntu 24.04 confines unprivileged user namespaces with an AppArmor
+      # profile, so `bwrap --unshare-user` dies on `setting up uid map: Permission
+      # denied` and `unshare -U -r` on `write failed /proc/self/uid_map`. Lifting
+      # it is what lets bubblewrap build its namespace at all — and it also
+      # un-skips the *non*-isolated overlay cases, which have been quietly
+      # skipping on every ubuntu runner for the same reason.
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
       # Fail loudly rather than skipping, exactly as the `fuse` job does: a silent
       # skip here is the failure mode this job exists to end.
+      #
+      # This is a *functional* probe, not a version or `--help` check: it is the
+      # whole isolated mechanism — user namespace plus overlay mount plus delta
+      # capture — so anything that would make the suite skip or fail shows up here,
+      # against a two-line reproduction rather than inside a test.
       - name: The isolation preconditions really are satisfied
         run: |
           bwrap --version
-          bwrap --help | grep -q -- --overlay-src || {
-            echo "::error::this bubblewrap has no --overlay-src; the suite would skip"; exit 1; }
-          echo "bubblewrap with overlay support present; the isolated tests will not self-skip"
+          mkdir -p probe/lower probe/upper probe/work
+          echo lower > probe/lower/a.txt
+          bwrap --unshare-user --unshare-pid --die-with-parent --new-session \
+                --proc /proc --dev /dev --tmpfs /tmp \
+                --ro-bind /usr /usr --ro-bind-try /bin /bin \
+                --ro-bind-try /lib /lib --ro-bind-try /lib64 /lib64 \
+                --overlay-src "$PWD/probe/lower" \
+                --overlay "$PWD/probe/upper" "$PWD/probe/work" /probe \
+                --chdir /probe -- /bin/sh -c 'cat a.txt && echo delta > b.txt' \
+            || { echo "::error::bubblewrap cannot build an isolated overlay here; the suite would skip"; exit 1; }
+          test -f probe/upper/b.txt \
+            || { echo "::error::the overlay captured no delta"; exit 1; }
+          echo "bubblewrap builds an isolated overlay and captures a delta; the tests will not self-skip"
 
       # ORIGOFS_REQUIRE_BWRAP turns a would-be skip into a failure, so this job
       # cannot silently go back to testing nothing.
