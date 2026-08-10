@@ -70,9 +70,11 @@ class GcsConfig:
         allow_http: bool = False,
     ) -> None: ...
 
-if sys.platform != "win32":
-    # Only registered on Unix (`#[cfg(unix)]` in lib.rs) -- FUSE has no Windows
-    # equivalent, so this class doesn't exist there at all.
+if sys.platform == "linux":
+    # Only registered on Linux (`#[cfg(target_os = "linux")]` in lib.rs). FUSE has
+    # no Windows equivalent, and on macOS it needs the macFUSE kernel extension --
+    # a system dependency a wheel can't carry -- so this class doesn't exist on
+    # either. macOS mounts over NFSv3 via `serve_nfs` instead.
     class Mount:
         """A live FUSE mount; unmounts on ``unmount()``, ``with``-exit, or drop."""
         def unmount(self) -> None: ...
@@ -428,8 +430,12 @@ class Workspace:
         self, actor_id: int, session_id: Optional[int] = None
     ) -> list[dict[str, Any]]: ...
 
-    if sys.platform != "win32":
+    if sys.platform == "linux":
         def mount(self, mountpoint: str) -> Mount: ...
+    else:
+        def mount(self, mountpoint: str) -> NoReturn: ...
+
+    if sys.platform != "win32":
         async def serve_nfs(
             self, addr: str, shutdown: Optional[Awaitable[Any]] = None
         ) -> None:
@@ -440,7 +446,6 @@ class Workspace:
             per-connection task and socket goes with it."""
             ...
     else:
-        def mount(self, mountpoint: str) -> NoReturn: ...
         def serve_nfs(
             self, addr: str, shutdown: Optional[Awaitable[Any]] = None
         ) -> NoReturn: ...
@@ -453,5 +458,6 @@ def content_hash(data: bytes) -> str:
 
 def fuse_mountable() -> bool:
     """Whether a FUSE mount is possible here (``/dev/fuse`` present). Always
-    ``False`` off Unix (no FUSE)."""
+    ``False`` off Linux: Windows has no FUSE, and the macOS wheel ships without it
+    (macFUSE is a kernel extension a wheel can't carry) — use ``serve_nfs`` there."""
     ...

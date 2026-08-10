@@ -32,7 +32,7 @@ use pyo3::exceptions::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::tokio::future_into_py;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -82,11 +82,23 @@ fn io_err(e: std::io::Error) -> PyErr {
     }
 }
 
-/// Error for a mount/serve operation that isn't available off Unix (no FUSE/NFS).
-#[cfg(not(unix))]
+/// Error for a mount/serve operation this platform doesn't have.
+///
+/// The two surfaces have different reaches, so this is deliberately vague about
+/// *which* one is missing and lets the caller name it:
+///
+/// * **FUSE mounting is Linux-only.** `fuser` links `libfuse`, which on macOS
+///   means the macFUSE kernel extension — a system dependency a `pip install`
+///   cannot provide, and one the published wheels therefore do not assume.
+///   `docs/DESIGN.md` already puts macOS on NFSv3 rather than FUSE.
+/// * **NFS serving is Unix-wide**, so macOS keeps `serve_nfs` and the mount
+///   story it was always meant to have there.
+///
+/// Needed on every target except Linux, which has both.
+#[cfg(not(target_os = "linux"))]
 fn unsupported(what: &str) -> PyErr {
     PyOSError::new_err(format!(
-        "{what} is not available on this platform (Unix/FUSE only); use the HTTP API (origofs.fastapi) or embed the SDK"
+        "{what} is not available on this platform; use serve_nfs (Unix), the HTTP API (origofs.fastapi), or embed the SDK"
     ))
 }
 
@@ -528,14 +540,14 @@ impl GcsConfig {
 
 /// A live FUSE mount. Unmounts when `unmount()` is called or the object is
 /// dropped. Usable as a context manager. Unix only (FUSE).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[pyclass]
 struct Mount {
     session: Option<fuser::BackgroundSession>,
     mountpoint: String,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[pymethods]
 impl Mount {
     /// Unmount now (idempotent).
@@ -2347,7 +2359,7 @@ impl Workspace {
     /// background. Returns a `Mount` handle; unmount by calling `.unmount()`,
     /// exiting its `with` block, or dropping it. Requires FUSE (`/dev/fuse`).
     /// Unix only.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn mount(&self, py: Python<'_>, mountpoint: String) -> PyResult<Mount> {
         let ws = self.inner.clone();
         let mp = mountpoint.clone();
@@ -2362,7 +2374,7 @@ impl Workspace {
 
     /// FUSE mounting is not available on this platform (Unix/FUSE only). Use the
     /// HTTP API (`origofs.fastapi`) or embed the SDK directly.
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     fn mount(&self, _mountpoint: String) -> PyResult<()> {
         Err(unsupported("FUSE mounting"))
     }
@@ -3004,13 +3016,13 @@ fn merge_outcome_dict(py: Python<'_>, outcome: &origofs_sdk::MergeOutcome) -> Py
 
 /// Whether a FUSE mount is possible here (`/dev/fuse` present and usable).
 /// Always `false` off Unix (no FUSE).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[pyfunction]
 fn fuse_mountable() -> bool {
     origofs_sdk::fuse::mountable()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 #[pyfunction]
 fn fuse_mountable() -> bool {
     false
@@ -3040,7 +3052,7 @@ fn _origofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CoeditSyncReply>()?;
     m.add_class::<CoeditRelayNote>()?;
     m.add_class::<CoeditRelaySub>()?;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     m.add_class::<Mount>()?;
     m.add_function(wrap_pyfunction!(fuse_mountable, m)?)?;
     m.add_function(wrap_pyfunction!(content_hash, m)?)?;
