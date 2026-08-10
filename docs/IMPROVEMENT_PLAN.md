@@ -1,7 +1,9 @@
 # Improvement plan — open issues, triaged against `main`
 
 Written 2026-08-10 against `e479591`. Every claim below was verified by reading
-the code at the cited location, not inferred from an issue's checkboxes.
+the code at the cited location, not inferred from an issue's checkboxes. The
+housekeeping it recommends has since been carried out — #78 is closed, #75 is
+rewritten, and the P0 finding is filed as #99.
 
 ## Summary
 
@@ -10,10 +12,10 @@ Nine issues are open. The picture they paint is out of date in both directions:
 - **Two trackers are substantially stale.** #75 lists twelve remaining items;
   eleven have shipped. #78's proposal has landed essentially in full on the Rust
   surfaces, and `CLAUDE.md` already documents it as engine-enforced.
-- **One real trust gap is not filed at all.** The Python FastAPI router
+- **One real trust gap was not filed at all.** The Python FastAPI router
   (`crates/origofs-py/python/origofs/fastapi.py`) still mutates through the
   *unattributed* engine ops, so it is exactly the bypass #78 closed — on the one
-  surface #78 never audited. See P0 below.
+  surface #78 never audited. Now #99; see P0 below.
 - **The seven issues filed on 2026-08-10 (#92–#98) are all genuinely open**, and
   they are notably coherent: they are one integrator's report from wrapping the
   Python bindings for a multi-tenant, Plate-based host. They should be read as a
@@ -23,8 +25,9 @@ Nine issues are open. The picture they paint is out of date in both directions:
 
 | # | Title | Verified status |
 |---|---|---|
-| #78 | WritePolicy per-call-site, fails open | **Done on Rust surfaces** — see below |
-| #75 | Remaining open work, consolidated | **11 of 12 shipped** — see below |
+| #78 | WritePolicy per-call-site, fails open | **Done on Rust surfaces** — closed as completed |
+| #99 | Python router bypasses the write policy | Filed off the P0 finding below |
+| #75 | Remaining open work, consolidated | **11 of 12 shipped** — rewritten to its 2 real items |
 | #96 | abi3 wheels to PyPI | Open. No release workflow, no tags |
 | #95 | TypedDict stubs | Open. 31 `dict[str, Any]` in `__init__.pyi`, 0 `TypedDict` |
 | #94 | `revert_session` path scope | Open. Signature is `(actor_id, session_id)` at all four layers |
@@ -33,7 +36,7 @@ Nine issues are open. The picture they paint is out of date in both directions:
 | #97 | Co-edit interval checkpointing | Open. `_Rooms.leave` is the only checkpoint |
 | #92 | Structured (XmlFragment) co-edit doc | Open. `coedit.rs:75` is a single flat `TextRef` |
 
-### #78 — close it, with one carve-out
+### #78 — closed, with one carve-out
 
 Shipped and verified: `OrigoFSError::Denied` (`error.rs`), `ensure_may_write`
 (`suggest.rs`), `remove_as`/`rename_as`/`mkdir_as`/`symlink_as`,
@@ -45,10 +48,10 @@ fails on an unclassified MCP tool, and
 source and fails on a mutating route that doesn't bind its principal.
 `origofs-core/tests/write_policy.rs` covers each refusal and each exemption.
 
-The carve-out is P0 below: the Python router is a third surface, and neither
-guard test covers it.
+The carve-out is P0 below, now tracked as #99: the Python router is a third
+surface, and neither guard test covers it.
 
-### #75 — rewrite it down to one item
+### #75 — rewritten down to two items
 
 Verified **shipped** since the issue was written: offline→reconnect resync
 (`origofs-core/src/resync.rs`, `origofs-sdk/tests/resync.rs`), metrics
@@ -76,7 +79,7 @@ in the tree, not even in prose.
 
 ## The plan
 
-### P0 — Close the Python router's write-policy bypass *(unfiled; file it)*
+### P0 — Close the Python router's write-policy bypass (#99)
 
 `crates/origofs-py/python/origofs/fastapi.py` authenticates every mutating route
 and then discards the principal — the handlers literally name it `_ctx`:
@@ -225,23 +228,27 @@ A "bring your own schema — we attribute the runs, you own serialization" cut i
 enough to unblock a native binding and defers both questions. The reporter has
 offered to test a prototype against Plate/Slate; take them up on it.
 
-### Housekeeping
+### Housekeeping — done
 
-- Close **#78**, citing `write_policy.rs`, `mcp.rs`, and `api_write_policy.rs`.
-  Open the P0 Python-router issue referencing it.
-- Rewrite **#75** down to the agentfs importer plus the FUSE `inval_entry`
-  follow-up, or close it and file those two separately. A tracker that is 92%
-  stale actively misleads — it currently claims metrics, resync, presence writes,
-  and migration coverage are missing when all four are tested on `main`.
-- **#75's remaining items are low priority.** The agentfs importer has no
-  evidence of demand; the FUSE dentry gap is documented and bounded at one
-  second, and its fix is an API break. Neither should outrank #92–#98, which come
-  from an actual integrator.
+- **#78 closed as completed**, with each of its eight proposal items mapped to
+  where it landed and both anti-regression guards confirmed
+  (`write_policy.rs`, `mcp.rs`, `api_write_policy.rs`).
+- **#99 filed** off the P0 finding, referencing #78 as the scope it completes.
+- **#75 rewritten** down to the agentfs importer plus the FUSE `inval_entry`
+  follow-up; the item-by-item verification of the eleven shipped items is kept as
+  a comment on the issue. It had become 92% stale, claiming metrics, resync,
+  presence writes, and migration coverage were missing when all four are tested
+  on `main`.
+
+**#75's two remaining items stay low priority.** The agentfs importer has no
+evidence of demand; the FUSE dentry gap is documented, bounded at one second, and
+its fix is an API break. Neither should outrank #92–#99, which come from an actual
+integrator.
 
 ## Suggested order
 
 ```
-P0  Python router write-policy bypass + 403      ← correctness, do first
+P0  Python router write-policy bypass + 403 (#99)  ← correctness, do first
 P1  PyPI wheels + tag + changelog                ← unblocks all Python adoption
 P2  TypedDict stubs · revert_session scope · WS session
 P3  Interval checkpointing · subprotocol auth
