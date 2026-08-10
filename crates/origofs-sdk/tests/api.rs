@@ -772,3 +772,91 @@ async fn presence_heartbeat_requires_a_session_bound_credential() {
     let (_st, body) = send(&fx.app, get("/presence")).await;
     assert!(as_json(&body).as_array().unwrap().is_empty());
 }
+
+// --- revert-session (#94) ---------------------------------------------------
+
+// `POST /v1/revert-session` had no test at all, on a route that deletes other
+// people's work. These cover the shape and the scope together.
+
+#[tokio::test]
+async fn revert_session_reports_the_paths_it_changed() {
+    let fx = fixture().await;
+    // The agent (whose token is session-bound) writes two files.
+    for p in ["/a.txt", "/b.txt"] {
+        let (st, _) = send(&fx.app, put_as(&format!("/files{p}"), T_AGENT, b"agent\n")).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    let (st, body) = send(
+        &fx.app,
+        post_json_as(
+            "/revert-session",
+            T_ADMIN,
+            json!({ "actor": fx.agent, "session": fx.session }),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = as_json(&body);
+    assert_eq!(v["files_changed"], json!(2));
+    // Which paths, not just how many — so a caller can invalidate precisely.
+    let mut paths: Vec<&str> = v["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    paths.sort();
+    assert_eq!(paths, vec!["/a.txt", "/b.txt"]);
+    // The reviewer is recorded, and it is the caller — not the actor being undone.
+    assert!(v["reverted_by"].is_i64());
+    assert_ne!(v["reverted_by"], json!(fx.agent));
+}
+
+#[tokio::test]
+async fn a_path_prefix_bounds_what_revert_session_touches() {
+    let fx = fixture().await;
+    for p in [
+        "/tenant-a/notes.txt",
+        "/tenant-b/notes.txt",
+        "/tenant-abc/notes.txt",
+    ] {
+        let (st, _) = send(&fx.app, put_as(&format!("/files{p}"), T_AGENT, b"agent\n")).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    let (st, body) = send(
+        &fx.app,
+        post_json_as(
+            "/revert-session",
+            T_ADMIN,
+            json!({ "actor": fx.agent, "session": fx.session, "path_prefix": "/tenant-a" }),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let v = as_json(&body);
+    assert_eq!(v["paths"], json!(["/tenant-a/notes.txt"]));
+
+    // The neighbour that merely shares a textual prefix keeps its bytes.
+    let (_st, body) = send(&fx.app, get("/files/tenant-abc/notes.txt")).await;
+    assert_eq!(&body[..], b"agent\n");
+    let (_st, body) = send(&fx.app, get("/files/tenant-b/notes.txt")).await;
+    assert_eq!(&body[..], b"agent\n");
+}
+
+#[tokio::test]
+async fn a_relative_path_prefix_is_rejected() {
+    let fx = fixture().await;
+    let (st, body) = send(
+        &fx.app,
+        post_json_as(
+            "/revert-session",
+            T_ADMIN,
+            json!({ "actor": fx.agent, "session": fx.session, "path_prefix": "tenant-a" }),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(as_json(&body)["error"]["code"], "invalid_argument");
+}

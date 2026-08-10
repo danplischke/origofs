@@ -1,0 +1,180 @@
+name: Release
+
+# Build the Python wheels and publish them, so a consumer can `pip install origofs`
+# instead of cloning the repo at a SHA and running `maturin build` in a dedicated
+# container stage (issue #96).
+#
+# The extension is abi3-py39 (`pyo3 = { features = ["abi3-py39"] }`), so **one
+# wheel per platform covers CPython 3.9+** — there is no per-version build matrix.
+#
+# No system dependencies are needed on any leg:
+#   * fuser's `libfuse` feature is off by default, so on Linux its build script
+#     takes the `pure-rust` mount path and probes no pkg-config at all;
+#   * macOS and Windows wheels carry no fuser — FUSE is scoped to
+#     `cfg(target_os = "linux")` in crates/origofs-py/Cargo.toml, because macFUSE
+#     is a kernel extension a wheel cannot provide. macOS mounts over NFSv3
+#     (`serve_nfs`), which is pure Rust.
+on:
+  push:
+    tags: ["v*"]
+  # Dry runs: build every wheel without tagging or publishing anything.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            args: --release --out dist --manylinux 2_28
+          # Cross-compiled inside maturin-action's container; the C toolchain for
+          # the target comes with it (aws-lc-rs/ring need one).
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            args: --release --out dist --manylinux 2_28
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            args: --release --out dist
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            args: --release --out dist
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: --release --out dist
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: ${{ matrix.args }}
+          sccache: "true"
+          # Only the Linux legs run in a container; ignored elsewhere.
+          manylinux: ${{ startsWith(matrix.name, 'linux') && '2_28' || 'auto' }}
+          working-directory: crates/origofs-py
+
+      # A wheel that imports is the minimum bar for publishing one. Skipped where
+      # the wheel can't run on the runner (the cross-built aarch64 legs).
+      - name: Smoke-test the wheel
+        if: matrix.name != 'linux-aarch64' && matrix.name != 'macos-x86_64'
+        shell: bash
+        working-directory: crates/origofs-py
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-index --find-links dist origofs
+          # Exercise the compiled core, not just the import: open a workspace,
+          # write attributed bytes, read blame back.
+          python - <<'PY'
+          import asyncio, tempfile, os, origofs
+
+          async def main():
+              d = tempfile.mkdtemp()
+              ws = await origofs.Workspace.open_local(
+                  os.path.join(d, "meta.db"), os.path.join(d, "cas")
+              )
+              actor = await ws.create_human("ci", None)
+              sess = await ws.create_session(actor, "smoke")
+              ctx = origofs.WriteCtx.session(actor, sess)
+              await ws.write_as(ctx, "/hello.txt", b"hi\n")
+              assert bytes(await ws.read("/hello.txt")) == b"hi\n"
+              spans = await ws.blame("/hello.txt")
+              assert spans, "blame came back empty"
+              print("origofs", origofs.__version__ if hasattr(origofs, "__version__") else "", "ok")
+
+          asyncio.run(main())
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: crates/origofs-py/dist/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: crates/origofs-py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: crates/origofs-py/dist/*.tar.gz
+
+  # Attach every artifact to the GitHub Release. This alone fixes the worst of
+  # #96 — a host can pin a URL + hash instead of carrying a Rust toolchain in a
+  # build stage — and it needs no account setup, unlike the PyPI job below.
+  github-release:
+    name: Attach to GitHub Release
+    needs: [wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  # Publish to PyPI via Trusted Publishing (OIDC — no API token in secrets).
+  #
+  # Disabled until the project is set up for it, so tagging never fails on a
+  # missing publisher. To enable:
+  #   1. On PyPI, add a trusted publisher for the `origofs` project:
+  #      owner `danplischke`, repo `origofs`, workflow `release.yml`,
+  #      environment `pypi`.
+  #   2. Create a `pypi` environment in the repo's settings.
+  #   3. Set the repository variable PUBLISH_TO_PYPI to `true`.
+  pypi:
+    name: Publish to PyPI
+    needs: [wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_TO_PYPI == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: upload
+          args: --non-interactive --skip-existing dist/*

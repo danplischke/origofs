@@ -5,13 +5,30 @@ build-backend = "maturin"
 [project]
 name = "origofs"
 description = "Python bindings for origofs (agent filesystem): async workspace ops, attribution, suggestions, and mount/NFS orchestration"
+# Rendered as the project page on PyPI. Without it the listing is a bare
+# description, which is most of what a reader sees before deciding to install.
+readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT OR Apache-2.0" }
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: System :: Filesystems",
+    "Topic :: Software Development :: Version Control",
+    "Framework :: AsyncIO",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
 ]
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/danplischke/origofs"
+Repository = "https://github.com/danplischke/origofs"
+Issues = "https://github.com/danplischke/origofs/issues"
+Changelog = "https://github.com/danplischke/origofs/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # The `origofs.fastapi` router integration (and the examples under examples/).

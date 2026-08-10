@@ -1025,19 +1025,56 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// Revert every line an actor wrote in a session, across all files they
-    /// touched. Returns the number of files changed. The removed lines are
+    /// touched. Returns the paths actually changed. The removed lines are
     /// dropped; remaining lines keep their authorship.
-    pub async fn revert_session(&self, actor_id: i64, session_id: i64) -> Result<usize> {
-        // Distinct files this actor touched in this session (from the op-log).
+    ///
+    /// # Scoping the blast radius
+    ///
+    /// `path_prefix` bounds the revert to one subtree. A multi-tenant host — one
+    /// workspace, tenant-scoped paths — needs this: an "undo this agent's work"
+    /// button lives in *some* tenant's UI, and if the session happened to touch a
+    /// path outside that tenant, an unscoped revert silently reverts it too
+    /// (#94).
+    ///
+    /// The prefix matches on **directory boundaries**, so `/tenant-a` covers
+    /// `/tenant-a` and `/tenant-a/notes.txt` but never `/tenant-abc/notes.txt`. A
+    /// trailing slash is accepted and ignored, and the prefix must be absolute.
+    ///
+    /// Doing it here rather than in the caller is the point. The obvious
+    /// workaround — call [`edit_ops`](Self::edit_ops), check the paths, then
+    /// revert — reads the session's reach and acts on it in two separate calls,
+    /// so a write landing in between is reverted without ever having been
+    /// checked. Here the reach is read and filtered before anything is written.
+    ///
+    /// Per-file atomicity is unchanged: each file's content, blame, and op-log
+    /// entry still commit together, but the files are separate transactions, so a
+    /// failure partway leaves earlier files reverted. That was already true and
+    /// the scope doesn't change it — what it guarantees is that nothing *outside*
+    /// the prefix is touched, not that the whole revert is one atom.
+    pub async fn revert_session(
+        &self,
+        actor_id: i64,
+        session_id: i64,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let scope = path_prefix.map(PathScope::new).transpose()?;
+
+        // Distinct files this actor touched in this session (from the op-log),
+        // filtered to the scope *before* any of them is written.
         let ops = self.meta.list_edit_ops(actor_id, Some(session_id)).await?;
         let mut paths: Vec<(Ino, String)> = Vec::new();
         for op in ops {
+            if let Some(s) = &scope
+                && !s.covers(&op.path)
+            {
+                continue;
+            }
             if !paths.iter().any(|(i, _)| *i == op.ino) {
                 paths.push((op.ino, op.path));
             }
         }
 
-        let mut changed = 0;
+        let mut changed = Vec::new();
         for (ino, path) in paths {
             // Blame and the current bytes both come from the content the inode
             // points at (M9); an empty file, or content with no recorded blame,
@@ -1101,7 +1138,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 actor_id,
                 tool_call_id: None,
                 ino,
-                path,
+                path: path.clone(),
                 op: "revert".to_string(),
                 byte_start: 0,
                 byte_len: size as i64,
@@ -1111,9 +1148,80 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             })
             .await?;
             tx.commit().await?;
-            changed += 1;
+            changed.push(path);
         }
         Ok(changed)
+    }
+}
+
+/// A `/`-boundary path prefix, for scoping an operation to a subtree.
+///
+/// The naive `path.starts_with(prefix)` is wrong in a way that matters for the
+/// multi-tenant case it exists to serve: `/tenant-a` would also match
+/// `/tenant-abc`, so the scope would leak into exactly the neighbouring tenant it
+/// was meant to exclude.
+struct PathScope {
+    /// Normalized: absolute, no trailing slash (so the root is `""`).
+    prefix: String,
+}
+
+impl PathScope {
+    fn new(prefix: &str) -> Result<Self> {
+        if !prefix.starts_with('/') {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "path prefix must be absolute, got {prefix:?}"
+            )));
+        }
+        Ok(Self {
+            prefix: prefix.trim_end_matches('/').to_string(),
+        })
+    }
+
+    /// Whether `path` is the prefix itself or sits under it.
+    fn covers(&self, path: &str) -> bool {
+        // The root prefix (`/`, normalized to `""`) covers everything.
+        if self.prefix.is_empty() {
+            return true;
+        }
+        path == self.prefix
+            || (path.starts_with(&self.prefix)
+                && path.as_bytes().get(self.prefix.len()) == Some(&b'/'))
+    }
+}
+
+#[cfg(test)]
+mod path_scope_tests {
+    use super::PathScope;
+
+    #[test]
+    fn a_prefix_matches_only_on_directory_boundaries() {
+        let s = PathScope::new("/tenant-a").unwrap();
+        assert!(s.covers("/tenant-a"));
+        assert!(s.covers("/tenant-a/notes.txt"));
+        assert!(s.covers("/tenant-a/deep/nested/f"));
+        // The whole point: a sibling sharing a textual prefix is not covered.
+        assert!(!s.covers("/tenant-abc/notes.txt"));
+        assert!(!s.covers("/tenant-a2"));
+        assert!(!s.covers("/other/tenant-a"));
+    }
+
+    #[test]
+    fn a_trailing_slash_is_accepted_and_means_the_same_thing() {
+        let with = PathScope::new("/tenant-a/").unwrap();
+        assert!(with.covers("/tenant-a/notes.txt"));
+        assert!(!with.covers("/tenant-abc/notes.txt"));
+    }
+
+    #[test]
+    fn the_root_covers_everything() {
+        let s = PathScope::new("/").unwrap();
+        assert!(s.covers("/"));
+        assert!(s.covers("/anything/at/all"));
+    }
+
+    #[test]
+    fn a_relative_prefix_is_refused() {
+        assert!(PathScope::new("tenant-a").is_err());
     }
 }
 

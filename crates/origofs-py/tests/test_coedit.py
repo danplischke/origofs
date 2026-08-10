@@ -18,9 +18,9 @@ import time
 import pytest
 
 import origofs
-from origofs.fastapi import build_router
+from origofs.fastapi import CheckpointPolicy, build_router
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.testclient import TestClient
 
 # One event loop for the synchronous test to drive the async client doc + reads;
@@ -256,3 +256,255 @@ def test_suggest_coedit_update_takes_raw_yjs_blobs():
     # than becoming a review row nobody can apply.
     with pytest.raises(ValueError):
         _run(lambda: ws.suggest_coedit_update(ctx, "/doc.md", base_sv, b"", None))
+
+
+# --- credential transport and per-connection sessions (#98) ------------------
+
+
+def _app_with_subprotocol_auth():
+    """An app whose `authn` reads the credential out of `Sec-WebSocket-Protocol`
+    -- the one header a browser *can* set on an upgrade, and the reason the router
+    has to echo the marker back."""
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    tokens = {"alice-token": origofs.WriteCtx.session(alice, alice_s)}
+
+    async def authn(sec_websocket_protocol: str = Header(default="")) -> origofs.WriteCtx:
+        # `new WebSocket(url, ["origofs", token])` arrives as "origofs, <token>".
+        parts = [p.strip() for p in sec_websocket_protocol.split(",") if p.strip()]
+        resolved = tokens.get(parts[1]) if len(parts) > 1 and parts[0] == "origofs" else None
+        if resolved is None:
+            raise HTTPException(status_code=401, detail="bad token")
+        return resolved
+
+    app = FastAPI()
+    app.include_router(build_router(ws, authn=authn))
+    return app, ws, alice, alice_s
+
+
+def test_a_credential_can_ride_the_websocket_subprotocol():
+    app, ws, alice, alice_s = _app_with_subprotocol_auth()
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+    client = origofs.CoeditDoc()
+    _run(lambda: client.insert(ctx, 0, "typed over a subprotocol"))  # 24 bytes
+
+    with TestClient(app) as tc:
+        # No ?token= in the URL at all -- the credential is in the subprotocol
+        # list, and the server has to select "origofs" or a browser would fail
+        # the handshake.
+        with tc.websocket_connect(
+            "/coedit/doc.md", subprotocols=["origofs", "alice-token"]
+        ) as sock:
+            assert sock.accepted_subprotocol == "origofs"
+            greeting = sock.receive_bytes()  # server -> client: SyncStep1
+            answer = _run(lambda: client.handle_sync(ctx, greeting))
+            sock.send_bytes(answer.reply)
+            time.sleep(0.1)  # let the server apply the frame before we close
+
+        blame = []
+        for _ in range(60):
+            try:
+                blame = _run(lambda: ws.blame("/doc.md"))
+            except FileNotFoundError:
+                blame = []
+            if blame:
+                break
+            time.sleep(0.05)
+
+    assert blame, "checkpoint on last-leave never populated blame"
+    assert blame[0]["actor"]["id"] == alice
+    assert blame[0]["session"] == alice_s
+
+
+def test_a_socket_offering_no_subprotocol_still_connects():
+    # The echo must be conditional: selecting a protocol the client never offered
+    # is itself a handshake failure.
+    app, _ws, _alice, _alice_s = _app_with_alice()
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            assert sock.accepted_subprotocol is None
+            sock.receive_bytes()
+
+
+def test_a_session_less_credential_gets_a_session_for_the_connection():
+    # A `WriteCtx.actor(...)` connection used to stamp edits (actor, session=None),
+    # which `revert_session` can never undo -- on the surface that produces the
+    # most edits.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+
+    async def authn(token: str = Query(...)) -> origofs.WriteCtx:
+        if token != "alice-token":
+            raise HTTPException(status_code=401, detail="bad token")
+        return origofs.WriteCtx.actor(alice)  # deliberately session-less
+
+    app = FastAPI()
+    app.include_router(build_router(ws, authn=authn))
+
+    ctx = origofs.WriteCtx.actor(alice)
+    client = origofs.CoeditDoc()
+    _run(lambda: client.insert(ctx, 0, "live edits are revertible"))
+
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            greeting = sock.receive_bytes()
+            answer = _run(lambda: client.handle_sync(ctx, greeting))
+            sock.send_bytes(answer.reply)
+            time.sleep(0.1)
+
+        blame = []
+        for _ in range(60):
+            try:
+                blame = _run(lambda: ws.blame("/doc.md"))
+            except FileNotFoundError:
+                blame = []
+            if blame:
+                break
+            time.sleep(0.05)
+
+    assert blame, "checkpoint on last-leave never populated blame"
+    session = blame[0]["session"]
+    assert session is not None, "a live edit must carry a session, or it can never be reverted"
+
+    # The point of having one.
+    changed = _run(lambda: ws.revert_session(alice, session))
+    assert changed == ["/doc.md"]
+    assert bytes(_run(lambda: ws.read("/doc.md"))) == b""
+
+
+# --- periodic checkpointing (#97) -------------------------------------------
+
+
+def test_an_idle_room_is_checkpointed_without_anyone_disconnecting():
+    # A room's CRDT lives in memory and used to reach durable storage only when
+    # its last socket left. A browser tab left open on a document *is* an open
+    # room, so that could be hours -- and a worker dying in between lost
+    # everything since the last checkpoint.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+
+    async def authn(token: str = Query(...)) -> origofs.WriteCtx:
+        if token != "alice-token":
+            raise HTTPException(status_code=401, detail="bad token")
+        return ctx
+
+    app = FastAPI()
+    app.include_router(
+        build_router(
+            ws,
+            authn=authn,
+            # Short timings so the test doesn't wait out the defaults.
+            checkpoint=CheckpointPolicy(idle_after=0.05, max_interval=None, tick=0.02),
+        )
+    )
+
+    client = origofs.CoeditDoc()
+    _run(lambda: client.insert(ctx, 0, "durable before I disconnect"))
+
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            greeting = sock.receive_bytes()
+            answer = _run(lambda: client.handle_sync(ctx, greeting))
+            sock.send_bytes(answer.reply)
+
+            # The socket stays OPEN throughout -- that is the whole point.
+            body = b""
+            for _ in range(60):
+                time.sleep(0.05)
+                try:
+                    body = bytes(_run(lambda: ws.read("/doc.md")))
+                except FileNotFoundError:
+                    body = b""
+                if body:
+                    break
+
+            assert body == b"durable before I disconnect", (
+                "an idle room was never checkpointed while its socket stayed open"
+            )
+
+            # And the marker says *when*, so a UI can render "last saved N ago"
+            # rather than only "this may be stale".
+            live = _run(lambda: ws.live_doc("/doc.md"))
+            assert live is not None and live["checkpointed_at"] is not None
+
+
+def test_a_room_with_no_edits_is_not_rewritten():
+    # The sweeper must not churn: an untouched room has nothing to crystallize,
+    # and writing it anyway would put an op-log entry and a blame rewrite behind
+    # every tick of every open document.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+
+    async def authn(token: str = Query(...)) -> origofs.WriteCtx:
+        return ctx
+
+    app = FastAPI()
+    app.include_router(
+        build_router(
+            ws,
+            authn=authn,
+            checkpoint=CheckpointPolicy(idle_after=0.01, max_interval=0.01, tick=0.01),
+        )
+    )
+
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            sock.receive_bytes()
+            time.sleep(0.3)  # many sweeper ticks, nobody typing
+            ops = _run(lambda: ws.edit_ops(alice, alice_s))
+            assert ops == [], f"the sweeper wrote {len(ops)} op-log entries for an idle room"
+
+
+def test_checkpointing_can_be_turned_off():
+    # An embedder that drives checkpoints itself can disable both triggers, which
+    # restores the checkpoint-on-last-leave-only behaviour.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+
+    async def authn(token: str = Query(...)) -> origofs.WriteCtx:
+        return ctx
+
+    app = FastAPI()
+    app.include_router(
+        build_router(
+            ws,
+            authn=authn,
+            checkpoint=CheckpointPolicy(idle_after=None, max_interval=None),
+        )
+    )
+
+    client = origofs.CoeditDoc()
+    _run(lambda: client.insert(ctx, 0, "only on last leave"))
+
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+            greeting = sock.receive_bytes()
+            answer = _run(lambda: client.handle_sync(ctx, greeting))
+            sock.send_bytes(answer.reply)
+            time.sleep(0.3)
+            with pytest.raises(FileNotFoundError):
+                _run(lambda: ws.read("/doc.md"))
+
+        # ...and the last-leave checkpoint still lands it.
+        body = b""
+        for _ in range(60):
+            try:
+                body = bytes(_run(lambda: ws.read("/doc.md")))
+            except FileNotFoundError:
+                body = b""
+            if body:
+                break
+            time.sleep(0.05)
+    assert body == b"only on last leave"

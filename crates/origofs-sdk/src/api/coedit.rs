@@ -11,11 +11,14 @@
 //! checkpointed into the byte-range blame index and evicted.
 //!
 //! Identity is resolved exactly as everywhere else — server-side, never trusted
-//! from the client. Because browsers can't set headers on a WebSocket, the token
-//! may ride in a `?token=` query param; it is authenticated through the same
-//! [`Authenticator`](super::Authenticator) as every other route. Content a socket
-//! contributes is attributed to *its* principal by the engine, no matter what the
-//! bytes claim.
+//! from the client, and through the same [`Authenticator`](super::Authenticator)
+//! as every other route. Because browsers can't set headers on a WebSocket
+//! upgrade, the credential may instead ride in `Sec-WebSocket-Protocol`
+//! (`new WebSocket(url, ["origofs", token])` — the one header a browser *can*
+//! set) or, less well, in a `?token=` query param. Content a socket contributes
+//! is attributed to *its* principal by the engine, no matter what the bytes
+//! claim, and a connection whose credential names no session gets one opened for
+//! it so its edits are revertible as a unit.
 //!
 //! **Multiple workers.** The registry is per-process, so two sockets editing one
 //! document on *different* workers would drift. When the workspace is
@@ -41,6 +44,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, broadcast};
 
 /// How many y-sync frames a slow socket can fall behind before it's dropped from
@@ -63,12 +67,127 @@ struct Room {
     /// Origin-tagged y-sync frames fanned out to the room. Each socket skips
     /// frames it originated — it already applied its own edit locally.
     tx: broadcast::Sender<(u64, Bytes)>,
+    /// Milliseconds (since the coordinator's epoch) of the most recent edit, and
+    /// of the most recent checkpoint. The checkpoint sweeper reads both to decide
+    /// whether this room is due; `dirty` says whether there is anything to write.
+    ///
+    /// Atomics rather than a lock: the edit stamp is touched on every applied
+    /// frame — the hottest path in the room — and taking the registry lock there
+    /// would serialize typing across every document on the worker.
+    last_edit_ms: AtomicU64,
+    last_checkpoint_ms: AtomicU64,
+    dirty: AtomicBool,
 }
 
-/// One registry entry: the room and how many sockets are currently attached.
+impl Room {
+    /// Record that an edit just landed, so the sweeper knows there is something to
+    /// checkpoint and when the room last went quiet.
+    fn touch_edit(&self, epoch: Instant) {
+        self.last_edit_ms
+            .store(elapsed_ms(epoch), Ordering::Relaxed);
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this room is due for a periodic checkpoint under `policy`.
+    ///
+    /// Two independent triggers, because they answer different questions:
+    /// **idle** bounds how long a *finished* burst of typing sits un-durable, and
+    /// **interval** bounds how far behind a *continuous* editing session can get —
+    /// which idle alone never would, since it keeps being reset.
+    fn is_due(&self, policy: &CheckpointPolicy, now_ms: u64) -> bool {
+        if !self.dirty.load(Ordering::Relaxed) {
+            return false;
+        }
+        let since_edit = now_ms.saturating_sub(self.last_edit_ms.load(Ordering::Relaxed));
+        let since_checkpoint =
+            now_ms.saturating_sub(self.last_checkpoint_ms.load(Ordering::Relaxed));
+        let idle_due = policy
+            .idle_after
+            .is_some_and(|d| since_edit >= d.as_millis() as u64);
+        let interval_due = policy
+            .max_interval
+            .is_some_and(|d| since_checkpoint >= d.as_millis() as u64);
+        idle_due || interval_due
+    }
+}
+
+/// Milliseconds since the coordinator's epoch. One monotonic clock for the whole
+/// registry, so room timings are comparable and immune to wall-clock jumps.
+fn elapsed_ms(epoch: Instant) -> u64 {
+    epoch.elapsed().as_millis() as u64
+}
+
+/// When a live co-editing room's document is written back to durable storage.
+///
+/// # Why this exists
+///
+/// A room's CRDT lives in process memory. Without a policy it reaches durable
+/// storage only when the **last socket leaves** — and a browser tab left open on a
+/// document is an open room, so "last leave" can be hours away. Until then
+/// `read`/`read_range` serve the last checkpoint and blame carries only the runs
+/// folded in at that point. The live marker tells a reader the bytes may lag,
+/// which is the right primitive, but over a long session "may lag" stops being a
+/// useful statement. And if the worker dies in between — a deploy, an OOM — the
+/// un-checkpointed part of the session is gone from the durable side. On Postgres
+/// the relay table bounds that exposure to its replay window; on SQLite the relay
+/// is off entirely, so the exposure is the whole session (#97).
+///
+/// [`Default`] checkpoints a room 5 seconds after it goes quiet, and at least
+/// every 60 seconds while it stays busy.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckpointPolicy {
+    /// Checkpoint this long after the last edit — bounds how long a finished burst
+    /// of typing sits un-durable. `None` disables the idle trigger.
+    pub idle_after: Option<Duration>,
+    /// Checkpoint at least this often while edits keep arriving — bounds a
+    /// *continuous* session, which the idle timer never would because each
+    /// keystroke resets it. `None` disables the interval trigger.
+    pub max_interval: Option<Duration>,
+    /// How often to look for due rooms. Also the granularity of the two triggers
+    /// above, so there is no point setting it finer than the smaller of them.
+    pub tick: Duration,
+}
+
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self {
+            idle_after: Some(Duration::from_secs(5)),
+            max_interval: Some(Duration::from_secs(60)),
+            tick: Duration::from_secs(1),
+        }
+    }
+}
+
+impl CheckpointPolicy {
+    /// Checkpoint only on last leave — the behaviour before periodic checkpointing
+    /// existed. Every edit between the last checkpoint and a crash is lost from the
+    /// durable side (bounded by the relay's replay window on Postgres, unbounded on
+    /// SQLite), so this is for an embedder that drives `checkpoint_all` itself.
+    pub fn on_last_leave_only() -> Self {
+        Self {
+            idle_after: None,
+            max_interval: None,
+            tick: Duration::from_secs(1),
+        }
+    }
+
+    /// Whether any trigger is armed (otherwise the sweeper is pointless).
+    fn is_armed(&self) -> bool {
+        self.idle_after.is_some() || self.max_interval.is_some()
+    }
+}
+
+/// One registry entry: the room, how many sockets are attached, and the identity
+/// a background checkpoint runs as.
 struct RoomSlot {
     room: Arc<Room>,
     conns: usize,
+    /// The most recent joiner's context. A periodic checkpoint has no connection
+    /// of its own to borrow an identity from, and this is the same one the final
+    /// checkpoint on last leave would have used. It only ever names the op-log
+    /// entry and backstops a span the CRDT left unattributed — every real run
+    /// keeps the author the engine stamped on it when it was typed.
+    ctx: WriteCtx,
 }
 
 /// The room registry backing the WebSocket endpoint. Cheap to clone (a handful of
@@ -86,6 +205,12 @@ pub struct Coordinator {
     relay: bool,
     /// Guards one-time spawn of the relay drain task.
     relay_started: Arc<AtomicBool>,
+    /// When rooms are written back to durable storage (#97).
+    policy: CheckpointPolicy,
+    /// Guards one-time spawn of the checkpoint sweeper.
+    sweeper_started: Arc<AtomicBool>,
+    /// The monotonic origin every room's timestamps are measured against.
+    epoch: Instant,
 }
 
 impl Coordinator {
@@ -104,6 +229,72 @@ impl Coordinator {
             origin: Arc::from(new_origin()),
             relay,
             relay_started: Arc::new(AtomicBool::new(false)),
+            policy: CheckpointPolicy::default(),
+            sweeper_started: Arc::new(AtomicBool::new(false)),
+            epoch: Instant::now(),
+        }
+    }
+
+    /// Use `policy` instead of the default for periodic checkpointing.
+    pub fn with_checkpoint_policy(mut self, policy: CheckpointPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Spawn the checkpoint sweeper once, on the first socket. A no-op when no
+    /// trigger is armed, or after the first call.
+    ///
+    /// Driven here rather than left to the host on purpose: a host has no signal
+    /// about room activity — it cannot see when a document went quiet — so
+    /// "call `checkpoint_all` on a timer" is both more work and strictly worse,
+    /// since it writes idle rooms and misses busy ones.
+    fn ensure_sweeper(&self) {
+        if !self.policy.is_armed() || self.sweeper_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let coord = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(coord.policy.tick);
+            // A checkpoint can outlast a tick on a slow store; skipping the missed
+            // ticks is right — bursting to catch up would pile writes onto a store
+            // already struggling.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                coord.checkpoint_due().await;
+            }
+        });
+    }
+
+    /// Checkpoint every room the policy says is due, leaving them live.
+    ///
+    /// The registry lock is taken only to pick the due rooms and released before
+    /// any I/O, so a checkpoint on a slow store never blocks a join or a leave.
+    /// A room that gets evicted in between is simply checkpointed once more than
+    /// strictly needed — the write is idempotent for unchanged content.
+    async fn checkpoint_due(&self) {
+        let now = elapsed_ms(self.epoch);
+        let due: Vec<(String, Arc<Room>, WriteCtx)> = {
+            let guard = self.rooms.lock().await;
+            guard
+                .iter()
+                .filter(|(_, slot)| slot.room.is_due(&self.policy, now))
+                .map(|(p, slot)| (p.clone(), slot.room.clone(), slot.ctx))
+                .collect()
+        };
+        for (path, room, ctx) in due {
+            // Clear `dirty` *before* the write, so an edit landing during it marks
+            // the room dirty again and gets its own checkpoint. The other order
+            // would swallow that edit until the next one arrived.
+            room.dirty.store(false, Ordering::Relaxed);
+            room.last_checkpoint_ms.store(now, Ordering::Relaxed);
+            let doc = room.doc.lock().await;
+            if self.ws.checkpoint_coedit(ctx, &path, &doc).await.is_err() {
+                // Put it back in the queue rather than waiting for the next edit:
+                // a failed checkpoint means these bytes are still not durable.
+                room.dirty.store(true, Ordering::Relaxed);
+                tracing::warn!(path, "coedit: periodic checkpoint failed");
+            }
         }
     }
 
@@ -129,6 +320,9 @@ impl Coordinator {
         let mut rooms = self.rooms.lock().await;
         if let Some(slot) = rooms.get_mut(path) {
             slot.conns += 1;
+            // The newest joiner is who a background checkpoint runs as, matching
+            // what the final checkpoint on last leave would have used.
+            slot.ctx = ctx;
             return Ok(slot.room.clone());
         }
         let doc = self.ws.open_coedit(ctx, path).await?;
@@ -147,15 +341,23 @@ impl Coordinator {
             }
         }
         let (tx, _) = broadcast::channel(FANOUT_CAPACITY);
+        let now = elapsed_ms(self.epoch);
         let room = Arc::new(Room {
             doc: Mutex::new(doc),
             tx,
+            last_edit_ms: AtomicU64::new(now),
+            // A fresh room counts as just-checkpointed: its content came *from* the
+            // durable blob, so the interval trigger should measure from now rather
+            // than firing immediately on a room nobody has typed into.
+            last_checkpoint_ms: AtomicU64::new(now),
+            dirty: AtomicBool::new(false),
         });
         rooms.insert(
             path.to_string(),
             RoomSlot {
                 room: room.clone(),
                 conns: 1,
+                ctx,
             },
         );
         Ok(room)
@@ -271,16 +473,28 @@ async fn relay_drain(
                     continue;
                 }
             }
+            // Deliberately *not* `touch_edit`: the worker that originated this
+            // edit marked its own room dirty and will checkpoint it. Marking it
+            // here too would have every worker hosting the document write the same
+            // converged content, which is wasted I/O rather than extra safety.
             let _ = room.tx.send((RELAY_ORIGIN, Bytes::from(note.delta)));
         }
     }
 }
 
 /// The `?token=` query for browser WebSocket clients that can't set headers.
+///
+/// Kept working, but no longer the only option for a browser — see
+/// [`authenticate_ws`] for why `Sec-WebSocket-Protocol` is the better one.
 #[derive(Deserialize)]
 pub(crate) struct TokenQuery {
     token: Option<String>,
 }
+
+/// The subprotocol a browser client offers to carry its credential:
+/// `Sec-WebSocket-Protocol: origofs, <token>`. The server echoes back `origofs`
+/// (never the token) as the selected protocol.
+const AUTH_SUBPROTOCOL: &str = "origofs";
 
 /// `GET /coedit/{*path}` — upgrade to a y-sync WebSocket for live co-editing.
 /// Cap on a single inbound y-sync frame.
@@ -310,6 +524,16 @@ pub(crate) async fn coedit_ws(
                 .into_response();
         }
     };
+    // A connection with no session produces edits `revert_session` can never undo
+    // — on the surface that generates *more* edits than any other, since every
+    // keystroke is one. So open a session for the connection when the credential
+    // didn't bind one. One session per connection is the only sensible unit here:
+    // it is exactly the span of "what this person typed in this sitting", which is
+    // what a reviewer wants to undo (#98).
+    let ctx = match session_bound_ctx(&state, &principal).await {
+        Ok(ctx) => ctx,
+        Err(e) => return super::ApiError::OrigoFS(e).into_response(),
+    };
     let path = abspath(&path);
     let coord = state.coedit.clone();
     // `DefaultBodyLimit` does not apply to WebSocket frames, so `ApiOptions::
@@ -320,13 +544,26 @@ pub(crate) async fn coedit_ws(
     upgrade
         .max_message_size(MAX_COEDIT_FRAME)
         .max_frame_size(MAX_COEDIT_FRAME)
-        .on_upgrade(move |socket| serve_socket(coord, principal.write_ctx(), path, socket))
+        // Echo `origofs` back as the selected subprotocol when the client offered
+        // it. A browser fails the handshake if it proposes protocols and the
+        // server names none of them, so the credential-carrying form only works
+        // with this. Only the marker is ever echoed — never the token beside it.
+        .protocols([AUTH_SUBPROTOCOL])
+        .on_upgrade(move |socket| serve_socket(coord, ctx, path, socket))
 }
 
-/// Authenticate a WebSocket upgrade: the real upgrade headers first (programmatic
-/// clients, cookies), then — for browsers that can't set headers — a `?token=`
-/// query param synthesized as a `Bearer` credential and run through the same
-/// [`Authenticator`](super::Authenticator).
+/// Authenticate a WebSocket upgrade, in the order a client should prefer.
+///
+/// 1. **The real upgrade headers** — programmatic clients and same-origin cookies.
+/// 2. **`Sec-WebSocket-Protocol: origofs, <token>`** — the one header a *browser*
+///    can set on an upgrade. This is the recommended browser path.
+/// 3. **`?token=`** — kept working, because it was the documented answer, but it
+///    is the worst place for a credential: URLs land in access logs, proxy logs,
+///    and `Referer`-adjacent tooling by default, while a subprotocol value does
+///    not (#98).
+///
+/// All three synthesize a `Bearer` credential and run through the same
+/// [`Authenticator`](super::Authenticator), so a host writes its auth once.
 async fn authenticate_ws(
     state: &AppState,
     headers: &HeaderMap,
@@ -335,7 +572,17 @@ async fn authenticate_ws(
     if let Some(p) = state.auth.authenticate(headers).await {
         return Some(p);
     }
-    let token = token?;
+    if let Some(t) = subprotocol_token(headers)
+        && let Some(p) = authenticate_token(state, &t).await
+    {
+        return Some(p);
+    }
+    authenticate_token(state, token?).await
+}
+
+/// Run a bare token through the host's [`Authenticator`] by synthesizing the
+/// `Authorization: Bearer …` header it already knows how to read.
+async fn authenticate_token(state: &AppState, token: &str) -> Option<super::Principal> {
     let mut synth = HeaderMap::new();
     synth.insert(
         AUTHORIZATION,
@@ -344,11 +591,47 @@ async fn authenticate_ws(
     state.auth.authenticate(&synth).await
 }
 
+/// The credential offered as a WebSocket subprotocol, i.e. the first entry after
+/// `origofs` in `Sec-WebSocket-Protocol: origofs, <token>`.
+///
+/// Returns `None` unless the list actually leads with our marker, so an unrelated
+/// subprotocol negotiation is never mistaken for a credential.
+fn subprotocol_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("sec-websocket-protocol")?.to_str().ok()?;
+    let mut parts = raw.split(',').map(str::trim).filter(|s| !s.is_empty());
+    if parts.next()? != AUTH_SUBPROTOCOL {
+        return None;
+    }
+    parts.next().map(str::to_string)
+}
+
+/// The [`WriteCtx`] a socket's edits are attributed to, with a session guaranteed.
+///
+/// A credential that binds a session is used as-is — the host has said what unit
+/// of work this is. A bare actor credential gets a fresh session opened for the
+/// connection, because the alternative is edits stamped `(actor, None)`, which
+/// `revert_session` can never undo. That is the feature the op-log exists for,
+/// missing on the surface that produces the most edits (#98).
+async fn session_bound_ctx(
+    state: &AppState,
+    principal: &super::Principal,
+) -> Result<WriteCtx, OrigoFSError> {
+    if let Some(s) = principal.session {
+        return Ok(WriteCtx::session(principal.actor, s));
+    }
+    let session = state
+        .ws
+        .create_session(principal.actor, Some("coedit"))
+        .await?;
+    Ok(WriteCtx::session(principal.actor, session))
+}
+
 /// Drive one connected socket: greet it, then pump y-sync frames both ways —
 /// inbound frames applied to (and attributed in) the shared doc and fanned out to
 /// peers, peers' frames delivered to this socket. Leaves the room on disconnect.
 async fn serve_socket(coord: Coordinator, ctx: WriteCtx, path: String, socket: WebSocket) {
     coord.ensure_relay(); // idempotent; starts the cross-worker drain on first use
+    coord.ensure_sweeper(); // idempotent; starts periodic checkpointing (#97)
     let room = match coord.join(&path, ctx).await {
         Ok(r) => r,
         Err(_) => return, // couldn't open the doc; drop the connection
@@ -385,6 +668,10 @@ async fn serve_socket(coord: Coordinator, ctx: WriteCtx, path: String, socket: W
                             break;
                         }
                         if !out.broadcast.is_empty() {
+                            // A frame worth broadcasting is a frame that changed
+                            // the document, which is exactly what makes the room
+                            // due for a checkpoint.
+                            room.touch_edit(coord.epoch);
                             let frame = Bytes::from(out.broadcast);
                             // Local sockets first (instant), then peer workers.
                             let _ = room.tx.send((conn_id, frame.clone()));

@@ -54,7 +54,7 @@ use tower_http::trace::TraceLayer;
 #[cfg(feature = "coedit")]
 mod coedit;
 #[cfg(feature = "coedit")]
-pub use coedit::Coordinator;
+pub use coedit::{CheckpointPolicy, Coordinator};
 
 /// Install the closure that `GET /metrics` renders (Prometheus text format).
 ///
@@ -234,6 +234,18 @@ pub struct ApiOptions {
     /// connection, so an unbounded accept loop converts a traffic spike into an
     /// out-of-memory kill rather than into latency. `None` disables the limit.
     pub max_concurrent_requests: Option<usize>,
+    /// When live co-editing rooms are written back to durable storage.
+    ///
+    /// A room's CRDT lives in memory; without periodic checkpointing it reaches
+    /// storage only when its last socket leaves, and a browser tab left open on a
+    /// document is an open room. The default checkpoints 5 seconds after a room
+    /// goes quiet and at least every 60 seconds while it stays busy — see
+    /// [`CheckpointPolicy`].
+    ///
+    /// Present only with the `coedit` feature, since without it there are no
+    /// rooms to checkpoint and the type does not exist.
+    #[cfg(feature = "coedit")]
+    pub checkpoint: CheckpointPolicy,
 }
 
 impl Default for ApiOptions {
@@ -244,6 +256,8 @@ impl Default for ApiOptions {
             max_body_bytes: 64 << 20,
             request_timeout: Some(Duration::from_secs(60)),
             max_concurrent_requests: Some(512),
+            #[cfg(feature = "coedit")]
+            checkpoint: CheckpointPolicy::default(),
         }
     }
 }
@@ -259,7 +273,7 @@ pub fn router(ws: Shared, auth: Arc<dyn Authenticator>) -> Router {
 pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions) -> Router {
     let state = AppState {
         #[cfg(feature = "coedit")]
-        coedit: Coordinator::new(ws.clone()),
+        coedit: Coordinator::new(ws.clone()).with_checkpoint_policy(options.checkpoint),
         ws,
         auth,
     };
@@ -542,7 +556,7 @@ fn client_message(e: &crate::OrigoFSError) -> String {
 
 /// An HTTP error: either a mapped [`crate::OrigoFSError`] or an explicit status
 /// (e.g. `401` from the [`Auth`] extractor).
-enum ApiError {
+pub(super) enum ApiError {
     OrigoFS(crate::OrigoFSError),
     Status(StatusCode, String),
 }
@@ -1411,6 +1425,11 @@ async fn checkout(
 struct RevertReq {
     actor: i64,
     session: i64,
+    /// Optional subtree to bound the revert to, matched on directory boundaries
+    /// (`/tenant-a` covers `/tenant-a/notes.txt`, never `/tenant-abc/notes.txt`).
+    /// Omit to revert everywhere the session wrote.
+    #[serde(default)]
+    path_prefix: Option<String>,
 }
 
 /// Undo exactly the lines one actor authored in one session, across every file
@@ -1431,11 +1450,16 @@ async fn revert_session(
 ) -> ApiResult<Json<serde_json::Value>> {
     ws.ensure_may_write(principal.write_ctx(), "revert a session")
         .await?;
-    let files_changed = ws.revert_session(req.actor, req.session).await?;
+    let paths = ws
+        .revert_session(req.actor, req.session, req.path_prefix.as_deref())
+        .await?;
     Ok(Json(json!({
         "actor": req.actor,
         "session": req.session,
-        "files_changed": files_changed,
+        "files_changed": paths.len(),
+        // Which paths, not just how many: a caller that caches per path can now
+        // invalidate exactly what changed instead of dropping everything.
+        "paths": paths,
         "reverted_by": principal.actor,
     })))
 }

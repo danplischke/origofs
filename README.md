@@ -284,7 +284,7 @@ every file the agent touched in that session and removes exactly the lines it
 authored, leaving surrounding human edits in place:
 
 ```rust
-let files_changed = ws.revert_session(agent_id, session_id).await?;
+let changed: Vec<String> = ws.revert_session(agent_id, session_id, None).await?;
 ```
 
 Reachable from every surface:
@@ -294,12 +294,27 @@ origofs revert-session --actor 7 --session 42 --by 1   # --by is checked against
 ```
 
 ```python
-files_changed = await ws.revert_session(agent_id, session_id)
+changed = await ws.revert_session(agent_id, session_id)
 ```
 
 ```http
 POST /v1/revert-session   {"actor": 7, "session": 42}
 ```
+
+It returns the paths it changed, not just a count, so a caller can invalidate
+exactly the caches that went stale. Pass a **path scope** to bound the blast
+radius — what a multi-tenant host needs, since an "undo the agent's work" button
+lives in one tenant's UI while the session it reverts may have written anywhere:
+
+```python
+changed = await ws.revert_session(agent_id, session_id, path_prefix="/tenant-a")
+```
+
+The prefix matches on directory boundaries, so `/tenant-a` covers
+`/tenant-a/notes.txt` and never `/tenant-abc/notes.txt`. Scoping inside the call
+is also what makes it safe: pre-flighting with `edit_ops` and then reverting
+reads the session's reach and acts on it in two steps, so a write landing in
+between is reverted without ever having been checked.
 
 ## Versioning
 
@@ -435,6 +450,20 @@ once (behind a load balancer), a Postgres `LISTEN/NOTIFY` relay fans each update
 out so every worker's replica converges. The co-editing endpoint is served as a
 WebSocket at `GET /coedit/{path}` by both the HTTP API and the FastAPI router.
 
+A browser can't set headers on a WebSocket upgrade, so the credential rides in
+the one header it *can* set — the subprotocol list:
+
+```js
+new WebSocket(`wss://host/v1/coedit/notes.md`, ["origofs", token])
+```
+
+The server echoes back `origofs` (never the token) and authenticates it through
+the same hook as every other route. A `?token=` query param also works and stays
+supported, but a URL is the worst place for a credential — it lands in access and
+proxy logs by default. Each connection is bound to a **session**, opened for it
+if the credential didn't name one, so a sitting's live edits can be undone as a
+unit with `revert_session`.
+
 While a document is open, its stored bytes are the last **checkpoint** — real,
 fully attributed, but possibly behind what people are typing. origofs records that
 as a per-path **live marker**, and the rule is to *surface* the staleness, never to
@@ -445,6 +474,28 @@ let (bytes, live) = ws.read_live("/notes.md").await?;   // never blocks, never f
 if live.is_some() { /* these bytes may lag an open editor */ }
 for doc in ws.live_paths().await? { … }                 // everything open right now
 ```
+
+**How far behind, and for how long.** A room's CRDT lives in the server's memory,
+so the durable bytes are only as fresh as the last checkpoint. By default a room
+is checkpointed **5 seconds after it goes quiet** and **at least every 60 seconds**
+while it stays busy — so the window a crash could lose is bounded by that, not by
+how long someone leaves a tab open. Both triggers are configurable (and can be
+turned off, for an embedder driving checkpoints itself):
+
+```rust
+use origofs_sdk::api::{ApiOptions, CheckpointPolicy};
+let options = ApiOptions {
+    checkpoint: CheckpointPolicy { idle_after: Some(Duration::from_secs(2)), ..Default::default() },
+    ..Default::default()
+};
+```
+
+```python
+build_router(ws, authn=authn, checkpoint=CheckpointPolicy(idle_after=2.0))
+```
+
+The live marker carries `checkpointed_at`, so a UI can show "last saved 3 minutes
+ago" rather than only "this may be stale".
 
 `read` keeps its contract unchanged and always answers; a reader is simply told
 whether the answer may be behind. Nothing forces a checkpoint on a reader's
@@ -633,10 +684,30 @@ the change feed, presence, actors/sessions, and the
 [co-editing](#live-co-editing-crdt) WebSocket at `/coedit/{path}` (long-lived
 rooms are created once per router, not per request).
 
-Every mutating route depends on `authn` and hands its `WriteCtx` straight to the
-workspace — the request body never names an actor, so a client can't forge
-attribution, and a propose-only actor's `PUT` lands in the review queue instead
-of the working tree. Reads are open by default: pass `reader=<dependency>` to
+One workspace can hold many tenants under scoped paths. Pass `root=` — fixed, or
+a dependency resolving it per request — and the router scopes itself:
+
+```python
+app.include_router(build_router(ws, authn=authn, root="/tenants/acme"))
+```
+
+A caller then asks for `/files/notes.md` and gets `/tenants/acme/notes.md`; there
+is no representable request for another tenant's file, because the root is
+prepended rather than compared against. Listing routes (`/status`, `/diff`,
+`/events`, `/presence`, `/suggestions`) are filtered to the root, and the
+id-addressed suggestion routes answer `404` outside it — `404`, not `403`, so a
+caller can't probe which ids exist. Operations no filter can narrow — commit,
+branches, checkout, and the commit log — are refused with `403`; mount an
+unscoped router for the operator surface that needs them.
+
+Every mutating route depends on `authn` and hands its `WriteCtx` straight to an
+**attributed** workspace call — the request body never names an actor, so a
+client can't forge attribution, and the caller's write policy is enforced by the
+engine rather than route by route. A propose-only actor's `PUT` or `DELETE`
+lands in the review queue instead of the working tree; rename, mkdir, commit,
+branch, checkout and registering actors are refused with `403`. Namespace
+mutations carry an actor too, so "who deleted this file" has an answer.
+Reads are open by default: pass `reader=<dependency>` to
 gate them, or `dependencies=[…]` (forwarded to `APIRouter`, along with `tags`
 and the rest) to gate everything. `GET /files/{path}` streams rather than
 buffering a whole file, and honors a single-range `Range` header (`206`/`416`),

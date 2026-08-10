@@ -1256,10 +1256,23 @@ impl Workspace {
         self.fs.edit_ops(actor_id, session_id).await
     }
 
-    /// Revert every line an actor wrote in a session. Returns files changed.
+    /// Revert every line an actor wrote in a session. Returns the changed paths.
+    ///
+    /// `path_prefix` bounds the revert to one subtree, matched on directory
+    /// boundaries — what a multi-tenant host needs so an "undo the agent's work"
+    /// button can't reach outside the tenant that offered it (#94). `None`
+    /// reverts everywhere the session wrote. Returning the paths rather than a
+    /// count also lets a caller invalidate exactly the caches that went stale.
     #[tracing::instrument(skip_all, fields(actor = actor_id, session = session_id))]
-    pub async fn revert_session(&self, actor_id: i64, session_id: i64) -> Result<usize> {
-        self.fs.revert_session(actor_id, session_id).await
+    pub async fn revert_session(
+        &self,
+        actor_id: i64,
+        session_id: i64,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<String>> {
+        self.fs
+            .revert_session(actor_id, session_id, path_prefix)
+            .await
     }
 
     // --- live collaboration ----------------------------------------------

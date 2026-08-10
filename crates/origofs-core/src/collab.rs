@@ -86,8 +86,17 @@ pub struct LiveDoc {
     /// content address differs, somebody wrote around the live document, and the
     /// next checkpoint reconciles instead of clobbering.
     pub content_hash: Option<String>,
-    /// When the path first became live.
+    /// When the path first became live. Does not move while it stays live — for
+    /// "how stale might these bytes be", read [`checkpointed_at`](Self::checkpointed_at).
     pub since: i64,
+    /// When the durable bytes were last crystallized, or `None` if this document
+    /// has been open but never checkpointed.
+    ///
+    /// [`since`](Self::since) says how long the path has been live, which is not
+    /// the same question. This is the one a reader actually has: the durable blob
+    /// is exactly as old as this, so a UI can say "last saved 3 minutes ago"
+    /// instead of only "this may be stale" (#97).
+    pub checkpointed_at: Option<i64>,
 }
 
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
@@ -131,18 +140,41 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Mark `path` as having an open live CRDT document, recording the file's
     /// current content address as the coherence marker. Called by
-    /// [`open_coedit`](Self::open_coedit) and refreshed by
-    /// [`checkpoint_coedit`](Self::checkpoint_coedit); cleared by
+    /// [`open_coedit`](Self::open_coedit); cleared by
     /// [`end_coedit`](Self::end_coedit).
     pub async fn mark_live(&self, ctx: crate::attribution::WriteCtx, path: &str) -> Result<()> {
+        self.set_live_marker(ctx, path, false).await
+    }
+
+    /// [`mark_live`](Self::mark_live), but also stamping *now* as the moment the
+    /// durable bytes were crystallized. Called by
+    /// [`checkpoint_coedit`](Self::checkpoint_coedit), and only from there — a
+    /// checkpoint stamp that any re-mark could set would be a lie the moment a
+    /// second editor joined.
+    pub async fn mark_checkpointed(
+        &self,
+        ctx: crate::attribution::WriteCtx,
+        path: &str,
+    ) -> Result<()> {
+        self.set_live_marker(ctx, path, true).await
+    }
+
+    async fn set_live_marker(
+        &self,
+        ctx: crate::attribution::WriteCtx,
+        path: &str,
+        checkpointed: bool,
+    ) -> Result<()> {
         let content = self.current_content_hex(path).await?;
+        let now = self.now_secs();
         self.meta
             .set_live_doc(
                 path,
                 ctx.session,
                 ctx.actor,
                 content.as_deref(),
-                self.now_secs(),
+                now,
+                checkpointed.then_some(now),
             )
             .await
     }

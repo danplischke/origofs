@@ -41,12 +41,24 @@ async def header_authn(
 # --- fake workspace ---------------------------------------------------------
 
 class FakeWs:
-    """Minimal async stand-in recording how the router calls it."""
+    """Minimal async stand-in recording how the router calls it.
+
+    Only the *attributed* methods are defined. That is deliberate: a router that
+    reaches for an unattributed engine op (``remove``, ``mkdir_p``, ``rename``,
+    ``commit``) hits an ``AttributeError`` here rather than quietly succeeding,
+    so the fake itself is part of the guard described in
+    ``test_every_mutating_route_passes_its_principal_to_an_attributed_call``.
+    """
 
     def __init__(self):
         self.files = {}
         self.writes = []          # (ctx, path, data)
         self.accepts = []         # (sid, ctx)
+        self.removes = []         # (ctx, path)
+        self.mkdirs = []          # (ctx, path)
+        self.renames = []         # (ctx, from, to)
+        self.commits = []         # (ctx, author, message)
+        self.sessions = []        # (actor_id, client)
 
     async def read(self, path):
         if path not in self.files:
@@ -63,8 +75,8 @@ class FakeWs:
             raise FileNotFoundError(path)
         return self.files[path][off : off + length]
 
-    async def mkdir_p(self, path):
-        pass
+    async def mkdir_as(self, ctx, path):
+        self.mkdirs.append((ctx, path))
 
     async def write_as(self, ctx, path, data):
         self.writes.append((ctx, path, data))
@@ -77,8 +89,34 @@ class FakeWs:
         self.files[path] = data
         return SimpleNamespace(wrote=True, suggestion_id=None)
 
-    async def remove(self, path):
+    async def remove_or_propose(self, ctx, path, summary=None):
+        self.removes.append((ctx, path))
         self.files.pop(path, None)
+        return SimpleNamespace(wrote=True, suggestion_id=None)
+
+    async def rename_as(self, ctx, from_, to):
+        self.renames.append((ctx, from_, to))
+        self.files[to] = self.files.pop(from_, b"")
+
+    async def commit_as(self, ctx, author, message):
+        self.commits.append((ctx, author, message))
+        return "0" * 64
+
+    async def create_branch_as(self, ctx, name):
+        pass
+
+    async def checkout_as(self, ctx, name):
+        pass
+
+    async def create_human(self, name, model):
+        return 1
+
+    async def create_agent(self, name, model, controller):
+        return 2
+
+    async def create_session(self, actor_id, client):
+        self.sessions.append((actor_id, client))
+        return 100 + actor_id
 
     async def ls(self, path):
         return [{"name": k.lstrip("/")} for k in self.files]
@@ -425,8 +463,11 @@ def test_create_actor_and_session_via_router():
     assert r.status_code == 200, r.text
     assert r.json()["id"] != new_id
 
-    r = c.post("/sessions", json={"actor": new_id, "client": "web"}, headers=hdr)
+    # A session belongs to whoever the credential resolves to, so the new actor
+    # mints its own with its own credential -- dan cannot mint one on its behalf.
+    r = c.post("/sessions", json={"client": "web"}, headers={"X-Actor-Id": str(new_id)})
     assert r.status_code == 200, r.text
+    assert r.json()["actor"] == new_id
     new_sid = r.json()["id"]
 
     # the freshly-minted actor/session pair is immediately usable
@@ -462,7 +503,7 @@ def test_actor_and_session_routes_require_auth():
     # for new users), not anonymous self-registration.
     c = _client(FakeWs())
     assert c.post("/actors", json={"name": "x"}).status_code == 401
-    assert c.post("/sessions", json={"actor": 1}).status_code == 401
+    assert c.post("/sessions", json={}).status_code == 401
 
 
 def test_suggest_delete_via_router():
@@ -558,6 +599,262 @@ def test_propose_only_actor_write_is_queued_via_router():
     assert c.get("/files/notes.txt").content == b"proposed"
     bl = c.get("/blame/notes.txt").json()
     assert bl and bl[0]["actor"]["id"] == author
+
+
+# --- the write policy reaches this surface too (issue #99) -------------------
+#
+# The router used to authenticate every mutating route and then throw the
+# principal away, calling the *unattributed* engine ops (`remove`, `mkdir_p`,
+# `rename`, `commit`). Those take no WriteCtx, so they skip `ensure_may_write`
+# and record no edit_op: a propose-only actor could not overwrite a file through
+# `PUT`, but could delete it and commit the deletion — the exact hop issue #78
+# closed on the Rust surfaces, still open on this one.
+
+
+def test_delete_is_attributed_and_policy_governed():
+    ws = FakeWs()
+    ws.files["/x.txt"] = b"bye"
+    c = _client(ws)
+    r = c.delete("/files/x.txt", headers={"X-Actor-Id": "42", "X-Session-Id": "9"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"removed": "/x.txt"}
+    ctx, path = ws.removes[-1]
+    assert ctx.actor_id == 42 and ctx.session_id == 9 and path == "/x.txt"
+
+
+def test_mkdir_rename_and_commit_are_attributed():
+    ws = FakeWs()
+    ws.files["/a.txt"] = b"data"
+    c = _client(ws)
+    hdr = {"X-Actor-Id": "42", "X-Session-Id": "9"}
+
+    assert c.post("/dirs/docs", headers=hdr).status_code == 200
+    assert c.post("/rename", json={"from": "/a.txt", "to": "/b.txt"}, headers=hdr).status_code == 200
+    assert c.post("/commit", json={"message": "m", "author": "dan"}, headers=hdr).status_code == 200
+
+    assert ws.mkdirs[-1][0].actor_id == 42
+    assert ws.renames[-1][0].actor_id == 42
+    ctx, author, message = ws.commits[-1]
+    # The git-level author string still rides the body; the *identity* the policy
+    # gate and the audit log see comes from the credential.
+    assert ctx.actor_id == 42 and author == "dan" and message == "m"
+
+
+def test_a_policy_refusal_maps_403_not_409():
+    # PermissionError is a subclass of OSError, which the router maps to 409 for
+    # a non-empty directory. A write-policy refusal is an authorization outcome
+    # and has to sort ahead of that arm.
+    class Denying(FakeWs):
+        async def mkdir_as(self, ctx, path):
+            raise PermissionError("actor 42 is propose-only and may not create a directory")
+
+    c = _client(Denying())
+    r = c.post("/dirs/docs", headers={"X-Actor-Id": "42"})
+    assert r.status_code == 403, r.text
+    assert "propose-only" in r.json()["detail"]
+
+
+def test_a_session_belongs_to_the_authenticated_actor():
+    # The body carries no actor. It used to, which let an authenticated caller
+    # mint a session belonging to somebody else.
+    ws = FakeWs()
+    c = _client(ws)
+    r = c.post("/sessions", json={"actor": 999, "client": "web"}, headers={"X-Actor-Id": "42"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"id": 142, "actor": 42}
+    assert ws.sessions[-1] == (42, "web")
+
+
+def test_a_queued_write_creates_no_directories():
+    # Parity with `tests/mcp.rs::a_queued_write_creates_no_directories`: parents
+    # are created only once the policy decision is known, so a proposal leaves
+    # the working tree untouched.
+    class Proposing(FakeWs):
+        async def ensure_may_write(self, ctx, what):
+            raise PermissionError("propose-only")
+
+        async def write_or_propose(self, ctx, path, data, summary=None):
+            return SimpleNamespace(wrote=False, suggestion_id=7)
+
+    ws = Proposing()
+    c = _client(ws)
+    r = c.put("/files/deep/nested/note.txt", content=b"hi", headers={"X-Actor-Id": "42"})
+    assert r.status_code == 200, r.text
+    assert r.json()["proposed"] == 7
+    assert ws.mkdirs == [], ws.mkdirs
+
+
+def test_every_mutating_route_passes_its_principal_to_an_attributed_call():
+    """Every mutating route is accounted for, and none of them throws its
+    identity away.
+
+    The Python counterpart of
+    ``origofs-sdk/tests/api_write_policy.rs::every_mutating_route_binds_its_principal``.
+    It parses the router source, pairs each ``POST``/``PUT``/``DELETE``
+    registration with its handler, and requires that handler to *bind* the
+    principal (``ctx: Any = Depends(authn)``) and actually *use* it — rather than
+    discard it as ``_ctx`` and call an unattributed engine method.
+
+    Discarding it is the precise shape of the bug: authentication passes, the
+    actor is dropped, and the call skips ``ensure_may_write`` and records no
+    ``edit_op``. A route that genuinely needs no actor must be named in
+    ``NO_ACTOR_NEEDED`` with a reason, which is the moment to notice whether that
+    is actually true.
+    """
+    import ast
+    import inspect
+    from origofs import fastapi as router_mod
+
+    # Empty today. An entry here claims the operation mutates nothing an actor
+    # could be blamed for.
+    NO_ACTOR_NEEDED: set[str] = set()
+
+    tree = ast.parse(inspect.getsource(router_mod))
+    build = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "build_router"
+    )
+
+    def mutating(fn):
+        """The route methods this handler is registered under, if any."""
+        verbs = set()
+        for dec in fn.decorator_list:
+            # @router.post("/x") -> Call(func=Attribute(attr='post'))
+            if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute):
+                if dec.func.attr in {"post", "put", "delete"}:
+                    verbs.add(dec.func.attr)
+        return verbs
+
+    handlers = [
+        n for n in build.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and mutating(n)
+    ]
+    assert len(handlers) >= 10, (
+        f"route scan found only {len(handlers)} mutating handlers — the scan is "
+        f"broken, not the router: {[h.name for h in handlers]}"
+    )
+
+    offenders = []
+    for fn in handlers:
+        if fn.name in NO_ACTOR_NEEDED:
+            continue
+        args = fn.args
+        # The principal is whichever parameter defaults to `Depends(authn)`.
+        bound = None
+        defaults = dict(zip([a.arg for a in args.args][-len(args.defaults):] if args.defaults else [],
+                            args.defaults))
+        defaults.update({
+            a.arg: d for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is not None
+        })
+        for name, default in defaults.items():
+            if (
+                isinstance(default, ast.Call)
+                and getattr(default.func, "id", None) == "Depends"
+                and default.args
+                and getattr(default.args[0], "id", None) == "authn"
+            ):
+                bound = name
+        if bound is None:
+            offenders.append(f"{fn.name}: does not depend on authn at all")
+            continue
+        if bound.startswith("_"):
+            offenders.append(f"{fn.name}: binds the principal as `{bound}` (discarded)")
+            continue
+        used = any(
+            isinstance(n, ast.Name) and n.id == bound for n in ast.walk(ast.Module(fn.body, []))
+        )
+        if not used:
+            offenders.append(f"{fn.name}: binds `{bound}` but never passes it on")
+
+    assert not offenders, (
+        "these mutating routes do not pass their authenticated principal to an "
+        "attributed workspace call, so they cannot be attributed or policy-gated:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nBind `ctx: Any = Depends(authn)` and call the `*_as` variant, or add "
+          "the route to NO_ACTOR_NEEDED with a reason."
+    )
+
+
+# --- acceptance criteria, against a real workspace ---------------------------
+
+
+def test_propose_only_actor_is_refused_every_direct_mutation_via_router():
+    d = tempfile.mkdtemp()
+
+    async def _setup():
+        ws = await origofs.Workspace.open_local(
+            os.path.join(d, "meta.db"), os.path.join(d, "cas")
+        )
+        reviewer = await ws.create_human("dan", None)
+        reviewer_s = await ws.create_session(reviewer, "web")
+        agent = await ws.create_agent("restricted", "opus", reviewer)
+        agent_s = await ws.create_session(agent, "mcp")
+        await ws.write("/doomed.txt", b"original")
+        await ws.write("/movable.txt", b"original")
+        await ws.commit("setup", "base")
+        await ws.create_branch("side")
+        await ws.set_write_policy(agent, "propose")
+        return ws, agent, agent_s, reviewer, reviewer_s
+
+    ws, agent, agent_s, reviewer, reviewer_s = asyncio.run(_setup())
+    c = _client(ws)
+    hdr = {"X-Actor-Id": str(agent), "X-Session-Id": str(agent_s)}
+
+    # A delete has a propose-shaped equivalent, so it is *queued*, not refused —
+    # and the file is still there.
+    r = c.delete("/files/doomed.txt", headers=hdr)
+    assert r.status_code == 200, r.text
+    sid = r.json()["proposed"]
+    assert sid is not None
+    assert c.get("/files/doomed.txt").content == b"original"
+
+    # The rest have no propose-shaped equivalent, so they are refused outright.
+    assert c.post("/rename", json={"from": "/movable.txt", "to": "/moved.txt"},
+                  headers=hdr).status_code == 403
+    assert c.post("/dirs/newdir", headers=hdr).status_code == 403
+    assert c.post("/commit", json={"message": "sneaky", "author": "x"},
+                  headers=hdr).status_code == 403
+    assert c.post("/branches", json={"name": "sneaky"}, headers=hdr).status_code == 403
+    assert c.post("/checkout", json={"name": "side"}, headers=hdr).status_code == 403
+    assert c.post("/actors", json={"name": "puppet"}, headers=hdr).status_code == 403
+
+    # Nothing landed.
+    assert c.get("/files/movable.txt").status_code == 200
+    assert c.get("/files/moved.txt").status_code == 404
+
+    # A direct actor accepts the queued deletion: it applies, and the audit trail
+    # credits the actor that asked for it.
+    rhdr = {"X-Actor-Id": str(reviewer), "X-Session-Id": str(reviewer_s)}
+    assert c.post(f"/suggestions/{sid}/accept", headers=rhdr).status_code == 200
+    assert c.get("/files/doomed.txt").status_code == 404
+
+
+def test_a_direct_actor_still_performs_all_of_them():
+    # The mirror image: the gate refuses a propose-only actor without getting in
+    # a normal one's way.
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    assert c.put("/files/a.txt", content=b"v1", headers=hdr).status_code == 200
+    assert c.post("/dirs/docs", headers=hdr).status_code == 200
+    assert c.post("/rename", json={"from": "/a.txt", "to": "/b.txt"}, headers=hdr).status_code == 200
+    assert c.post("/commit", json={"message": "work", "author": "dan"}, headers=hdr).status_code == 200
+    assert c.post("/branches", json={"name": "feature"}, headers=hdr).status_code == 200
+    assert c.post("/checkout", json={"name": "feature"}, headers=hdr).status_code == 200
+    assert c.delete("/files/b.txt", headers=hdr).json() == {"removed": "/b.txt"}
+    assert c.post("/actors", json={"name": "colleague"}, headers=hdr).status_code == 200
+
+
+def test_namespace_mutations_through_the_router_carry_an_actor():
+    # "Who deleted this file" had no answer on this surface: remove/rename/mkdir
+    # took no WriteCtx, so they recorded no edit_op.
+    c, ws, dan, sess, hdr = _real_client_with_actor()
+    c.put("/files/gone.txt", content=b"x", headers=hdr)
+    assert c.delete("/files/gone.txt", headers=hdr).status_code == 200
+
+    async def _ops():
+        return await ws.edit_ops(dan, sess)
+
+    ops = asyncio.run(_ops())
+    assert any(op["path"] == "/gone.txt" for op in ops), ops
 
 
 def _run_all():

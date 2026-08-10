@@ -171,6 +171,24 @@ about honest data going out. All three now return `TooLarge`.
   so an imported `rm -rf` recorded nothing about who ran it.
 - `origofs write --actor` used the policy-exempt `write_as`, so
   `origofs policy <actor> propose` had no effect on the CLI's own write command.
+- **`origofs.fastapi` was the third surface, and no one had audited it.** Every
+  mutating route authenticated the caller and then discarded the principal —
+  the handlers named it `_ctx` — calling the unattributed engine ops. Those skip
+  `ensure_may_write` and record no `edit_op`, so a propose-only actor could not
+  overwrite a file through `PUT` but could delete it and commit the deletion.
+  `DELETE`, `POST /dirs`, `/rename`, `/commit`, `/branches`, `/checkout` and
+  `/actors` now call the attributed variants: a propose-only delete is queued for
+  review, the rest are refused, and namespace mutations carry an actor.
+- The router mapped a policy refusal to `409`. `PermissionError` subclasses
+  `OSError`, which it maps to conflict for a non-empty directory; an
+  authorization outcome is `403`, and `409` already carries stale-base semantics
+  for suggestion accepts.
+- The router's `POST /sessions` read its actor from the request body, the same
+  break the Rust surface had two bullets above.
+- Both anti-regression guards now cover Python: a structural test that parses the
+  router and fails on a handler that binds its principal and drops it, and a fake
+  workspace defining only the attributed methods, so an unattributed call is an
+  `AttributeError` rather than a silent success.
 
 ### Fixed — security posture
 
@@ -206,6 +224,100 @@ about honest data going out. All three now return `TooLarge`.
   builtin exception rather than flattening everything to `OSError`, and is no
   longer `#[cfg(unix)]` — the streaming bindings touch the filesystem on every
   platform.
+- **Python wheels are built and published on tag** (`.github/workflows/release.yml`).
+  origofs was published nowhere, so every consumer built the extension: container
+  builds carried a Rust toolchain in a dedicated maturin stage, `uv sync` could
+  not install origofs at all — so a host had to import it lazily and degrade
+  everywhere — and pinning meant a commit SHA. abi3-py39, so one wheel per
+  platform covers CPython 3.9+: manylinux x86_64/aarch64, macOS arm64/x86_64,
+  Windows x64, plus an sdist. Each leg smoke-tests its own wheel by writing
+  attributed bytes and reading blame back. Tagged builds attach everything to the
+  GitHub Release; PyPI publishing uses Trusted Publishing and is off until the
+  `PUBLISH_TO_PYPI` repository variable is set.
+- PyPI-facing package metadata: the README as the long description, project URLs,
+  and classifiers.
+- **`revert_session` takes a `path_prefix`, and returns the paths it changed**
+  rather than a count. In a multi-tenant workspace — one workspace, tenant-scoped
+  paths — an "undo this agent's work" button lives in *one* tenant's UI, but the
+  session it reverts may have written anywhere, and an unscoped revert followed
+  it there silently. The prefix matches on directory boundaries, so `/tenant-a`
+  covers `/tenant-a/notes.txt` and never `/tenant-abc/notes.txt`. Filtering
+  inside the call is the point: the documented workaround — pre-flight with
+  `edit_ops`, check the paths, then revert — reads the session's reach and acts
+  on it in two calls, so a write landing in between is reverted without ever
+  having been checked. Across the engine, SDK, HTTP API (`path_prefix` in the
+  body, `paths` in the response), CLI (`--path-prefix`), and Python.
+- `POST /v1/revert-session` had no test at all, on a route that deletes other
+  people's work. It has three now.
+- **A co-editing credential can ride `Sec-WebSocket-Protocol`** —
+  `new WebSocket(url, ["origofs", token])`, the one header a browser can set on
+  an upgrade — on both the Rust HTTP API and the FastAPI router. The server
+  echoes back only the `origofs` marker, which the handshake requires and which
+  a client that offered no subprotocol must not receive. `?token=` was the
+  documented answer and keeps working, but a URL is the worst place for a
+  credential: it lands in access logs, proxy logs and `Referer`-adjacent tooling
+  by default, where a subprotocol value does not.
+- **`origofs.fastapi.build_router` takes a `root=`, so a multi-tenant host can
+  actually use it** (#93). A host putting many tenants in one workspace could
+  authorise the path-carrying routes — its dependency reads
+  `request.path_params["path"]` — but had nothing to authorise the
+  workspace-global ones against: `/log`, `/status`, `/diff`, `/events`,
+  `/presence`, `/branches`, `/suggestions`, and the id-addressed suggestion
+  routes, where a workspace-global id was itself enough to read, accept or reject
+  somebody else's proposal. The only safe move was to refuse all of them and
+  re-implement blame and suggestion review in front of the SDK.
+
+  `root` is a fixed path (mount one router per tenant) or a dependency resolving
+  one from the request (one router that scopes itself). Every caller-supplied
+  path resolves *under* it, so there is no representable request for another
+  tenant's file; listing routes are filtered to it; and the id-addressed
+  suggestion routes answer `404` outside it — `404` rather than `403` so a caller
+  cannot walk the id space to learn what other tenants have open. Operations no
+  filter can narrow — commit, branches, checkout, and the commit log, a shared
+  history whose messages and authors belong to everybody — are refused with
+  `403`. Actors and sessions stay workspace-wide, because identity is store-wide
+  in origofs by design and a tenant-scoped actor would be a fiction. Without
+  `root` nothing changes.
+
+  **The Rust HTTP API has the same workspace-global routes and the same gap.**
+  This fixes the surface the issue was filed against; the shape is unsolved
+  there.
+- **Live co-editing rooms are checkpointed on a cadence, not only on last
+  leave.** A room's CRDT lives in process memory, and its only path to durable
+  storage was the last socket disconnecting — but a browser tab left open on a
+  document *is* an open room, so that could be hours. Until then `read` served
+  the last checkpoint and blame carried only the runs folded in at that point,
+  and a worker dying in between lost the rest of the session from the durable
+  side (bounded by the relay's replay window on Postgres, unbounded on SQLite,
+  where the relay is off). A new `CheckpointPolicy` — on `ApiOptions` in Rust and
+  `build_router(checkpoint=…)` in Python — checkpoints a room 5 seconds after it
+  goes quiet and at least every 60 seconds while it stays busy. Two triggers
+  because they answer different questions: idle bounds a *finished* burst of
+  typing, interval bounds a *continuous* session, which idle alone never would
+  since every keystroke resets it. Driven inside the SDK rather than left to each
+  host, which has no signal about room activity — "call `checkpoint_all` on a
+  timer" writes idle rooms and misses busy ones. Disable both triggers for the
+  previous behaviour.
+- **`live_doc` reports `checkpointed_at`** (schema V16), so a reader learns not
+  just *that* the bytes may lag an open editor but by how much — "last saved 3
+  minutes ago" instead of "this may be stale". Distinct from `since`, which is
+  when the path first went live and deliberately never moves; `None` for a path
+  that is live but has never been checkpointed.
+- **A co-editing connection is bound to a session**, opened for it when the
+  credential names only an actor. Such a connection stamped its edits
+  `(actor, session=None)`, which `revert_session` can never undo — the feature
+  the op-log exists for, missing on the surface that produces the most edits,
+  since every keystroke is one. One session per connection is the natural unit:
+  exactly what one person typed in one sitting.
+- **The Python stubs type what they return.** 31 methods returned
+  `dict[str, Any]`/`list[dict[str, Any]]`, with the keys described only in a
+  neighbouring comment — so a caller had to guess whether `span["actor"]` was an
+  id or an inline record (it is a record), and whether a timestamp was
+  `created_at` or `created_ts` (both exist, on different records). 24 `TypedDict`s
+  now describe every record, with `Literal` unions for the closed string sets.
+  A runtime test drives a real workspace and compares each record's keys to its
+  declaration, so the stub cannot drift from the extension the way a comment
+  can — and a new record must be exercised or explicitly excused.
 
 ### Changed
 
@@ -223,6 +335,16 @@ about honest data going out. All three now return `TooLarge`.
   deliberately left exhaustive — see the note above each.
 - Added `LICENSE-MIT` and `LICENSE-APACHE`. Every crate declared
   `MIT OR Apache-2.0` but neither text was in the tree.
+- **FUSE is Linux-only in the Python extension**, narrower than the SDK's own
+  `cfg(unix)` reach. It was `cfg(unix)`, which made a macOS wheel unbuildable:
+  `fuser`'s build script unconditionally probes pkg-config for macFUSE there, and
+  a kernel extension is not something a wheel can carry — the same reason the
+  `macos` CI job already excludes FUSE. macOS keeps `serve_nfs`, the mount path
+  `docs/DESIGN.md` specifies for it, and `Workspace.mount()` raises a clear error
+  as it already did on Windows. Linux is untouched: `fuser`'s `libfuse` feature is
+  off by default, so it takes the pure-Rust mount path and needs no system
+  library. Building from source on a Mac with macFUSE installed still works by
+  enabling the `fuse` feature and the `fuser` dependency by hand.
 
 ### Performance
 

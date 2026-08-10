@@ -643,7 +643,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // `open_coedit`'s job — so a one-off checkpoint by a Rust caller holding a
         // `CoeditDoc` leaves no marker behind for a reader to trip over.
         if self.meta.get_live_doc(path).await?.is_some() {
-            self.mark_live(ctx, path).await?;
+            // `mark_checkpointed`, not `mark_live`: this is the one call site that
+            // has actually crystallized the bytes, so it is the only one entitled
+            // to stamp `checkpointed_at` (#97).
+            self.mark_checkpointed(ctx, path).await?;
         }
         Ok(())
     }
