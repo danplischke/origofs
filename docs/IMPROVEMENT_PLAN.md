@@ -28,11 +28,11 @@ Nine issues are open. The picture they paint is out of date in both directions:
 | #78 | WritePolicy per-call-site, fails open | **Done on Rust surfaces** — closed as completed |
 | #99 | Python router bypasses the write policy | Filed off the P0 finding below |
 | #75 | Remaining open work, consolidated | **11 of 12 shipped** — rewritten to its 2 real items |
-| #96 | abi3 wheels to PyPI | Open. No release workflow, no tags |
-| #95 | TypedDict stubs | Open. 31 `dict[str, Any]` in `__init__.pyi`, 0 `TypedDict` |
-| #94 | `revert_session` path scope | Open. Signature is `(actor_id, session_id)` at all four layers |
-| #93 | fastapi multi-tenant authorisation | Open. 14 workspace-global routes |
-| #98 | Co-edit WS credential + session | Open. `?token=` only; no subprotocol, no per-connection session |
+| #96 | abi3 wheels to PyPI | **Done** — `release.yml`; PyPI publish awaits setup |
+| #95 | TypedDict stubs | **Done** — 24 `TypedDict`s + a runtime parity test |
+| #94 | `revert_session` path scope | **Done** — `path_prefix` at all four layers |
+| #93 | fastapi multi-tenant authorisation | Open. 14 workspace-global routes (the `409`→`403` half is done) |
+| #98 | Co-edit WS credential + session | **Done** — subprotocol auth + session per connection |
 | #97 | Co-edit interval checkpointing | Open. `_Rooms.leave` is the only checkpoint |
 | #92 | Structured (XmlFragment) co-edit doc | Open. `coedit.rs:75` is a single flat `TextRef` |
 
@@ -248,13 +248,23 @@ integrator.
 ## Suggested order
 
 ```
-P0  Python router write-policy bypass + 403 (#99)  ← correctness, do first
-P1  PyPI wheels + tag + changelog                ← unblocks all Python adoption
-P2  TypedDict stubs · revert_session scope · WS session
-P3  Interval checkpointing · subprotocol auth
-P4  Multi-tenant authorisation (hooks, then root)
-P5  Structured co-editing (design first)
+P0  Python router write-policy bypass + 403 (#99)  ← DONE
+P1  PyPI wheels + changelog (#96)                  ← DONE (tag + PyPI setup left to the owner)
+P2  TypedDict stubs (#95) · revert_session scope (#94) · WS session (#98)  ← DONE
+P3  Interval checkpointing (#97)                   ← next
+P4  Multi-tenant authorisation (#93)
+P5  Structured co-editing (#92)
 ```
+
+**Where P1 stands.** The workflow is in place and every leg builds; what remains
+is not code. Tag `v0.1.0` to cut the first release (wheels attach to it with no
+account setup), and — to publish to PyPI — register the trusted publisher, create
+the `pypi` environment, and set the `PUBLISH_TO_PYPI` repository variable. Those
+are the owner's to do.
+
+**#98's subprotocol half shipped early**, with the session half, since both are
+about the `WriteCtx` a socket carries and touching that file twice made no sense.
+P3 is therefore just #97's interval checkpointing.
 
 P0 and P1 are independent and can run in parallel. Everything in P2 is
 independent of everything else. P4 is worth doing before P5, because a host that
