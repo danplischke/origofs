@@ -585,14 +585,28 @@ method is a coroutine, so it drops straight into `async def` handlers, and
 structured results come back as plain JSON-serializable `dict`/`list`.
 
 ```bash
+pip install origofs
+```
+
+Wheels are **abi3**, so one per platform covers CPython ≥ 3.9 — no Rust toolchain
+at install time. They're built for manylinux (x86_64/aarch64), macOS
+(arm64/x86_64) and Windows x64, and attached to every
+[release](https://github.com/danplischke/origofs/releases) as well as published
+to PyPI. The integrations below ship as extras: `fastapi`, `fsspec`, `upath`,
+`llamaindex`, `markitdown`, `db`.
+
+To build it yourself instead — a platform without a wheel, or working on the
+bindings:
+
+```bash
 cd crates/origofs-py
 python -m venv .venv && . .venv/bin/activate
 pip install maturin && maturin develop     # builds the extension + installs `origofs`
 ```
 
-Wheels are abi3 (`maturin build --release` — one wheel works on CPython ≥ 3.9).
-The integrations below ship as extras: `fastapi`, `fsspec`, `upath`,
-`llamaindex`, `markitdown`, `db`.
+`Workspace.mount()` (FUSE) is Linux-only in the published wheel: `fuser` needs
+macFUSE on macOS, which is a kernel extension a wheel cannot carry. macOS mounts
+over NFSv3 with `serve_nfs` instead.
 
 ```python
 import origofs

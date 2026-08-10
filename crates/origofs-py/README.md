@@ -7,7 +7,18 @@ and orchestrate FUSE/NFS mounts.
 Every I/O method returns an **awaitable**, so it drops straight into `async def`
 handlers. Structured results come back as plain `dict`/`list` (JSON-serializable).
 
-## Build
+## Install
+
+```bash
+pip install origofs
+```
+
+abi3 wheels, so one per platform covers CPython ≥ 3.9 and no Rust toolchain is
+needed at install time.
+
+## Build from source
+
+For a platform without a wheel, or to work on the bindings:
 
 ```bash
 cd crates/origofs-py

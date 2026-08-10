@@ -7,6 +7,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] — 2026-08-10
+
+The first tagged release, and the first one you can install rather than build:
+`origofs` now ships as abi3 wheels (see *Added* below). Everything that follows
+was previously reachable only by cloning at a commit SHA.
+
 ### Added — object storage
 
 - **`S3Config` accepts a `session_token`.** The S3 builder set only the access
@@ -358,7 +366,8 @@ about honest data going out. All three now return `TooLarge`.
 
 ## Stability
 
-origofs is pre-1.0 and **not yet published to crates.io**. Until 1.0:
+origofs is pre-1.0. The Python package is published to PyPI as `origofs`; the
+Rust crates are **not yet on crates.io**. Until 1.0:
 
 - **Minor versions (`0.x`) may break API compatibility.** Breaking changes are
   listed under `### Changed` with the reason and the migration.
@@ -374,3 +383,6 @@ origofs is pre-1.0 and **not yet published to crates.io**. Until 1.0:
 The `#[non_exhaustive]` markings above exist so that the changes most likely
 during hardening — a new error variant, a new counter on a report — are additive
 rather than breaking.
+
+[Unreleased]: https://github.com/danplischke/origofs/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/danplischke/origofs/releases/tag/v0.1.0
