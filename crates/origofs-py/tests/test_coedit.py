@@ -414,9 +414,18 @@ def test_an_idle_room_is_checkpointed_without_anyone_disconnecting():
             sock.send_bytes(answer.reply)
 
             # The socket stays OPEN throughout -- that is the whole point.
+            #
+            # Wait for the LAST step of a checkpoint, not the first. A checkpoint
+            # writes the file, then the sidecar blob, then stamps
+            # ``checkpointed_at``; breaking as soon as ``read`` returns bytes can
+            # catch the middle of that sequence, and the marker assertion below
+            # then fails on a checkpoint that was merely still in progress.
             body = b""
             for _ in range(60):
                 time.sleep(0.05)
+                marker = _run(lambda: ws.live_doc("/doc.md"))
+                if marker is None or marker["checkpointed_at"] is None:
+                    continue
                 try:
                     body = bytes(_run(lambda: ws.read("/doc.md")))
                 except FileNotFoundError:
