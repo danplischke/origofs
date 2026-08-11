@@ -20,6 +20,16 @@ fn git(dir: &Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
+        // Keep the working tree byte-exact, on every platform. Git for Windows
+        // ships `core.autocrlf=true` in its *system* config, so a checkout there
+        // rewrites the LF in our exported blobs to CRLF and the working-tree
+        // assertion below reads back `fn main() {}\r\n`. That is the host's
+        // checkout filter doing exactly what it is configured to do — the blob
+        // itself is correct, which `git show main:pkg/main.rs` above proves — so
+        // the fix belongs here rather than in the exporter. Pinning it also stops
+        // a developer's own global `core.autocrlf` from deciding whether this
+        // suite passes. A no-op wherever autocrlf is already off.
+        .args(["-c", "core.autocrlf=false", "-c", "core.eol=lf"])
         .args(args)
         .output()
         .expect("git must be installed for interop tests");
