@@ -21,10 +21,16 @@ async fn local_cas_write_fsyncs_object_and_directory() {
 
     assert_eq!(store.sync_count(), 0);
     store.put(b"durable bytes").await.unwrap();
-    // One fsync for the object file, one for its parent directory (unix).
+    // One fsync for the object file, plus one for its parent directory — but the
+    // directory fsync is `#[cfg(unix)]` in `write_tmp_then_rename`, because
+    // Windows has no portable equivalent. Assert the barrier each platform
+    // actually has, rather than the weaker `>= 1` that would hold everywhere:
+    // dropping the directory fsync on Unix has to keep failing this test.
+    let expected = if cfg!(unix) { 2 } else { 1 };
     assert!(
-        store.sync_count() >= 2,
-        "a durable write must fsync the object and its directory, saw {}",
+        store.sync_count() >= expected,
+        "a durable write must fsync the object{}, saw {}",
+        if cfg!(unix) { " and its directory" } else { "" },
         store.sync_count()
     );
 

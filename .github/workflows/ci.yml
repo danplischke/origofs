@@ -628,6 +628,101 @@ jobs:
           cargo nextest run --profile ci -p origofs-core
           cargo nextest run --profile ci -p origofs-sdk --features api,mcp,sandbox,git,nfs
 
+  # The Windows leg (#107). `release.yml` builds an `x86_64-pc-windows-msvc`
+  # wheel and attaches it to the GitHub Release — but nothing in CI had ever
+  # compiled that target. The first attempt would have been inside the release
+  # job that also cuts the release, so a Windows break would have taken the whole
+  # release down at the worst possible moment to discover it. It *was* broken:
+  # `origofs-sdk`'s sandbox module used `std::os::unix` unconditionally, so
+  # `--features full` — and therefore all of `origofs-cli` — could not compile for
+  # Windows at all.
+  #
+  # Windows is also the only place the platform splits get exercised in the
+  # negative. `fuse`, `nfs` and `sandbox` are Unix-only modules of origofs-sdk, so
+  # this leg is what proves `--features full` still resolves to a buildable set
+  # with all three absent, and that `origofs-cli` degrades to a clear
+  # per-subcommand error instead of failing to build.
+  #
+  # No Docker on the Windows runner, so — exactly as on the macOS leg — there is
+  # no Postgres or MinIO here: the SQLite metadata path carries the suite and the
+  # PG-gated tests self-skip.
+  #
+  # `shell: bash` on every multi-command step is deliberate, not habit. The
+  # default shell on a Windows runner is PowerShell, where a *native* command
+  # exiting non-zero does not stop the script — only the last command's exit code
+  # is checked. A failing `cargo clippy` on the first line of a multi-line `run:`
+  # would be masked by a passing `cargo test` on the second, and the job would go
+  # green having caught nothing. That is the same silent-pass failure mode the
+  # `fuse` and `sandbox-isolate` jobs exist to end.
+  windows:
+    name: Windows (SQLite + portable surfaces + wheel)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # origofs-py is a pyo3 extension, so building the workspace needs a Python
+      # interpreter available for it to link against. It is also what runs the
+      # wheel smoke test at the foot of this job.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Lint with warnings denied, matching the Linux `rust` job. `--features full`
+      # is the interesting one here: on Windows it resolves to api + mcp + git,
+      # with fuse/nfs/sandbox compiled out, and it must still be a clean build.
+      # origofs-cli is linted too because it is the crate that consumes `full` and
+      # has to keep working with three of its surfaces missing.
+      - name: Clippy (deny warnings)
+        shell: bash
+        run: |
+          cargo clippy -p origofs-core --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features full --all-targets -- -D warnings
+          cargo clippy -p origofs-cli --all-targets -- -D warnings
+
+      # Core on the SQLite path plus the portable SDK surfaces. This is where
+      # path handling and the file-locking / rename / delete-while-open semantics
+      # that differ most on Windows actually get executed, rather than assumed.
+      - name: Test
+        shell: bash
+        run: |
+          cargo nextest run --profile ci -p origofs-core
+          cargo nextest run --profile ci -p origofs-sdk --features full
+
+      # The artifact #107 is really about. Build the wheel the way `release.yml`
+      # builds it — same action, same target — so this is the same compile, run on
+      # every PR instead of once, at the tag, in the job that cuts the release.
+      - name: Build the Python wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist
+          sccache: "true"
+          working-directory: crates/origofs-py
+
+      # …and then run it. Building proves it compiles; this proves the wheel that
+      # would ship actually works — a workspace opens, an attributed write lands,
+      # and blame comes back naming the actor. Shared with `release.yml` so the
+      # two cannot drift.
+      - name: The wheel imports and works
+        shell: bash
+        working-directory: crates/origofs-py
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-index --find-links dist origofs
+          python ../../.github/scripts/wheel_smoke.py
+
   # B9 (#70): benchmark-regression signal. The criterion micro-benchmarks in
   # benches/engine.rs cover the hot paths — content-defined-chunking writes,
   # whole-file reads, the incremental copy-on-write edit, tree/commit building,

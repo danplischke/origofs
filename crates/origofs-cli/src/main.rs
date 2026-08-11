@@ -934,52 +934,60 @@ async fn main() -> Result<()> {
             isolate,
             cmd,
         } => {
-            if isolate {
-                // Surface the specific reason (absent / too old / built without
-                // overlays), not a blanket "needs bwrap on PATH".
-                if let Some(gap) = origofs_sdk::sandbox::bwrap_gap() {
-                    anyhow::bail!("--isolate is unavailable: {gap}");
-                }
-            } else if !origofs_sdk::sandbox::overlay_supported() {
-                anyhow::bail!(
-                    "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
-                );
-            } else {
-                // Say it at the moment it matters. Without `--isolate` the child
-                // runs with the invoker's privileges over a plain copy-on-write
-                // overlay: the whole host filesystem stays reachable, including
-                // this workspace's meta.db and cas, with no network namespace and
-                // no seccomp. That caveat lived only in `--help` and doc comments,
-                // while strictly less dangerous things (a non-loopback NFS or
-                // metrics bind) both warned at runtime.
-                eprintln!(
-                    "warning: running without --isolate: this captures edits but is NOT a \
+            #[cfg(not(unix))]
+            {
+                let _ = (actor, discard, isolate, cmd);
+                return Err(unix_only("sandbox", "an unprivileged overlayfs mount"));
+            }
+            #[cfg(unix)]
+            {
+                if isolate {
+                    // Surface the specific reason (absent / too old / built without
+                    // overlays), not a blanket "needs bwrap on PATH".
+                    if let Some(gap) = origofs_sdk::sandbox::bwrap_gap() {
+                        anyhow::bail!("--isolate is unavailable: {gap}");
+                    }
+                } else if !origofs_sdk::sandbox::overlay_supported() {
+                    anyhow::bail!(
+                        "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
+                    );
+                } else {
+                    // Say it at the moment it matters. Without `--isolate` the child
+                    // runs with the invoker's privileges over a plain copy-on-write
+                    // overlay: the whole host filesystem stays reachable, including
+                    // this workspace's meta.db and cas, with no network namespace and
+                    // no seccomp. That caveat lived only in `--help` and doc comments,
+                    // while strictly less dangerous things (a non-loopback NFS or
+                    // metrics bind) both warned at runtime.
+                    eprintln!(
+                        "warning: running without --isolate: this captures edits but is NOT a \
                      security boundary. The command runs with your privileges and can read \
                      and modify anything you can, including this workspace's meta.db and \
                      cas. Run only code you trust, or pass --isolate for a real filesystem \
                      boundary (needs a non-setuid bwrap >= 0.11.0, for --overlay support)."
-                );
+                    );
+                }
+                let tmp = cli
+                    .workspace
+                    .join(format!("sandbox-{}", std::process::id()));
+                let opts = origofs_sdk::sandbox::RunOpts {
+                    actor,
+                    discard,
+                    work_root: tmp.clone(),
+                    isolate,
+                };
+                let outcome = origofs_sdk::sandbox::run(&ws, opts, &cmd).await?;
+                let _ = std::fs::remove_dir_all(&tmp);
+                if outcome.imported {
+                    println!(
+                        "command exited {}; imported {} change(s)",
+                        outcome.exit_code, outcome.files_changed
+                    );
+                } else {
+                    println!("command exited {}; delta discarded", outcome.exit_code);
+                }
+                std::process::exit(outcome.exit_code);
             }
-            let tmp = cli
-                .workspace
-                .join(format!("sandbox-{}", std::process::id()));
-            let opts = origofs_sdk::sandbox::RunOpts {
-                actor,
-                discard,
-                work_root: tmp.clone(),
-                isolate,
-            };
-            let outcome = origofs_sdk::sandbox::run(&ws, opts, &cmd).await?;
-            let _ = std::fs::remove_dir_all(&tmp);
-            if outcome.imported {
-                println!(
-                    "command exited {}; imported {} change(s)",
-                    outcome.exit_code, outcome.files_changed
-                );
-            } else {
-                println!("command exited {}; delta discarded", outcome.exit_code);
-            }
-            std::process::exit(outcome.exit_code);
         }
         Cmd::Overlay {
             actor,
@@ -987,63 +995,79 @@ async fn main() -> Result<()> {
             isolate,
             cmd,
         } => {
-            if isolate {
-                // Surface the specific reason (absent / too old / built without
-                // overlays), not a blanket "needs bwrap on PATH".
-                if let Some(gap) = origofs_sdk::sandbox::bwrap_gap() {
-                    anyhow::bail!("--isolate is unavailable: {gap}");
-                }
-            } else if !origofs_sdk::sandbox::overlay_supported() {
-                anyhow::bail!(
-                    "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
-                );
-            } else {
-                // Say it at the moment it matters. Without `--isolate` the child
-                // runs with the invoker's privileges over a plain copy-on-write
-                // overlay: the whole host filesystem stays reachable, including
-                // this workspace's meta.db and cas, with no network namespace and
-                // no seccomp. That caveat lived only in `--help` and doc comments,
-                // while strictly less dangerous things (a non-loopback NFS or
-                // metrics bind) both warned at runtime.
-                eprintln!(
-                    "warning: running without --isolate: this captures edits but is NOT a \
+            #[cfg(not(unix))]
+            {
+                let _ = (actor, sync_ms, isolate, cmd);
+                return Err(unix_only("overlay", "an unprivileged overlayfs mount"));
+            }
+            #[cfg(unix)]
+            {
+                if isolate {
+                    // Surface the specific reason (absent / too old / built without
+                    // overlays), not a blanket "needs bwrap on PATH".
+                    if let Some(gap) = origofs_sdk::sandbox::bwrap_gap() {
+                        anyhow::bail!("--isolate is unavailable: {gap}");
+                    }
+                } else if !origofs_sdk::sandbox::overlay_supported() {
+                    anyhow::bail!(
+                        "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
+                    );
+                } else {
+                    // Say it at the moment it matters. Without `--isolate` the child
+                    // runs with the invoker's privileges over a plain copy-on-write
+                    // overlay: the whole host filesystem stays reachable, including
+                    // this workspace's meta.db and cas, with no network namespace and
+                    // no seccomp. That caveat lived only in `--help` and doc comments,
+                    // while strictly less dangerous things (a non-loopback NFS or
+                    // metrics bind) both warned at runtime.
+                    eprintln!(
+                        "warning: running without --isolate: this captures edits but is NOT a \
                      security boundary. The command runs with your privileges and can read \
                      and modify anything you can, including this workspace's meta.db and \
                      cas. Run only code you trust, or pass --isolate for a real filesystem \
                      boundary (needs a non-setuid bwrap >= 0.11.0, for --overlay support)."
+                    );
+                }
+                let tmp = cli
+                    .workspace
+                    .join(format!("overlay-{}", std::process::id()));
+                let opts = origofs_sdk::sandbox::LiveOpts {
+                    actor,
+                    work_root: tmp.clone(),
+                    sync_interval: std::time::Duration::from_millis(sync_ms),
+                    isolate,
+                };
+                let outcome = origofs_sdk::sandbox::run_live(&ws, opts, &cmd).await?;
+                let _ = std::fs::remove_dir_all(&tmp);
+                println!(
+                    "agent exited {}; streamed {} change(s) into origofs",
+                    outcome.exit_code, outcome.files_changed
                 );
+                std::process::exit(outcome.exit_code);
             }
-            let tmp = cli
-                .workspace
-                .join(format!("overlay-{}", std::process::id()));
-            let opts = origofs_sdk::sandbox::LiveOpts {
-                actor,
-                work_root: tmp.clone(),
-                sync_interval: std::time::Duration::from_millis(sync_ms),
-                isolate,
-            };
-            let outcome = origofs_sdk::sandbox::run_live(&ws, opts, &cmd).await?;
-            let _ = std::fs::remove_dir_all(&tmp);
-            println!(
-                "agent exited {}; streamed {} change(s) into origofs",
-                outcome.exit_code, outcome.files_changed
-            );
-            std::process::exit(outcome.exit_code);
         }
         Cmd::Mount { mountpoint } => {
-            if !origofs_sdk::fuse::mountable() {
-                anyhow::bail!("FUSE mount unavailable here (needs root + /dev/fuse)");
+            #[cfg(not(unix))]
+            {
+                let _ = mountpoint;
+                return Err(unix_only("mount", "FUSE (`/dev/fuse`)"));
             }
-            std::fs::create_dir_all(&mountpoint)?;
-            println!(
-                "mounting origofs at {} (unmount with `umount` to stop)",
-                mountpoint.display()
-            );
-            // The mount drives its own runtime, so run it off the async main thread.
-            let handle = std::thread::spawn(move || origofs_sdk::fuse::mount(ws, &mountpoint));
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("mount thread panicked"))??;
+            #[cfg(unix)]
+            {
+                if !origofs_sdk::fuse::mountable() {
+                    anyhow::bail!("FUSE mount unavailable here (needs root + /dev/fuse)");
+                }
+                std::fs::create_dir_all(&mountpoint)?;
+                println!(
+                    "mounting origofs at {} (unmount with `umount` to stop)",
+                    mountpoint.display()
+                );
+                // The mount drives its own runtime, so run it off the async main thread.
+                let handle = std::thread::spawn(move || origofs_sdk::fuse::mount(ws, &mountpoint));
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("mount thread panicked"))??;
+            }
         }
         Cmd::Mcp { agent_name, model } => {
             let server = origofs_sdk::mcp::McpServer::create(ws, &agent_name, &model).await?;
@@ -1265,23 +1289,54 @@ async fn main() -> Result<()> {
             result?;
         }
         Cmd::Nfs { addr } => {
-            // NFSv3 is unauthenticated; warn loudly if this isn't a loopback bind.
-            if addr
-                .parse::<std::net::SocketAddr>()
-                .map(|s| !s.ip().is_loopback())
-                .unwrap_or(false)
+            #[cfg(not(unix))]
             {
-                eprintln!(
-                    "warning: binding NFS to a non-loopback address ({addr}); NFSv3 has no authentication — anyone who can reach it gets full, unattributed access. Prefer a loopback bind reached over a tunnel/VPN."
-                );
+                let _ = addr;
+                return Err(unix_only("nfs", "the NFSv3 server surface"));
             }
-            println!(
-                "serving origofs over NFSv3 at {addr} (SIGTERM/Ctrl-C to stop)\n  mount with: mount -t nfs -o vers=3,tcp,port=<port>,mountport=<port>,nolock <host>:/ /mnt"
-            );
-            origofs_sdk::nfs::serve(ws, &addr).await?;
+            #[cfg(unix)]
+            {
+                // NFSv3 is unauthenticated; warn loudly if this isn't a loopback bind.
+                if addr
+                    .parse::<std::net::SocketAddr>()
+                    .map(|s| !s.ip().is_loopback())
+                    .unwrap_or(false)
+                {
+                    eprintln!(
+                        "warning: binding NFS to a non-loopback address ({addr}); NFSv3 has no authentication — anyone who can reach it gets full, unattributed access. Prefer a loopback bind reached over a tunnel/VPN."
+                    );
+                }
+                println!(
+                    "serving origofs over NFSv3 at {addr} (SIGTERM/Ctrl-C to stop)\n  mount with: mount -t nfs -o vers=3,tcp,port=<port>,mountport=<port>,nolock <host>:/ /mnt"
+                );
+                origofs_sdk::nfs::serve(ws, &addr).await?;
+            }
         }
     }
     Ok(())
+}
+
+/// The error for a subcommand whose surface only exists on Unix.
+///
+/// `mount` (FUSE), `nfs` (NFSv3), and `sandbox`/`overlay` (overlayfs edit-capture)
+/// each drive a kernel interface Windows does not have, so the corresponding
+/// `origofs-sdk` modules are `#[cfg(all(unix, …))]` and are simply absent there.
+///
+/// The clap definitions stay on every platform anyway, deliberately: `--help`,
+/// argument parsing, and the docs then read the same everywhere, and someone
+/// running one of these on Windows gets a sentence explaining *why* it cannot
+/// work and what to use instead — rather than clap's "unrecognized subcommand",
+/// which reads like a typo or a broken install. This mirrors what the Python
+/// bindings already do (`Workspace.mount()` / `serve_nfs()` raise a clear error
+/// off-platform rather than vanishing from the class). #107.
+#[cfg(not(unix))]
+fn unix_only(subcommand: &str, surface: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`origofs {subcommand}` is not available on this platform: it is built on {surface}, \
+         which Windows does not provide. The portable surfaces work here — `origofs serve` \
+         (HTTP API), `origofs mcp`, and `origofs git` — as do all the ordinary file, \
+         versioning, and attribution commands."
+    )
 }
 
 /// Build the HTTP API authenticator from `--auth-token` specs. origofs never trusts a

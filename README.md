@@ -606,7 +606,10 @@ pip install maturin && maturin develop     # builds the extension + installs `or
 
 `Workspace.mount()` (FUSE) is Linux-only in the published wheel: `fuser` needs
 macFUSE on macOS, which is a kernel extension a wheel cannot carry. macOS mounts
-over NFSv3 with `serve_nfs` instead.
+over NFSv3 with `serve_nfs` instead. On Windows neither mount path exists — both
+methods raise a clear error — and the rest of the binding works normally. The
+Windows wheel is built and exercised on every pull request, not just at release
+time.
 
 ```python
 import origofs
@@ -901,6 +904,15 @@ origofs --workspace "$WS" gc     # safe alongside writers (age-gated); cheapest 
 They all funnel into the same engine, so a write lands on the change feed and
 carries attribution no matter which one it came through. [**Python**](#python)
 gets its own section above — it's the surface most services are built on.
+
+**Platforms.** Everything above runs on Linux and macOS. On **Windows** the
+portable surfaces — CLI, Rust SDK, Python, HTTP API, MCP and git interop — work
+as documented, over either metadata backend. The three that are kernel
+interfaces Windows has no equivalent of are compiled out there: FUSE, NFS, and
+the overlay/sandbox mount (which is built on overlayfs whiteouts). `origofs
+mount`, `origofs nfs`, `origofs sandbox` and `origofs overlay` still exist as
+subcommands and exit with a message explaining why they can't run, rather than
+disappearing from `--help`. Each platform is built and tested in CI.
 
 ## Development
 
