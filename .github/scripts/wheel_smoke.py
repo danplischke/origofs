@@ -32,7 +32,26 @@ import tempfile
 import origofs
 
 
+def check_exports() -> None:
+    """Every name the package promises actually resolves.
+
+    `origofs/__init__.py` re-exports the compiled extension's symbols by hand, so
+    a class registered under a `#[cfg]` — as the Linux-only `Mount` is — can sit
+    in that import list and simply not exist in the wheel for another platform.
+    The result is an `ImportError` on `import origofs` itself, on that platform
+    only, which no amount of Linux testing will show. That is exactly how the
+    macOS and Windows wheels came to be un-importable (#107).
+
+    Reaching this function at all means the import already succeeded; this then
+    catches the subtler direction, a name in `__all__` that was never bound.
+    """
+    missing = [n for n in origofs.__all__ if not hasattr(origofs, n)]
+    assert not missing, f"names in __all__ missing from the module: {missing}"
+
+
 async def main() -> None:
+    check_exports()
+
     d = tempfile.mkdtemp()
     ws = await origofs.Workspace.open_local(
         os.path.join(d, "meta.db"), os.path.join(d, "cas")

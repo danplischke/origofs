@@ -14,6 +14,8 @@ its own extra dependencies only when used):
 
     from origofs.fastapi import build_router   # needs `pip install "origofs[fastapi]"`
 """
+import sys
+
 from ._origofs import (
     OrigoFSError,
     ConflictError,
@@ -22,7 +24,6 @@ from ._origofs import (
     CoeditRelaySub,
     CoeditSyncReply,
     GcsConfig,
-    Mount,
     S3Config,
     Subscription,
     Workspace,
@@ -40,7 +41,6 @@ __all__ = [
     "CoeditRelaySub",
     "CoeditSyncReply",
     "GcsConfig",
-    "Mount",
     "S3Config",
     "Subscription",
     "Workspace",
@@ -49,3 +49,22 @@ __all__ = [
     "content_hash",
     "fuse_mountable",
 ]
+
+# `Mount` is registered by the extension only on Linux (`#[cfg(target_os =
+# "linux")]` in src/lib.rs): FUSE has no Windows equivalent, and on macOS it needs
+# the macFUSE kernel extension, which a `pip install` cannot provide.
+#
+# Importing it unconditionally therefore made `import origofs` raise
+#     ImportError: cannot import name 'Mount' from 'origofs._origofs'
+# on every non-Linux wheel — so the published macOS and Windows wheels installed
+# cleanly and then could not be imported at all. Nothing caught it because no
+# wheel had ever been built or run outside Linux (#107).
+#
+# `__init__.pyi` already gates the class behind this same `sys.platform` check,
+# so this is the runtime catching up with the typed contract rather than a change
+# to it. `Workspace.mount()` still exists on every platform and raises a clear
+# OSError off Linux, which is the surface a caller actually reaches for.
+if sys.platform == "linux":
+    from ._origofs import Mount
+
+    __all__.append("Mount")
