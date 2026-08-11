@@ -1,5 +1,7 @@
 <div align="center">
 
+!!This is experimental and heavily vibe coded. Please do not use it.
+
 # origofs
 
 **A filesystem where humans and AI agents share the same files —
