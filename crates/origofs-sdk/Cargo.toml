@@ -84,6 +84,14 @@ nfs     = ["dep:nfsserve", "dep:async-trait"]
 
 # Every surface at once — what `origofs-cli` and `origofs-py` enable. (Not
 # `coedit`, which stays separately opt-in.)
+#
+# Three of these — `fuse`, `nfs`, `sandbox` — are **Unix-only modules**: each is
+# `#[cfg(all(unix, feature = "…"))]` in `lib.rs`, because each is a kernel
+# interface Windows does not have (FUSE, NFS-as-a-mount, overlayfs whiteouts).
+# Enabling `full` on Windows is therefore *not* an error — it stays a valid,
+# buildable feature set that yields the portable surfaces (api, mcp, git) and
+# quietly omits the other three, which is what lets `origofs-cli` build there.
+# Turning any of the three on individually behaves the same way.
 full    = ["api", "mcp", "sandbox", "git", "fuse", "nfs"]
 
 # Opt-in CRDT co-editing (roadmap M8): re-exports `CoeditDoc` + the

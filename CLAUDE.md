@@ -68,6 +68,16 @@ so an accidental newer-stdlib use or a dependency MSRV bump is caught. CI lives 
 `.github/workflows/ci.yml` (fmt + clippy + tests, an explicit `coedit` pass, and the
 `msrv` floor) and otherwise runs on stable. Use a recent stable toolchain.
 
+**All three platforms are built and tested**: Linux is the primary leg, plus a
+`macos` job (SQLite + the NFS surface, no FUSE) and a `windows` job (SQLite + the
+portable surfaces, plus the `x86_64-pc-windows-msvc` wheel `release.yml` ships).
+Cross-checking Windows locally without a Windows box:
+`rustup target add x86_64-pc-windows-gnu`, install `gcc-mingw-w64-x86-64`, then
+`cargo clippy --target x86_64-pc-windows-gnu -p origofs-sdk --features full
+--all-targets`. No `cfg(target_env)` appears anywhere in the tree, so the
+`gnu`/`msvc` split changes nothing about which code is selected — the `gnu`
+cross-check catches every `cfg`-shaped break, and only linking differs.
+
 ## The one architectural idea everything hangs on
 
 **The metadata store and the content store are split, and never mixed.**
@@ -200,8 +210,20 @@ Each is a module under `crates/origofs-sdk/src/`, gated by the matching feature
 |---|---|---|
 | `api` | `origofs_sdk::api` | HTTP/JSON server (axum). `Authenticator`/`BearerAuth` resolve identity server-side. |
 | `mcp` | `origofs_sdk::mcp` | MCP server — agents call filesystem tools over stdio, auto-attributed. |
-| `sandbox` | `origofs_sdk::sandbox` | Overlay / sandbox edit-capture: run a process over a copy-on-write view, import its delta as attributed writes. Not a security boundary by default; opt-in bubblewrap *filesystem* isolation via `--isolate` (see below). |
+| `sandbox` | `origofs_sdk::sandbox` | Overlay / sandbox edit-capture: run a process over a copy-on-write view, import its delta as attributed writes. Not a security boundary by default; opt-in bubblewrap *filesystem* isolation via `--isolate` (see below). **Unix-only** (`cfg(unix)`) — it is built on overlayfs whiteouts, which are character devices. |
 | `fuse`, `nfs` | `origofs_sdk::fuse` / `::nfs` | POSIX mounts (FUSE on Linux; NFSv3 elsewhere). **Unix-only** (`cfg(unix)`). |
+
+**`full` is platform-dependent, and that is deliberate.** Three of its six
+surfaces (`fuse`, `nfs`, `sandbox`) are `#[cfg(all(unix, feature = "…"))]`
+modules, so on Windows `--features full` is still a valid, buildable set that
+yields `api` + `mcp` + `git` and omits the rest. `origofs-cli` consumes `full` and
+must keep compiling there: its `mount`/`nfs`/`sandbox`/`overlay` subcommands keep
+their clap definitions on every platform and `#[cfg]`-split only their bodies,
+returning `unix_only(…)` on Windows so the user gets an explanation rather than
+clap's "unrecognized subcommand". **When adding a surface that touches a kernel
+interface, gate the module on `unix` (not just the feature) and split the CLI arm
+the same way** — gating on the feature alone is what kept the Windows target from
+compiling at all until #107.
 | `git` | `origofs_sdk::git` | Real-`git` interop: export/import genuine git objects. The `git-remote-origofs` binary (shipped by `origofs-cli`, `git clone origofs://…`) builds on it. |
 | `coedit` | — | Opt-in CRDT co-editing (yrs); adds the y-sync WebSocket to the `api` surface. Kept separate from `full`. |
 | `metrics` | — | Opt-in metrics recording (emit-only, no exporter); adds `GET /metrics` + per-request instrumentation to the `api` surface. Kept separate from `full`. |

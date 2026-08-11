@@ -80,6 +80,11 @@ jobs:
 
       # A wheel that imports is the minimum bar for publishing one. Skipped where
       # the wheel can't run on the runner (the cross-built aarch64 legs).
+      #
+      # The script is shared with ci.yml's `windows` job rather than inlined here,
+      # so the check that runs on every PR and the check that gates a release
+      # cannot drift apart — and this copy is the one nobody would run until a tag
+      # (#107).
       - name: Smoke-test the wheel
         if: matrix.name != 'linux-aarch64' && matrix.name != 'macos-x86_64'
         shell: bash
@@ -87,27 +92,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --no-index --find-links dist origofs
-          # Exercise the compiled core, not just the import: open a workspace,
-          # write attributed bytes, read blame back.
-          python - <<'PY'
-          import asyncio, tempfile, os, origofs
-
-          async def main():
-              d = tempfile.mkdtemp()
-              ws = await origofs.Workspace.open_local(
-                  os.path.join(d, "meta.db"), os.path.join(d, "cas")
-              )
-              actor = await ws.create_human("ci", None)
-              sess = await ws.create_session(actor, "smoke")
-              ctx = origofs.WriteCtx.session(actor, sess)
-              await ws.write_as(ctx, "/hello.txt", b"hi\n")
-              assert bytes(await ws.read("/hello.txt")) == b"hi\n"
-              spans = await ws.blame("/hello.txt")
-              assert spans, "blame came back empty"
-              print("origofs", origofs.__version__ if hasattr(origofs, "__version__") else "", "ok")
-
-          asyncio.run(main())
-          PY
+          python ../../.github/scripts/wheel_smoke.py
 
       - uses: actions/upload-artifact@v4
         with:

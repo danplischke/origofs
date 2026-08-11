@@ -4,7 +4,7 @@
 //! Self-skips where unprivileged overlayfs isn't available. The isolated
 //! (bubblewrap) cases at the foot of the file skip too, unless
 //! `ORIGOFS_REQUIRE_BWRAP` is set — then a missing bubblewrap fails the run.
-#![cfg(feature = "sandbox")]
+#![cfg(all(unix, feature = "sandbox"))]
 
 use origofs_sdk::sandbox::{
     LiveSync, RunOpts, bwrap_gap, import_upper, is_opaque_dir, overlay_supported, run,

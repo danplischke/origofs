@@ -48,7 +48,7 @@ pub use origofs_core::{GcsConfig, ObjectContentStore, S3Config};
 // Each surface that was formerly its own crate is now an opt-in, feature-gated
 // module over this same `Workspace`. A default build pulls none of their
 // dependencies (axum, fuser, nfsserve, …); enable the ones you need, or `full`.
-// FUSE/NFS are Unix-only. See `Cargo.toml` `[features]`.
+// FUSE/NFS/sandbox are Unix-only. See `Cargo.toml` `[features]`.
 #[cfg(feature = "api")]
 pub mod api;
 #[cfg(all(unix, feature = "fuse"))]
@@ -59,7 +59,17 @@ pub mod git;
 pub mod mcp;
 #[cfg(all(unix, feature = "nfs"))]
 pub mod nfs;
-#[cfg(feature = "sandbox")]
+// Unix-only, for the same reason FUSE and NFS are — not an oversight. The whole
+// surface is built on a kernel overlay: an unprivileged `unshare -U -r -m`
+// overlayfs mount, a delta read back out of `upper/`, and deletions encoded as
+// overlayfs whiteouts — which are *character devices* (`rdev` 0:0) and opaque-dir
+// xattrs. Windows has no overlayfs, no user namespaces, and no char-device
+// whiteout to detect, so there is nothing here to port: it would be a different
+// implementation, not this one compiled elsewhere.
+//
+// This was previously gated on the feature alone, which is what made `full` — and
+// therefore `origofs-cli` — fail to compile for `*-pc-windows-*` (#107).
+#[cfg(all(unix, feature = "sandbox"))]
 pub mod sandbox;
 
 /// Resolves when the process is asked to stop: `SIGTERM` or `SIGINT` on Unix,
