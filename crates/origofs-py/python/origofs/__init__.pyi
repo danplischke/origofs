@@ -13,7 +13,7 @@ extension's dict builders set every key unconditionally. So
 """
 from __future__ import annotations
 import sys
-from typing import Any, Awaitable, Literal, NoReturn, Optional, TypedDict
+from typing import Any, Awaitable, Dict, List, Literal, NoReturn, Optional, Tuple, TypedDict
 
 # --- record shapes ----------------------------------------------------------
 #
@@ -202,6 +202,20 @@ class LiveMarker(TypedDict):
     content_hash: Optional[str]
     since: int
     checkpointed_at: Optional[int]
+
+
+class TreeRun(TypedDict):
+    """One attributed text run of a tree co-edited document (``CoeditTreeDoc.runs``).
+
+    ``node`` is the id origofs stamped on the run — the token to cite in a span map
+    — and is ``None`` for a run origofs never stamped (content a host seeded
+    directly), whose ``actor`` is then ``0``.
+    """
+
+    text: str
+    node: Optional[str]
+    actor: int
+    session: int
 
 
 class ConflictRecord(TypedDict):
@@ -409,6 +423,65 @@ class CoeditDoc:
         """The full current text."""
         ...
 
+class CoeditTreeDoc:
+    """A live **tree-shaped** co-edited document (issue #92): a ``Y.XmlFragment`` a
+    rich-text editor (``@platejs/yjs``, ``y-prosemirror``, ``y-slate``, TipTap) binds
+    to natively, instead of ``CoeditDoc``'s flat ``Y.Text``.
+
+    Obtain a server-side room doc from ``Workspace.open_coedit_tree``, drive it with
+    the same y-sync protocol, and land it with ``Workspace.checkpoint_coedit_tree`` —
+    which takes *your* serialized bytes plus a span map, because origofs does not own
+    the document schema. Safe to share one instance across many WebSocket handlers."""
+    def __init__(self, root: Optional[str] = None) -> None:
+        """A fresh, empty document rooted at the ``XmlFragment`` named ``root``
+        (default ``"content"``)."""
+        ...
+    async def append_text(self, ctx: WriteCtx, tag: str, text: str) -> str:
+        """Append ``<tag>text</tag>`` to the root attributed to ``ctx``, returning
+        the node id stamped on the run — ready to cite in a span map. The tree
+        analogue of ``CoeditDoc.insert``, and just as narrow: for an in-process
+        agent or a test client, not for a real editor (which drives arbitrary tree
+        edits over y-sync)."""
+        ...
+    async def sync_start(self) -> bytes:
+        """The y-sync ``SyncStep1`` frame to greet a new client with."""
+        ...
+    async def state_vector(self) -> bytes:
+        """This document's Yjs state vector (``encodeStateVector``)."""
+        ...
+    async def state_update(self) -> bytes:
+        """This document's full state as a Yjs update (``encodeStateAsUpdate``)."""
+        ...
+    async def handle_sync(self, ctx: WriteCtx, data: bytes) -> CoeditSyncReply:
+        """Handle one inbound y-sync payload from a connection authenticated as
+        ``ctx``; its content is attributed to ``ctx`` server-side."""
+        ...
+    async def apply_relayed(self, frame: bytes) -> None:
+        """Merge a y-sync frame relayed from another worker without re-attribution."""
+        ...
+    async def runs(self) -> List[TreeRun]:
+        """Every text run in document order, with the node id and author stamped on
+        it — the server-side reading of ``ytext.toDelta()``. Walk it to build a span
+        map when *you* serialize the document (rather than a browser editor)."""
+        ...
+    async def authors(self) -> Dict[str, Tuple[int, int]]:
+        """Every node id origofs has stamped, as ``{node: (actor_id, session_id)}`` —
+        what a span map resolves against. An id absent here has no author."""
+        ...
+    async def resumed(self) -> bool:
+        """Whether this document came from a coherent sidecar rather than opening
+        empty. **Check before binding an editor**: origofs cannot rebuild a tree from
+        a flat file (that needs your schema), so seed from ``read(path)`` when this
+        is ``False`` or a checkpoint writes an empty body over real content."""
+        ...
+    async def is_empty(self) -> bool:
+        """Whether the tree has no nodes at all."""
+        ...
+    async def plain_text(self) -> str:
+        """The whole tree's text in document order, with no structure — for
+        inspection and tests. Not the durable body: that is your serialization."""
+        ...
+
 class CoeditRelayNote:
     """One relayed co-editing update from another worker (see
     ``Workspace.coedit_subscribe`` / ``coedit_replay``)."""
@@ -575,6 +648,24 @@ class Workspace:
     # clears that marker once the session's final checkpoint has landed.
     async def open_coedit(self, ctx: WriteCtx, path: str) -> CoeditDoc: ...
     async def checkpoint_coedit(self, ctx: WriteCtx, path: str, doc: CoeditDoc) -> None: ...
+    # The tree shape (#92): a Y.XmlFragment a rich-text editor binds to natively.
+    # origofs does not own the document schema, so the *host* serializes and says
+    # which byte ranges came from which co-edit node; origofs resolves each node to
+    # the author it stamped itself. Bytes no span covers go to `ctx`.
+    async def open_coedit_tree(
+        self, ctx: WriteCtx, path: str, root: Optional[str] = None
+    ) -> CoeditTreeDoc: ...
+    async def checkpoint_coedit_tree(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        doc: CoeditTreeDoc,
+        body: bytes,
+        spans: List[Tuple[int, int, str]],
+    ) -> None: ...
+    # Persist the CRDT alone, with no body -- durability for a shape only the host
+    # can serialize. Deliberately does not stamp "last saved": the file has not moved.
+    async def persist_coedit_tree(self, path: str, doc: CoeditTreeDoc) -> None: ...
     async def end_coedit(self, path: str) -> None: ...
     # Propose against a co-edited path as a CRDT merge rather than a whole file
     # body: base = the document's Yjs state vector, proposal = an

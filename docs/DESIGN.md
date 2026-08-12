@@ -451,6 +451,48 @@ metadata round-trips are cut by caching dentries with `LISTEN/NOTIFY`-driven inv
 The boundary: **live co-editing is for open, editor-attached files; commit-time merge is for everything else.**
 Both funnel into one attribution store, so blame is uniform regardless of path.
 
+**Two document shapes, one protocol (ruling, #92).** A co-edited document is either a flat `Y.Text` or a
+`Y.XmlFragment` **tree**. The flat shape is right for source files and anything a diff tool reads; the tree
+shape exists because every mainstream rich-text CRDT binding (`@platejs/yjs`, `y-prosemirror`, `y-slate`,
+TipTap) binds to a structured document and cannot attach to flat text. Without it a host had to *mirror* —
+serialize its editor to text on every change and diff it against the shared `Y.Text` — which loses the caret on
+every remote edit, turns serializer round-trip noise into authored bytes, and, worst, caps attribution at the
+granularity of the host's whole-file text diff. That last one undercuts the project's headline promise, so the
+tree shape is not a convenience: byte-level authorship is only as good as the edits a client can express.
+
+Both shapes share one y-sync driver and one attribution rule — the content an update *introduces* is stamped
+server-side with the connection's actor, never with an author the client names. Attribution is a **content**
+diff per text node rather than "which runs lack an author", because Yjs makes an insert inherit the formatting
+attributes at its position: text typed against the end of another author's run arrives already wearing their
+stamp, and only a content diff sees through that.
+
+**origofs does not own the document schema.** A tree has no canonical byte serialization, and adopting one
+(Markdown? HTML?) would make the engine responsible for a document model and a dialect — a fight this project
+does not need, and one that would demote every host with a different schema. So the *host* serializes and hands
+origofs the bytes plus a **span map**: `[(byte_start, byte_end, node)]`, where each `node` is an id origofs
+itself stamped (visible to the client as an ordinary Yjs formatting attribute). origofs resolves node → author
+from its own stamps and lands the result through the same `write_as_blamed` as the flat path. The host names
+byte ranges and nodes; it can never name an actor, and an id origofs never issued resolves to nobody. Three
+consequences follow, and all three are deliberate:
+
+- **A wrong span map yields wrong blame.** origofs validates ordering, overlap, range and character boundaries,
+  and it validates that a node id is one it issued — but it cannot check that the host mapped the right bytes to
+  the right node, because it cannot read the host's serializer. That is the price of not owning the schema, and
+  it belongs in the docs rather than in a discovery.
+- **A stale sidecar opens an *empty* tree.** `open_coedit` rebuilds a flat document from the file's text plus its
+  blame; the tree cannot be rebuilt that way, because parsing bytes back into nodes needs the schema. So
+  `open_coedit_tree` reports `resumed()`, and a host that ignores it will checkpoint an empty body over a real
+  file.
+- **An out-of-band write is refused, not reconciled.** The flat path folds a foreign write in by replaying it as
+  attributed CRDT operations (`reconcile_with`); a tree has no such replay. Since clobbering silently is the one
+  outcome worse than an error, `checkpoint_coedit_tree` returns `Conflict` and the host re-seeds.
+
+**Durability splits with the schema.** Only the host can produce a tree's bytes, so only the host can crystallize
+the file — but the CRDT is fully known server-side. `persist_coedit_tree` therefore writes the ydoc sidecar
+*alone*, with no body, and the room sweeper calls it on the same tick a flat room checkpoints on. A crash then
+costs no editing history even though the file has not moved; and because the file has not moved, it deliberately
+does **not** stamp `checkpointed_at` — saying otherwise would tell a reader its bytes are fresher than they are.
+
 **The live/dirty marker (ruling).** While a path is promoted to a CRDT document, its durable bytes are the last
 **checkpoint** — a real, fully attributed state, but possibly behind the `Y.Doc` people are typing into. A
 workspace-scoped `live_doc` row records that a path is open (plus the file's content address as of the last

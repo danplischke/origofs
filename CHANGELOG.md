@@ -7,6 +7,55 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
+### Added
+
+- **A structured (`Y.XmlFragment`) co-editing shape, so rich-text editors bind
+  natively (#92).** `CoeditDoc` models a document as one flat `Y.Text`, but every
+  mainstream rich-text CRDT binding — `@platejs/yjs`, `y-prosemirror`, `y-slate`,
+  TipTap — binds to a structured tree, so none of them could attach to an origofs
+  room. Hosts had to mirror: serialize the editor to text on every change and diff
+  it against the shared `Y.Text`. That converges, but the caret is lost on every
+  remote edit, serializer round-trip noise reads as authored bytes, and attribution
+  is only ever as sharp as the host's whole-file text diff — which is the part that
+  undercuts the project's headline promise, since byte-level authorship is only as
+  good as the edits a client can express.
+
+  `CoeditTreeDoc` is the structured shape, attributed by the same server-side rule
+  as the flat path: the content an update *introduces* is stamped with the
+  connection's actor, never with an author the client names. It is a *content* diff
+  per text node rather than "which runs lack an author", because Yjs makes an insert
+  inherit the formatting attributes at its position — text typed against the end of
+  someone else's run arrives already wearing their stamp.
+
+  **origofs does not adopt a document model to do it.** A tree has no canonical byte
+  serialization, and picking one would make the engine responsible for a dialect. The
+  host — which owns the schema, because its editor defines it — supplies the
+  serialized body plus a span map (`[(byte_start, byte_end, node)]`), and origofs
+  resolves each node id to the author it stamped itself, landing the result through
+  the existing `write_as_blamed`. The host names byte ranges and nodes, never an
+  actor. Bytes no span covers — a bullet marker, a fence, a paragraph break — fall
+  back to the checkpointing actor, the same rule the flat path already uses for an
+  unattributed run.
+
+  Two behaviours follow from not owning the schema, and both are deliberate: a
+  document whose sidecar is missing or stale opens **empty** (a tree cannot be
+  rebuilt from flat bytes), so `resumed()` must be checked before an editor is bound;
+  and an out-of-band write is refused with `Conflict` rather than reconciled, because
+  clobbering it silently is the one outcome worse than an error.
+
+  Served at `GET /v1/coedit-tree/{path}` (same authentication, frame cap and
+  per-connection session as the flat socket) with the host-driven
+  `POST /v1/coedit-tree-checkpoint/{path}`, on both the Rust API and the FastAPI
+  router; `open_coedit_tree` / `checkpoint_coedit_tree` / `persist_coedit_tree` on
+  the SDK and the Python bindings.
+
+- **Server-side durability for a shape the server cannot serialize.** Because only
+  the host can produce a tree's bytes, `persist_coedit_tree` writes the ydoc sidecar
+  *alone*, with no body, and the room sweeper calls it on the same tick a flat room
+  checkpoints on. A worker crash then costs no editing history even though the file
+  has not moved — and because it has not moved, this deliberately does not stamp
+  `checkpointed_at`, which would tell a reader its bytes are fresher than they are.
+
 ### Fixed
 
 - **`sandbox --isolate` did not work on any current LTS distribution.** The

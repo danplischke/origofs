@@ -320,6 +320,11 @@ def _parse_range(range_header: Optional[str], size: int) -> Optional[tuple]:
 # (never the token) as the selected protocol.
 _COEDIT_SUBPROTOCOL = "origofs"
 
+# The `XmlFragment` root a tree room binds to when the client names none. Editors
+# differ (`y-prosemirror` defaults to "prosemirror", `@platejs/yjs` is
+# configurable), so it is always explicit on the wire and this is only the default.
+_DEFAULT_TREE_ROOT = "content"
+
 
 async def _session_bound(ws: Any, ctx: Any) -> Any:
     """`ctx` with a session guaranteed, opening one if it has none.
@@ -416,11 +421,20 @@ class _Room:
     """One live document shared by every socket editing it: the attributed CRDT
     plus the set of connected sockets to fan edits out to."""
 
-    __slots__ = ("doc", "conns", "ctx", "last_edit", "last_checkpoint", "dirty")
+    __slots__ = (
+        "doc", "conns", "ctx", "path", "xml_root",
+        "last_edit", "last_checkpoint", "dirty",
+    )
 
-    def __init__(self, doc: "origofs.CoeditDoc", ctx: Any) -> None:
-        self.doc: "origofs.CoeditDoc" = doc
+    def __init__(self, doc: Any, ctx: Any, path: str, xml_root: Optional[str] = None) -> None:
+        self.doc = doc
         self.conns: set[_Conn] = set()
+        # The workspace path this room edits, and -- for a tree room (#92) -- the
+        # `XmlFragment` root it is bound to. `xml_root` is `None` for the flat
+        # shape, and is what decides how the room reaches durable storage: the
+        # server can materialize a `Y.Text`, but only the host can serialize a tree.
+        self.path = path
+        self.xml_root = xml_root
         # The newest joiner's context: a periodic checkpoint has no connection of
         # its own to borrow an identity from, and this is the same one the final
         # checkpoint on last leave uses. It only names the op-log entry and
@@ -459,7 +473,28 @@ class _Room:
                 conn.out.put_nowait(frame)
 
 
-async def _finalize(writer_task: "asyncio.Task[None]", rooms: "_Rooms", path: str, ctx: Any, conn: "_Conn") -> None:
+def _flat_key(path: str) -> tuple:
+    """Registry key for a flat (``Y.Text``) room."""
+    return ("flat", path)
+
+
+def _tree_key(path: str, xml_root: str) -> tuple:
+    """Registry key for a tree (``Y.XmlFragment``) room (#92).
+
+    The shape is part of the key because one path may legitimately be open in both
+    at once — a terminal editor on the flat shape, a browser on the tree — and the
+    two must never share a document.
+    """
+    return ("tree", xml_root, path)
+
+
+def _relay_key(key: tuple) -> str:
+    """The routing key peers publish and subscribe under, so two shapes of one path
+    stay separate across workers. ``\0`` cannot occur in a path."""
+    return key[1] if key[0] == "flat" else "tree\0{}\0{}".format(key[1], key[2])
+
+
+async def _finalize(writer_task: "asyncio.Task[None]", rooms: "_Rooms", key: tuple, ctx: Any, conn: "_Conn") -> None:
     """Tear a connection down: stop its writer and leave the room (which
     checkpoints on the last leave). Run this under :func:`asyncio.shield` — the
     socket closing tends to cancel the endpoint task, and the checkpoint must still
@@ -469,7 +504,7 @@ async def _finalize(writer_task: "asyncio.Task[None]", rooms: "_Rooms", path: st
         await writer_task
     except BaseException:  # noqa: BLE001 - already-cancelled writer; nothing to do
         pass
-    await rooms.leave(path, ctx, conn)
+    await rooms.leave(key, ctx, conn)
 
 
 class _Rooms:
@@ -491,7 +526,8 @@ class _Rooms:
 
     def __init__(self, ws: Any, policy: Optional[CheckpointPolicy] = None) -> None:
         self._ws = ws
-        self._rooms: dict[str, _Room] = {}
+        # Keyed by shape as well as path -- see `_flat_key` / `_tree_key`.
+        self._rooms: dict[tuple, _Room] = {}
         self._lock = asyncio.Lock()
         self._policy = policy if policy is not None else CheckpointPolicy()
         self._sweeper_task: Optional["asyncio.Task[None]"] = None
@@ -550,23 +586,34 @@ class _Rooms:
         """
         now = time.monotonic()
         async with self._lock:
-            due = [
-                (path, room)
-                for path, room in self._rooms.items()
-                if room.is_due(self._policy, now)
-            ]
-        for path, room in due:
+            due = [room for room in self._rooms.values() if room.is_due(self._policy, now)]
+        for room in due:
             # Clear `dirty` *before* the write, so an edit landing during it marks
             # the room dirty again and gets its own checkpoint. The other order
             # would swallow that edit until the next one arrived.
             room.dirty = False
             room.last_checkpoint = now
             try:
-                await self._ws.checkpoint_coedit(room.ctx, path, room.doc)
+                await self._write_back(room)
             except Exception:
                 # Put it back in the queue rather than waiting for the next edit:
                 # a failed checkpoint means these bytes are still not durable.
                 room.dirty = True
+
+    async def _write_back(self, room: _Room) -> None:
+        """Write a room back to durable storage, as far as the server is able to.
+
+        A flat room checkpoints in full -- text and blame -- because the server can
+        materialize its bytes. A tree room only gets its **sidecar** persisted: the
+        body is the host's serialization and the server has no serializer, so
+        producing one here would mean inventing a document model. The file and its
+        blame move when the host calls :meth:`checkpoint_tree`; this is what keeps a
+        crash from costing the editing history in between.
+        """
+        if room.xml_root is None:
+            await self._ws.checkpoint_coedit(room.ctx, room.path, room.doc)
+        else:
+            await self._ws.persist_coedit_tree(room.path, room.doc)
 
     async def _drain(self) -> None:
         """Apply peers' published deltas to the rooms this worker hosts and fan
@@ -585,7 +632,10 @@ class _Rooms:
             for note in notes:
                 if note.origin == self._origin:
                     continue  # our own op — already applied + fanned out locally
-                room = self._rooms.get(note.path)
+                room = next(
+                    (r for k, r in self._rooms.items() if _relay_key(k) == note.path),
+                    None,
+                )
                 if room is None:
                     continue  # not hosting this document here
                 try:
@@ -594,61 +644,88 @@ class _Rooms:
                     continue
                 room.fanout(None, note.delta)  # to every local socket
 
-    async def publish(self, path: str, frame: bytes) -> None:
+    async def publish(self, key: tuple, frame: bytes) -> None:
         """Publish a local edit's delta to peer workers (a no-op without the relay)."""
         if not self._relay:
             return
         try:
-            await self._ws.coedit_publish(path, self._origin, frame)
+            await self._ws.coedit_publish(_relay_key(key), self._origin, frame)
         except Exception:
             pass  # relay is best-effort; local editing continues regardless
 
-    async def join(self, path: str, ctx: Any, conn: _Conn) -> _Room:
+    async def join(self, key: tuple, ctx: Any, conn: _Conn) -> _Room:
         async with self._lock:
-            room = self._rooms.get(path)
+            room = self._rooms.get(key)
             if room is None:
-                doc = await self._ws.open_coedit(ctx, path)
+                path = key[1] if key[0] == "flat" else key[2]
+                xml_root = None if key[0] == "flat" else key[1]
+                if xml_root is None:
+                    doc = await self._ws.open_coedit(ctx, path)
+                else:
+                    doc = await self._ws.open_coedit_tree(ctx, path, xml_root)
                 if self._relay:
                     # Ensure the relay table exists, then replay recent ops so this
                     # room catches up to peers before its first socket syncs.
                     try:
                         await self._ws.coedit_relay_init()
-                        for note in await self._ws.coedit_replay(path):
+                        for note in await self._ws.coedit_replay(_relay_key(key)):
                             await doc.apply_relayed(note.delta)
                     except Exception:
                         pass
-                room = _Room(doc, ctx)
-                self._rooms[path] = room
+                room = _Room(doc, ctx, path, xml_root)
+                self._rooms[key] = room
             else:
                 # The newest joiner is who a background checkpoint runs as.
                 room.ctx = ctx
             room.conns.add(conn)
             return room
 
-    async def leave(self, path: str, ctx: Any, conn: _Conn) -> None:
+    async def leave(self, key: tuple, ctx: Any, conn: _Conn) -> None:
         async with self._lock:
-            room = self._rooms.get(path)
+            room = self._rooms.get(key)
             if room is None:
                 return
             room.conns.discard(conn)
             if not room.conns:
-                # Final checkpoint under the registry lock so a concurrent join
+                # Final write-back under the registry lock so a concurrent join
                 # can't fork a fresh room off a half-written sidecar -- or clear
                 # the live marker out from under a room still taking edits.
-                await self._ws.checkpoint_coedit(ctx, path, room.doc)
-                # Only after that checkpoint lands: until it does, the durable
-                # blob really does lag the document, and the marker is what says
-                # so. (`open_coedit` set it; this is the matching clear, exactly
-                # as the Rust api::Coordinator does on last leave.)
+                room.ctx = ctx
+                await self._write_back(room)
+                # Only after that lands: until it does, the durable blob really
+                # does lag the document, and the marker is what says so.
+                # (`open_coedit` set it; this is the matching clear, exactly as
+                # the Rust api::Coordinator does on last leave.)
                 try:
-                    await self._ws.end_coedit(path)
+                    await self._ws.end_coedit(room.path)
                 except Exception:
                     # An older extension without `end_coedit`, or a transient
                     # metadata error: a marker left behind is the *safe* failure
                     # direction (a reader is told the bytes may lag when they
                     # don't), so it must not fail the disconnect path.
                     pass
-                del self._rooms[path]
+                del self._rooms[key]
+
+    async def checkpoint_tree(
+        self, key: tuple, ctx: Any, body: bytes, spans: list
+    ) -> None:
+        """Land a tree room's bytes: the host's serialized `body` plus the span map
+        saying which byte ranges came from which co-edit node (#92).
+
+        Runs against the **live** room when one exists, so the node ids the host
+        cites resolve against the same stamps its socket is seeing; falls back to
+        the document on disk when the host checkpoints with no socket attached.
+        """
+        room = self._rooms.get(key)
+        path, xml_root = key[2], key[1]
+        if room is None:
+            doc = await self._ws.open_coedit_tree(ctx, path, xml_root)
+            await self._ws.checkpoint_coedit_tree(ctx, path, doc, body, spans)
+            return
+        await self._ws.checkpoint_coedit_tree(ctx, path, room.doc, body, spans)
+        # The host has crystallized these bytes, so the room is no longer behind.
+        room.dirty = False
+        room.last_checkpoint = time.monotonic()
 
 
 # --- router factory ---------------------------------------------------------
@@ -1267,68 +1344,141 @@ def build_router(
         unit — it is exactly "what this person typed in this sitting", which is
         what ``revert_session`` undoes.
         """
+        await _serve_coedit(ws, rooms, websocket, _scoped(root, path), ctx, None)
+
+    @router.websocket("/coedit-tree/{path:path}")
+    async def coedit_tree(
+        websocket: WebSocket,
+        path: str,
+        ctx: Any = Depends(authn),
+        root: str = Depends(_root),
+        xml_root: str = Query(_DEFAULT_TREE_ROOT, alias="root"),
+    ) -> None:
+        """Live co-editing over a ``Y.XmlFragment`` — the **tree** shape (#92), so
+        ``@platejs/yjs``, ``y-prosemirror``, ``y-slate`` or TipTap bind natively
+        instead of mirroring a flat ``Y.Text``.
+
+        Identical to ``/coedit/{path}`` in authentication, credential transport and
+        per-connection sessions. It differs only in what reaches durable storage:
+        origofs does not own your document schema, so it cannot serialize a tree.
+        The server persists the CRDT on the policy's tick (a crash then costs no
+        editing history) and **you** land the file by POSTing to
+        ``/coedit-tree-checkpoint/{path}`` with your serialized body and a span map.
+
+        ``?root=`` names the ``XmlFragment`` your editor binds to; it must match
+        the one you pass at checkpoint time.
+        """
+        await _serve_coedit(ws, rooms, websocket, _scoped(root, path), ctx, xml_root)
+
+    @router.post("/coedit-tree-checkpoint/{path:path}")
+    async def coedit_tree_checkpoint(
+        path: str,
+        payload: dict,
+        ctx: Any = Depends(authn),
+        root: str = Depends(_root),
+    ) -> dict:
+        """Land a tree document's bytes (#92).
+
+        The flat shape needs no equivalent route: the server can materialize a
+        ``Y.Text``, so it checkpoints itself. A tree's bytes exist only once your
+        serializer has run, so you are the only party that can supply them — along
+        with the span map saying which bytes came from which co-edit node.
+
+        Body: ``{"body": "...", "spans": [[start, end, node], ...], "root": "..."}``.
+        Authorship is still resolved server-side from origofs's own stamps — the
+        request names byte ranges and node ids, never an actor. Bytes no span covers
+        (your serializer's own punctuation) are attributed to the caller.
+        """
         p = _scoped(root, path)
-        # A browser that proposes subprotocols fails the handshake unless the
-        # server selects one of them, so echo the marker back when it was offered.
-        # Only ever the marker -- never the token beside it.
-        offered = websocket.scope.get("subprotocols") or []
-        chosen = _COEDIT_SUBPROTOCOL if _COEDIT_SUBPROTOCOL in offered else None
-        await websocket.accept(subprotocol=chosen)
-
-        # Bind a session to the connection if the credential didn't carry one,
-        # so `revert_session` can undo this sitting's edits (see the docstring).
+        body = payload.get("body", "")
+        body = body.encode() if isinstance(body, str) else bytes(body)
+        spans = [(int(a), int(b), str(node)) for a, b, node in payload.get("spans", [])]
+        xml_root = payload.get("root") or _DEFAULT_TREE_ROOT
         ctx = await _session_bound(ws, ctx)
-        rooms.ensure_relay()  # idempotent; starts the cross-worker drain on first use
-        rooms.ensure_sweeper()  # idempotent; starts periodic checkpointing (#97)
-        conn = _Conn(websocket)
-        room = await rooms.join(p, ctx, conn)
-
-        async def writer() -> None:
-            while True:
-                await websocket.send_bytes(await conn.out.get())
-
-        # Greet the client with SyncStep1, then let the writer own all sends.
-        conn.out.put_nowait(await room.doc.sync_start())
-        writer_task = asyncio.create_task(writer())
-        try:
-            while True:
-                data = await websocket.receive_bytes()
-                try:
-                    reply = await room.doc.handle_sync(ctx, data)
-                except ValueError as e:
-                    # A malformed/corrupt y-sync frame -- the binary protocol has
-                    # no way to resync mid-stream, so close cleanly (1002:
-                    # protocol error) instead of leaving this client with a hard
-                    # reset and crashing the ASGI app with an uncaught exception.
-                    await _safe_close(websocket, 1002, str(e))
-                    return
-                except Exception as e:
-                    # Anything else handle_sync raises (an origofs-side failure
-                    # applying an otherwise-valid frame, or a type this router
-                    # doesn't specifically anticipate) -- not the client's
-                    # protocol fault, so 1011: internal error. Broad on purpose:
-                    # the whole point is that nothing from handle_sync should be
-                    # able to crash the connection uncleanly, not just the two
-                    # exception shapes observed so far.
-                    await _safe_close(websocket, 1011, str(e))
-                    return
-                if reply.reply:
-                    conn.out.put_nowait(reply.reply)
-                if reply.broadcast:
-                    # A frame worth broadcasting is a frame that changed the
-                    # document, which is exactly what makes the room due for a
-                    # checkpoint.
-                    room.touch_edit()
-                    room.fanout(conn, reply.broadcast)  # local sockets
-                    await rooms.publish(p, reply.broadcast)  # peer workers
-        except WebSocketDisconnect:
-            pass
-        finally:
-            # Shielded so the last-leave checkpoint completes even though closing
-            # the socket cancels this endpoint task.
-            try:
-                await asyncio.shield(_finalize(writer_task, rooms, p, ctx, conn))
-            except asyncio.CancelledError:
-                pass
+        # Through the shared mapper, so a malformed span map is a 400 and a write
+        # that landed outside the session is a 409 -- the same translation every
+        # other route gets, rather than a second one that could drift from it.
+        await _run(rooms.checkpoint_tree(_tree_key(p, xml_root), ctx, body, spans))
+        return {"path": p, "bytes": len(body), "spans": len(spans)}
 
     return router
+
+
+async def _serve_coedit(
+    ws: Any,
+    rooms: "_Rooms",
+    websocket: WebSocket,
+    p: str,
+    ctx: Any,
+    xml_root: Optional[str],
+) -> None:
+    """Drive one co-editing socket, flat (``xml_root is None``) or tree.
+
+    Shared by both routes so neither can drift from the other on identity,
+    handshake, session binding, or teardown -- the parts that are the same for both
+    shapes, and the parts where a divergence would be a security bug rather than a
+    behaviour difference.
+    """
+    key = _flat_key(p) if xml_root is None else _tree_key(p, xml_root)
+    # A browser that proposes subprotocols fails the handshake unless the
+    # server selects one of them, so echo the marker back when it was offered.
+    # Only ever the marker -- never the token beside it.
+    offered = websocket.scope.get("subprotocols") or []
+    chosen = _COEDIT_SUBPROTOCOL if _COEDIT_SUBPROTOCOL in offered else None
+    await websocket.accept(subprotocol=chosen)
+
+    # Bind a session to the connection if the credential didn't carry one,
+    # so `revert_session` can undo this sitting's edits.
+    ctx = await _session_bound(ws, ctx)
+    rooms.ensure_relay()  # idempotent; starts the cross-worker drain on first use
+    rooms.ensure_sweeper()  # idempotent; starts periodic checkpointing (#97)
+    conn = _Conn(websocket)
+    room = await rooms.join(key, ctx, conn)
+
+    async def writer() -> None:
+        while True:
+            await websocket.send_bytes(await conn.out.get())
+
+    # Greet the client with SyncStep1, then let the writer own all sends.
+    conn.out.put_nowait(await room.doc.sync_start())
+    writer_task = asyncio.create_task(writer())
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            try:
+                reply = await room.doc.handle_sync(ctx, data)
+            except ValueError as e:
+                # A malformed/corrupt y-sync frame -- the binary protocol has
+                # no way to resync mid-stream, so close cleanly (1002:
+                # protocol error) instead of leaving this client with a hard
+                # reset and crashing the ASGI app with an uncaught exception.
+                await _safe_close(websocket, 1002, str(e))
+                return
+            except Exception as e:
+                # Anything else handle_sync raises (an origofs-side failure
+                # applying an otherwise-valid frame, or a type this router
+                # doesn't specifically anticipate) -- not the client's
+                # protocol fault, so 1011: internal error. Broad on purpose:
+                # the whole point is that nothing from handle_sync should be
+                # able to crash the connection uncleanly, not just the two
+                # exception shapes observed so far.
+                await _safe_close(websocket, 1011, str(e))
+                return
+            if reply.reply:
+                conn.out.put_nowait(reply.reply)
+            if reply.broadcast:
+                # A frame worth broadcasting is a frame that changed the
+                # document, which is exactly what makes the room due for a
+                # checkpoint.
+                room.touch_edit()
+                room.fanout(conn, reply.broadcast)  # local sockets
+                await rooms.publish(key, reply.broadcast)  # peer workers
+    except WebSocketDisconnect:
+        pass
+    finally:
+        # Shielded so the last-leave write-back completes even though closing
+        # the socket cancels this endpoint task.
+        try:
+            await asyncio.shield(_finalize(writer_task, rooms, key, ctx, conn))
+        except asyncio.CancelledError:
+            pass

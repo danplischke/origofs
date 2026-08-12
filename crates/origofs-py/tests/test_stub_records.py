@@ -107,6 +107,10 @@ async def _collect() -> dict:
     await ws.touch(human, sess, "/docs/notes.txt")
     await ws.lock("/docs/notes.txt", "dan")
 
+    # A tree co-edited document, for the run shape a host's span map is built from.
+    tree = await ws.open_coedit_tree(ctx, "/docs/tree.md", "content")
+    await tree.append_text(ctx, "p", "structured")
+
     records = {
         "ActorRecord": await ws.actor(human),
         "BlameSpan": (await ws.blame("/docs/notes.txt"))[0],
@@ -128,6 +132,7 @@ async def _collect() -> dict:
         "SchemaVersion": await ws.schema_version(),
         "MigrateReport": await ws.migrate(),
         "ReadyReport": await ws.ready(),
+        "TreeRun": (await tree.runs())[0],
     }
     assert commit  # the commit above is what `log`/`branches` report on
     return records

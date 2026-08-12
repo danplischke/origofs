@@ -31,7 +31,9 @@ pub use origofs_core::{
 #[cfg(feature = "encryption")]
 pub use origofs_core::EncryptedStore;
 #[cfg(feature = "coedit")]
-pub use origofs_core::{COEDIT_SIDECAR_DIR, CoeditDoc};
+pub use origofs_core::{
+    COEDIT_SIDECAR_DIR, CoeditDoc, CoeditTreeDoc, DEFAULT_TREE_ROOT, SyncReply, TreeRun, TreeSpan,
+};
 // The cross-worker co-editing relay rides on Postgres `LISTEN`/`NOTIFY`, so
 // these types exist only when both features are on.
 #[cfg(all(feature = "coedit", feature = "postgres"))]
@@ -1389,6 +1391,60 @@ impl Workspace {
         self.fs
             .suggest_coedit_update(ctx, path, base_sv, update, summary)
             .await
+    }
+
+    /// Open a **tree-shaped** live co-editing document for `path` (issue #92),
+    /// rooted at the `XmlFragment` named `root` — the shape `@platejs/yjs`,
+    /// `y-prosemirror` and `y-slate` bind to natively, as opposed to
+    /// [`open_coedit`](Self::open_coedit)'s flat `Y.Text`.
+    ///
+    /// Resumes from the sidecar when it is still coherent with the file. Otherwise
+    /// the document opens **empty** with
+    /// [`resumed`](CoeditTreeDoc::resumed) false — origofs cannot rebuild a tree
+    /// from flat bytes, because that needs the host's schema — and the host must
+    /// seed it from [`read`](Self::read) before binding an editor. Requires the
+    /// `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn open_coedit_tree(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        root: &str,
+    ) -> Result<CoeditTreeDoc> {
+        self.fs.open_coedit_tree(ctx, path, root).await
+    }
+
+    /// Checkpoint a tree-shaped co-editing document into `path`, landing the host's
+    /// serialized `body` with per-node authorship resolved from `spans` (see
+    /// [`TreeSpan`]).
+    ///
+    /// origofs does not own the document schema, so the *host* serializes and says
+    /// which bytes came from which co-edit node; origofs resolves each node to the
+    /// author it stamped itself and lands the result in the byte-range blame index.
+    /// A write that landed outside the session since the last checkpoint is refused
+    /// with [`OrigoFSError::Conflict`] rather than clobbered. Requires the `coedit`
+    /// feature.
+    #[cfg(feature = "coedit")]
+    pub async fn checkpoint_coedit_tree(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditTreeDoc,
+        body: &[u8],
+        spans: &[TreeSpan],
+    ) -> Result<()> {
+        self.fs
+            .checkpoint_coedit_tree(ctx, path, doc, body, spans)
+            .await
+    }
+
+    /// Persist a tree document's CRDT sidecar **without** landing a body — the
+    /// server-side half of durability for a shape only the host can serialize. A
+    /// crashed worker then loses no editing history, while the file and its blame
+    /// stay where the last real checkpoint left them. Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn persist_coedit_tree(&self, path: &str, doc: &CoeditTreeDoc) -> Result<()> {
+        self.fs.persist_coedit_tree(path, doc).await
     }
 
     /// End a live co-editing session for `path`: clear its live marker so byte

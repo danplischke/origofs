@@ -848,6 +848,200 @@ impl CoeditDoc {
     }
 }
 
+/// A live **tree-shaped** co-edited document (issue #92): a `Y.XmlFragment` a
+/// rich-text editor (`@platejs/yjs`, `y-prosemirror`, `y-slate`, TipTap) binds to
+/// natively, instead of `CoeditDoc`'s flat `Y.Text`.
+///
+/// Obtain one from [`Workspace.open_coedit_tree`], drive it with the same y-sync
+/// wire protocol, and land it with [`Workspace.checkpoint_coedit_tree`] — which
+/// takes *your* serialized bytes plus a span map, because origofs does not own the
+/// document schema. `authors()` is the map those spans resolve against.
+///
+/// Internally synchronized, so one instance is safe to share across many concurrent
+/// WebSocket handlers — exactly how a FastAPI room mounts it.
+#[pyclass]
+struct CoeditTreeDoc {
+    inner: Arc<tokio::sync::Mutex<origofs_sdk::CoeditTreeDoc>>,
+}
+
+#[pymethods]
+impl CoeditTreeDoc {
+    /// A fresh, empty document rooted at the ``XmlFragment`` named `root`. Server
+    /// rooms come from `Workspace.open_coedit_tree`.
+    #[new]
+    #[pyo3(signature = (root=None))]
+    fn new(root: Option<String>) -> Self {
+        let root = root.unwrap_or_else(|| origofs_sdk::DEFAULT_TREE_ROOT.to_string());
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(origofs_sdk::CoeditTreeDoc::new(
+                &root,
+            ))),
+        }
+    }
+
+    /// Append ``<tag>text</tag>`` to the root, attributed to `ctx`, and return the
+    /// node id stamped on the text run — ready to cite in a span map.
+    ///
+    /// The tree analogue of ``CoeditDoc.insert``, and deliberately just as narrow:
+    /// the in-process path for a Python-side agent seeding or appending to a
+    /// document, and for a test client. A real editor does not use it — it owns the
+    /// schema and drives arbitrary tree edits over y-sync, where ``handle_sync``
+    /// attributes them.
+    #[pyo3(signature = (ctx, tag, text))]
+    fn append_text<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        tag: String,
+        text: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            Ok(inner.lock().await.append_text(c, &tag, &text))
+        })
+    }
+
+    /// The y-sync frame to greet a freshly-connected client with.
+    fn sync_start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let bytes = inner.lock().await.sync_start();
+            Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
+        })
+    }
+
+    /// This document's Yjs state vector (``encodeStateVector``).
+    fn state_vector<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let bytes = inner.lock().await.state_vector();
+            Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
+        })
+    }
+
+    /// This document's full state as a Yjs update (``encodeStateAsUpdate``).
+    fn state_update<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let bytes = inner.lock().await.state_update();
+            Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
+        })
+    }
+
+    /// Handle one inbound y-sync payload from a connection authenticated as `ctx`.
+    /// Content the client contributes is attributed to `ctx` server-side, never
+    /// trusted from the bytes. Returns a [`CoeditSyncReply`] routing the response.
+    fn handle_sync<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        data: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let out = inner.lock().await.handle_sync(c, &data).map_err(to_pyerr)?;
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    CoeditSyncReply {
+                        reply: out.reply,
+                        broadcast: out.broadcast,
+                    },
+                )
+            })
+        })
+    }
+
+    /// Merge a y-sync frame that was already attributed elsewhere — a peer
+    /// worker's relayed delta, or (for a client-side doc) the server's own reply —
+    /// *without* re-attribution. Idempotent.
+    fn apply_relayed<'py>(&self, py: Python<'py>, frame: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.lock().await.apply_relayed(&frame).map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Every node id origofs has stamped, as ``{node: (actor_id, session_id)}``.
+    ///
+    /// This is what a span map resolves against — useful for inspection, and for a
+    /// host that wants to show "who wrote this node" without waiting for a
+    /// checkpoint. A node id absent from this map resolves to no author.
+    fn authors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let authors = inner.lock().await.authors();
+            Python::attach(|py| {
+                let out = pyo3::types::PyDict::new(py);
+                for (node, (actor, session)) in authors {
+                    out.set_item(node, (actor, session))?;
+                }
+                Ok(out.unbind())
+            })
+        })
+    }
+
+    /// Whether this document was resumed from a coherent sidecar rather than
+    /// created empty.
+    ///
+    /// **Check this before binding an editor.** origofs cannot rebuild a *tree*
+    /// from a flat file — that needs your schema — so a document whose sidecar is
+    /// missing or stale opens empty, and checkpointing it would write an empty body
+    /// over a file with content. Seed it from ``await ws.read(path)`` first.
+    fn resumed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move { Ok(inner.lock().await.resumed()) })
+    }
+
+    /// Whether the tree has no nodes at all.
+    fn is_empty<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move { Ok(inner.lock().await.is_empty()) })
+    }
+
+    /// Every text run in document order, as
+    /// ``{"text", "node", "actor", "session"}`` dicts — the server-side reading of
+    /// what a browser host gets from ``ytext.toDelta()``.
+    ///
+    /// This is what a caller serializing the document *itself* (a Python agent
+    /// rather than a browser editor) walks to build its span map: emit bytes for
+    /// each run, record the byte range it occupied, cite its ``node``. A run
+    /// origofs never stamped has ``node`` ``None`` and actor ``0``.
+    fn runs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let runs = inner.lock().await.runs();
+            Python::attach(|py| {
+                let out = pyo3::types::PyList::empty(py);
+                for run in runs {
+                    let item = pyo3::types::PyDict::new(py);
+                    item.set_item("text", run.text)?;
+                    item.set_item("node", run.node)?;
+                    item.set_item("actor", run.actor)?;
+                    item.set_item("session", run.session)?;
+                    out.append(item)?;
+                }
+                Ok(out.unbind())
+            })
+        })
+    }
+
+    /// The whole tree's text in document order, with no structure — a cheap
+    /// projection for inspection and tests. **Not** the durable body: that is your
+    /// serialization, which only you can produce.
+    fn plain_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move { Ok(inner.lock().await.plain_text()) })
+    }
+
+    fn __repr__(&self) -> String {
+        "CoeditTreeDoc()".to_string()
+    }
+}
+
 /// One relayed co-editing update from another worker: the attributed `delta`
 /// (a y-sync frame) `origin` produced for `path`, ordered by `seq`.
 #[pyclass(frozen)]
@@ -1911,6 +2105,101 @@ impl Workspace {
         future_into_py(py, async move {
             let guard = inner.lock().await;
             ws.checkpoint_coedit(c, &path, &guard)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Open a **tree-shaped** live co-editing document for `path` (issue #92),
+    /// rooted at the ``XmlFragment`` named `root` — the shape `@platejs/yjs`,
+    /// `y-prosemirror` and `y-slate` bind to natively.
+    ///
+    /// Resumes from the sidecar when it is still coherent with the file; otherwise
+    /// the document opens **empty** with ``resumed()`` false, because rebuilding a
+    /// tree from flat bytes would need your schema. Seed it from ``read(path)``
+    /// before binding an editor.
+    #[pyo3(signature = (ctx, path, root=None))]
+    fn open_coedit_tree<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        root: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        let root = root.unwrap_or_else(|| origofs_sdk::DEFAULT_TREE_ROOT.to_string());
+        future_into_py(py, async move {
+            let doc = ws
+                .open_coedit_tree(c, &path, &root)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    CoeditTreeDoc {
+                        inner: Arc::new(tokio::sync::Mutex::new(doc)),
+                    },
+                )
+            })
+        })
+    }
+
+    /// Checkpoint a tree-shaped co-editing `doc` into `path`: land **your**
+    /// serialized `body` with per-node authorship resolved from `spans`.
+    ///
+    /// `spans` is a list of ``(byte_start, byte_end, node)`` tuples saying which
+    /// bytes of `body` came from which co-edit node — ordered, non-overlapping, on
+    /// character boundaries. origofs resolves each node to the author it stamped
+    /// itself, so you name ranges and nodes, never an actor. Bytes no span covers
+    /// (your serializer's own punctuation) are attributed to `ctx`.
+    ///
+    /// Raises ``Conflict`` if the file was written outside the session since the
+    /// last checkpoint: a tree cannot be reconciled with a foreign write, so the
+    /// alternative would be clobbering it silently. Re-read, reseed, retry.
+    fn checkpoint_coedit_tree<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        doc: Py<CoeditTreeDoc>,
+        body: Vec<u8>,
+        spans: Vec<(u64, u64, String)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        let inner = doc.borrow(py).inner.clone();
+        let spans: Vec<origofs_sdk::TreeSpan> = spans
+            .into_iter()
+            .map(|(start, end, node)| origofs_sdk::TreeSpan::new(start, end, node))
+            .collect();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            ws.checkpoint_coedit_tree(c, &path, &guard, &body, &spans)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Persist a tree document's CRDT sidecar **without** landing a body — the
+    /// server-side half of durability for a shape only you can serialize.
+    ///
+    /// Call it on a timer for long-lived rooms: a crash then costs no editing
+    /// history, while the file and its blame stay where the last real checkpoint
+    /// left them (so it deliberately does not stamp "last saved").
+    fn persist_coedit_tree<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        doc: Py<CoeditTreeDoc>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let inner = doc.borrow(py).inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            ws.persist_coedit_tree(&path, &guard)
                 .await
                 .map_err(to_pyerr)?;
             Ok(())
@@ -3068,6 +3357,7 @@ fn _origofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GcsConfig>()?;
     m.add_class::<Subscription>()?;
     m.add_class::<CoeditDoc>()?;
+    m.add_class::<CoeditTreeDoc>()?;
     m.add_class::<CoeditSyncReply>()?;
     m.add_class::<CoeditRelayNote>()?;
     m.add_class::<CoeditRelaySub>()?;

@@ -29,7 +29,7 @@
 //! to catch up. On SQLite (single-writer) the relay is simply off.
 
 use super::{AppState, abspath};
-use crate::{CoeditDoc, OrigoFSError, Workspace, WriteCtx};
+use crate::{CoeditDoc, CoeditTreeDoc, OrigoFSError, TreeSpan, Workspace, WriteCtx};
 use axum::{
     body::Bytes,
     extract::{
@@ -58,12 +58,50 @@ const FANOUT_CAPACITY: usize = 256;
 #[cfg(feature = "postgres")]
 const RELAY_ORIGIN: u64 = u64::MAX;
 
+/// Which document shape a room holds: the flat `Y.Text` every source file uses, or
+/// the `Y.XmlFragment` tree a rich-text editor binds to (#92).
+///
+/// The two share one wire protocol — that is the whole point of factoring the
+/// y-sync driver in `origofs-core` — and differ only in how they reach durable
+/// storage. A flat room checkpoints itself, because the server can materialize its
+/// bytes. A tree room cannot: only the host owns the schema, so the server persists
+/// the CRDT sidecar and the host lands the body through
+/// [`checkpoint_tree`](Coordinator::checkpoint_tree).
+enum RoomDoc {
+    Flat(CoeditDoc),
+    Tree(CoeditTreeDoc),
+}
+
+impl RoomDoc {
+    fn sync_start(&self) -> Vec<u8> {
+        match self {
+            Self::Flat(d) => d.sync_start(),
+            Self::Tree(d) => d.sync_start(),
+        }
+    }
+
+    fn handle_sync(&self, ctx: WriteCtx, data: &[u8]) -> Result<crate::SyncReply, OrigoFSError> {
+        match self {
+            Self::Flat(d) => d.handle_sync(ctx, data),
+            Self::Tree(d) => d.handle_sync(ctx, data),
+        }
+    }
+
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    fn apply_relayed(&self, frame: &[u8]) -> Result<(), OrigoFSError> {
+        match self {
+            Self::Flat(d) => d.apply_relayed(frame),
+            Self::Tree(d) => d.apply_relayed(frame),
+        }
+    }
+}
+
 /// A live co-editing room: one shared, attributed CRDT plus a fan-out channel.
 /// Every socket editing the same path attaches to the same `Room`.
 struct Room {
     /// The shared document. `handle_sync` holds this only for the (synchronous)
     /// duration of applying one payload — never across an `.await`.
-    doc: Mutex<CoeditDoc>,
+    doc: Mutex<RoomDoc>,
     /// Origin-tagged y-sync frames fanned out to the room. Each socket skips
     /// frames it originated — it already applied its own edit locally.
     tx: broadcast::Sender<(u64, Bytes)>,
@@ -177,6 +215,38 @@ impl CheckpointPolicy {
     }
 }
 
+/// How a room is addressed in the registry — and, for a tree room, on the
+/// cross-worker relay, whose `path` column is just an opaque routing key.
+///
+/// A path may legitimately be open in both shapes at once (a flat room for a
+/// terminal editor, a tree room for a browser one), and the two must never share a
+/// document, so the key carries the shape. `\0` cannot occur in a path —
+/// `validate_component` refuses it — so it is a safe separator.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RoomKey {
+    Flat(String),
+    Tree { root: String, path: String },
+}
+
+impl RoomKey {
+    /// The workspace path this room edits.
+    fn path(&self) -> &str {
+        match self {
+            Self::Flat(p) => p,
+            Self::Tree { path, .. } => path,
+        }
+    }
+
+    /// The routing key peers publish and subscribe under.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    fn relay_key(&self) -> String {
+        match self {
+            Self::Flat(p) => p.clone(),
+            Self::Tree { root, path } => format!("tree\0{root}\0{path}"),
+        }
+    }
+}
+
 /// One registry entry: the room, how many sockets are attached, and the identity
 /// a background checkpoint runs as.
 struct RoomSlot {
@@ -195,7 +265,7 @@ struct RoomSlot {
 #[derive(Clone)]
 pub struct Coordinator {
     ws: Arc<Workspace>,
-    rooms: Arc<Mutex<HashMap<String, RoomSlot>>>,
+    rooms: Arc<Mutex<HashMap<RoomKey, RoomSlot>>>,
     next_conn: Arc<AtomicU64>,
     /// This worker's unique id, tagged on every published op so the relay drain
     /// can skip our own echo. Only meaningful with the relay, i.e. on Postgres.
@@ -274,27 +344,47 @@ impl Coordinator {
     /// strictly needed — the write is idempotent for unchanged content.
     async fn checkpoint_due(&self) {
         let now = elapsed_ms(self.epoch);
-        let due: Vec<(String, Arc<Room>, WriteCtx)> = {
+        let due: Vec<(RoomKey, Arc<Room>, WriteCtx)> = {
             let guard = self.rooms.lock().await;
             guard
                 .iter()
                 .filter(|(_, slot)| slot.room.is_due(&self.policy, now))
-                .map(|(p, slot)| (p.clone(), slot.room.clone(), slot.ctx))
+                .map(|(k, slot)| (k.clone(), slot.room.clone(), slot.ctx))
                 .collect()
         };
-        for (path, room, ctx) in due {
+        for (key, room, ctx) in due {
             // Clear `dirty` *before* the write, so an edit landing during it marks
             // the room dirty again and gets its own checkpoint. The other order
             // would swallow that edit until the next one arrived.
             room.dirty.store(false, Ordering::Relaxed);
             room.last_checkpoint_ms.store(now, Ordering::Relaxed);
-            let doc = room.doc.lock().await;
-            if self.ws.checkpoint_coedit(ctx, &path, &doc).await.is_err() {
+            if self.write_back(&key, &room, ctx).await.is_err() {
                 // Put it back in the queue rather than waiting for the next edit:
                 // a failed checkpoint means these bytes are still not durable.
                 room.dirty.store(true, Ordering::Relaxed);
-                tracing::warn!(path, "coedit: periodic checkpoint failed");
+                tracing::warn!(path = key.path(), "coedit: periodic checkpoint failed");
             }
+        }
+    }
+
+    /// Write a room back to durable storage, as far as the server is able to.
+    ///
+    /// A flat room checkpoints in full — text and blame — because the server can
+    /// materialize its bytes. A tree room only gets its **sidecar** persisted: the
+    /// body is the host's serialization and the server has no serializer, so
+    /// producing one here would mean inventing a document model. The file and its
+    /// blame move when the host calls [`checkpoint_tree`](Self::checkpoint_tree);
+    /// this call is what keeps a crash from costing the editing history in between.
+    async fn write_back(
+        &self,
+        key: &RoomKey,
+        room: &Room,
+        ctx: WriteCtx,
+    ) -> Result<(), OrigoFSError> {
+        let doc = room.doc.lock().await;
+        match &*doc {
+            RoomDoc::Flat(d) => self.ws.checkpoint_coedit(ctx, key.path(), d).await,
+            RoomDoc::Tree(d) => self.ws.persist_coedit_tree(key.path(), d).await,
         }
     }
 
@@ -316,16 +406,21 @@ impl Coordinator {
     /// to `ctx` for any promotion of existing file text) on the first join. A freshly
     /// created room replays recent relayed ops so it catches up to peers on other
     /// workers before its first socket syncs.
-    async fn join(&self, path: &str, ctx: WriteCtx) -> Result<Arc<Room>, OrigoFSError> {
+    async fn join(&self, key: &RoomKey, ctx: WriteCtx) -> Result<Arc<Room>, OrigoFSError> {
         let mut rooms = self.rooms.lock().await;
-        if let Some(slot) = rooms.get_mut(path) {
+        if let Some(slot) = rooms.get_mut(key) {
             slot.conns += 1;
             // The newest joiner is who a background checkpoint runs as, matching
             // what the final checkpoint on last leave would have used.
             slot.ctx = ctx;
             return Ok(slot.room.clone());
         }
-        let doc = self.ws.open_coedit(ctx, path).await?;
+        let doc = match key {
+            RoomKey::Flat(path) => RoomDoc::Flat(self.ws.open_coedit(ctx, path).await?),
+            RoomKey::Tree { root, path } => {
+                RoomDoc::Tree(self.ws.open_coedit_tree(ctx, path, root).await?)
+            }
+        };
         // The relay is Postgres-backed (`LISTEN`/`NOTIFY`), so without that backend
         // compiled in there is nothing to catch up from — a single-worker build is
         // a valid configuration, not a degraded one.
@@ -334,7 +429,7 @@ impl Coordinator {
             // Ensure the relay table exists before this room takes edits, so the
             // first publish can't race it, then replay recent ops to catch up.
             let _ = self.ws.coedit_relay_init().await;
-            if let Ok(notes) = self.ws.coedit_replay(path).await {
+            if let Ok(notes) = self.ws.coedit_replay(&key.relay_key()).await {
                 for note in notes {
                     let _ = doc.apply_relayed(&note.delta);
                 }
@@ -353,7 +448,7 @@ impl Coordinator {
             dirty: AtomicBool::new(false),
         });
         rooms.insert(
-            path.to_string(),
+            key.clone(),
             RoomSlot {
                 room: room.clone(),
                 conns: 1,
@@ -363,10 +458,55 @@ impl Coordinator {
         Ok(room)
     }
 
+    /// Land a tree room's bytes: the host's serialized `body` plus the span map
+    /// saying which bytes came from which co-edit node (#92).
+    ///
+    /// This is the tree shape's checkpoint. It runs against the **live** room when
+    /// one exists — so the node ids the host cites resolve against the same stamps
+    /// its socket is seeing — and falls back to the document on disk when the host
+    /// checkpoints without a socket attached.
+    pub(crate) async fn checkpoint_tree(
+        &self,
+        path: &str,
+        root: &str,
+        ctx: WriteCtx,
+        body: &[u8],
+        spans: &[TreeSpan],
+    ) -> Result<(), OrigoFSError> {
+        let key = RoomKey::Tree {
+            root: root.to_string(),
+            path: path.to_string(),
+        };
+        let room = self.rooms.lock().await.get(&key).map(|s| s.room.clone());
+        let Some(room) = room else {
+            let doc = self.ws.open_coedit_tree(ctx, path, root).await?;
+            return self
+                .ws
+                .checkpoint_coedit_tree(ctx, path, &doc, body, spans)
+                .await;
+        };
+        let doc = room.doc.lock().await;
+        let RoomDoc::Tree(doc) = &*doc else {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "{path} is open as a flat co-editing document; it checkpoints itself"
+            )));
+        };
+        self.ws
+            .checkpoint_coedit_tree(ctx, path, doc, body, spans)
+            .await?;
+        // The host has crystallized these bytes, so the room is no longer behind —
+        // clearing `dirty` keeps the sweeper from immediately re-persisting a
+        // sidecar the checkpoint just wrote.
+        room.dirty.store(false, Ordering::Relaxed);
+        room.last_checkpoint_ms
+            .store(elapsed_ms(self.epoch), Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Publish an attributed delta (a y-sync frame) to peer workers, if the relay
     /// is on. Fire-and-forget: CRDT merges commute, so relay order doesn't matter,
     /// and the socket loop never blocks on the database.
-    fn relay_publish(&self, path: &str, frame: Bytes) {
+    fn relay_publish(&self, key: &RoomKey, frame: Bytes) {
         if !self.relay {
             return;
         }
@@ -374,15 +514,15 @@ impl Coordinator {
         {
             let ws = self.ws.clone();
             let origin = self.origin.clone();
-            let path = path.to_string();
+            let route = key.relay_key();
             tokio::spawn(async move {
-                let _ = ws.coedit_publish(&path, &origin, &frame).await;
+                let _ = ws.coedit_publish(&route, &origin, &frame).await;
             });
         }
         // Nothing to publish to without the relay; the local fan-out above has
         // already delivered this frame to every socket on this worker.
         #[cfg(not(feature = "postgres"))]
-        let _ = (path, frame);
+        let _ = (key, frame);
     }
 
     /// Detach from the room for `path`. When the last socket leaves, checkpoint the
@@ -392,9 +532,9 @@ impl Coordinator {
     /// under the registry lock so a concurrent join can't fork a fresh room off a
     /// half-written sidecar — or clear the marker out from under a room that is
     /// still taking edits.
-    async fn leave(&self, path: &str, ctx: WriteCtx) {
+    async fn leave(&self, key: &RoomKey, ctx: WriteCtx) {
         let mut rooms = self.rooms.lock().await;
-        let evict = match rooms.get_mut(path) {
+        let evict = match rooms.get_mut(key) {
             Some(slot) => {
                 slot.conns = slot.conns.saturating_sub(1);
                 slot.conns == 0
@@ -402,16 +542,20 @@ impl Coordinator {
             None => return,
         };
         if evict {
-            if let Some(slot) = rooms.get(path) {
-                let doc = slot.room.doc.lock().await;
-                // Best-effort: a failed checkpoint must not wedge the registry, but
+            if let Some(slot) = rooms.get(key) {
+                // Best-effort: a failed write-back must not wedge the registry, but
                 // it does mean this room's since-last edits aren't yet durable.
-                let _ = self.ws.checkpoint_coedit(ctx, path, &doc).await;
+                let _ = self.write_back(key, &slot.room, ctx).await;
             }
-            // Only after the final checkpoint: until it lands, the durable blob
+            // Only after the final write-back: until it lands, the durable blob
             // really does lag the document, and the marker is what says so.
-            let _ = self.ws.end_coedit(path).await;
-            rooms.remove(path);
+            //
+            // A tree room clears the marker too, even though the *file* may still
+            // lag — the host's last checkpoint is as fresh as its bytes will get,
+            // and leaving the flag set would tell every future reader that a
+            // document nobody has open may be stale.
+            let _ = self.ws.end_coedit(key.path()).await;
+            rooms.remove(key);
         }
     }
 
@@ -419,16 +563,15 @@ impl Coordinator {
     /// long-lived rooms whose sockets never all disconnect. An embedder can call
     /// this on a timer; per-room state loss on a crash is bounded by the interval.
     pub async fn checkpoint_all(&self, ctx: WriteCtx) {
-        let rooms: Vec<(String, Arc<Room>)> = {
+        let rooms: Vec<(RoomKey, Arc<Room>)> = {
             let guard = self.rooms.lock().await;
             guard
                 .iter()
-                .map(|(p, slot)| (p.clone(), slot.room.clone()))
+                .map(|(k, slot)| (k.clone(), slot.room.clone()))
                 .collect()
         };
-        for (path, room) in rooms {
-            let doc = room.doc.lock().await;
-            let _ = self.ws.checkpoint_coedit(ctx, &path, &doc).await;
+        for (key, room) in rooms {
+            let _ = self.write_back(&key, &room, ctx).await;
         }
     }
 }
@@ -448,7 +591,7 @@ fn new_origin() -> String {
 #[cfg(feature = "postgres")]
 async fn relay_drain(
     ws: Arc<Workspace>,
-    rooms: Arc<Mutex<HashMap<String, RoomSlot>>>,
+    rooms: Arc<Mutex<HashMap<RoomKey, RoomSlot>>>,
     origin: Arc<str>,
 ) {
     let mut sub = match ws.coedit_subscribe().await {
@@ -464,7 +607,13 @@ async fn relay_drain(
             if &*origin == note.origin.as_str() {
                 continue; // our own op — already applied and fanned out locally
             }
-            let Some(room) = rooms.lock().await.get(&note.path).map(|s| s.room.clone()) else {
+            let room = rooms
+                .lock()
+                .await
+                .iter()
+                .find(|(key, _)| key.relay_key() == note.path)
+                .map(|(_, slot)| slot.room.clone());
+            let Some(room) = room else {
                 continue; // not hosting this document on this worker
             };
             {
@@ -491,6 +640,16 @@ pub(crate) struct TokenQuery {
     token: Option<String>,
 }
 
+/// The tree socket's query: a credential (as above) plus the `XmlFragment` root the
+/// editor binds to, since editors differ (`y-prosemirror` uses `"prosemirror"`,
+/// `@platejs/yjs` is configurable). Defaults to
+/// [`DEFAULT_TREE_ROOT`](crate::DEFAULT_TREE_ROOT).
+#[derive(Deserialize)]
+pub(crate) struct TreeQuery {
+    token: Option<String>,
+    root: Option<String>,
+}
+
 /// The subprotocol a browser client offers to carry its credential:
 /// `Sec-WebSocket-Protocol: origofs, <token>`. The server echoes back `origofs`
 /// (never the token) as the selected protocol.
@@ -514,7 +673,51 @@ pub(crate) async fn coedit_ws(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let principal = match authenticate_ws(&state, &headers, q.token.as_deref()).await {
+    let path = abspath(&path);
+    upgrade_room(
+        state,
+        RoomKey::Flat(path),
+        q.token.as_deref(),
+        headers,
+        upgrade,
+    )
+    .await
+}
+
+/// `GET /coedit-tree/{*path}` — the same y-sync socket over the **tree** document
+/// shape (#92), so `@platejs/yjs`, `y-prosemirror`, `y-slate` or TipTap can bind
+/// natively instead of mirroring a flat `Y.Text`.
+///
+/// Identical in every other respect: same authentication, same frame cap, same
+/// per-connection session. It differs only in what reaches durable storage — see
+/// [`Coordinator::checkpoint_tree`], which the host calls with its own serialized
+/// bytes, because origofs does not own the document schema.
+pub(crate) async fn coedit_tree_ws(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(q): Query<TreeQuery>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let key = RoomKey::Tree {
+        root: q
+            .root
+            .unwrap_or_else(|| crate::DEFAULT_TREE_ROOT.to_string()),
+        path: abspath(&path),
+    };
+    upgrade_room(state, key, q.token.as_deref(), headers, upgrade).await
+}
+
+/// Authenticate an upgrade and hand the socket to its room. Shared by both shapes
+/// so neither can drift from the other on identity, framing, or session binding.
+async fn upgrade_room(
+    state: AppState,
+    key: RoomKey,
+    token: Option<&str>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let principal = match authenticate_ws(&state, &headers, token).await {
         Some(p) => p,
         None => {
             return (
@@ -534,7 +737,6 @@ pub(crate) async fn coedit_ws(
         Ok(ctx) => ctx,
         Err(e) => return super::ApiError::OrigoFS(e).into_response(),
     };
-    let path = abspath(&path);
     let coord = state.coedit.clone();
     // `DefaultBodyLimit` does not apply to WebSocket frames, so `ApiOptions::
     // max_body_bytes` silently did not govern this route at all — the one hole in
@@ -549,7 +751,80 @@ pub(crate) async fn coedit_ws(
         // server names none of them, so the credential-carrying form only works
         // with this. Only the marker is ever echoed — never the token beside it.
         .protocols([AUTH_SUBPROTOCOL])
-        .on_upgrade(move |socket| serve_socket(coord, ctx, path, socket))
+        .on_upgrade(move |socket| serve_socket(coord, ctx, key, socket))
+}
+
+/// One `(byte_start, byte_end, node)` entry of a checkpoint's span map.
+#[derive(Deserialize)]
+pub(crate) struct TreeSpanDto {
+    start: u64,
+    end: u64,
+    node: String,
+}
+
+/// `POST /coedit-tree/checkpoint/{*path}` — the host lands a tree document's bytes.
+#[derive(Deserialize)]
+pub(crate) struct TreeCheckpointReq {
+    /// The host's serialization of the document. UTF-8 text; origofs stores it
+    /// verbatim and never re-derives it.
+    body: String,
+    /// Which byte ranges came from which co-edit node. Ordered, non-overlapping,
+    /// on character boundaries. Ranges left uncovered — the serializer's own
+    /// punctuation — are attributed to the authenticated actor.
+    #[serde(default)]
+    spans: Vec<TreeSpanDto>,
+    /// The `XmlFragment` root, matching the socket's `?root=`.
+    #[serde(default)]
+    root: Option<String>,
+}
+
+/// Checkpoint a tree-shaped co-edited document (#92).
+///
+/// The flat shape has no equivalent route because it does not need one: the server
+/// can materialize a `Y.Text`, so it checkpoints itself on a timer and on last
+/// leave. A tree's bytes exist only once the host's serializer has run, so the host
+/// is the only party that can supply them — along with the span map that says which
+/// bytes came from which node. Authorship is still resolved server-side from
+/// origofs's own stamps; the request names byte ranges and node ids, never an actor.
+pub(crate) async fn coedit_tree_checkpoint(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<TreeCheckpointReq>,
+) -> Response {
+    let Some(principal) = state.auth.authenticate(&headers).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated: a valid credential is required",
+        )
+            .into_response();
+    };
+    let ctx = match session_bound_ctx(&state, &principal).await {
+        Ok(ctx) => ctx,
+        Err(e) => return super::ApiError::OrigoFS(e).into_response(),
+    };
+    let root = req
+        .root
+        .unwrap_or_else(|| crate::DEFAULT_TREE_ROOT.to_string());
+    let spans: Vec<TreeSpan> = req
+        .spans
+        .into_iter()
+        .map(|s| TreeSpan::new(s.start, s.end, s.node))
+        .collect();
+    let path = abspath(&path);
+    match state
+        .coedit
+        .checkpoint_tree(&path, &root, ctx, req.body.as_bytes(), &spans)
+        .await
+    {
+        Ok(()) => axum::Json(serde_json::json!({
+            "path": path,
+            "bytes": req.body.len(),
+            "spans": spans.len(),
+        }))
+        .into_response(),
+        Err(e) => super::ApiError::OrigoFS(e).into_response(),
+    }
 }
 
 /// Authenticate a WebSocket upgrade, in the order a client should prefer.
@@ -629,10 +904,10 @@ async fn session_bound_ctx(
 /// Drive one connected socket: greet it, then pump y-sync frames both ways —
 /// inbound frames applied to (and attributed in) the shared doc and fanned out to
 /// peers, peers' frames delivered to this socket. Leaves the room on disconnect.
-async fn serve_socket(coord: Coordinator, ctx: WriteCtx, path: String, socket: WebSocket) {
+async fn serve_socket(coord: Coordinator, ctx: WriteCtx, key: RoomKey, socket: WebSocket) {
     coord.ensure_relay(); // idempotent; starts the cross-worker drain on first use
     coord.ensure_sweeper(); // idempotent; starts periodic checkpointing (#97)
-    let room = match coord.join(&path, ctx).await {
+    let room = match coord.join(&key, ctx).await {
         Ok(r) => r,
         Err(_) => return, // couldn't open the doc; drop the connection
     };
@@ -647,7 +922,7 @@ async fn serve_socket(coord: Coordinator, ctx: WriteCtx, path: String, socket: W
         doc.sync_start()
     };
     if sink.send(Message::Binary(greeting.into())).await.is_err() {
-        coord.leave(&path, ctx).await;
+        coord.leave(&key, ctx).await;
         return;
     }
 
@@ -675,7 +950,7 @@ async fn serve_socket(coord: Coordinator, ctx: WriteCtx, path: String, socket: W
                             let frame = Bytes::from(out.broadcast);
                             // Local sockets first (instant), then peer workers.
                             let _ = room.tx.send((conn_id, frame.clone()));
-                            coord.relay_publish(&path, frame);
+                            coord.relay_publish(&key, frame);
                         }
                     }
                     Message::Close(_) => break,
@@ -699,5 +974,5 @@ async fn serve_socket(coord: Coordinator, ctx: WriteCtx, path: String, socket: W
         }
     }
 
-    coord.leave(&path, ctx).await;
+    coord.leave(&key, ctx).await;
 }
