@@ -27,7 +27,26 @@ use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{Any, Doc, GetString, Out, ReadTxn, StateVector, Text, TextRef, Transact, Update};
 
 /// The formatting-attribute key under which each run's `"actor,session"` is kept.
-const AUTHOR_KEY: &str = "a";
+/// Shared with [`crate::coedit_tree`], which stamps the same key on tree nodes.
+pub(crate) const AUTHOR_KEY: &str = "a";
+
+/// The attribute *value* stamped under [`AUTHOR_KEY`]: `"actor,session"`.
+pub(crate) fn author_value(ctx: WriteCtx) -> String {
+    format!("{},{}", ctx.actor, ctx.session.unwrap_or(0))
+}
+
+/// The author formatting attribute for `ctx`, as a `yrs` attribute set.
+pub(crate) fn author_attrs(ctx: WriteCtx) -> Attrs {
+    Attrs::from([(AUTHOR_KEY.into(), Any::from(author_value(ctx)))])
+}
+
+/// Parse an `(actor, session)` pair from an author attribute's string value.
+pub(crate) fn parse_author(value: &str) -> (i64, i64) {
+    let mut it = value.split(',');
+    let actor = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let session = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    (actor, session)
+}
 
 /// A live co-edited document: a `yrs` text CRDT whose inserts are attributed.
 ///
@@ -76,18 +95,11 @@ impl CoeditDoc {
         Self { doc, text }
     }
 
-    fn author_attrs(ctx: WriteCtx) -> Attrs {
-        Attrs::from([(
-            AUTHOR_KEY.into(),
-            Any::from(format!("{},{}", ctx.actor, ctx.session.unwrap_or(0))),
-        )])
-    }
-
     /// Insert `chunk` at character `index`, attributed to `ctx`.
     pub fn insert(&self, ctx: WriteCtx, index: u32, chunk: &str) {
         let mut txn = self.doc.transact_mut();
         self.text
-            .insert_with_attributes(&mut txn, index, chunk, Self::author_attrs(ctx));
+            .insert_with_attributes(&mut txn, index, chunk, author_attrs(ctx));
     }
 
     /// Remove `len` characters starting at `index`.
@@ -163,7 +175,7 @@ impl CoeditDoc {
         let after = self.text();
         let ranges = inserted_ranges(&before, &after);
         if !ranges.is_empty() {
-            let attrs = Self::author_attrs(ctx);
+            let attrs = author_attrs(ctx);
             let mut txn = self.doc.transact_mut();
             for (index, len) in ranges {
                 self.text.format(&mut txn, index, len, attrs.clone());
@@ -182,18 +194,7 @@ impl CoeditDoc {
     /// [`handle_sync`](Self::handle_sync), which attributes. Idempotent: a frame
     /// already merged (or folded into a checkpoint) is a no-op.
     pub fn apply_relayed(&self, frame: &[u8]) -> Result<()> {
-        let mut decoder = DecoderV1::new(Cursor::new(frame));
-        let reader = MessageReader::new(&mut decoder);
-        for msg in reader {
-            let msg =
-                msg.map_err(|e| OrigoFSError::InvalidArgument(format!("bad relayed frame: {e}")))?;
-            // Only content messages carry state; awareness/etc. are ignored on the
-            // relay (presence is gossiped between the clients on each worker).
-            if let Message::Sync(SyncMessage::Update(u) | SyncMessage::SyncStep2(u)) = msg {
-                self.apply_update(&u)?;
-            }
-        }
-        Ok(())
+        apply_relayed(&self.doc, frame)
     }
 
     /// The y-sync frame to greet a freshly-connected client with: a `SyncStep1`
@@ -201,10 +202,7 @@ impl CoeditDoc {
     /// whatever we're missing. Pair with [`handle_sync`](Self::handle_sync), which
     /// also answers the client's own `SyncStep1`.
     pub fn sync_start(&self) -> Vec<u8> {
-        let sv = self.doc.transact().state_vector();
-        let mut encoder = EncoderV1::new();
-        Message::Sync(SyncMessage::SyncStep1(sv)).encode(&mut encoder);
-        encoder.to_vec()
+        sync_start(&self.doc)
     }
 
     /// Drive one inbound y-sync payload from a connection authenticated as `ctx`.
@@ -218,68 +216,7 @@ impl CoeditDoc {
     /// the server keeps no awareness state, so peers gossip presence through the
     /// room's fan-out.
     pub fn handle_sync(&self, ctx: WriteCtx, data: &[u8]) -> Result<SyncReply> {
-        let mut decoder = DecoderV1::new(Cursor::new(data));
-        let reader = MessageReader::new(&mut decoder);
-        let mut reply = EncoderV1::new();
-        let mut broadcast = EncoderV1::new();
-        let (mut has_reply, mut has_broadcast) = (false, false);
-
-        for msg in reader {
-            let msg =
-                msg.map_err(|e| OrigoFSError::InvalidArgument(format!("bad y-sync frame: {e}")))?;
-            match msg {
-                // The client wants what we have: answer with the update it lacks.
-                Message::Sync(SyncMessage::SyncStep1(sv)) => {
-                    let update = self.doc.transact().encode_state_as_update_v1(&sv);
-                    Message::Sync(SyncMessage::SyncStep2(update)).encode(&mut reply);
-                    has_reply = true;
-                }
-                // The client is handing us content (initial sync or a live edit):
-                // apply + attribute, then fan the attributed delta out to peers —
-                // and back to the sender.
-                Message::Sync(SyncMessage::SyncStep2(update))
-                | Message::Sync(SyncMessage::Update(update)) => {
-                    let delta = self.apply_update_as(ctx, &update)?;
-                    if !delta.is_empty() {
-                        Message::Sync(SyncMessage::Update(delta.clone())).encode(&mut broadcast);
-                        has_broadcast = true;
-                        // Echo it to the sender too. Attributing the edit adds CRDT
-                        // items (the author marks) to our doc that the sender's doc
-                        // lacks — it never saw them, since the sender doesn't get the
-                        // broadcast. Without them the sender diverges structurally,
-                        // and a *later* peer edit positioned against those items can't
-                        // integrate (it waits, pending, on origins the sender is
-                        // missing). Sending the delta back keeps every replica — server
-                        // and all clients, author included — structurally identical.
-                        // Re-applying the sender's own items is a no-op (updates are
-                        // idempotent); only the attribution items are new.
-                        Message::Sync(SyncMessage::Update(delta)).encode(&mut reply);
-                        has_reply = true;
-                    }
-                }
-                // Cursor presence: relay to the room, keep no server-side state.
-                Message::Awareness(_) | Message::AwarenessQuery => {
-                    msg.encode(&mut broadcast);
-                    has_broadcast = true;
-                }
-                // Auth is resolved out-of-band (before we ever get here); custom
-                // tags are not part of our protocol. Ignore both.
-                Message::Auth(_) | Message::Custom(_, _) => {}
-            }
-        }
-
-        Ok(SyncReply {
-            reply: if has_reply {
-                reply.to_vec()
-            } else {
-                Vec::new()
-            },
-            broadcast: if has_broadcast {
-                broadcast.to_vec()
-            } else {
-                Vec::new()
-            },
-        })
+        drive_sync(&self.doc, data, |update| self.apply_update_as(ctx, update))
     }
 
     /// Reconstruct a document from a serialized state produced by
@@ -310,7 +247,7 @@ impl CoeditDoc {
                 OrigoFSError::InvalidArgument("co-edit rebuild: span not on a char boundary".into())
             })?;
             if actor != 0 {
-                let attrs = Self::author_attrs(WriteCtx::session(actor, session));
+                let attrs = author_attrs(WriteCtx::session(actor, session));
                 this.text
                     .insert_with_attributes(&mut txn, u16_idx, piece, attrs);
             } else {
@@ -355,7 +292,7 @@ impl CoeditDoc {
             () => {
                 if let Some((author, piece)) = pending.take() {
                     if author.0 != 0 {
-                        let attrs = Self::author_attrs(WriteCtx::session(author.0, author.1));
+                        let attrs = author_attrs(WriteCtx::session(author.0, author.1));
                         self.text
                             .insert_with_attributes(&mut txn, idx, &piece, attrs);
                     } else {
@@ -478,6 +415,115 @@ fn author_of(attrs: Option<&Attrs>) -> (i64, i64) {
     (actor, session)
 }
 
+/// Merge a y-sync frame relayed from another worker into `doc` — content another
+/// replica already attributed — *without* re-attribution. Shared by both document
+/// shapes; see [`CoeditDoc::apply_relayed`] for what it is for.
+pub(crate) fn apply_relayed(doc: &Doc, frame: &[u8]) -> Result<()> {
+    let mut decoder = DecoderV1::new(Cursor::new(frame));
+    let reader = MessageReader::new(&mut decoder);
+    for msg in reader {
+        let msg =
+            msg.map_err(|e| OrigoFSError::InvalidArgument(format!("bad relayed frame: {e}")))?;
+        // Only content messages carry state; awareness/etc. are ignored on the
+        // relay (presence is gossiped between the clients on each worker).
+        if let Message::Sync(SyncMessage::Update(u) | SyncMessage::SyncStep2(u)) = msg {
+            let update = Update::decode_v1(&u)
+                .map_err(|e| OrigoFSError::InvalidArgument(format!("bad co-edit update: {e}")))?;
+            doc.transact_mut()
+                .apply_update(update)
+                .map_err(|e| OrigoFSError::InvalidArgument(format!("apply co-edit update: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// The y-sync `SyncStep1` frame greeting a freshly-connected client with `doc`'s
+/// state vector. Shared by both document shapes.
+pub(crate) fn sync_start(doc: &Doc) -> Vec<u8> {
+    let sv = doc.transact().state_vector();
+    let mut encoder = EncoderV1::new();
+    Message::Sync(SyncMessage::SyncStep1(sv)).encode(&mut encoder);
+    encoder.to_vec()
+}
+
+/// Drive one inbound y-sync payload against `doc`, applying any content the client
+/// contributed through `apply_as` — the caller's *attributing* apply, which is the
+/// only thing that differs between the flat and tree shapes.
+///
+/// A payload may pack several messages; each is handled in order. This is the
+/// transport-agnostic core of live co-editing: the axum WebSocket route, the
+/// FastAPI route, and the tests all funnel bytes through here. Awareness (cursor
+/// presence) is relayed verbatim; the server keeps no awareness state, so peers
+/// gossip presence through the room's fan-out.
+pub(crate) fn drive_sync(
+    doc: &Doc,
+    data: &[u8],
+    apply_as: impl Fn(&[u8]) -> Result<Vec<u8>>,
+) -> Result<SyncReply> {
+    let mut decoder = DecoderV1::new(Cursor::new(data));
+    let reader = MessageReader::new(&mut decoder);
+    let mut reply = EncoderV1::new();
+    let mut broadcast = EncoderV1::new();
+    let (mut has_reply, mut has_broadcast) = (false, false);
+
+    for msg in reader {
+        let msg =
+            msg.map_err(|e| OrigoFSError::InvalidArgument(format!("bad y-sync frame: {e}")))?;
+        match msg {
+            // The client wants what we have: answer with the update it lacks.
+            Message::Sync(SyncMessage::SyncStep1(sv)) => {
+                let update = doc.transact().encode_state_as_update_v1(&sv);
+                Message::Sync(SyncMessage::SyncStep2(update)).encode(&mut reply);
+                has_reply = true;
+            }
+            // The client is handing us content (initial sync or a live edit):
+            // apply + attribute, then fan the attributed delta out to peers —
+            // and back to the sender.
+            Message::Sync(SyncMessage::SyncStep2(update))
+            | Message::Sync(SyncMessage::Update(update)) => {
+                let delta = apply_as(&update)?;
+                if !delta.is_empty() {
+                    Message::Sync(SyncMessage::Update(delta.clone())).encode(&mut broadcast);
+                    has_broadcast = true;
+                    // Echo it to the sender too. Attributing the edit adds CRDT
+                    // items (the author marks) to our doc that the sender's doc
+                    // lacks — it never saw them, since the sender doesn't get the
+                    // broadcast. Without them the sender diverges structurally,
+                    // and a *later* peer edit positioned against those items can't
+                    // integrate (it waits, pending, on origins the sender is
+                    // missing). Sending the delta back keeps every replica — server
+                    // and all clients, author included — structurally identical.
+                    // Re-applying the sender's own items is a no-op (updates are
+                    // idempotent); only the attribution items are new.
+                    Message::Sync(SyncMessage::Update(delta)).encode(&mut reply);
+                    has_reply = true;
+                }
+            }
+            // Cursor presence: relay to the room, keep no server-side state.
+            Message::Awareness(_) | Message::AwarenessQuery => {
+                msg.encode(&mut broadcast);
+                has_broadcast = true;
+            }
+            // Auth is resolved out-of-band (before we ever get here); custom
+            // tags are not part of our protocol. Ignore both.
+            Message::Auth(_) | Message::Custom(_, _) => {}
+        }
+    }
+
+    Ok(SyncReply {
+        reply: if has_reply {
+            reply.to_vec()
+        } else {
+            Vec::new()
+        },
+        broadcast: if has_broadcast {
+            broadcast.to_vec()
+        } else {
+            Vec::new()
+        },
+    })
+}
+
 /// The routing for one processed y-sync payload: [`reply`](Self::reply) goes back
 /// to the connection it came from (e.g. a `SyncStep2` answering its `SyncStep1`);
 /// [`broadcast`](Self::broadcast) fans out to the room's *other* peers (the
@@ -499,7 +545,7 @@ fn utf16_len(s: &str) -> u32 {
 /// formatting directly — that appear in `after` but not `before`: the text this
 /// update inserted. A character-level diff so multi-cursor and batched edits each
 /// attribute to their exact range rather than one coarse span.
-fn inserted_ranges(before: &str, after: &str) -> Vec<(u32, u32)> {
+pub(crate) fn inserted_ranges(before: &str, after: &str) -> Vec<(u32, u32)> {
     let diff = TextDiff::from_chars(before, after);
     let mut ranges = Vec::new();
     let mut idx: u32 = 0; // UTF-16 offset into `after`

@@ -13,6 +13,8 @@ pub mod chunk;
 pub mod clock;
 #[cfg(feature = "coedit")]
 pub mod coedit;
+#[cfg(feature = "coedit")]
+pub mod coedit_tree;
 pub mod collab;
 pub mod content;
 pub mod corpus;
@@ -50,6 +52,10 @@ pub use chunk::{AVG_CHUNK, ChunkRef, MAX_CHUNK, MIN_CHUNK, Manifest};
 pub use clock::{Clock, SystemClock};
 #[cfg(feature = "coedit")]
 pub use coedit::{COEDIT_SIDECAR_DIR, CoeditDoc, coedit_sidecar_path};
+#[cfg(feature = "coedit")]
+pub use coedit_tree::{
+    CoeditTreeDoc, DEFAULT_TREE_ROOT, NODE_KEY, TreeSpan, coedit_tree_sidecar_path,
+};
 pub use collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, PRESENCE_WINDOW_SECS, Presence};
 pub use content::{
     ContentStore, DEDUP_REFRESH_AFTER_SECS, LocalCasStore, MemStore, TieredStore, VerifyingStore,
