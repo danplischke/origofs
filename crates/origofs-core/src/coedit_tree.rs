@@ -121,6 +121,21 @@ impl TreeSpan {
     }
 }
 
+/// One attributed text run of a tree document (see [`CoeditTreeDoc::runs`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeRun {
+    /// The run's raw text.
+    pub text: String,
+    /// The [`NODE_KEY`] id origofs stamped on it, or `None` for a run it never
+    /// stamped (content a host seeded directly). An unstamped run has no author to
+    /// resolve, so citing it in a span map falls back to the checkpointer.
+    pub node: Option<String>,
+    /// The actor that wrote it, or `0` if unstamped.
+    pub actor: i64,
+    /// That actor's session, or `0`.
+    pub session: i64,
+}
+
 /// A live, tree-shaped co-edited document: a `yrs` `XmlFragment` whose inserted
 /// text runs and elements are attributed server-side.
 ///
@@ -202,6 +217,29 @@ impl CoeditTreeDoc {
     /// client uses.
     pub fn fragment(&self) -> &XmlFragmentRef {
         &self.frag
+    }
+
+    /// Append `<tag>text</tag>` to the root, attributed to `ctx`, and return the
+    /// node id stamped on the text run — ready to cite in a span map.
+    ///
+    /// The tree analogue of [`CoeditDoc::insert`](crate::coedit::CoeditDoc::insert),
+    /// and deliberately just as narrow: it is the in-process path for an agent
+    /// seeding or appending to a document, and for a test client. A real editor
+    /// does not use it — it owns the schema and drives arbitrary tree edits over
+    /// y-sync, where [`apply_update_as`](Self::apply_update_as) attributes them.
+    pub fn append_text(&self, ctx: WriteCtx, tag: &str, text: &str) -> String {
+        let node = self.fresh_node_id();
+        let mut txn = self.doc.transact_mut();
+        let el = self
+            .frag
+            .push_back(&mut txn, yrs::types::xml::XmlElementPrelim::empty(tag));
+        let run = el.push_back(&mut txn, yrs::types::xml::XmlTextPrelim::new(text));
+        let mut attrs = author_attrs(ctx);
+        attrs.insert(NODE_KEY.into(), Any::from(node.clone()));
+        run.format(&mut txn, 0, crate::coedit::utf16_len(text), attrs);
+        el.insert_attribute(&mut txn, AUTHOR_KEY, author_value(ctx));
+        el.insert_attribute(&mut txn, NODE_KEY, self.fresh_node_id());
+        node
     }
 
     /// The underlying `yrs` document, for a Rust caller that needs a transaction.
@@ -322,6 +360,42 @@ impl CoeditTreeDoc {
                     }
                 }
                 XmlOut::Fragment(_) => {} // nested fragments carry no attributes
+            }
+        }
+        out
+    }
+
+    /// Every text run in document order, with the node id and author stamped on it
+    /// — the server-side reading of what a browser host gets from
+    /// `ytext.toDelta()`.
+    ///
+    /// This is what a caller serializing the document *itself* (a Rust or Python
+    /// agent rather than a browser editor) walks to build its span map: emit bytes
+    /// for each run, record the range it occupied, cite [`TreeRun::node`].
+    pub fn runs(&self) -> Vec<TreeRun> {
+        let txn = self.doc.transact();
+        let mut out = Vec::new();
+        for node in self.frag.successors(&txn) {
+            let XmlOut::Text(text) = node else { continue };
+            for chunk in text.diff(&txn, YChange::identity) {
+                let Out::Any(Any::String(piece)) = &chunk.insert else {
+                    continue;
+                };
+                let attrs = chunk.attributes.as_deref();
+                let id = match attrs.and_then(|a| a.get(NODE_KEY)) {
+                    Some(Any::String(id)) => Some(id.to_string()),
+                    _ => None,
+                };
+                let (actor, session) = match attrs.and_then(|a| a.get(AUTHOR_KEY)) {
+                    Some(Any::String(a)) => parse_author(a),
+                    _ => (0, 0),
+                };
+                out.push(TreeRun {
+                    text: piece.to_string(),
+                    node: id,
+                    actor,
+                    session,
+                });
             }
         }
         out

@@ -537,7 +537,7 @@ pub struct SyncReply {
 }
 
 /// UTF-16 code-unit length of `s` — the unit `yrs`/Yjs index text in.
-fn utf16_len(s: &str) -> u32 {
+pub(crate) fn utf16_len(s: &str) -> u32 {
     s.chars().map(|c| c.len_utf16() as u32).sum()
 }
 

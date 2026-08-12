@@ -429,9 +429,18 @@ same document **concurrently** and converge — a CRDT (`yrs`) under the hood, w
 authorship tracked per character. It speaks the standard Yjs **y-sync** protocol,
 so an unmodified Yjs client connects to the co-editing WebSocket with no custom
 server code — a plain-text or Markdown editor bound to the shared text (over
-`y-websocket`) collaborates out of the box. The shared document is a flat-text
-CRDT, so a *structural* rich-text editor such as PlateJS shapes its Yjs document
-to match rather than binding the flat text directly.
+`y-websocket`) collaborates out of the box.
+
+A document comes in **two shapes**, and a client picks the one its editor speaks:
+
+| Shape | Endpoint | Bind with |
+|---|---|---|
+| **flat** — one `Y.Text` | `GET /coedit/{path}` | `y-websocket`, any plain-text/Markdown editor |
+| **tree** — a `Y.XmlFragment` | `GET /coedit-tree/{path}` | `@platejs/yjs`, `y-prosemirror`, `y-slate`, TipTap |
+
+The flat shape is the right one for source files and anything a diff tool reads.
+The tree shape is for rich-text editors, which bind to a structured document
+natively — see [Structured co-editing](#structured-co-editing-rich-text-editors).
 
 The server stays the sole authority on **who wrote what**: whatever a client's
 bytes claim, each inserted run is attributed to the *authenticated* actor. When a
@@ -506,6 +515,70 @@ the co-editing coordinator first, then reads; `origofs`'s own git export warns a
 lists any live path rather than exporting stale bytes silently. `end_coedit` clears
 the marker once the final checkpoint has landed.
 
+#### Structured co-editing (rich-text editors)
+
+Every mainstream rich-text CRDT binding — `@platejs/yjs`, `y-prosemirror`,
+`y-slate`, TipTap — binds to a `Y.XmlFragment` **tree**, not a flat `Y.Text`. Point
+one at `GET /coedit-tree/{path}?root=content` and it binds directly:
+
+```js
+const doc = new Y.Doc()
+new WebsocketProvider(`wss://host/v1/coedit-tree`, "notes.md", doc, {
+  params: { root: "content" },
+  protocols: ["origofs", token],
+})
+// …bind doc.getXmlFragment("content") with your editor's Yjs plugin…
+```
+
+Content is attributed exactly as on the flat shape — server-side, to the socket's
+authenticated actor, whatever the bytes claim. What differs is how bytes reach
+disk. **origofs does not own your document schema**, so it will not serialize a
+tree: picking Markdown or HTML would make the engine responsible for a document
+model and a dialect. Instead you serialize, and say which byte ranges came from
+which co-edit node:
+
+```js
+await fetch(`/v1/coedit-tree-checkpoint/notes.md`, {
+  method: "POST",
+  headers: { authorization: `Bearer ${token}` },
+  body: JSON.stringify({ body, spans }),   // spans: [{start, end, node}]
+})
+```
+
+Each `node` is an id **origofs assigned** when it stamped that run — read it off
+`ytext.toDelta()` (`attributes.n`) or `element.getAttribute("n")`. You name byte
+ranges and nodes; origofs resolves each node to the author it stamped itself and
+lands the result in the same byte-range blame index as every other write. A
+request can never name an author, and an id origofs never issued resolves to
+nobody. Bytes no span covers — your serializer's own punctuation — are attributed
+to the caller.
+
+Three consequences worth knowing before you build on it:
+
+- **A wrong span map means wrong blame.** origofs validates that spans are ordered,
+  non-overlapping, in range, and on character boundaries, but it cannot check that
+  you mapped the right bytes to the right node — it cannot read your serializer.
+  That is the price of not owning the schema.
+- **A stale sidecar opens an empty document.** origofs can rebuild a flat document
+  from the file's text and blame; it cannot rebuild a *tree*, because parsing bytes
+  back into nodes needs your schema. Check `resumed()` and seed from `read(path)`
+  when it is false, or a checkpoint writes an empty body over real content.
+- **An out-of-band write is refused, not merged.** The flat path folds a foreign
+  write in by diffing text into CRDT operations; a tree cannot be reconciled that
+  way, so the checkpoint fails with a conflict. Re-read, reseed, checkpoint again.
+
+Durability is split to match: the server persists the CRDT sidecar on the same
+sweeper tick as a flat room — so a crash costs no editing history — while the file
+and its blame move only when you checkpoint. From Rust or Python:
+
+```python
+doc = await ws.open_coedit_tree(ctx, "/notes.md", "content")
+if not await doc.resumed():
+    ...  # seed the tree from `await ws.read("/notes.md")` — your schema, your parse
+await ws.checkpoint_coedit_tree(ctx, "/notes.md", doc, body, spans)
+await ws.persist_coedit_tree("/notes.md", doc)   # CRDT only; the file stays put
+```
+
 ### HTTP API
 
 Every operation is available over HTTP/JSON — files as raw bytes, everything else
@@ -531,7 +604,8 @@ The data surface is versioned under **`/v1`**; liveness (`/health`) and readines
 (`/readyz`) stay at the root so an orchestrator probes them independent of the API
 version. Full routes cover files, dirs, stat, blame, rename, commit/log,
 branches/checkout, events, presence (`GET` to list, `POST` to heartbeat), actors,
-sessions, diff, suggestions, and the live co-editing WebSocket.
+sessions, diff, suggestions, and the live co-editing WebSockets (flat and
+[tree](#structured-co-editing-rich-text-editors)).
 
 `POST /v1/presence` takes an optional `{"path": …}` and nothing else: the actor
 and session come from the credential, so a browser client can keep itself visible
@@ -698,8 +772,9 @@ curl -X PUT --data-binary 'x' http://127.0.0.1:8000/fs/files/y   # 401: no ident
 One `build_router` call mounts the whole workspace: files, dirs, stat, rename,
 blame, commit/log/status, diff, branches/checkout, the suggestion review queue,
 the change feed, presence, actors/sessions, and the
-[co-editing](#live-co-editing-crdt) WebSocket at `/coedit/{path}` (long-lived
-rooms are created once per router, not per request).
+[co-editing](#live-co-editing-crdt) WebSockets at `/coedit/{path}` and
+`/coedit-tree/{path}` with its `/coedit-tree-checkpoint/{path}` (long-lived rooms
+are created once per router, not per request).
 
 One workspace can hold many tenants under scoped paths. Pass `root=` — fixed, or
 a dependency resolving it per request — and the router scopes itself:

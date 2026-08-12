@@ -32,7 +32,7 @@ pub use origofs_core::{
 pub use origofs_core::EncryptedStore;
 #[cfg(feature = "coedit")]
 pub use origofs_core::{
-    COEDIT_SIDECAR_DIR, CoeditDoc, CoeditTreeDoc, DEFAULT_TREE_ROOT, SyncReply, TreeSpan,
+    COEDIT_SIDECAR_DIR, CoeditDoc, CoeditTreeDoc, DEFAULT_TREE_ROOT, SyncReply, TreeRun, TreeSpan,
 };
 // The cross-worker co-editing relay rides on Postgres `LISTEN`/`NOTIFY`, so
 // these types exist only when both features are on.

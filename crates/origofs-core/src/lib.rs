@@ -54,7 +54,7 @@ pub use clock::{Clock, SystemClock};
 pub use coedit::{COEDIT_SIDECAR_DIR, CoeditDoc, SyncReply, coedit_sidecar_path};
 #[cfg(feature = "coedit")]
 pub use coedit_tree::{
-    CoeditTreeDoc, DEFAULT_TREE_ROOT, NODE_KEY, TreeSpan, coedit_tree_sidecar_path,
+    CoeditTreeDoc, DEFAULT_TREE_ROOT, NODE_KEY, TreeRun, TreeSpan, coedit_tree_sidecar_path,
 };
 pub use collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, PRESENCE_WINDOW_SECS, Presence};
 pub use content::{
