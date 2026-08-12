@@ -51,7 +51,7 @@ pub use attribution::{
 pub use chunk::{AVG_CHUNK, ChunkRef, MAX_CHUNK, MIN_CHUNK, Manifest};
 pub use clock::{Clock, SystemClock};
 #[cfg(feature = "coedit")]
-pub use coedit::{COEDIT_SIDECAR_DIR, CoeditDoc, coedit_sidecar_path};
+pub use coedit::{COEDIT_SIDECAR_DIR, CoeditDoc, SyncReply, coedit_sidecar_path};
 #[cfg(feature = "coedit")]
 pub use coedit_tree::{
     CoeditTreeDoc, DEFAULT_TREE_ROOT, NODE_KEY, TreeSpan, coedit_tree_sidecar_path,

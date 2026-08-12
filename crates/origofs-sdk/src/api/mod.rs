@@ -315,7 +315,17 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
     // param a browser can't send as a header), so it sits outside the read gate.
     #[cfg(feature = "coedit")]
     {
-        data = data.route("/coedit/{*path}", get(coedit::coedit_ws));
+        data = data
+            .route("/coedit/{*path}", get(coedit::coedit_ws))
+            // The tree shape (#92): the same socket over a `Y.XmlFragment`, plus the
+            // checkpoint the *host* drives — origofs does not own the document
+            // schema, so only the host can serialize a tree to bytes. Both
+            // authenticate themselves, for the same reason the flat socket does.
+            .route("/coedit-tree/{*path}", get(coedit::coedit_tree_ws))
+            .route(
+                "/coedit-tree-checkpoint/{*path}",
+                post(coedit::coedit_tree_checkpoint),
+            );
     }
     // Per-request metrics wrap the *data* surface only, outside the read gate so a
     // rejected (401) request is still counted. Liveness/readiness and the scrape
