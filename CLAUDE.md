@@ -166,11 +166,21 @@ write path enforces this and you must not weaken it:
   author** while recording the approver (and refuses a stale base). Reviewer must
   differ from author.
 - **The `Propose` write policy is enforced in the engine, not per surface.**
-  Every *attributed* mutation on `Fs` — `write_or_propose`, `remove_or_propose`,
-  `rename_as`, `mkdir_as`, `symlink_as`, `chmod_as`, `chown_as`, `commit_as`,
-  `accept_suggestion`, `reject_suggestion` — runs `ensure_may_write`
-  (`suggest.rs`), which refuses a propose-only actor with `OrigoFSError::Denied`
-  (`403` on the HTTP API). Ops with
+  Every *attributed* mutation on `Fs` — `write_as`, `write_or_propose`,
+  `remove_or_propose`, `rename_as`, `mkdir_as`, `symlink_as`, `chmod_as`,
+  `chown_as`, `commit_as`, `accept_suggestion`, `reject_suggestion` — runs
+  `ensure_may_write` (`suggest.rs`), which refuses a propose-only actor with
+  `OrigoFSError::Denied` (`403` on the HTTP API).
+
+  **Path-scoped grants refine that (`acl.rs`, migration V18, issue #123).** Ops
+  that take a path call `ensure_may_write_at`, which resolves the actor's access
+  by **longest matching path prefix** (directory-boundary matching, so `/tenant-a`
+  never covers `/tenant-abc`) and falls back to the actor's write policy when no
+  grant covers the path — which is why V18 needed no backfill. `rename_as` checks
+  **both** sides. `docs/PERMISSIONS.md` is the full picture; the short version is
+  that **`mode`/`uid`/`gid` are never consulted for authorization** (actors are the
+  principal, not uids) and **grants are unenforceable through a mount**, which has
+  no actor context. Ops with
   a propose-shaped equivalent queue instead of refusing. **A new mutating endpoint
   on any surface must call an attributed variant**, never the raw `remove`/
   `rename`/`mkdir_p`/`symlink`/`chmod`/`chown`/`commit` — those take no actor,

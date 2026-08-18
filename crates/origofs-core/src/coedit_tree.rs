@@ -571,6 +571,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         path: &str,
         root: &str,
     ) -> Result<CoeditTreeDoc> {
+        // See `open_coedit`: gated at the door, because the checkpoint write-back
+        // is deliberately exempt.
+        self.ensure_may_write_at(ctx, "co-edit", path).await?;
         let doc = self.load_coedit_tree(path, root).await?;
         self.mark_live(ctx, path).await?;
         Ok(doc)

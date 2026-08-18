@@ -137,6 +137,18 @@ class StatResult(TypedDict):
     ctime: int
 
 
+class GrantRecord(TypedDict):
+    """One path-scoped access grant (``grants``).
+
+    ``perms`` is comma-separated (``"read,write"``) or ``"none"``. Longest matching
+    ``prefix`` wins; an actor with no covering grant falls back to its write policy.
+    Grants do not restrict a FUSE/NFS mount — see ``docs/PERMISSIONS.md`` §5.
+    """
+
+    prefix: str
+    perms: str
+
+
 class DirEntry(TypedDict):
     """One entry of a directory listing (``ls``)."""
 
@@ -596,6 +608,10 @@ class Workspace:
         self, ctx: WriteCtx, path: str, data: bytes, summary: Optional[str] = None
     ) -> WriteOutcome: ...
     async def set_write_policy(self, actor_id: int, policy: str) -> None: ...
+    async def grant(self, actor: int, prefix: str, perms: str) -> None: ...
+    async def revoke(self, actor: int, prefix: str) -> bool: ...
+    async def grants(self, actor: int) -> list[GrantRecord]: ...
+    async def effective_perms(self, actor: int, path: str) -> str: ...
     async def mkdir_p(self, path: str) -> None: ...
     async def ls(self, path: str) -> list[DirEntry]: ...
     async def stat(self, path: str) -> StatResult: ...

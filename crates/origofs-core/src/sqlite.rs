@@ -14,6 +14,7 @@
 //! [`blocking_section`] so the multi-thread scheduler is told about it rather
 //! than silently losing a worker to a WAL fsync.
 
+use crate::acl::{Grant, Perms};
 use crate::attribution::{
     Actor, ActorInit, ActorKind, EditOp, EditOpInit, ToolCallInit, WritePolicy,
 };
@@ -999,6 +1000,69 @@ impl MetadataStore for SqliteMetadataStore {
                 return Err(OrigoFSError::NotFound(format!("actor #{actor_id}")));
             }
             Ok(())
+        })
+    }
+
+    async fn set_grant(&self, actor_id: i64, prefix: &str, perms: Perms) -> Result<()> {
+        let prefix = prefix.to_string();
+        blocking_section(move || {
+            let conn = self.lock();
+            // Refuse a grant for an actor that does not exist: a typo'd id would
+            // otherwise sit in the table looking like policy while governing
+            // nobody. `set_write_policy` takes the same care for the same reason.
+            let known: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM actor WHERE id = ?1",
+                    params![actor_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if known.is_none() {
+                return Err(OrigoFSError::NotFound(format!("actor #{actor_id}")));
+            }
+            conn.execute(
+                "INSERT INTO acl(workspace_id, actor_id, path_prefix, perms) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(workspace_id, actor_id, path_prefix) \
+                 DO UPDATE SET perms = excluded.perms",
+                params![self.workspace_id, actor_id, prefix, perms.bits() as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn remove_grant(&self, actor_id: i64, prefix: &str) -> Result<bool> {
+        let prefix = prefix.to_string();
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM acl WHERE workspace_id = ?1 AND actor_id = ?2 AND path_prefix = ?3",
+                params![self.workspace_id, actor_id, prefix],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    async fn list_grants(&self, actor_id: i64) -> Result<Vec<Grant>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT path_prefix, perms FROM acl \
+                 WHERE workspace_id = ?1 AND actor_id = ?2",
+            )?;
+            let rows = stmt.query_map(params![self.workspace_id, actor_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (path_prefix, perms) = row?;
+                out.push(Grant {
+                    actor_id,
+                    path_prefix,
+                    perms: Perms::from_bits(perms as u32)?,
+                });
+            }
+            Ok(out)
         })
     }
 

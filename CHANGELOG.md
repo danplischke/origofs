@@ -9,6 +9,54 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ### Added
 
+- **Path-scoped access grants: permissions that are actually enforced — migration
+  V18 (#123).** The write policy (#78) was workspace-wide and binary: an actor
+  wrote everywhere or proposed everywhere. It could not say *"this agent may write
+  under `/src/parser` and nowhere else"*, which is the first thing anyone pointing
+  several agents at one workspace asks for.
+
+  A grant refines the policy for a subtree, resolved by **longest matching
+  prefix**. An actor with no covering grant falls back to its write policy — so the
+  migration needed no backfill, `set_write_policy` keeps meaning what it meant, and
+  an actor created *after* V18 is governed the same way. Deny-by-default needs no
+  separate mode: grant `/` read-only and grant the subtrees that should be
+  writable.
+
+  Matching is on **directory boundaries**, not string prefixes. `/tenant-a` must
+  never cover `/tenant-abc`; that is the classic bug in prefix-scoped
+  authorization, and `origofs.fastapi` had already solved it for request scoping —
+  `acl::covers` is the same rule in the engine, where every surface inherits it
+  instead of re-deriving it.
+
+  Enforced at the engine, never per surface. `ensure_may_write_at` is the new
+  chokepoint, and `write_as` — previously ungated, and reachable from `Workspace`,
+  the Python bindings, and the sandbox's delta import — now runs it too, so a
+  scoped agent cannot write anywhere by picking the lower-level call or by
+  laundering an edit through a sandbox run. `rename_as` checks **both** sides:
+  checking only the source lets an actor move a file it controls *into* a subtree
+  it does not. `open_coedit` is gated at the door, because the co-edit checkpoint
+  write-back is deliberately exempt and would otherwise be a way around a grant.
+
+  `write_or_propose` and `remove_or_propose` became three-way: write access lands,
+  propose access queues, and **no access is refused outright** rather than queued —
+  queueing would file a suggestion that accepting must then refuse for the same
+  reason, while telling the caller its edit was merely awaiting review.
+
+  The exemptions are unchanged and still load-bearing: the unattributed engine ops
+  (checkout, merge materialization) and `write_as_expecting`, which is how an
+  accepted suggestion lands attributed to its original author — an author who is
+  frequently propose-only, because that is why the queue exists.
+
+  Reachable from every surface with an actor: `Workspace::grant`/`revoke`/`grants`/
+  `effective_perms`, `origofs grant|revoke|grants`, and the Python bindings.
+
+  **Two limits, stated plainly.** Grants govern *writes*; reads carry no actor
+  context anywhere in the engine, so a grant restricts writing, not seeing (#124).
+  And they are unenforceable through a FUSE/NFS mount, which has no actor context —
+  a mount is a trusted surface, and a workspace whose threat model includes the
+  agent holding the mount should not be mounted. `docs/PERMISSIONS.md` §5 records
+  that ruling and why option 2 (mount-per-actor) is the intended fix.
+
 - **`chmod` and `chown`, and inode ownership (`uid`/`gid`) — migration V17 (#121,
   #122).** `mode` had been stored since V1, committed into tree objects, reported by
   both mounts, and read by the git exporter for the exec bit. Nothing could change

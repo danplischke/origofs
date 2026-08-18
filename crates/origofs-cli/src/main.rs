@@ -238,6 +238,28 @@ enum Cmd {
         /// `direct` or `propose`.
         policy: String,
     },
+    /// Grant an actor access at and below a path prefix.
+    ///
+    /// Longest matching prefix wins; an actor with no covering grant falls back to
+    /// its write policy. Grants do **not** restrict a FUSE/NFS mount, which has no
+    /// actor context — see `docs/PERMISSIONS.md` §5.
+    Grant {
+        /// The actor id to grant to.
+        actor: i64,
+        /// Absolute path prefix, e.g. `/src/parser`. `/` is the whole workspace.
+        prefix: String,
+        /// Comma-separated: `read`, `write`, `propose`, or `none`.
+        perms: String,
+    },
+    /// Remove an actor's grant at exactly this prefix.
+    Revoke { actor: i64, prefix: String },
+    /// List an actor's access grants, longest prefix first.
+    Grants {
+        actor: i64,
+        /// Also show what the actor may do at this path, after resolution.
+        #[arg(long)]
+        at: Option<String>,
+    },
     /// Show per-line authorship (blame) for a file.
     Blame { path: String },
     /// Undo exactly the lines one actor authored in one session, across every file
@@ -960,6 +982,38 @@ async fn main() -> Result<()> {
             })?;
             ws.set_write_policy(actor, p).await?;
             println!("actor #{actor} write policy set to {}", p.as_str());
+        }
+        Cmd::Grant {
+            actor,
+            prefix,
+            perms,
+        } => {
+            let p = origofs_sdk::Perms::parse(&perms)?;
+            ws.grant(actor, &prefix, p).await?;
+            println!("actor #{actor}: {prefix} = {}", p.as_str());
+        }
+        Cmd::Revoke { actor, prefix } => {
+            // Report whether anything was actually removed: a revoke against a
+            // typo'd prefix that printed "revoked" would leave an operator
+            // believing they closed access they did not.
+            if ws.revoke(actor, &prefix).await? {
+                println!("actor #{actor}: revoked {prefix}");
+            } else {
+                println!("actor #{actor}: no grant at {prefix}");
+            }
+        }
+        Cmd::Grants { actor, at } => {
+            let grants = ws.grants(actor).await?;
+            if grants.is_empty() {
+                println!("actor #{actor}: no grants (falls back to its write policy)");
+            }
+            for g in &grants {
+                println!("{}\t{}", g.path_prefix, g.perms.as_str());
+            }
+            if let Some(path) = at {
+                let p = ws.effective_perms(actor, &path).await?;
+                println!("effective at {path}: {}", p.as_str());
+            }
         }
         Cmd::RevertSession {
             actor,

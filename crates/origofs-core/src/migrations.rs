@@ -188,6 +188,23 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V17_SQLITE,
         postgres: V17_POSTGRES,
     },
+    // V18 — path-scoped access grants (`docs/PERMISSIONS.md` §3b, issue #123).
+    //
+    // The per-actor `write_policy` (V10) is workspace-wide and binary: an actor may
+    // write everywhere or propose everywhere. This table refines it per subtree, so
+    // "this agent may write under /src/parser and nowhere else" becomes
+    // expressible. Longest matching `path_prefix` wins; an actor with **no** rows
+    // falls back to its `write_policy` at the root, which is why this migration is
+    // behaviour-preserving and needs no backfill — including for actors created
+    // after it runs.
+    //
+    // Workspace-scoped like the rest of the working-tree tables (V11/V12): a grant
+    // in one workspace must not authorize anything in another.
+    Migration {
+        version: 18,
+        sqlite: V18_SQLITE,
+        postgres: V18_POSTGRES,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -399,6 +416,29 @@ ALTER TABLE inode ADD COLUMN gid INTEGER NOT NULL DEFAULT 0;
 const V17_POSTGRES: &str = "
 ALTER TABLE inode ADD COLUMN IF NOT EXISTS uid BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE inode ADD COLUMN IF NOT EXISTS gid BIGINT NOT NULL DEFAULT 0;
+";
+
+// V18 — path-scoped access grants (see the migration entry above). `perms` is the
+// bitset in `acl.rs`: 1 = read, 2 = write, 4 = propose.
+const V18_SQLITE: &str = "
+CREATE TABLE IF NOT EXISTS acl(
+    workspace_id INTEGER NOT NULL,
+    actor_id     INTEGER NOT NULL,
+    path_prefix  TEXT    NOT NULL,
+    perms        INTEGER NOT NULL,
+    PRIMARY KEY(workspace_id, actor_id, path_prefix)
+);
+CREATE INDEX IF NOT EXISTS idx_acl_actor ON acl(workspace_id, actor_id);
+";
+const V18_POSTGRES: &str = "
+CREATE TABLE IF NOT EXISTS acl(
+    workspace_id BIGINT NOT NULL,
+    actor_id     BIGINT NOT NULL,
+    path_prefix  TEXT   NOT NULL,
+    perms        BIGINT NOT NULL,
+    PRIMARY KEY(workspace_id, actor_id, path_prefix)
+);
+CREATE INDEX IF NOT EXISTS idx_acl_actor ON acl(workspace_id, actor_id);
 ";
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS`; the migration runner tolerates a

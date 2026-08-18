@@ -8,6 +8,7 @@
 //! critical sections on the unique dentry index), and `LISTEN/NOTIFY` change
 //! feeds (consumed by the watch API in M8).
 
+use crate::acl::{Grant, Perms};
 use crate::attribution::{
     Actor, ActorInit, ActorKind, EditOp, EditOpInit, ToolCallInit, WritePolicy,
 };
@@ -1414,6 +1415,61 @@ impl MetadataStore for PostgresMetadataStore {
             return Err(OrigoFSError::NotFound(format!("actor #{actor_id}")));
         }
         Ok(())
+    }
+
+    async fn set_grant(&self, actor_id: i64, prefix: &str, perms: Perms) -> Result<()> {
+        let c = self.client().await?;
+        // Refuse a grant for an unknown actor; see the SQLite twin.
+        let known = c
+            .query_opt("SELECT id FROM actor WHERE id = $1", &[&actor_id])
+            .await?;
+        if known.is_none() {
+            return Err(OrigoFSError::NotFound(format!("actor #{actor_id}")));
+        }
+        c.execute(
+            "INSERT INTO acl(workspace_id, actor_id, path_prefix, perms) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (workspace_id, actor_id, path_prefix) \
+             DO UPDATE SET perms = EXCLUDED.perms",
+            &[
+                &self.workspace_id,
+                &actor_id,
+                &prefix,
+                &(perms.bits() as i64),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_grant(&self, actor_id: i64, prefix: &str) -> Result<bool> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM acl WHERE workspace_id = $1 AND actor_id = $2 AND path_prefix = $3",
+                &[&self.workspace_id, &actor_id, &prefix],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn list_grants(&self, actor_id: i64) -> Result<Vec<Grant>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT path_prefix, perms FROM acl WHERE workspace_id = $1 AND actor_id = $2",
+                &[&self.workspace_id, &actor_id],
+            )
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(Grant {
+                actor_id,
+                path_prefix: r.get(0),
+                perms: Perms::from_bits(r.get::<_, i64>(1) as u32)?,
+            });
+        }
+        Ok(out)
     }
 
     async fn actor_by_subject(&self, subject: &str) -> Result<Option<Actor>> {

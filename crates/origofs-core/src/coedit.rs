@@ -803,6 +803,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// so a byte reader can tell that the durable blob may lag this document. Call
     /// [`end_coedit`](Self::end_coedit) when the session finishes to clear it.
     pub async fn open_coedit(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
+        // Gate at the door, not at the checkpoint (#123). A live document is
+        // write-back machinery: edits accumulate in the CRDT and land through
+        // `write_as_blamed`, which is deliberately ungated so a checkpoint cannot
+        // fail halfway. Refusing an actor that lacks write access *here* is what
+        // keeps that exemption from becoming a way around its grant.
+        self.ensure_may_write_at(ctx, "co-edit", path).await?;
         let doc = self.load_coedit(ctx, path).await?;
         self.mark_live(ctx, path).await?;
         Ok(doc)

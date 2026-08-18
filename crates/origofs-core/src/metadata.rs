@@ -2,6 +2,7 @@
 //! and attribution. Content bytes never live here — only content addresses do
 //! (`docs/DESIGN.md` §4b).
 
+use crate::acl::{Grant, Perms};
 use crate::attribution::{Actor, ActorInit, EditOp, EditOpInit, ToolCallInit, WritePolicy};
 use crate::collab::{Event, EventInit, LiveDoc, Presence};
 use crate::error::Result;
@@ -259,6 +260,19 @@ pub trait MetadataStore: Send + Sync {
 
     async fn create_actor(&self, init: ActorInit) -> Result<i64>;
     async fn get_actor(&self, id: i64) -> Result<Option<Actor>>;
+    /// Upsert a path-scoped access grant (`docs/PERMISSIONS.md` §3b). `prefix` is
+    /// expected pre-normalized by [`crate::acl::normalize_prefix`].
+    async fn set_grant(&self, actor_id: i64, prefix: &str, perms: Perms) -> Result<()>;
+
+    /// Remove a grant. Returns whether a row was actually removed, so a caller can
+    /// tell "revoked" from "there was nothing there" — a revoke that silently
+    /// succeeds against a typo'd prefix leaves an operator believing they closed
+    /// access they did not.
+    async fn remove_grant(&self, actor_id: i64, prefix: &str) -> Result<bool>;
+
+    /// Every grant for `actor_id`, in no particular order.
+    async fn list_grants(&self, actor_id: i64) -> Result<Vec<Grant>>;
+
     /// Set an actor's write policy (direct vs. propose-only). Actor-agnostic — the
     /// gate is a property of the actor, not their kind.
     async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()>;
@@ -655,6 +669,15 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()> {
         (**self).set_write_policy(actor_id, policy).await
+    }
+    async fn set_grant(&self, actor_id: i64, prefix: &str, perms: Perms) -> Result<()> {
+        (**self).set_grant(actor_id, prefix, perms).await
+    }
+    async fn remove_grant(&self, actor_id: i64, prefix: &str) -> Result<bool> {
+        (**self).remove_grant(actor_id, prefix).await
+    }
+    async fn list_grants(&self, actor_id: i64) -> Result<Vec<Grant>> {
+        (**self).list_grants(actor_id).await
     }
     async fn actor_by_subject(&self, subject: &str) -> Result<Option<Actor>> {
         (**self).actor_by_subject(subject).await

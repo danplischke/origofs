@@ -18,6 +18,7 @@
 //! machinery, the change feed, and attribution. Rejected/superseded proposals
 //! leave orphaned chunks that ordinary GC reclaims.
 
+use crate::acl::{self, Grant, Perms};
 use crate::attribution::{WriteCtx, WritePolicy};
 use crate::collab::EventInit;
 use crate::content::ContentStore;
@@ -230,6 +231,85 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         }
     }
 
+    /// What `actor` may do at `path` (`docs/PERMISSIONS.md` §3b, issue #123).
+    ///
+    /// The longest [`Grant`] prefix covering `path` wins. An actor with **no**
+    /// covering grant falls back to its workspace-wide
+    /// [`WritePolicy`](crate::WritePolicy), which is what makes migration V18
+    /// behaviour-preserving and keeps an actor created *after* it governed the same
+    /// way (see [`crate::acl`]).
+    pub async fn effective_perms(&self, actor: i64, path: &str) -> Result<Perms> {
+        let grants = self.meta.list_grants(actor).await?;
+        if let Some(g) = acl::resolve(&grants, path) {
+            return Ok(g.perms);
+        }
+        Ok(match self.write_policy_of(actor).await? {
+            WritePolicy::Direct => Perms::RW,
+            WritePolicy::Propose => Perms::RP,
+        })
+    }
+
+    /// **The path-scoped trust gate.** Refuse `op` on `path` unless `ctx`'s actor
+    /// holds [`Perms::WRITE`] there.
+    ///
+    /// The path-aware counterpart of [`ensure_may_write`](Self::ensure_may_write),
+    /// and the one every *path-taking* attributed mutation on [`Fs`](crate::Fs)
+    /// calls. Operations with no path of their own — `commit`, `checkout`,
+    /// registering an actor — keep using the workspace-wide check.
+    ///
+    /// The refusal distinguishes the two reasons deliberately: an actor that may
+    /// *propose* here is told to submit a suggestion (the pre-#123 message, which
+    /// surfaces already handle), while one with no access at all is told it has
+    /// none. Collapsing them would tell an agent to file a suggestion that would
+    /// then be refused for the same reason.
+    pub async fn ensure_may_write_at(&self, ctx: WriteCtx, op: &str, path: &str) -> Result<()> {
+        let perms = self.effective_perms(ctx.actor, path).await?;
+        if perms.contains(Perms::WRITE) {
+            return Ok(());
+        }
+        Err(OrigoFSError::Denied(if perms.contains(Perms::PROPOSE) {
+            format!(
+                "actor {} is propose-only and may not {op} directly at {path}; \
+                 submit a suggestion for review instead",
+                ctx.actor
+            )
+        } else {
+            format!(
+                "actor {} may not {op} at {path} (access there is {})",
+                ctx.actor,
+                perms.as_str()
+            )
+        }))
+    }
+
+    /// Grant `actor` `perms` at and below `prefix`, replacing any grant already
+    /// recorded for that exact prefix.
+    pub async fn grant(&self, actor: i64, prefix: &str, perms: Perms) -> Result<()> {
+        let prefix = acl::normalize_prefix(prefix)?;
+        self.meta.set_grant(actor, &prefix, perms).await
+    }
+
+    /// Remove `actor`'s grant at exactly `prefix`. Returns whether one existed —
+    /// a revoke against a typo'd prefix must not look like it closed access.
+    pub async fn revoke(&self, actor: i64, prefix: &str) -> Result<bool> {
+        let prefix = acl::normalize_prefix(prefix)?;
+        self.meta.remove_grant(actor, &prefix).await
+    }
+
+    /// Every grant recorded for `actor`, longest prefix first (the order they are
+    /// consulted in).
+    pub async fn grants(&self, actor: i64) -> Result<Vec<Grant>> {
+        let mut g = self.meta.list_grants(actor).await?;
+        g.sort_by(|a, b| {
+            b.path_prefix
+                .trim_end_matches('/')
+                .len()
+                .cmp(&a.path_prefix.trim_end_matches('/').len())
+                .then_with(|| a.path_prefix.cmp(&b.path_prefix))
+        });
+        Ok(g)
+    }
+
     /// Submit a removal of `path` **governed by the actor's write policy** (§6) —
     /// the deletion counterpart of [`write_or_propose`](Self::write_or_propose).
     ///
@@ -245,12 +325,20 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         path: &str,
         summary: Option<&str>,
     ) -> Result<WriteOutcome> {
-        match self.write_policy_of(ctx.actor).await? {
-            WritePolicy::Direct => {
+        let perms = self.effective_perms(ctx.actor, path).await?;
+        if !perms.contains(Perms::WRITE) && !perms.contains(Perms::PROPOSE) {
+            return Err(OrigoFSError::Denied(format!(
+                "actor {} may not remove {path} (access there is {})",
+                ctx.actor,
+                perms.as_str()
+            )));
+        }
+        match perms.contains(Perms::WRITE) {
+            true => {
                 self.remove_as(ctx, path).await?;
                 Ok(WriteOutcome::Wrote)
             }
-            WritePolicy::Propose => {
+            false => {
                 let id = self.suggest_delete(ctx, path, summary).await?;
                 Ok(WriteOutcome::Proposed(id))
             }
@@ -273,17 +361,24 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         data: &[u8],
         summary: Option<&str>,
     ) -> Result<WriteOutcome> {
-        // An unknown actor has no policy on record: default to direct (matching the
-        // column default). Identity is resolved server-side before we get here, so
-        // in practice the actor always exists.
-        let policy = self
-            .meta
-            .get_actor(ctx.actor)
-            .await?
-            .map(|a| a.write_policy)
-            .unwrap_or(WritePolicy::Direct);
-        match policy {
-            WritePolicy::Direct => {
+        // Path-scoped since #123: the same actor may write under one subtree and
+        // only propose under another. An unknown actor has no policy on record and
+        // falls back to direct (matching the column default); identity is resolved
+        // server-side before we get here, so in practice the actor always exists.
+        let perms = self.effective_perms(ctx.actor, path).await?;
+        // No access at all is a refusal, not a proposal. Queueing here would file a
+        // suggestion that `accept_suggestion` must then refuse for the same reason,
+        // leaving an un-acceptable row behind and telling the caller its edit was
+        // merely awaiting review.
+        if !perms.contains(Perms::WRITE) && !perms.contains(Perms::PROPOSE) {
+            return Err(OrigoFSError::Denied(format!(
+                "actor {} may not write at {path} (access there is {})",
+                ctx.actor,
+                perms.as_str()
+            )));
+        }
+        match perms.contains(Perms::WRITE) {
+            true => {
                 // Missing parents are created here, *after* the policy decision.
                 // Surfaces used to do it before calling in, so an edit that was
                 // merely queued for review had already mutated the working tree —
@@ -297,7 +392,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 self.write_as(ctx, path, data).await?;
                 Ok(WriteOutcome::Wrote)
             }
-            WritePolicy::Propose => {
+            false => {
                 let id = self.suggest(ctx, path, data, summary).await?;
                 Ok(WriteOutcome::Proposed(id))
             }

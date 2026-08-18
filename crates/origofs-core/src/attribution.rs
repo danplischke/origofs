@@ -494,7 +494,26 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// [`write_as_expecting`](Self::write_as_expecting) is the same guarantee
     /// against a caller-chosen base; [`write_as_blamed`](Self::write_as_blamed)
     /// deliberately keeps the unconditional behaviour — see there.
+    /// **Gated since #123.** The actor must hold [`Perms::WRITE`] at `path`. This
+    /// is the whole-body attributed write every surface reaches — `Workspace`, the
+    /// Python bindings, and the sandbox's delta import all call it — so leaving it
+    /// ungated would have let a scoped agent write anywhere by picking the
+    /// unattributed-sounding name, and let a sandbox run launder an edit past the
+    /// grant that governs the actor who launched it.
+    ///
+    /// The check sits here rather than only in
+    /// [`write_or_propose`](Self::write_or_propose) so it cannot be skipped by
+    /// choosing the lower-level call; `write_or_propose` re-checks on its direct
+    /// branch, which is redundant and cheap.
+    ///
+    /// Internal machinery stays exempt by going around it:
+    /// [`write_as_expecting`](Self::write_as_expecting) (how `accept_suggestion`
+    /// lands an approved edit attributed to its original author, who may be
+    /// propose-only precisely because the suggestion queue exists) and
+    /// [`write_as_blamed`](Self::write_as_blamed) (the co-editing checkpoint
+    /// write-back) both call `write_as_inner` directly.
     pub async fn write_as(&self, ctx: WriteCtx, path: &str, data: &[u8]) -> Result<()> {
+        self.ensure_may_write_at(ctx, "write a file", path).await?;
         crate::retry::retrying("write_as", || self.write_as_attempt(ctx, path, data)).await
     }
 
@@ -846,7 +865,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// accepts requests from possibly-untrusted actors: it queues a propose-only
     /// actor's removal for review instead of refusing it outright.
     pub async fn remove_as(&self, ctx: WriteCtx, path: &str) -> Result<()> {
-        self.ensure_may_write(ctx, "remove files").await?;
+        self.ensure_may_write_at(ctx, "remove files", path).await?;
         // Capture identity and content *before* the removal: afterwards the inode
         // is gone and the op-log could not name what was destroyed.
         let inode = self.stat(path).await?;
@@ -876,7 +895,13 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// The source is recoverable from the inode's earlier ops, and the change-feed
     /// event emitted at the workspace boundary carries `from → to` in its `detail`.
     pub async fn rename_as(&self, ctx: WriteCtx, from: &str, to: &str) -> Result<()> {
-        self.ensure_may_write(ctx, "rename files").await?;
+        // Both sides. Checking only the source lets an actor move a file it
+        // controls *into* a subtree it does not — the destination is as much a
+        // mutation as the source, and a one-sided check is how a scoped agent
+        // would smuggle content into a neighbour's tree.
+        self.ensure_may_write_at(ctx, "rename files", from).await?;
+        self.ensure_may_write_at(ctx, "rename files into", to)
+            .await?;
         let inode = self.stat(from).await?;
         self.rename(from, to).await?;
         self.meta
@@ -900,7 +925,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Create a directory (and any missing parents), attributed to `ctx` and
     /// subject to its write policy.
     pub async fn mkdir_as(&self, ctx: WriteCtx, path: &str) -> Result<Ino> {
-        self.ensure_may_write(ctx, "create directories").await?;
+        self.ensure_may_write_at(ctx, "create directories", path)
+            .await?;
         let ino = self.mkdir_p(path).await?;
         self.meta
             .append_edit_op(EditOpInit {
@@ -923,7 +949,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Create a symlink at `linkpath` pointing at `target`, attributed to `ctx`
     /// and subject to its write policy.
     pub async fn symlink_as(&self, ctx: WriteCtx, target: &str, linkpath: &str) -> Result<Ino> {
-        self.ensure_may_write(ctx, "create symlinks").await?;
+        self.ensure_may_write_at(ctx, "create symlinks", linkpath)
+            .await?;
         let ino = self.symlink(target, linkpath).await?;
         self.meta
             .append_edit_op(EditOpInit {
@@ -956,7 +983,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// about a file, not authored content, so it belongs in the op-log without
     /// touching the blame index.
     pub async fn chmod_as(&self, ctx: WriteCtx, path: &str, mode: u32) -> Result<Inode> {
-        self.ensure_may_write(ctx, "change permissions").await?;
+        self.ensure_may_write_at(ctx, "change permissions", path)
+            .await?;
         let inode = self.chmod(path, mode).await?;
         self.meta
             .append_edit_op(EditOpInit {
@@ -986,7 +1014,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> Result<Inode> {
-        self.ensure_may_write(ctx, "change ownership").await?;
+        self.ensure_may_write_at(ctx, "change ownership", path)
+            .await?;
         let inode = self.chown(path, uid, gid).await?;
         self.meta
             .append_edit_op(EditOpInit {

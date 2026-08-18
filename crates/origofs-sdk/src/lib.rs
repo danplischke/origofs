@@ -22,10 +22,11 @@ pub use origofs_core::metrics;
 pub use origofs_core::{
     Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DEFAULT_GC_GRACE_SECS,
     DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event, EventInit, FileKind,
-    GcStats, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError, PackStore, Passage,
-    PassageOptions, Presence, RebuildReport, ResyncOutcome, ResyncReport, Segmentation, Suggestion,
-    SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit,
-    TransferStats, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    GcStats, Grant, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError, PackStore, Passage,
+    PassageOptions, Perms, Presence, RebuildReport, ResyncOutcome, ResyncReport, Segmentation,
+    Suggestion, SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore,
+    ToolCallInit, TransferStats, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome,
+    WritePolicy,
 };
 // Backend-specific re-exports, gated to match `origofs-core`'s own features.
 #[cfg(feature = "encryption")]
@@ -1158,6 +1159,37 @@ impl Workspace {
     /// operator has deliberately restricted, and a surface has no other way to ask.
     pub async fn ensure_may_write(&self, ctx: WriteCtx, op: &str) -> Result<()> {
         self.fs.ensure_may_write(ctx, op).await
+    }
+
+    /// What `actor` may do at `path` (`docs/PERMISSIONS.md` §3b).
+    ///
+    /// The longest access grant covering `path` wins; an actor with no covering
+    /// grant falls back to its workspace-wide write policy, which is what makes
+    /// grants purely additive.
+    pub async fn effective_perms(&self, actor: i64, path: &str) -> Result<Perms> {
+        self.fs.effective_perms(actor, path).await
+    }
+
+    /// Grant `actor` `perms` at and below `prefix`, replacing any grant recorded
+    /// for that exact prefix.
+    ///
+    /// Grants restrict the SDK, the HTTP API, MCP and the CLI. They are **not**
+    /// enforceable through a FUSE/NFS mount, which has no actor context — see
+    /// `docs/PERMISSIONS.md` §5.
+    #[tracing::instrument(level = "debug", skip_all, fields(actor = actor, prefix = %prefix))]
+    pub async fn grant(&self, actor: i64, prefix: &str, perms: Perms) -> Result<()> {
+        self.fs.grant(actor, prefix, perms).await
+    }
+
+    /// Remove `actor`'s grant at exactly `prefix`; returns whether one existed.
+    #[tracing::instrument(level = "debug", skip_all, fields(actor = actor, prefix = %prefix))]
+    pub async fn revoke(&self, actor: i64, prefix: &str) -> Result<bool> {
+        self.fs.revoke(actor, prefix).await
+    }
+
+    /// Every grant recorded for `actor`, longest prefix first.
+    pub async fn grants(&self, actor: i64) -> Result<Vec<Grant>> {
+        self.fs.grants(actor).await
     }
 
     /// Submit an edit to `path` governed by the actor's write policy: a `Direct`

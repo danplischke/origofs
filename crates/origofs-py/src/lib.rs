@@ -30,7 +30,7 @@ use pyo3::exceptions::{
     PyPermissionError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
 #[cfg(target_os = "linux")]
 use std::path::Path;
@@ -1589,6 +1589,81 @@ impl Workspace {
         future_into_py(py, async move {
             ws.write_as(c, &path, &data).await.map_err(to_pyerr)?;
             Ok(())
+        })
+    }
+
+    /// Grant `actor` access at and below `prefix` (``docs/PERMISSIONS.md`` §3b).
+    ///
+    /// `perms` is comma-separated: ``"read"``, ``"write"``, ``"propose"``, or
+    /// ``"none"``. Longest matching prefix wins, and an actor with no covering
+    /// grant falls back to its write policy — so grants are purely additive.
+    ///
+    /// Grants restrict this SDK, the HTTP API, MCP and the CLI. They are **not**
+    /// enforceable through a FUSE/NFS mount, which has no actor context.
+    ///
+    /// ```python
+    /// await ws.grant(agent, "/", "read")              # read-only everywhere...
+    /// await ws.grant(agent, "/src/parser", "read,write")  # ...except here
+    /// ```
+    fn grant<'py>(
+        &self,
+        py: Python<'py>,
+        actor: i64,
+        prefix: String,
+        perms: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let p = origofs_sdk::Perms::parse(&perms).map_err(to_pyerr)?;
+            ws.grant(actor, &prefix, p).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Remove `actor`'s grant at exactly `prefix`. Returns whether one existed, so
+    /// a revoke against a typo'd prefix does not look like it closed access.
+    fn revoke<'py>(
+        &self,
+        py: Python<'py>,
+        actor: i64,
+        prefix: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.revoke(actor, &prefix).await.map_err(to_pyerr)
+        })
+    }
+
+    /// An actor's grants, longest prefix first: dicts of `prefix` and `perms`.
+    fn grants<'py>(&self, py: Python<'py>, actor: i64) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let grants = ws.grants(actor).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                let out = PyList::empty(py);
+                for g in &grants {
+                    let d = PyDict::new(py);
+                    d.set_item("prefix", &g.path_prefix)?;
+                    d.set_item("perms", g.perms.as_str())?;
+                    out.append(d)?;
+                }
+                Ok(out.into_any().unbind())
+            })
+        })
+    }
+
+    /// What `actor` may do at `path`, after grant resolution: a string like
+    /// ``"read,write"`` or ``"none"``.
+    fn effective_perms<'py>(
+        &self,
+        py: Python<'py>,
+        actor: i64,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let p = ws.effective_perms(actor, &path).await.map_err(to_pyerr)?;
+            Ok(p.as_str())
         })
     }
 

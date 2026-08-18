@@ -524,3 +524,71 @@ async def test_a_propose_only_actor_cannot_chmod_or_chown():
     hctx = origofs.WriteCtx.session(human, hsess)
     assert (await ws.chmod_as(hctx, "/f", 0o600))["mode"] & 0o7777 == 0o600
     assert (await ws.chown_as(hctx, "/f", uid=1000))["uid"] == 1000
+
+
+# --- path-scoped access grants (#123) --------------------------------------
+
+
+@asyncio_test
+async def test_grants_narrow_an_actor_to_a_subtree():
+    ws = await workspace()
+    await ws.mkdir_p("/src/parser")
+    await ws.mkdir_p("/docs")
+    await ws.write("/docs/readme.md", b"theirs")
+    await ws.write("/src/parser/lex.rs", b"theirs")
+
+    agent = await ws.create_agent("claude", "opus", None)
+    sess = await ws.create_session(agent, "test")
+    ctx = origofs.WriteCtx.session(agent, sess)
+
+    # Read-only everywhere, writable in one subtree — how deny-by-default is
+    # expressed without a separate mode.
+    await ws.grant(agent, "/", "read")
+    await ws.grant(agent, "/src/parser", "read,write")
+
+    assert await ws.effective_perms(agent, "/docs/readme.md") == "read"
+    assert await ws.effective_perms(agent, "/src/parser/lex.rs") == "read,write"
+
+    await ws.write_as(ctx, "/src/parser/lex.rs", b"mine")
+    assert bytes(await ws.read("/src/parser/lex.rs")) == b"mine"
+
+    with pytest.raises(PermissionError):
+        await ws.write_as(ctx, "/docs/readme.md", b"mine")
+    assert bytes(await ws.read("/docs/readme.md")) == b"theirs"
+
+
+@asyncio_test
+async def test_a_grant_does_not_cover_a_sibling_sharing_its_string_prefix():
+    """`/tenant-a` must not cover `/tenant-abc` — the classic prefix-scoping bug."""
+    ws = await workspace()
+    await ws.mkdir_p("/tenant-a")
+    await ws.mkdir_p("/tenant-abc")
+    await ws.write("/tenant-abc/secrets", b"theirs")
+
+    agent = await ws.create_agent("claude", "opus", None)
+    sess = await ws.create_session(agent, "test")
+    ctx = origofs.WriteCtx.session(agent, sess)
+
+    await ws.grant(agent, "/", "read")
+    await ws.grant(agent, "/tenant-a", "read,write")
+
+    assert await ws.effective_perms(agent, "/tenant-abc/secrets") == "read"
+    with pytest.raises(PermissionError):
+        await ws.write_as(ctx, "/tenant-abc/secrets", b"mine")
+
+
+@asyncio_test
+async def test_grants_list_longest_first_and_revoke_reports_reality():
+    ws = await workspace()
+    agent = await ws.create_agent("claude", "opus", None)
+
+    await ws.grant(agent, "/", "read")
+    await ws.grant(agent, "/src", "read,write")
+    listed = await ws.grants(agent)
+    assert [g["prefix"] for g in listed] == ["/src", "/"]
+    assert listed[0]["perms"] == "read,write"
+
+    # A revoke against a prefix with no grant must not look like it closed access.
+    assert await ws.revoke(agent, "/srcs") is False
+    assert await ws.revoke(agent, "/src") is True
+    assert [g["prefix"] for g in await ws.grants(agent)] == ["/"]

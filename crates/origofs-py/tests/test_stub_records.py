@@ -82,6 +82,13 @@ async def _workspace():
     )
 
 
+async def _one_grant(ws):
+    """A single path-scoped access grant, so `GrantRecord` is checked for real."""
+    actor = await ws.create_agent("grantee", "opus", None)
+    await ws.grant(actor, "/src", "read,write")
+    return await ws.grants(actor)
+
+
 async def _collect() -> dict:
     """One live instance of each record, keyed by its TypedDict name."""
     ws = await _workspace()
@@ -133,6 +140,7 @@ async def _collect() -> dict:
         "MigrateReport": await ws.migrate(),
         "ReadyReport": await ws.ready(),
         "TreeRun": (await tree.runs())[0],
+        "GrantRecord": (await _one_grant(ws))[0],
     }
     assert commit  # the commit above is what `log`/`branches` report on
     return records

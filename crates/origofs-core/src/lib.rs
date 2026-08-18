@@ -8,6 +8,7 @@
 //!
 //! See `docs/DESIGN.md` for the full architecture and the milestone roadmap.
 
+pub mod acl;
 pub mod attribution;
 pub mod chunk;
 pub mod clock;
@@ -45,6 +46,7 @@ mod util;
 pub mod version;
 pub mod vfs;
 
+pub use acl::{Grant, Perms};
 pub use attribution::{
     Actor, ActorInit, ActorKind, BlameRange, EditOp, ToolCallInit, WriteCtx, WritePolicy,
 };

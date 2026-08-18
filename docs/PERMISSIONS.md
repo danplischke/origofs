@@ -1,11 +1,16 @@
 # Permissions in origofs — what exists, and how to add them
 
-> Status: **partly implemented.** Taken against `adb6ec8` (2026-08-18). Phase 1 —
-> ownership and a working `chmod`/`chown` (§3a, issues #121/#122) — **has shipped**;
-> migration V17 adds `inode.uid`/`inode.gid` and both mounts now apply mode and
-> ownership instead of discarding them. §1d and §1b below are kept as the record of
-> what the baseline was, marked where they no longer hold. Everything from §3b on
-> remains a proposal.
+> Status: **mostly implemented.** Taken against `adb6ec8` (2026-08-18).
+>
+> * **§3a ownership** (#121/#122) — shipped. Migration V17 adds `inode.uid`/`gid`;
+>   both mounts apply mode and ownership instead of discarding them.
+> * **§3b write ACLs** (#123) — shipped. Migration V18 adds path-scoped grants,
+>   enforced in the engine by `ensure_may_write_at`.
+> * **§3c read ACLs** (#124) — still a proposal, and still recommended against
+>   until there is a concrete requirement.
+>
+> §1 is kept as the record of what the baseline was, marked where it no longer
+> holds.
 >
 > Companion to `docs/MULTI_TENANCY.md`, which specifies the *isolation* boundary
 > (tenants and workspaces); this document covers *authorization within* one — who
@@ -13,12 +18,18 @@
 
 ## Summary
 
-**origofs has no file or folder permissions.** `mode` and (since V17) `uid`/`gid`
-are stored, committed, and reported — and nothing anywhere consults them to allow
-or deny an operation. Shipping `chmod`/`chown` changed what origofs *records*, not
-what it *enforces*; that distinction is the whole of §2. The only authorization in
-the engine is still the per-actor **write policy** (`Direct | Propose`) — global,
-binary, and write-only.
+**origofs enforces permissions on actors, not on POSIX mode.** Two systems, kept
+apart deliberately (§2):
+
+* `mode`/`uid`/`gid` are stored, committed, and reported, and **nothing consults
+  them to allow or deny anything**. On a FUSE mount the *kernel* evaluates them.
+* **Path-scoped grants** (§3b, migration V18) are the real gate: an actor's access
+  is resolved per path by longest matching prefix, and every attributed mutation
+  in the engine checks it. An actor with no covering grant falls back to its
+  workspace-wide write policy, so grants are purely additive.
+
+What is still missing is **read** enforcement (§3c): reads carry no actor context
+anywhere, so a grant restricts writing, not seeing.
 
 That is a defensible place to have started: the write policy plus the workspace
 wall covers "an untrusted agent can't land edits without review" and "project A
@@ -98,7 +109,7 @@ proceeds on a false premise. That shape is what the tests assert against — eve
 case re-`stat`s and compares rather than checking that the call returned `Ok`,
 because the broken version returned `Ok` too.
 
-### 1e. The actual authorization model is the write policy
+### 1e. The authorization model *was* the write policy — **now the floor under §3b**
 
 `WritePolicy::{Direct, Propose}` (`attribution.rs:59`), a column on `actor`
 (migration V10), enforced by `ensure_may_write(ctx, op)` (`suggest.rs:222`). It is
@@ -118,6 +129,11 @@ Its shape matters for everything below:
 policy is *"enforced in the engine, not per surface"*, and `tests/mcp.rs` fails on
 an unclassified MCP tool so a new ungated one cannot ship silently. Any permission
 system must inherit that rule or it will be re-holed by the next surface.
+
+**It still applies, as the fallback.** §3b did not replace the write policy; it
+refines it. An actor with no covering grant resolves to exactly this, which is why
+V18 needed no backfill and why an actor created *after* it is governed the same
+way.
 
 ### 1f. Isolation is workspaces; authorization inside one is absent
 
@@ -201,7 +217,12 @@ call further along. `crates/origofs-py/tests/test_parity.py` exists because six
 attributed variants, the bindings, and the `--actor` flags landed with the feature
 rather than after it.
 
-### 3b. Write ACLs — the high-leverage change ([#123](https://github.com/danplischke/origofs/issues/123))
+### 3b. Write ACLs — **shipped** ([#123](https://github.com/danplischke/origofs/issues/123))
+
+> **Implemented** in migration V18 and `crates/origofs-core/src/acl.rs`. What
+> follows described the plan and now describes the build; the differences from the
+> original sketch are called out inline.
+
 
 Every attributed mutation already funnels through one function, so give it a path:
 
@@ -309,9 +330,18 @@ Three options, in increasing cost:
 3. **Map uid → actor.** A real multi-user mount. Requires §3a plus an actor↔uid
    table, and is the only option that lets several actors share one mount.
 
-Whichever is chosen must be decided *before* §3b ships, because "ACLs exist" and
-"ACLs are bypassable by design on two surfaces" need to be stated in the same
-breath.
+**Ruling: option 1, for now, stated loudly.** §3b shipped with the bypass
+documented rather than closed, because closing it is a separate feature and
+leaving grants unbuilt in the meantime would have been worse: grants restrict the
+SDK, the HTTP API, MCP, the CLI, and the Python bindings — every surface that
+*has* an actor — while the mounts remain exactly as unrestricted as they were
+before grants existed. Nothing regressed; a gap simply stayed open.
+
+The honest framing, which belongs in any deployment doc that mentions grants: **a
+mount is a trusted surface.** If a workspace's threat model includes the agent
+that holds the mount, do not mount it — use the API or MCP, which are governed.
+Option 2 (mount-per-actor) remains the intended fix, and §3a's ownership work is
+the half of it that already landed.
 
 ---
 
@@ -321,8 +351,8 @@ breath.
 |---|---|---|---|---|
 | 0 | ~~`chmod`/`chown` stop silently no-oping (§1d)~~ — **done** | #121 | — | tiny |
 | 1 | ~~`uid`/`gid` + working `chmod`/`chown` + honest mount attrs (§3a)~~ — **done** | #122 | V17 | small |
-| 2 | Path-scoped write ACLs (§3b) + the mount ruling (§5) | #123 | V18 | medium |
-| 3 | Surface parity: port the Python router's scoping to the Rust API, add bindings, extend the MCP classification test | #125 | — | medium |
+| 2 | ~~Path-scoped write ACLs (§3b) + the mount ruling (§5)~~ — **done** | #123 | V18 | medium |
+| 3 | Surface parity: port the Python router's scoping to the Rust API, extend the MCP classification test | #125 | — | medium |
 | 4 | Read ACLs (§3c) — only against a real requirement | #124 | V19 | large |
 
 Phase 2 is the one that changes what the product can claim: it turns a global
