@@ -19,7 +19,7 @@ use crate::content::ContentStore;
 use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
-use crate::types::{Hash, Ino};
+use crate::types::{Hash, Ino, Inode};
 use similar::{ChangeTag, TextDiff};
 use std::collections::{HashMap, VecDeque};
 
@@ -941,6 +941,69 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             })
             .await?;
         Ok(ino)
+    }
+
+    /// Change a path's permission bits, attributed to `ctx` and subject to its
+    /// write policy.
+    ///
+    /// A propose-only actor is **refused** rather than queued: there is no
+    /// propose-shaped equivalent of a `chmod`, the same way there is none for
+    /// `symlink_as`. Metadata is still a mutation an untrusted agent should not be
+    /// able to make unreviewed — `chmod 000` on a file it may not write is a denial
+    /// of service the write policy exists to prevent.
+    ///
+    /// The recorded op has no byte range (like `mkdir`/`symlink`): mode is metadata
+    /// about a file, not authored content, so it belongs in the op-log without
+    /// touching the blame index.
+    pub async fn chmod_as(&self, ctx: WriteCtx, path: &str, mode: u32) -> Result<Inode> {
+        self.ensure_may_write(ctx, "change permissions").await?;
+        let inode = self.chmod(path, mode).await?;
+        self.meta
+            .append_edit_op(EditOpInit {
+                session_id: ctx.session,
+                actor_id: ctx.actor,
+                tool_call_id: ctx.tool_call,
+                ino: inode.ino,
+                path: path.to_string(),
+                op: "chmod".to_string(),
+                byte_start: 0,
+                byte_len: 0,
+                pre_hash: None,
+                post_hash: None,
+                ts: self.now_secs(),
+            })
+            .await?;
+        Ok(inode)
+    }
+
+    /// Change a path's owning user and/or group, attributed to `ctx` and subject to
+    /// its write policy. See [`Fs::chmod_as`] for why this refuses rather than
+    /// queues, and why the op carries no byte range.
+    pub async fn chown_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode> {
+        self.ensure_may_write(ctx, "change ownership").await?;
+        let inode = self.chown(path, uid, gid).await?;
+        self.meta
+            .append_edit_op(EditOpInit {
+                session_id: ctx.session,
+                actor_id: ctx.actor,
+                tool_call_id: ctx.tool_call,
+                ino: inode.ino,
+                path: path.to_string(),
+                op: "chown".to_string(),
+                byte_start: 0,
+                byte_len: 0,
+                pre_hash: None,
+                post_hash: None,
+                ts: self.now_secs(),
+            })
+            .await?;
+        Ok(inode)
     }
 
     // --- queries ----------------------------------------------------------

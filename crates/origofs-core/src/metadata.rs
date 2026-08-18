@@ -96,6 +96,16 @@ pub trait MetadataStore: Send + Sync {
     /// Set an inode's link count.
     async fn set_nlink(&self, ino: Ino, nlink: i64) -> Result<()>;
 
+    /// Replace an inode's **permission** bits (`chmod`), leaving the file-type
+    /// bits intact — the stored `mode` carries both, and dropping the type half
+    /// would corrupt the committed tree entry and the git exporter's exec-bit
+    /// check. Touches `ctime`, as POSIX requires.
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()>;
+
+    /// Set an inode's owning user and/or group (`chown`). `None` leaves that half
+    /// unchanged, because POSIX lets a caller supply only one. Touches `ctime`.
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()>;
+
     /// Delete an inode and any symlink row. The caller ensures `nlink` hit 0.
     /// Reclaiming now-unreferenced content is deferred to GC (M9).
     async fn delete_inode(&self, ino: Ino) -> Result<()>;
@@ -535,6 +545,12 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn set_nlink(&self, ino: Ino, nlink: i64) -> Result<()> {
         (**self).set_nlink(ino, nlink).await
+    }
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()> {
+        (**self).set_mode(ino, mode).await
+    }
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        (**self).set_owner(ino, uid, gid).await
     }
     async fn delete_inode(&self, ino: Ino) -> Result<()> {
         (**self).delete_inode(ino).await

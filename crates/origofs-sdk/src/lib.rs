@@ -635,6 +635,57 @@ impl Workspace {
         self.fs.stat(path).await
     }
 
+    /// Change a path's permission bits (`chmod`), returning the updated inode.
+    ///
+    /// Only the low 12 bits are honoured; the file-type bits are preserved. Until
+    /// migration V17 this had no implementation at all and both mounts accepted a
+    /// mode change and silently discarded it (issue #121).
+    ///
+    /// **Not an access check.** Nothing in origofs consults `mode` to allow or deny
+    /// an operation — on a FUSE mount the kernel does, because the mount asks it
+    /// to. See `docs/PERMISSIONS.md`.
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path, mode = mode))]
+    pub async fn chmod(&self, path: &str, mode: u32) -> Result<Inode> {
+        self.fs.chmod(path, mode).await
+    }
+
+    /// Change a path's owning user and/or group (`chown`), returning the updated
+    /// inode. `None` leaves that half unchanged, matching `chown(2)`'s `-1`.
+    ///
+    /// Ownership exists so the mounts report a real owner instead of the hardcoded
+    /// root they used before migration V17. origofs's own principals are **actors**,
+    /// not uids (`docs/PERMISSIONS.md` §2).
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path))]
+    pub async fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<Inode> {
+        self.fs.chown(path, uid, gid).await
+    }
+
+    /// [`chmod`](Self::chmod), attributed to `ctx` and subject to its write policy.
+    ///
+    /// Prefer this wherever an actor is known. A propose-only actor is refused —
+    /// there is no propose-shaped equivalent of a `chmod`, and `chmod 000` on a file
+    /// an agent may not write is exactly the unreviewed damage the policy prevents.
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path, mode = mode))]
+    pub async fn chmod_as(&self, ctx: WriteCtx, path: &str, mode: u32) -> Result<Inode> {
+        let i = self.fs.chmod_as(ctx, path, mode).await?;
+        self.emit("chmod", path, None, None, None).await;
+        Ok(i)
+    }
+
+    /// [`chown`](Self::chown), attributed to `ctx` and subject to its write policy.
+    #[tracing::instrument(level = "debug", skip_all, fields(path = %path))]
+    pub async fn chown_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode> {
+        let i = self.fs.chown_as(ctx, path, uid, gid).await?;
+        self.emit("chown", path, None, None, None).await;
+        Ok(i)
+    }
+
     #[tracing::instrument(level = "debug", skip_all, fields(path = %path))]
     pub async fn remove(&self, path: &str) -> Result<()> {
         self.fs.remove(path).await?;

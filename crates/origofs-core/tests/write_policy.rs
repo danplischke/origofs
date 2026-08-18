@@ -67,6 +67,20 @@ async fn propose_only_actor_is_refused_every_direct_mutation() {
         fs.symlink_as(agent, "/a.txt", "/link").await.unwrap_err(),
         "symlink_as",
     );
+    // Metadata is a mutation too. `chmod 000` on a file an agent may not write is
+    // the same denial of service one call further along — the shape of #78 that
+    // this whole file exists to close. No propose-shaped equivalent exists for
+    // either, so both refuse outright rather than queueing (like `symlink_as`).
+    assert_denied(
+        fs.chmod_as(agent, "/a.txt", 0o000).await.unwrap_err(),
+        "chmod_as",
+    );
+    assert_denied(
+        fs.chown_as(agent, "/a.txt", Some(0), None)
+            .await
+            .unwrap_err(),
+        "chown_as",
+    );
     assert_denied(
         fs.commit_as(agent, "claude", "nope").await.unwrap_err(),
         "commit_as",
@@ -209,6 +223,10 @@ async fn internal_machinery_stays_exempt() {
 
     fs.write("/f.txt", b"one").await.unwrap();
     fs.mkdir_p("/sub").await.unwrap();
+    // The unattributed metadata ops are exempt for the same reason as the rest:
+    // checkout materializes a committed tree's modes without an actor to blame.
+    fs.chmod("/f.txt", 0o600).await.unwrap();
+    fs.chown("/f.txt", Some(1), Some(1)).await.unwrap();
     fs.rename("/f.txt", "/sub/f.txt").await.unwrap();
     fs.remove("/sub/f.txt").await.unwrap();
     assert!(fs.stat("/sub/f.txt").await.is_err());

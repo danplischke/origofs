@@ -98,6 +98,19 @@ pub struct Inode {
     pub ino: Ino,
     pub kind: FileKind,
     pub mode: u32,
+    /// Owning user/group (migration V17, `docs/PERMISSIONS.md` §3a).
+    ///
+    /// Both default to 0 — new inodes are root-owned, and [`Fs::vfs_chown`] is
+    /// how an owner is set. These exist so the mounts can report a real owner
+    /// instead of hardcoding one; they are **not** an authorization mechanism.
+    /// origofs's principals are actors, not uids (`docs/PERMISSIONS.md` §2), and
+    /// nothing in the engine consults `mode`/`uid`/`gid` to allow or deny an
+    /// operation. On a FUSE mount the *kernel* evaluates them, because the mount
+    /// asks it to with `MountOption::DefaultPermissions`.
+    ///
+    /// [`Fs::vfs_chown`]: crate::Fs::vfs_chown
+    pub uid: u32,
+    pub gid: u32,
     pub nlink: i64,
     pub size: u64,
     /// Content address of the whole body (M0). `None` for empty files, dirs, symlinks.

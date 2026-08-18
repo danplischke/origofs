@@ -9,6 +9,42 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ### Added
 
+- **`chmod` and `chown`, and inode ownership (`uid`/`gid`) — migration V17 (#121,
+  #122).** `mode` had been stored since V1, committed into tree objects, reported by
+  both mounts, and read by the git exporter for the exec bit. Nothing could change
+  it. Both mounts' `setattr` bound their mode argument, discarded it, and replied
+  with the attributes they had just re-read, so a `chmod` returned success and did
+  nothing — and mode was write-once at creation, riding into git history whatever
+  the file happened to be created with. The NFS surface said so in a comment; the
+  FUSE surface said it with three leading underscores.
+
+  Silent success is the part that mattered. `EPERM` would have been honest; a script
+  that checks its return code proceeds on a false premise. Every test added here
+  re-`stat`s and compares rather than asserting the call returned `Ok`, because the
+  broken version returned `Ok` too.
+
+  Ownership had no storage at all — both mounts hardcoded `uid: 0, gid: 0`. That is
+  why `allow_other` and non-root mounts could not work: the FUSE mount asks the
+  kernel to enforce mode (`MountOption::DefaultPermissions`), and against uid 0 every
+  non-root caller lands in the *other* class and loses write access to the whole
+  tree. V17 adds both columns `NOT NULL DEFAULT 0`, so existing stores are unchanged
+  and new inodes stay root-owned; `chown` is how an owner is set.
+
+  A `chmod` replaces the **permission** bits only. The stored `mode` carries the
+  file-type bits too, and an implementation that assigned the mode outright would
+  pass a naive "did it change?" assertion while turning every file into kind 0 — in
+  the committed tree entry as much as in the working tree.
+
+  Reachable from every surface rather than just the mounts: `Fs::chmod`/`chown`,
+  `Workspace::chmod`/`chown`, `origofs chmod`/`chown` (octal, like `chmod(1)`), and
+  the Python bindings, whose `StatResult` now carries `uid`/`gid`. The stub-parity
+  test caught the `__init__.pyi` half that a Rust-only change would have left behind.
+
+  **None of this is authorization.** origofs still consults neither `mode` nor
+  `uid`/`gid` to allow or deny anything — on a mount the kernel does. What changed is
+  what origofs *records*, not what it *enforces*. `docs/PERMISSIONS.md` covers the
+  distinction and proposes the actor-scoped ACLs (#123) that would be the other half.
+
 - **A structured (`Y.XmlFragment`) co-editing shape, so rich-text editors bind
   natively (#92).** `CoeditDoc` models a document as one flat `Y.Text`, but every
   mainstream rich-text CRDT binding — `@platejs/yjs`, `y-prosemirror`, `y-slate`,

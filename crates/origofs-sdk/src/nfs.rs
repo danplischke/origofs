@@ -18,8 +18,8 @@
 use crate::{FileKind, Inode, OrigoFSError, Workspace};
 use async_trait::async_trait;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_mode3,
-    set_size3, specdata3,
+    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_gid3,
+    set_mode3, set_size3, set_uid3, specdata3,
 };
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
@@ -110,8 +110,8 @@ fn attr(inode: &Inode) -> fattr3 {
         ftype: ftype(inode.kind),
         mode: inode.mode & 0o7777,
         nlink: inode.nlink.max(1) as u32,
-        uid: 0,
-        gid: 0,
+        uid: inode.uid,
+        gid: inode.gid,
         size: inode.size,
         used: inode.size,
         rdev: specdata3 {
@@ -166,9 +166,30 @@ impl NFSFileSystem for OrigoFSNfs {
                 .await
                 .map_err(stat)?;
         }
-        // origofs's minimal inode set doesn't persist uid/gid/atime/mtime; mode
-        // changes aren't yet surfaced by vfs_*, so those set-attrs are accepted
-        // but no-op. Size (truncate) is the one that matters for NFS clients.
+        if let set_mode3::mode(m) = setattr.mode {
+            self.ws.fs().vfs_chmod(id as i64, m).await.map_err(stat)?;
+        }
+        // One call for both halves, so `chown user:group` lands atomically and
+        // touches `ctime` once.
+        let uid = match setattr.uid {
+            set_uid3::uid(u) => Some(u),
+            _ => None,
+        };
+        let gid = match setattr.gid {
+            set_gid3::gid(g) => Some(g),
+            _ => None,
+        };
+        if uid.is_some() || gid.is_some() {
+            self.ws
+                .fs()
+                .vfs_chown(id as i64, uid, gid)
+                .await
+                .map_err(stat)?;
+        }
+        // atime/mtime are still accepted and ignored: origofs's inode has no atime,
+        // and mtime is derived from writes. Mode and ownership used to be dropped
+        // the same way, which was worse than refusing them — the reply carried the
+        // unchanged attributes, so `chmod` reported success and did nothing (#121).
         Ok(attr(
             &self.ws.fs().vfs_getattr(id as i64).await.map_err(stat)?,
         ))

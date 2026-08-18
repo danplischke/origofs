@@ -121,6 +121,8 @@ fn inode_dict(py: Python<'_>, i: &Inode) -> PyResult<Py<PyAny>> {
     d.set_item("ino", i.ino)?;
     d.set_item("kind", i.kind.as_str())?;
     d.set_item("mode", i.mode)?;
+    d.set_item("uid", i.uid)?;
+    d.set_item("gid", i.gid)?;
     d.set_item("nlink", i.nlink)?;
     d.set_item("size", i.size)?;
     d.set_item("content", hash_opt(i.content.as_ref()))?;
@@ -1676,6 +1678,88 @@ impl Workspace {
         let ws = self.inner.clone();
         future_into_py(py, async move {
             let inode = ws.stat(&path).await.map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// Change a path's permission bits (``chmod``); returns the updated inode dict.
+    ///
+    /// Only the low 12 bits are honoured — the file-type bits are preserved.
+    ///
+    /// This is **not** an access check: nothing in origofs consults ``mode`` to
+    /// allow or deny an operation. On a FUSE mount the kernel does, because the
+    /// mount asks it to. See ``docs/PERMISSIONS.md``.
+    ///
+    /// ```python
+    /// await ws.chmod("/build.sh", 0o755)
+    /// ```
+    fn chmod<'py>(&self, py: Python<'py>, path: String, mode: u32) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let inode = ws.chmod(&path, mode).await.map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// Change a path's owning user and/or group (``chown``); returns the updated
+    /// inode dict. Passing ``None`` for either leaves that half unchanged, matching
+    /// ``chown(2)``'s ``-1``.
+    ///
+    /// Ownership exists so the mounts can report a real owner; origofs's own
+    /// principals are **actors**, not uids (``docs/PERMISSIONS.md`` §2).
+    ///
+    /// ```python
+    /// await ws.chown("/data", uid=1000, gid=1000)
+    /// await ws.chown("/data", gid=100)          # uid untouched
+    /// ```
+    #[pyo3(signature = (path, uid=None, gid=None))]
+    fn chown<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let inode = ws.chown(&path, uid, gid).await.map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// ``chmod`` attributed to ``ctx`` (records an edit-op). Prefer this wherever an
+    /// actor is known: a propose-only actor is **refused**, because there is no
+    /// propose-shaped equivalent of a ``chmod`` and ``chmod 000`` on a file an agent
+    /// may not write is exactly the unreviewed damage the write policy prevents.
+    fn chmod_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        mode: u32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let inode = ws.chmod_as(c, &path, mode).await.map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// ``chown`` attributed to ``ctx``. See :meth:`chmod_as`.
+    #[pyo3(signature = (ctx, path, uid=None, gid=None))]
+    fn chown_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let inode = ws.chown_as(c, &path, uid, gid).await.map_err(to_pyerr)?;
             Python::attach(|py| inode_dict(py, &inode))
         })
     }

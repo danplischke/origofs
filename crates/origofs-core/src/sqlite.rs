@@ -94,8 +94,21 @@ impl SqliteMetadataStore {
 
 /// Build an [`Inode`] from a raw row tuple.
 #[allow(clippy::type_complexity)]
-fn build_inode(row: (i64, String, i64, i64, i64, Option<String>, i64, i64)) -> Result<Inode> {
-    let (ino, kind, mode, nlink, size, content_hash, mtime, ctime) = row;
+fn build_inode(
+    row: (
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+    ),
+) -> Result<Inode> {
+    let (ino, kind, mode, uid, gid, nlink, size, content_hash, mtime, ctime) = row;
     let kind = FileKind::parse(&kind)
         .ok_or_else(|| OrigoFSError::Metadata(format!("unknown inode kind {kind:?}")))?;
     let content = match content_hash {
@@ -109,6 +122,8 @@ fn build_inode(row: (i64, String, i64, i64, i64, Option<String>, i64, i64)) -> R
         ino,
         kind,
         mode: mode as u32,
+        uid: uid as u32,
+        gid: gid as u32,
         nlink,
         size: size as u64,
         content,
@@ -285,7 +300,7 @@ impl MetadataStore for SqliteMetadataStore {
             let conn = self.lock();
             let row = conn
                 .query_row(
-                    "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                    "SELECT ino, kind, mode, uid, gid, nlink, size, content_hash, mtime, ctime
                      FROM inode WHERE ino = ?1",
                     params![ino],
                     |r| {
@@ -295,9 +310,11 @@ impl MetadataStore for SqliteMetadataStore {
                             r.get::<_, i64>(2)?,
                             r.get::<_, i64>(3)?,
                             r.get::<_, i64>(4)?,
-                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, i64>(5)?,
                             r.get::<_, i64>(6)?,
-                            r.get::<_, i64>(7)?,
+                            r.get::<_, Option<String>>(7)?,
+                            r.get::<_, i64>(8)?,
+                            r.get::<_, i64>(9)?,
                         ))
                     },
                 )
@@ -324,7 +341,7 @@ impl MetadataStore for SqliteMetadataStore {
                     .collect::<Vec<_>>()
                     .join(",");
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                    "SELECT ino, kind, mode, uid, gid, nlink, size, content_hash, mtime, ctime
                      FROM inode WHERE ino IN ({placeholders})"
                 ))?;
                 let binds: Vec<&dyn rusqlite::ToSql> =
@@ -336,9 +353,11 @@ impl MetadataStore for SqliteMetadataStore {
                         r.get::<_, i64>(2)?,
                         r.get::<_, i64>(3)?,
                         r.get::<_, i64>(4)?,
-                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, i64>(5)?,
                         r.get::<_, i64>(6)?,
-                        r.get::<_, i64>(7)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, i64>(8)?,
+                        r.get::<_, i64>(9)?,
                     ))
                 })?;
                 for row in rows {
@@ -379,6 +398,44 @@ impl MetadataStore for SqliteMetadataStore {
             conn.execute(
                 "UPDATE inode SET nlink = ?1 WHERE ino = ?2",
                 params![nlink, ino],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // Replace only the permission bits. The stored `mode` carries the
+            // file-type bits too (`S_IFREG`/`S_IFDIR`, set at creation in
+            // `vfs_create`/`vfs_mkdir`), and a `chmod` that dropped them would
+            // turn every file into kind 0 as far as any consumer of the raw mode
+            // is concerned — including the committed tree entry and the git
+            // exporter's exec-bit check.
+            conn.execute(
+                "UPDATE inode SET mode = (mode & ~4095) | (?1 & 4095), ctime = ?2 \
+                 WHERE ino = ?3",
+                params![mode as i64, now_secs(), ino],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // COALESCE so a `chown :group` (or `chown user`) leaves the other half
+            // alone — POSIX lets either be omitted, and writing back a value the
+            // caller never supplied would silently reassign it.
+            conn.execute(
+                "UPDATE inode SET uid = COALESCE(?1, uid), gid = COALESCE(?2, gid), \
+                 ctime = ?3 WHERE ino = ?4",
+                params![
+                    uid.map(|u| u as i64),
+                    gid.map(|g| g as i64),
+                    now_secs(),
+                    ino
+                ],
             )?;
             Ok(())
         })

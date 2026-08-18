@@ -78,6 +78,33 @@ enum Cmd {
     },
     /// Show inode metadata for a path.
     Stat { path: String },
+    /// Change a path's permission bits. `mode` is octal, e.g. 755.
+    ///
+    /// origofs does not consult `mode` to allow or deny anything — on a FUSE mount
+    /// the kernel does. See `docs/PERMISSIONS.md`.
+    Chmod {
+        /// Octal permission bits (e.g. 644, 755). Only the low 12 bits are used.
+        mode: String,
+        path: String,
+        /// Attribute the change to this actor id (records an edit-op, and is
+        /// refused for a propose-only actor).
+        #[arg(long)]
+        actor: Option<i64>,
+    },
+    /// Change a path's owning user and/or group. Omitted halves are left alone.
+    Chown {
+        path: String,
+        /// New owning user id.
+        #[arg(long)]
+        uid: Option<u32>,
+        /// New owning group id.
+        #[arg(long)]
+        gid: Option<u32>,
+        /// Attribute the change to this actor id (records an edit-op, and is
+        /// refused for a propose-only actor).
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Remove a file or empty directory.
     Rm { path: String },
     /// Move/rename a path.
@@ -478,6 +505,13 @@ async fn open_workspace(cli: &Cli) -> Result<Workspace> {
     cfg.open(&cli.workspace).await
 }
 
+/// A `WriteCtx` for a `--actor` flag, minting a `cli` session so the ops it
+/// records group together the way `revert_session` needs.
+async fn cli_ctx(ws: &Workspace, actor: i64) -> Result<WriteCtx> {
+    let session = ws.create_session(actor, Some("cli")).await?;
+    Ok(WriteCtx::session(actor, session))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -578,13 +612,48 @@ async fn main() -> Result<()> {
         Cmd::Stat { path } => {
             let i = ws.stat(&path).await?;
             println!(
-                "ino={} kind={} mode={:o} nlink={} size={}",
+                "ino={} kind={} mode={:o} uid={} gid={} nlink={} size={}",
                 i.ino,
                 i.kind.as_str(),
                 i.mode,
+                i.uid,
+                i.gid,
                 i.nlink,
                 i.size
             );
+        }
+        Cmd::Chmod { mode, path, actor } => {
+            // Octal, like chmod(1) — `origofs chmod 755 …` must not silently mean
+            // decimal 755 (0o1363), which is a plausible typo away from a
+            // world-writable file.
+            let bits = u32::from_str_radix(&mode, 8).map_err(|_| {
+                origofs_sdk::OrigoFSError::InvalidArgument(format!(
+                    "mode must be octal (e.g. 644, 755); got {mode:?}"
+                ))
+            })?;
+            let i = match actor {
+                Some(a) => ws.chmod_as(cli_ctx(&ws, a).await?, &path, bits).await?,
+                None => ws.chmod(&path, bits).await?,
+            };
+            println!("{path}: mode={:o}", i.mode & 0o7777);
+        }
+        Cmd::Chown {
+            path,
+            uid,
+            gid,
+            actor,
+        } => {
+            if uid.is_none() && gid.is_none() {
+                return Err(origofs_sdk::OrigoFSError::InvalidArgument(
+                    "chown needs at least one of --uid or --gid".into(),
+                )
+                .into());
+            }
+            let i = match actor {
+                Some(a) => ws.chown_as(cli_ctx(&ws, a).await?, &path, uid, gid).await?,
+                None => ws.chown(&path, uid, gid).await?,
+            };
+            println!("{path}: uid={} gid={}", i.uid, i.gid);
         }
         Cmd::Rm { path } => {
             ws.remove(&path).await?;

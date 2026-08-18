@@ -1,17 +1,24 @@
 # Permissions in origofs — what exists, and how to add them
 
-> Status: **concept / RFC.** Taken against `adb6ec8` (2026-08-18). Companion to
-> `docs/MULTI_TENANCY.md`, which specifies the *isolation* boundary (tenants and
-> workspaces); this document covers *authorization within* one — who may read and
-> write which paths. The baseline in §1 is what the code does today; §3 onward is
-> a proposal, not a description.
+> Status: **partly implemented.** Taken against `adb6ec8` (2026-08-18). Phase 1 —
+> ownership and a working `chmod`/`chown` (§3a, issues #121/#122) — **has shipped**;
+> migration V17 adds `inode.uid`/`inode.gid` and both mounts now apply mode and
+> ownership instead of discarding them. §1d and §1b below are kept as the record of
+> what the baseline was, marked where they no longer hold. Everything from §3b on
+> remains a proposal.
+>
+> Companion to `docs/MULTI_TENANCY.md`, which specifies the *isolation* boundary
+> (tenants and workspaces); this document covers *authorization within* one — who
+> may read and write which paths.
 
 ## Summary
 
-**origofs has no file or folder permissions.** `mode` is stored, committed, and
-reported, and nothing anywhere consults it to allow or deny an operation. The
-only authorization in the engine is the per-actor **write policy**
-(`Direct | Propose`) — global, binary, and write-only.
+**origofs has no file or folder permissions.** `mode` and (since V17) `uid`/`gid`
+are stored, committed, and reported — and nothing anywhere consults them to allow
+or deny an operation. Shipping `chmod`/`chown` changed what origofs *records*, not
+what it *enforces*; that distinction is the whole of §2. The only authorization in
+the engine is still the per-actor **write policy** (`Direct | Propose`) — global,
+binary, and write-only.
 
 That is a defensible place to have started: the write policy plus the workspace
 wall covers "an untrusted agent can't land edits without review" and "project A
@@ -36,10 +43,14 @@ That is the complete list of uses. A grep for permission-check machinery across
 `crates/*/src` returns one hit — `format.rs:check_readable` — which is about
 object format versions, not access.
 
-### 1b. There is no ownership at all
+### 1b. There was no ownership at all — **fixed in V17**
 
-No `uid`, no `gid`: not on `Inode`, not on `InodeInit`, not in any migration
-through V16. **Both mounts hardcode `uid: 0, gid: 0`** (`fuse.rs`, `nfs.rs:113`).
+Before migration V17 there was no `uid` and no `gid` anywhere: not on `Inode`, not
+on `InodeInit`, not in the schema, and **both mounts hardcoded `uid: 0, gid: 0`**.
+
+V17 adds both columns (`NOT NULL DEFAULT 0`, so existing stores are unchanged and
+new inodes stay root-owned), `Fs::chown`/`vfs_chown` set them, and both mounts now
+report the stored values. This is POSIX fidelity only — see §2.
 
 ### 1c. The kernel is asked to enforce mode, vacuously
 
@@ -48,14 +59,23 @@ the kernel to run real POSIX checks against the attributes origofs reports. Sinc
 every inode reports as root-owned and `fuse_mountable()` requires `is_root`, every
 check passes and the mount is root-only by construction.
 
-This is coherent rather than broken, but it is exactly why `allow_other` or a
-non-root mount is not currently viable: a non-root caller would be evaluated
-against uid 0 in the *other* class and lose write access to the entire tree. Fixing
-that is §3a, not a mount-option change.
+This was coherent rather than broken, but it is exactly why `allow_other` or a
+non-root mount was not viable: a non-root caller is evaluated against uid 0 in the
+*other* class and loses write access to the entire tree. V17 (§3a) supplies the
+missing half — real ownership the kernel can evaluate — so this is now a matter of
+setting owners rather than a structural block. Enabling `allow_other` itself is
+still a separate, deliberate decision.
 
-### 1d. `chmod` silently does nothing ([#121](https://github.com/danplischke/origofs/issues/121))
+### 1d. `chmod` silently did nothing — **fixed** ([#121](https://github.com/danplischke/origofs/issues/121))
 
-Both mounts accept a mode change and discard it.
+> **Resolved.** `Fs::chmod`/`vfs_chmod` and `Fs::chown`/`vfs_chown` now exist, both
+> mounts' `setattr` apply them, and `crates/origofs-core/tests/permissions.rs`
+> pins the behaviour on both backends — including that a mode change reaches the
+> *permission* bits only. `fuse_mount_chmod_and_chown_take_effect` drives it
+> through a real mount with `std::fs::set_permissions`. What follows is the
+> baseline that was.
+
+Both mounts accepted a mode change and discarded it.
 
 - FUSE `setattr` (`fuse.rs:623`) binds `_mode`, `_uid`, `_gid` with leading
   underscores and honours only `size`. It then replies with the **unchanged**
@@ -72,9 +92,11 @@ history forever. NFS at least creates with sensible defaults (`0o644` for files,
 `0o755` for dirs, `nfs.rs:246`/`:260`); FUSE passes the caller's mode through at
 create and that is the only chance to set it.
 
-The silence is the problem more than the missing feature: an accepted-and-ignored
+The silence was the problem more than the missing feature: an accepted-and-ignored
 `chmod` is worse than `EPERM`, because a script that checks its return code
-proceeds on a false premise.
+proceeds on a false premise. That shape is what the tests assert against — every
+case re-`stat`s and compares rather than checking that the call returned `Ok`,
+because the broken version returned `Ok` too.
 
 ### 1e. The actual authorization model is the write policy
 
@@ -166,11 +188,18 @@ This is small, and it is what unblocks `allow_other`, non-root mounts, and the
 `link`/`statfs` items in the JuiceFS review (#119). It buys **no** authorization by
 itself — it makes the mount stop lying.
 
-One decision: whether mode/uid/gid changes are *attributed*. A `chmod` is a
-metadata mutation an actor performed, and the audit log arguably wants it. Cheapest
-consistent answer: `chmod_as`/`chown_as` are attributed ops that append an
-`edit_op` with no byte range, and the unattributed forms stay internal like the
-rest of the exempt machinery (§4).
+**Resolved: they are attributed.** `chmod_as`/`chown_as` run `ensure_may_write`
+and append an `edit_op` with no byte range (like `mkdir`/`symlink`), and the
+unattributed `chmod`/`chown` stay internal like the rest of the exempt machinery
+(§4). A propose-only actor is **refused** rather than queued — there is no
+propose-shaped equivalent of a `chmod`, exactly as for `symlink_as`.
+
+Shipping only the unattributed form would have reproduced issue #78 in miniature:
+`chmod 000` on a file an agent may not write is the same denial of service, one
+call further along. `crates/origofs-py/tests/test_parity.py` exists because six
+`Workspace` features once shipped in their unattributed forms only, so the
+attributed variants, the bindings, and the `--actor` flags landed with the feature
+rather than after it.
 
 ### 3b. Write ACLs — the high-leverage change ([#123](https://github.com/danplischke/origofs/issues/123))
 
@@ -290,8 +319,8 @@ breath.
 
 | Phase | Scope | Issue | Migration | Cost |
 |---|---|---|---|---|
-| 0 | `chmod`/`chown` stop silently no-oping (§1d) — at minimum, fail loudly | #121 | — | tiny |
-| 1 | `uid`/`gid` + working `chmod`/`chown` + honest mount attrs (§3a) | #122 | V17 | small |
+| 0 | ~~`chmod`/`chown` stop silently no-oping (§1d)~~ — **done** | #121 | — | tiny |
+| 1 | ~~`uid`/`gid` + working `chmod`/`chown` + honest mount attrs (§3a)~~ — **done** | #122 | V17 | small |
 | 2 | Path-scoped write ACLs (§3b) + the mount ruling (§5) | #123 | V18 | medium |
 | 3 | Surface parity: port the Python router's scoping to the Rust API, add bindings, extend the MCP classification test | #125 | — | medium |
 | 4 | Read ACLs (§3c) — only against a real requirement | #124 | V19 | large |
@@ -301,9 +330,9 @@ binary trust flag into "this agent may write under `/src/parser` and nowhere
 else", which is the thing anyone pointing several agents at one workspace will ask
 for first.
 
-Phase 0 is worth doing immediately and independently of all of it — a `chmod` that
-returns success without doing anything is a bug regardless of what the permission
-model eventually becomes.
+Phases 0 and 1 shipped together: they are one code path (`setattr`), and doing #121
+alone would have been superseded by #122 within a commit. Phase 2 is the next
+thing, and it is gated on the §5 mount ruling rather than on any of the above.
 
 ---
 

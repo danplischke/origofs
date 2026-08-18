@@ -432,3 +432,95 @@ async def test_encryption_at_rest_round_trips_and_rejects_a_wrong_key():
     wrong = await origofs.Workspace.open_local_encrypted(db, cas, "wrong passphrase")
     with pytest.raises(Exception):
         await wrong.read("/secret.txt")
+
+
+# --- permissions -----------------------------------------------------------
+# `chmod`/`chown` and the `uid`/`gid` inode fields (migration V17, issues #121
+# and #122). Bound here rather than left Rust-only, which is the failure this
+# whole file exists to catch.
+
+
+@asyncio_test
+async def test_chmod_changes_the_permission_bits_and_keeps_the_file_type():
+    ws = await workspace()
+    await ws.write("/build.sh", b"#!/bin/sh\n")
+
+    S_IFREG = 0o100000
+    assert (await ws.stat("/build.sh"))["mode"] == S_IFREG | 0o644
+
+    after = await ws.chmod("/build.sh", 0o755)
+
+    # The whole mode word, not just the low bits: an implementation that assigned
+    # the mode outright would drop S_IFREG and change the file's kind.
+    assert after["mode"] == S_IFREG | 0o755
+    assert (await ws.stat("/build.sh"))["mode"] == S_IFREG | 0o755
+
+    # And the content is untouched.
+    assert bytes(await ws.read("/build.sh")) == b"#!/bin/sh\n"
+
+
+@asyncio_test
+async def test_chown_sets_ownership_and_leaves_an_omitted_half_alone():
+    ws = await workspace()
+    await ws.write("/f", b"x")
+
+    # V17 defaults: new inodes are root-owned, so the migration is
+    # behaviour-preserving for stores that predate it.
+    st = await ws.stat("/f")
+    assert (st["uid"], st["gid"]) == (0, 0)
+
+    after = await ws.chown("/f", uid=1000, gid=100)
+    assert (after["uid"], after["gid"]) == (1000, 100)
+
+    # `chown :group` and `chown user` are both legal; the omitted half must not be
+    # silently reassigned.
+    after = await ws.chown("/f", gid=42)
+    assert (after["uid"], after["gid"]) == (1000, 42)
+
+    after = await ws.chown("/f", uid=7)
+    assert (after["uid"], after["gid"]) == (7, 42)
+
+
+@asyncio_test
+async def test_chmod_and_chown_on_a_missing_path_raise():
+    ws = await workspace()
+    # Never accepted-and-ignored — that silent success is exactly what #121 was.
+    with pytest.raises(FileNotFoundError):
+        await ws.chmod("/nope", 0o600)
+    with pytest.raises(FileNotFoundError):
+        await ws.chown("/nope", uid=1)
+
+
+@asyncio_test
+async def test_a_propose_only_actor_cannot_chmod_or_chown():
+    """Metadata is a mutation too.
+
+    ``chmod 000`` on a file an agent may not write is the same denial of service
+    one call further along — the shape of #78. There is no propose-shaped
+    equivalent of a ``chmod``, so both refuse outright rather than queueing.
+    """
+    ws = await workspace()
+    await ws.write("/f", b"x")
+
+    reviewer = await ws.create_human("reviewer", None)
+    agent = await ws.create_agent("claude", "opus", reviewer)
+    sess = await ws.create_session(agent, "test")
+    ctx = origofs.WriteCtx.session(agent, sess)
+    await ws.set_write_policy(agent, "propose")
+
+    with pytest.raises(PermissionError):
+        await ws.chmod_as(ctx, "/f", 0o000)
+    with pytest.raises(PermissionError):
+        await ws.chown_as(ctx, "/f", uid=0)
+
+    # Unchanged by the refused calls.
+    st = await ws.stat("/f")
+    assert st["mode"] & 0o7777 == 0o644
+    assert (st["uid"], st["gid"]) == (0, 0)
+
+    # A direct actor may do both, and the change lands.
+    human = await ws.create_human("dan", None)
+    hsess = await ws.create_session(human, "test")
+    hctx = origofs.WriteCtx.session(human, hsess)
+    assert (await ws.chmod_as(hctx, "/f", 0o600))["mode"] & 0o7777 == 0o600
+    assert (await ws.chown_as(hctx, "/f", uid=1000))["uid"] == 1000

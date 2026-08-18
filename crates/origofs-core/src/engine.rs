@@ -1055,6 +1055,31 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(buf.freeze())
     }
 
+    /// Change a path's permission bits (`chmod`), returning the updated inode.
+    ///
+    /// The path-addressed twin of [`Fs::vfs_chmod`], which the mounts call by
+    /// inode. Only the low 12 bits are honoured; the file-type bits are preserved.
+    ///
+    /// Unattributed by design, like [`Fs::mkdir_p`] and the other raw ops: it takes
+    /// no `WriteCtx`, so it is exempt from the `Propose` write policy. See
+    /// `docs/PERMISSIONS.md` §4 — mode is metadata about a file, not a byte range
+    /// anyone can be blamed for, and nothing in the engine consults it to allow or
+    /// deny anything.
+    pub async fn chmod(&self, path: &str, mode: u32) -> Result<Inode> {
+        let ino = self.resolve(path).await?;
+        self.vfs_chmod(ino, mode).await
+    }
+
+    /// Change a path's owning user and/or group (`chown`), returning the updated
+    /// inode. `None` leaves that half unchanged, matching `chown(2)`'s `-1`.
+    ///
+    /// See [`Fs::chmod`] for why this is unattributed, and `docs/PERMISSIONS.md`
+    /// §2 for why ownership is not origofs's authorization mechanism.
+    pub async fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<Inode> {
+        let ino = self.resolve(path).await?;
+        self.vfs_chown(ino, uid, gid).await
+    }
+
     /// Fetch inode metadata for a path.
     pub async fn stat(&self, path: &str) -> Result<Inode> {
         let ino = self.resolve(path).await?;

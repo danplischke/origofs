@@ -117,11 +117,19 @@ class EditOp(TypedDict):
 
 
 class StatResult(TypedDict):
-    """An inode (``stat``). ``content`` is the manifest hash, ``None`` for a dir."""
+    """An inode (``stat``). ``content`` is the manifest hash, ``None`` for a dir.
+
+    ``mode`` carries the file-type bits as well as the permission bits, so compare
+    against ``mode & 0o7777`` for permissions alone. ``uid``/``gid`` default to 0
+    (root-owned) and are set by :meth:`Workspace.chown`. None of the three is an
+    access check — see ``docs/PERMISSIONS.md``.
+    """
 
     ino: int
     kind: FileKind
     mode: int
+    uid: int
+    gid: int
     nlink: int
     size: int
     content: Optional[str]
@@ -591,6 +599,18 @@ class Workspace:
     async def mkdir_p(self, path: str) -> None: ...
     async def ls(self, path: str) -> list[DirEntry]: ...
     async def stat(self, path: str) -> StatResult: ...
+    async def chmod(self, path: str, mode: int) -> StatResult: ...
+    async def chown(
+        self, path: str, uid: Optional[int] = None, gid: Optional[int] = None
+    ) -> StatResult: ...
+    async def chmod_as(self, ctx: WriteCtx, path: str, mode: int) -> StatResult: ...
+    async def chown_as(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        uid: Optional[int] = None,
+        gid: Optional[int] = None,
+    ) -> StatResult: ...
     async def remove(self, path: str) -> None: ...
     async def rename(self, from_: str, to: str) -> None: ...
 

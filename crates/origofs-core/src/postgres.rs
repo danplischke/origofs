@@ -653,7 +653,7 @@ fn row_to_inode(r: &Row) -> Result<Inode> {
     let kind_s: String = r.get(1);
     let kind = FileKind::parse(&kind_s)
         .ok_or_else(|| OrigoFSError::Metadata(format!("unknown inode kind {kind_s:?}")))?;
-    let content = match r.get::<_, Option<String>>(5) {
+    let content = match r.get::<_, Option<String>>(7) {
         Some(s) => Some(
             Hash::from_hex(&s)
                 .ok_or_else(|| OrigoFSError::Metadata(format!("bad content hash {s:?}")))?,
@@ -664,11 +664,13 @@ fn row_to_inode(r: &Row) -> Result<Inode> {
         ino: r.get(0),
         kind,
         mode: r.get::<_, i64>(2) as u32,
-        nlink: r.get(3),
-        size: r.get::<_, i64>(4) as u64,
+        uid: r.get::<_, i64>(3) as u32,
+        gid: r.get::<_, i64>(4) as u32,
+        nlink: r.get(5),
+        size: r.get::<_, i64>(6) as u64,
         content,
-        mtime: r.get(6),
-        ctime: r.get(7),
+        mtime: r.get(8),
+        ctime: r.get(9),
     })
 }
 
@@ -818,7 +820,7 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let row = c
             .query_opt(
-                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                "SELECT ino, kind, mode, uid, gid, nlink, size, content_hash, mtime, ctime
                  FROM inode WHERE ino = $1",
                 &[&ino],
             )
@@ -839,7 +841,7 @@ impl MetadataStore for PostgresMetadataStore {
         // plan stays a single index probe per key.
         let rows = c
             .query(
-                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                "SELECT ino, kind, mode, uid, gid, nlink, size, content_hash, mtime, ctime
                  FROM inode WHERE ino = ANY($1)",
                 &[&inos],
             )
@@ -892,6 +894,42 @@ impl MetadataStore for PostgresMetadataStore {
         c.execute(
             "UPDATE inode SET nlink = $1 WHERE ino = $2",
             &[&nlink, &ino],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()> {
+        let c = self.client().await?;
+        // Permission bits only — the stored `mode` also carries the file-type bits
+        // (`S_IFREG`/`S_IFDIR`); see the SQLite twin for why dropping them matters.
+        //
+        // Every literal and the parameter are cast to `bigint` explicitly. Without
+        // that, Postgres infers `$1` from the `4095` it is ANDed with — `int4` —
+        // and rejects the bound `i64` with `WrongType { postgres: Int4, rust:
+        // "i64" }` at execute time. SQLite's dynamic typing hides this entirely,
+        // so the same statement text passes there and fails here.
+        c.execute(
+            "UPDATE inode SET mode = (mode & ~(4095::bigint)) \
+             | ($1::bigint & 4095::bigint), ctime = $2 WHERE ino = $3",
+            &[&(mode as i64), &now_secs(), &ino],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        let c = self.client().await?;
+        // COALESCE so an omitted half is left alone; see the SQLite twin.
+        c.execute(
+            "UPDATE inode SET uid = COALESCE($1, uid), gid = COALESCE($2, gid), \
+             ctime = $3 WHERE ino = $4",
+            &[
+                &uid.map(|u| u as i64),
+                &gid.map(|g| g as i64),
+                &now_secs(),
+                &ino,
+            ],
         )
         .await?;
         Ok(())

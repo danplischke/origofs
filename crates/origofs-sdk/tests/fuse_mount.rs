@@ -345,3 +345,87 @@ fn fuse_mount_sees_remote_write_over_postgres() {
     drop(session);
     let _ = rt.block_on(ws.remove(&path));
 }
+
+/// `chmod` and `chown` through the mount must actually change the inode.
+///
+/// This is the regression guard for issue #121. `setattr` used to bind its mode,
+/// uid and gid arguments and drop them, then reply with the attributes it had just
+/// re-read — so the syscall returned success, the caller's `Result` was `Ok`, and
+/// nothing changed. A test that only asserted `chmod(…).is_ok()` would have passed
+/// against the broken code; the assertions below re-`stat` and compare, which is
+/// the only thing that distinguishes "applied" from "accepted and discarded".
+#[test]
+fn fuse_mount_chmod_and_chown_take_effect() {
+    if !mountable() {
+        eprintln!("skipping: FUSE mount unavailable (need root + /dev/fuse)");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let ws = rt.block_on(async {
+        let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+            .await
+            .unwrap();
+        ws.write("/build.sh", b"#!/bin/sh\n").await.unwrap();
+        ws
+    });
+    drop(rt);
+
+    let session = spawn(ws, &mnt).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let script = mnt.join("build.sh");
+    assert_eq!(
+        std::fs::metadata(&script).unwrap().permissions().mode() & 0o7777,
+        0o644,
+        "the mode the file was created with"
+    );
+
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The attr TTL means the kernel may still be serving the pre-`chmod` cached
+    // attributes; `setattr`'s own reply refreshes them, but wait it out rather
+    // than racing the cache.
+    let deadline = Instant::now() + GIVE_UP;
+    loop {
+        let m = std::fs::metadata(&script).unwrap().permissions().mode();
+        if m & 0o7777 == 0o755 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "chmod did not take effect through the mount (mode still {:o})",
+            m & 0o7777
+        );
+        std::thread::sleep(MOUNT_TTL / 4);
+    }
+
+    // Still a regular file: `chmod` must not have eaten the file-type bits.
+    assert!(std::fs::metadata(&script).unwrap().is_file());
+    assert_eq!(std::fs::read(&script).unwrap(), b"#!/bin/sh\n");
+
+    // And ownership, which had no storage at all before migration V17.
+    std::os::unix::fs::chown(&script, Some(1000), Some(100)).unwrap();
+    let deadline = Instant::now() + GIVE_UP;
+    loop {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(&script).unwrap();
+        if (md.uid(), md.gid()) == (1000, 100) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "chown did not take effect through the mount (now {}:{})",
+            md.uid(),
+            md.gid()
+        );
+        std::thread::sleep(MOUNT_TTL / 4);
+    }
+
+    drop(session); // unmounts
+}

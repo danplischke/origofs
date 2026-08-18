@@ -586,8 +586,8 @@ fn to_attr(i: &Inode) -> FileAttr {
         kind: ftype(i.kind),
         perm: (i.mode & 0o7777) as u16,
         nlink: i.nlink.max(1) as u32,
-        uid: 0,
-        gid: 0,
+        uid: i.uid,
+        gid: i.gid,
         rdev: 0,
         blksize: 4096,
         flags: 0,
@@ -620,13 +620,19 @@ impl Filesystem for OrigoFSFuse {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `atime`/`mtime`/`ctime` and the BSD flags are still accepted and ignored —
+    /// origofs's inode has no atime and derives mtime from writes. `size`, `mode`
+    /// and `uid`/`gid` are honoured. Mode and ownership used to be accepted and
+    /// silently dropped, which is worse than refusing them: the reply carried the
+    /// unchanged attributes, so `chmod` reported success and changed nothing
+    /// (issue #121).
     fn setattr(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
@@ -641,6 +647,21 @@ impl Filesystem for OrigoFSFuse {
         let ino = ino.0 as i64;
         if let Some(sz) = size
             && let Err(e) = self.blk(self.ws.fs().vfs_truncate(ino, sz))
+        {
+            reply.error(errno(&e));
+            return;
+        }
+        if let Some(m) = mode
+            && let Err(e) = self.blk(self.ws.fs().vfs_chmod(ino, m))
+        {
+            reply.error(errno(&e));
+            return;
+        }
+        // One call for both halves: `chown user:group` arrives as a single
+        // `setattr`, and applying it as two updates would touch `ctime` twice and
+        // leave a window where only half had landed.
+        if (uid.is_some() || gid.is_some())
+            && let Err(e) = self.blk(self.ws.fs().vfs_chown(ino, uid, gid))
         {
             reply.error(errno(&e));
             return;

@@ -258,6 +258,39 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(true)
     }
 
+    /// Change an inode's permission bits (`chmod`), returning the updated inode.
+    ///
+    /// Only the low 12 bits are honoured; the file-type bits are preserved by the
+    /// store (see [`MetadataStore::set_mode`]). Until this existed, both mounts
+    /// bound their `setattr` mode argument and discarded it, then replied with the
+    /// *unchanged* attributes — so a `chmod` reported success and did nothing, and
+    /// mode was effectively write-once at creation (issue #121).
+    ///
+    /// **This is not an access check.** Nothing in the engine consults `mode`; on a
+    /// FUSE mount the kernel does, because the mount asks it to with
+    /// `MountOption::DefaultPermissions`. See `docs/PERMISSIONS.md`.
+    pub async fn vfs_chmod(&self, ino: Ino, mode: u32) -> Result<Inode> {
+        // Reject a missing inode up front so `chmod` on a stale handle is ENOENT
+        // rather than a silent no-op UPDATE that matches zero rows — the exact
+        // failure mode this method exists to remove.
+        self.vfs_getattr(ino).await?;
+        self.meta.set_mode(ino, mode).await?;
+        self.vfs_getattr(ino).await
+    }
+
+    /// Change an inode's owning user and/or group (`chown`), returning the updated
+    /// inode. `None` leaves that half unchanged, matching `chown(2)`'s `-1`.
+    ///
+    /// Ownership exists so the mounts can report a real owner instead of the
+    /// hardcoded `uid: 0, gid: 0` they used before migration V17. It is **not** an
+    /// authorization mechanism — origofs's principals are actors, not uids
+    /// (`docs/PERMISSIONS.md` §2).
+    pub async fn vfs_chown(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<Inode> {
+        self.vfs_getattr(ino).await?; // see `vfs_chmod`
+        self.meta.set_owner(ino, uid, gid).await?;
+        self.vfs_getattr(ino).await
+    }
+
     /// Create a regular file under `parent`.
     pub async fn vfs_create(&self, parent: Ino, name: &str, mode: u32) -> Result<Inode> {
         validate_component(name)?;
