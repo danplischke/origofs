@@ -53,7 +53,7 @@ non-root mount is not currently viable: a non-root caller would be evaluated
 against uid 0 in the *other* class and lose write access to the entire tree. Fixing
 that is §3a, not a mount-option change.
 
-### 1d. `chmod` silently does nothing
+### 1d. `chmod` silently does nothing ([#121](https://github.com/danplischke/origofs/issues/121))
 
 Both mounts accept a mode change and discard it.
 
@@ -110,7 +110,7 @@ and attribution tables, per-workspace root inodes, per-workspace blame.
 
 Nothing in the engine does that, and no surface offers a hook for it.
 
-### 1g. One real per-path control exists, and it is Python-only
+### 1g. One real per-path control exists, and it is Python-only ([#125](https://github.com/danplischke/origofs/issues/125))
 
 `origofs.fastapi`'s root-scoping (`fastapi.py:215`–`:268`) is the only working
 path-level access control in the repository, and it is well built:
@@ -155,7 +155,7 @@ decision is §5, and it is the only hard coupling between them.
 
 ## 3. Proposal
 
-### 3a. Ownership (`uid`/`gid`) — migration V17
+### 3a. Ownership (`uid`/`gid`) — migration V17 ([#122](https://github.com/danplischke/origofs/issues/122))
 
 Add `uid`/`gid` to `Inode`, `InodeInit`, and the schema, defaulting to 0 so
 existing workspaces are unchanged by the migration. Surface `chmod`/`chown` as
@@ -172,7 +172,7 @@ consistent answer: `chmod_as`/`chown_as` are attributed ops that append an
 `edit_op` with no byte range, and the unattributed forms stay internal like the
 rest of the exempt machinery (§4).
 
-### 3b. Write ACLs — the high-leverage change
+### 3b. Write ACLs — the high-leverage change ([#123](https://github.com/danplischke/origofs/issues/123))
 
 Every attributed mutation already funnels through one function, so give it a path:
 
@@ -209,7 +209,7 @@ Notes on the shape:
   sides; checking only the source lets an actor move a file it controls into a tree
   it does not.
 
-### 3c. Read ACLs — the expensive half, staged separately
+### 3c. Read ACLs — the expensive half, staged separately ([#124](https://github.com/danplischke/origofs/issues/124))
 
 Writes are cheap because `ensure_may_write` already exists. Reads have no
 equivalent: `read`, `read_range`, `ls`, `stat`, `blame` take **no actor context at
@@ -288,13 +288,13 @@ breath.
 
 ## 6. Staging
 
-| Phase | Scope | Migration | Cost |
-|---|---|---|---|
-| 0 | `chmod`/`chown` stop silently no-oping (§1d) — at minimum, fail loudly | — | tiny |
-| 1 | `uid`/`gid` + working `chmod`/`chown` + honest mount attrs (§3a) | V17 | small |
-| 2 | Path-scoped write ACLs (§3b) + the mount ruling (§5) | V18 | medium |
-| 3 | Surface parity: port the Python router's scoping to the Rust API, add bindings, extend the MCP classification test | — | medium |
-| 4 | Read ACLs (§3c) — only against a real requirement | V19 | large |
+| Phase | Scope | Issue | Migration | Cost |
+|---|---|---|---|---|
+| 0 | `chmod`/`chown` stop silently no-oping (§1d) — at minimum, fail loudly | #121 | — | tiny |
+| 1 | `uid`/`gid` + working `chmod`/`chown` + honest mount attrs (§3a) | #122 | V17 | small |
+| 2 | Path-scoped write ACLs (§3b) + the mount ruling (§5) | #123 | V18 | medium |
+| 3 | Surface parity: port the Python router's scoping to the Rust API, add bindings, extend the MCP classification test | #125 | — | medium |
+| 4 | Read ACLs (§3c) — only against a real requirement | #124 | V19 | large |
 
 Phase 2 is the one that changes what the product can claim: it turns a global
 binary trust flag into "this agent may write under `/src/parser` and nowhere
