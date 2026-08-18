@@ -81,7 +81,7 @@ The one genuinely new question is **attribution**. `write_as` diffs against the
 previous body to compute per-range blame; a slice already *is* a per-range record
 of "this actor wrote these bytes at this offset." That is arguably a better fit
 than the diff, but it needs designing rather than assuming — see
-[§10](#10-open-questions).
+[§11](#11-open-questions).
 
 Take the *slice* idea. Do **not** take fixed-size blocks with it (see §8).
 
@@ -307,7 +307,64 @@ was never built.
 
 ---
 
-## 10. Open questions
+## 10. What this means for the Python bindings ([#120](https://github.com/danplischke/origofs/issues/120))
+
+The findings above are written from the Rust side, but `origofs-py` is a
+hand-written pyo3 surface (~3.4k lines) with **its own** `open_*` constructors,
+its own method surface, and its own read/write helpers. So "fix it in the engine"
+lands differently depending on the finding, and `tests/test_parity.py` exists
+precisely because that has bitten before — its docstring opens with *"The
+Workspace surface that had no Python binding at all"* and lists six features that
+were Rust-only while the README claimed parity.
+
+Three distinct outcomes:
+
+**Inherited for free.** The bindings delegate straight through
+(`origofs-py/src/lib.rs:1303` → `Workspace::open_s3`), so anything that changes
+behaviour *behind* an existing binding reaches Python with no binding work:
+
+- **§4, the cache tier (#114).** Python's `open_s3`/`open_pg_s3`/`open_gcs` build
+  the same un-tiered stack. This is the finding that hits Python hardest, because
+  the read-heavy Python workloads — `origofs.rag`, `origofs.fsspec`,
+  `origofs.llamaindex` — are exactly the ones re-fetching the same chunks from the
+  bucket on every call.
+- **§3, serial chunk reads (#113).** See below; this is worse than filed.
+
+**Needs a binding, and a `test_parity.py` entry.** §5 trash, §6 quotas, §7a dump,
+§7b `info` all add *new* engine API. None of it is reachable from Python until a
+pyo3 method is added — and the parity test is the mechanism that stops that being
+forgotten. Budget the binding as part of the work, not as follow-up.
+
+**Does not apply to the direct Python path at all.** §1 slices (#111) and §2
+per-handle buffering (#112) are both about `vfs_write`, which is only reached
+through a mount. Python's `write`/`write_as`/`pipe_file` go through
+`Fs::write_as` — a whole-file replacement *by design*, not a partial-range
+read-modify-write. `origofs.fsspec`'s own docstring states the contract: *"origofs
+content is immutable and addressed whole-file, so an open writable file is staged
+and committed atomically on `close()`."* Slices help Python only via
+`Workspace.mount()` / `serve_nfs()` (`lib.rs:2657`, `lib.rs:2706`).
+
+### §3 is broader than it was first filed
+
+The serial chunk loop is **not** confined to `vfs_read`. The same
+`for c in &manifest.chunks { … get_range(…).await }` shape appears in:
+
+| Path | Reached from Python by |
+|---|---|
+| `vfs_read` (`vfs.rs:113`) | `mount()`, `serve_nfs()` |
+| `read_range` (`engine.rs:1014`) | `Workspace.read_range`, `fsspec._fetch_range` → `cat_file` |
+| `read_range_stream` (`engine.rs:885`) | `read_to_path` |
+| `read_stream` (`engine.rs:955`) | `read_to_path`, streaming responses |
+
+`origofs.fastapi` compounds it: streaming a whole file loops `read_range` at
+`_STREAM_CHUNK` = 1 MiB (`fastapi.py:898`), and each of those calls is itself ~16
+serial round trips at the 64 KiB average chunk size. On an S3-backed workspace
+that is the dominant cost of serving a file, and it is the cheapest thing on this
+whole list to fix.
+
+---
+
+## 11. Open questions
 
 1. **Slices and blame.** A slice is `(actor, session, offset, len, content)` —
    which is nearly the `edit_op` record already. Does the slice list *become* the
@@ -338,7 +395,10 @@ was never built.
    surface.
 4. **§5 trash (#115)** — the highest value-per-line item on this list given who
    the users are.
-5. **§1 slices + compaction (#111)** — the structural change. Wants §10's open
+5. **§1 slices + compaction (#111)** — the structural change. Wants §11's open
    questions answered first.
 6. **§6 quotas (#116)** and **§7a portable dump (#117)** — both worth doing,
    neither blocking. **§9 POSIX holes (#119)** as they bite.
+
+Throughout, **§10 (#120)**: for anything that adds engine API, the pyo3 binding
+and its `test_parity.py` entry are part of the item, not follow-up.
