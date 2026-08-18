@@ -129,3 +129,10 @@ per contiguous same-author span — roughly one per line for multi-author text �
 it is rewritten on every attributed write. A very large multi-author text file
 approaches the ~1 GB column limit. This is the one place file size touches the
 metadata database.
+
+---
+
+Several of these ceilings are consequences of *how* the write path is built rather
+than of the design — the whole-file read-modify-write behind a mount above all.
+[`docs/JUICEFS-REVIEW.md`](JUICEFS-REVIEW.md) §1 works through what it would take
+to lift that one.
