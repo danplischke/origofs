@@ -440,6 +440,11 @@ is meaningless in tenant B.
   client-named tenant; both are resolved server-side from a verified credential.*
   This is a one-line extension of the rule already enforced in `build_api_auth`.
 
+**Within a workspace there is no authorization at all** — no per-path grants, and
+`mode` is stored but never enforced. The write policy is the whole of it, and it is
+per-actor and global. `docs/PERMISSIONS.md` covers that baseline and proposes the
+path-scoped ACL the "policy check in the resolver/router" above is standing in for.
+
 ---
 
 ## 8. Cross-cutting subsystems under multi-tenancy
