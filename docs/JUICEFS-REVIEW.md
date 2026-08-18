@@ -25,7 +25,7 @@ origofs's workload, and the temptation to copy them wholesale is real.
 
 ---
 
-## 1. Slice-based writes — the one structural change
+## 1. Slice-based writes — the one structural change ([#111](https://github.com/danplischke/origofs/issues/111))
 
 **JuiceFS.** A file is a sequence of 64 MiB *chunks*; each chunk holds a list of
 *slices*; each slice is a run of 4 MiB *blocks* in object storage. A `pwrite`
@@ -81,13 +81,13 @@ The one genuinely new question is **attribution**. `write_as` diffs against the
 previous body to compute per-range blame; a slice already *is* a per-range record
 of "this actor wrote these bytes at this offset." That is arguably a better fit
 than the diff, but it needs designing rather than assuming — see
-[§9](#9-open-questions).
+[§10](#10-open-questions).
 
 Take the *slice* idea. Do **not** take fixed-size blocks with it (see §8).
 
 ---
 
-## 2. Per-handle write buffering
+## 2. Per-handle write buffering ([#112](https://github.com/danplischke/origofs/issues/112))
 
 **JuiceFS.** Buffers writes per file handle in a read/write buffer (`--buffer-size`),
 coalesces the kernel's 128 KiB pages into whole-block uploads, and flushes on
@@ -114,7 +114,7 @@ better either.
 
 ---
 
-## 3. Reads: concurrency and readahead
+## 3. Reads: concurrency and readahead ([#113](https://github.com/danplischke/origofs/issues/113))
 
 `vfs_read` (`vfs.rs:113`) walks the manifest and awaits `get_range` for each
 covering chunk **strictly one at a time**. On an S3-backed workspace at 30 ms
@@ -132,7 +132,7 @@ is only meaningful once there is a cache worth prefetching into — see §4.
 
 ---
 
-## 4. The cache tier is built and never wired up
+## 4. The cache tier is built and never wired up ([#114](https://github.com/danplischke/origofs/issues/114))
 
 `TieredStore` (`content.rs:834`) is a complete, tested two-tier store. **No
 `open_*` constructor in `origofs-sdk` uses it.** `open_s3`, `open_pg_s3`,
@@ -165,7 +165,7 @@ default cache directory into the remote `open_*` recipes.
 
 ---
 
-## 5. Trash
+## 5. Trash ([#115](https://github.com/danplischke/origofs/issues/115))
 
 **JuiceFS.** Deleted files move to a `.trash` directory and are purged after
 `trash-days`.
@@ -187,7 +187,7 @@ closer to origofs's existing grain than it is to JuiceFS's.
 
 ---
 
-## 6. Directory quotas, recursive stats, and `statfs`
+## 6. Directory quotas, recursive stats, and `statfs` ([#116](https://github.com/danplischke/origofs/issues/116))
 
 **JuiceFS.** Maintains per-directory used-space and inode counts, enforces
 capacity and inode quotas per directory, and answers `statfs` from them.
@@ -207,7 +207,7 @@ and `du` answerable.
 
 ## 7. Operational surface
 
-### 7a. A portable metadata dump
+### 7a. A portable metadata dump ([#117](https://github.com/danplischke/origofs/issues/117))
 
 `MetadataStore::backup_to` has a default impl that **returns an error**
 (`metadata.rs:51`): "this metadata backend has no built-in backup; use the
@@ -230,7 +230,7 @@ the equivalent buys three things at once:
   working tree, and not tool-call history;
 - a debugging artifact, which is what `dump` gets used for most in practice.
 
-### 7b. `info`, `bench`, `stats`
+### 7b. `info`, `bench`, `stats` ([#118](https://github.com/danplischke/origofs/issues/118))
 
 `juicefs info <file>` prints a file's chunk/slice/block layout. origofs has
 Prometheus metrics behind the `metrics` feature (emit-only, no exporter linked)
@@ -287,7 +287,7 @@ deduplicated, which is most of the tree.
 
 ---
 
-## 9. POSIX holes the mounts will hit
+## 9. POSIX holes the mounts will hit ([#119](https://github.com/danplischke/origofs/issues/119))
 
 Not a JuiceFS idea so much as a checklist JuiceFS has finished and origofs has
 not. Each of these is currently absent rather than stubbed, so it fails
@@ -330,12 +330,15 @@ was never built.
 
 ## Suggested order
 
-1. **§3 concurrent chunk reads** and **§4 bound + wire the cache tier** — small,
-   local, no design questions, and they make everything after this measurable.
-2. **§7b `origofs info`** — so §1 gets measured rather than argued about.
-3. **§2 per-handle write buffering** — large win, contained to the FUSE surface.
-4. **§5 trash** — the highest value-per-line item on this list given who the users
-   are.
-5. **§1 slices + compaction** — the structural change. Wants §9's open questions
-   answered first.
-6. **§6 quotas** and **§7a portable dump** — both worth doing, neither blocking.
+1. **§3 concurrent chunk reads (#113)** and **§4 bound + wire the cache tier
+   (#114)** — small, local, no design questions, and they make everything after
+   this measurable.
+2. **§7b `origofs info` (#118)** — so §1 gets measured rather than argued about.
+3. **§2 per-handle write buffering (#112)** — large win, contained to the FUSE
+   surface.
+4. **§5 trash (#115)** — the highest value-per-line item on this list given who
+   the users are.
+5. **§1 slices + compaction (#111)** — the structural change. Wants §10's open
+   questions answered first.
+6. **§6 quotas (#116)** and **§7a portable dump (#117)** — both worth doing,
+   neither blocking. **§9 POSIX holes (#119)** as they bite.
