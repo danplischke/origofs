@@ -9,6 +9,63 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ### Added
 
+- **Permission-checked reads, and HTTP root scoping (#124, #125).** A write gate
+  whose side doors leak the same information is decoration: #123 stopped a scoped
+  agent *changing* a neighbour's files, and left it able to read them, blame them,
+  and watch them change.
+
+  Reads now have the `*_as` counterparts the write path has had since M4 —
+  `read_as`, `read_range_as`, `stat_as`, `ls_as`, `blame_as`, `status_as`,
+  `diff_as`, `diff_file_as` — so no existing signature changed and internal
+  machinery stayed exempt by construction. The breaking read-context change the
+  original analysis feared was not needed.
+
+  Two rules the build settled. **A read denial is `NotFound`, not `Denied`**: a 403
+  confirms the path exists, which is the leak the grant closes, so an unreadable
+  path is indistinguishable from a missing one. Writes keep returning `Denied`,
+  because a writer that can read the path already knows it is there. And
+  **enumerations filter rather than fail** — an erroring `ls` would itself signal
+  that something unreadable is in there, so unreadable children drop out while the
+  directory itself must be readable.
+
+  `blame` is gated separately from the file it describes: it answers *who wrote
+  which lines*, a disclosure about people as much as about content. `log` is
+  deliberately left ungated and said so in the docs — it returns commit metadata,
+  not paths, and a commit *message* mentioning a path is a disclosure a per-path
+  grant was never going to police.
+
+  **`ApiOptions::root`** scopes the Rust HTTP API to a subtree, which
+  `origofs.fastapi` has had from the start — the more dangerous half of a parity
+  gap, since an embedder reading the Python docs would reasonably assume the
+  scoping lived in the shared layer. It does now: `scope_path`, `in_scope` and
+  `covers` live in `origofs_core::acl` and both surfaces resolve through them.
+
+  The root is **prepended, not compared**, so an out-of-scope path is
+  unrepresentable rather than rejected — there is no request a scoped client can
+  send that addresses a neighbour. Records naming an out-of-scope path answer
+  **404**, never 403, so an id probe cannot enumerate neighbours; the change feed,
+  presence, the suggestion queue and `diff` all filter; `/dirs` lists the router's
+  root rather than the workspace's; and `revert-session` — the most destructive
+  route here — is confined to the root, while still requiring an absolute prefix
+  rather than guessing at a relative one.
+
+  Scoping and grants are orthogonal and a deployment usually wants both: a root
+  restricts *what the router can address*, a grant restricts *what an actor may
+  do*. One caveat is worth stating: with `gate_reads: false` (the default) an
+  anonymous request is subject to no actor's grants, because there is no actor.
+
+  Two Postgres tests (`fuse_mount_sees_remote_write_over_postgres`, the co-edit
+  cluster) started failing in a full run while passing in isolation: the new
+  suites' `DROP SCHEMA public CASCADE` tore the schema out from under other test
+  binaries, which `cargo test` runs concurrently against one
+  `ORIGOFS_PG_TEST_URL`. They now take their own **workspace** in the shared
+  database instead of resetting it — same isolation for the inode, grant and ref
+  space, without touching anyone else's rows.
+
+  MCP gates every read unconditionally — it always has an actor. Grants and
+  scoping still do not apply to a FUSE/NFS mount, which has no actor context;
+  `docs/PERMISSIONS.md` §5 records that as a ruling, not an oversight.
+
 - **Path-scoped access grants: permissions that are actually enforced — migration
   V18 (#123).** The write policy (#78) was workspace-wide and binary: an actor
   wrote everywhere or proposed everywhere. It could not say *"this agent may write

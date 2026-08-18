@@ -592,3 +592,56 @@ async def test_grants_list_longest_first_and_revoke_reports_reality():
     assert await ws.revoke(agent, "/srcs") is False
     assert await ws.revoke(agent, "/src") is True
     assert [g["prefix"] for g in await ws.grants(agent)] == ["/"]
+
+
+@asyncio_test
+async def test_read_grants_hide_a_path_as_not_found():
+    """A denial is FileNotFoundError, not PermissionError.
+
+    A 403-shaped answer confirms the path exists, which is the leak a read grant
+    closes: an actor that may not see /secret must not be able to tell it from a
+    path that was never there.
+    """
+    ws = await workspace()
+    await ws.mkdir_p("/secret")
+    await ws.mkdir_p("/open")
+    await ws.write("/secret/x", b"classified")
+    await ws.write("/open/y", b"fine")
+
+    agent = await ws.create_agent("claude", "opus", None)
+    sess = await ws.create_session(agent, "test")
+    ctx = origofs.WriteCtx.session(agent, sess)
+    await ws.grant(agent, "/", "read")
+    await ws.grant(agent, "/secret", "none")
+
+    assert bytes(await ws.read_as(ctx, "/open/y")) == b"fine"
+
+    for call in (
+        ws.read_as(ctx, "/secret/x"),
+        ws.stat_as(ctx, "/secret/x"),
+        ws.blame_as(ctx, "/secret/x"),
+    ):
+        with pytest.raises(FileNotFoundError):
+            await call
+
+    # The plain reads stay ungated — they are what internal machinery is built on.
+    assert bytes(await ws.read("/secret/x")) == b"classified"
+
+
+@asyncio_test
+async def test_a_listing_omits_unreadable_children_rather_than_failing():
+    """An erroring `ls` would itself signal that something unreadable is in there."""
+    ws = await workspace()
+    await ws.mkdir_p("/proj/mine")
+    await ws.mkdir_p("/proj/theirs")
+
+    agent = await ws.create_agent("claude", "opus", None)
+    sess = await ws.create_session(agent, "test")
+    ctx = origofs.WriteCtx.session(agent, sess)
+    await ws.grant(agent, "/", "read")
+    await ws.grant(agent, "/proj/theirs", "none")
+
+    names = sorted(e["name"] for e in await ws.ls_as(ctx, "/proj"))
+    assert names == ["mine"]
+    # The unattributed listing still sees both.
+    assert sorted(e["name"] for e in await ws.ls("/proj")) == ["mine", "theirs"]

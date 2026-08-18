@@ -172,6 +172,19 @@ write path enforces this and you must not weaken it:
   `ensure_may_write` (`suggest.rs`), which refuses a propose-only actor with
   `OrigoFSError::Denied` (`403` on the HTTP API).
 
+  **Reads have the same shape (`read_acl.rs`, issue #124).** `read_as`, `stat_as`,
+  `ls_as`, `blame_as`, `diff_as`/`status_as`/`diff_file_as` check
+  [`Perms::READ`]; the plain reads stay ungated because checkout, merge, gc and
+  the mounts are built on them. **A read denial is `NotFound`, not `Denied`** — a
+  403 confirms the path exists, which is the leak the grant closes — and
+  enumerations *filter* rather than failing. `log` is deliberately ungated: it
+  returns commit metadata, not paths.
+
+  **The HTTP API can also be scoped to a subtree** (`ApiOptions::root`, issue
+  #125), which is orthogonal: a root restricts *what the router can address*, a
+  grant restricts *what an actor may do*. Both use `origofs_core::acl`, shared
+  with `origofs.fastapi` rather than reimplemented.
+
   **Path-scoped grants refine that (`acl.rs`, migration V18, issue #123).** Ops
   that take a path call `ensure_may_write_at`, which resolves the actor's access
   by **longest matching path prefix** (directory-boundary matching, so `/tenant-a`

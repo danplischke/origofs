@@ -117,7 +117,7 @@ impl McpServer {
         let path = || args.get("path").and_then(Value::as_str).unwrap_or_default();
         match name {
             "origofs_read" => {
-                let bytes = self.ws.read(path()).await?;
+                let bytes = self.ws.read_as(self.ctx(), path()).await?;
                 Ok(String::from_utf8_lossy(&bytes).into_owned())
             }
             "origofs_write" => {
@@ -176,7 +176,7 @@ impl McpServer {
                         "edit: `old` and `new` are identical — nothing to change".into(),
                     ));
                 }
-                let bytes = self.ws.read(p).await?;
+                let bytes = self.ws.read_as(self.ctx(), p).await?;
                 let text = std::str::from_utf8(&bytes).map_err(|_| {
                     OrigoFSError::InvalidArgument(format!(
                         "{p}: not a UTF-8 text file; edit works on text"
@@ -363,7 +363,7 @@ impl McpServer {
                 Ok(format!("rejected suggestion #{id}"))
             }
             "origofs_ls" => {
-                let entries = self.ws.ls(path()).await?;
+                let entries = self.ws.ls_as(self.ctx(), path()).await?;
                 Ok(entries
                     .iter()
                     .map(|e| format!("{}\t{}", e.kind.as_str(), e.name))
@@ -392,7 +392,7 @@ impl McpServer {
                 }
             }
             "origofs_blame" => {
-                let ranges = self.ws.blame(path()).await?;
+                let ranges = self.ws.blame_as(self.ctx(), path()).await?;
                 Ok(ranges
                     .iter()
                     .map(|r| {

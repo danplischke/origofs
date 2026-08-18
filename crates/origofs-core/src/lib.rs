@@ -36,6 +36,7 @@ pub mod objectstore;
 pub mod pack;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod read_acl;
 pub mod recover;
 pub mod resync;
 mod retry;

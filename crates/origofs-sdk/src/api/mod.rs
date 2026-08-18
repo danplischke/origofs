@@ -168,6 +168,9 @@ impl Authenticator for LocalDevAuth {
 struct AppState {
     ws: Arc<Workspace>,
     auth: Arc<dyn Authenticator>,
+    /// The subtree this router serves, or empty for the whole workspace
+    /// ([`ApiOptions::root`]).
+    root: String,
     /// The live co-editing room registry (roadmap M8). Shared across sockets, so
     /// it lives on the state rather than being opened per request like the rest.
     #[cfg(feature = "coedit")]
@@ -177,6 +180,70 @@ struct AppState {
 impl FromRef<AppState> for Shared {
     fn from_ref(s: &AppState) -> Shared {
         s.ws.clone()
+    }
+}
+
+/// A workspace handle that knows the router's [`root`](ApiOptions::root).
+///
+/// Handlers that take a caller-supplied path use this instead of [`Shared`], so
+/// the path is resolved *inside* the root rather than compared against it — an
+/// out-of-scope path is unrepresentable rather than rejected. Derefs to
+/// [`Workspace`], so everything else about a handler is unchanged.
+///
+/// This is `origofs.fastapi`'s scoping, which was the only working implementation
+/// in the tree (issue #125); the matching rules now live in `origofs_core::acl` and
+/// both surfaces share them.
+#[derive(Clone)]
+pub(crate) struct ScopedWs {
+    ws: Arc<Workspace>,
+    root: String,
+}
+
+impl std::ops::Deref for ScopedWs {
+    type Target = Workspace;
+    fn deref(&self) -> &Workspace {
+        &self.ws
+    }
+}
+
+impl ScopedWs {
+    /// Build one from the router state, for a handler that takes `State<AppState>`
+    /// directly (the co-editing sockets, which need the state for the room
+    /// registry as well).
+    #[cfg(feature = "coedit")]
+    fn from_state(s: &AppState) -> ScopedWs {
+        Self::from_ref(s)
+    }
+
+    /// Resolve a caller-supplied path inside the root.
+    fn scoped(&self, path: &str) -> ApiResult<String> {
+        Ok(origofs_core::acl::scope_path(&self.root, path)?)
+    }
+
+    /// Whether a record naming `path` is visible here. A `None` path is out of
+    /// scope for a scoped router: an idle presence row still tells a scoped reader
+    /// that a neighbour exists.
+    fn in_scope(&self, path: Option<&str>) -> bool {
+        origofs_core::acl::in_scope(&self.root, path)
+    }
+
+    /// Refuse an out-of-scope record as **404**, never 403: a scoped caller must
+    /// not be able to tell "this exists but is not yours" from "no such thing".
+    fn require_in_scope(&self, path: Option<&str>) -> ApiResult<()> {
+        if self.in_scope(path) {
+            Ok(())
+        } else {
+            Err(ApiError::status(StatusCode::NOT_FOUND, "not found"))
+        }
+    }
+}
+
+impl FromRef<AppState> for ScopedWs {
+    fn from_ref(s: &AppState) -> ScopedWs {
+        ScopedWs {
+            ws: s.ws.clone(),
+            root: s.root.clone(),
+        }
     }
 }
 
@@ -199,6 +266,42 @@ impl FromRequestParts<AppState> for Auth {
     }
 }
 
+/// The authenticated principal, if the request carried one.
+///
+/// Read routes take this rather than [`Auth`] so they keep working on a router
+/// that allows anonymous reads (`gate_reads: false`, the default) while still
+/// enforcing per-actor read grants for a caller that *is* identified.
+///
+/// The consequence is worth stating plainly: with `gate_reads` off, an anonymous
+/// request is not subject to any actor's grants, because there is no actor. A
+/// deployment that relies on read grants must set `gate_reads: true`.
+struct MaybeAuth(Option<Principal>);
+
+impl FromRequestParts<AppState> for MaybeAuth {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(MaybeAuth(state.auth.authenticate(&parts.headers).await))
+    }
+}
+
+impl MaybeAuth {
+    /// Refuse `path` as **404** when an identified caller may not read it.
+    ///
+    /// `NotFound`, never `403`: a `403` confirms the path exists, which is the leak
+    /// a read grant closes. The engine's `ensure_readable` makes the same choice —
+    /// this just threads the principal to it.
+    async fn may_read(&self, ws: &Workspace, path: &str) -> ApiResult<()> {
+        match self.0 {
+            Some(p) => Ok(ws.ensure_readable(p.write_ctx(), path).await?),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Options for [`router_with`].
 #[derive(Clone)]
 pub struct ApiOptions {
@@ -207,6 +310,20 @@ pub struct ApiOptions {
     /// on, every data route demands a valid credential (`/health`/`/readyz` stay
     /// open).
     pub gate_reads: bool,
+    /// Serve only this subtree, e.g. `/tenant-a`. `None` (the default) serves the
+    /// whole workspace.
+    ///
+    /// Caller-supplied paths are resolved *inside* the root — prepended, not
+    /// compared — so a client cannot address anything outside it: there is no
+    /// representable request for another tenant's path. Records naming an
+    /// out-of-scope path answer **404**, not 403, so a scoped caller cannot tell
+    /// "exists but not yours" from "no such thing".
+    ///
+    /// This is deployment-level scoping and is **independent of** per-actor access
+    /// grants (`docs/PERMISSIONS.md` §3b): a root restricts *what this router can
+    /// address*, a grant restricts *what an actor may do*. A deployment normally
+    /// wants both.
+    pub root: Option<String>,
     /// Origins allowed by CORS (e.g. `https://app.example.com`). Empty means no
     /// cross-origin access — same-origin only — which is the safe default; a
     /// browser client on another origin needs its origin listed here.
@@ -252,6 +369,7 @@ impl Default for ApiOptions {
     fn default() -> Self {
         Self {
             gate_reads: false,
+            root: None,
             cors_origins: Vec::new(),
             max_body_bytes: 64 << 20,
             request_timeout: Some(Duration::from_secs(60)),
@@ -276,6 +394,11 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
         coedit: Coordinator::new(ws.clone()).with_checkpoint_policy(options.checkpoint),
         ws,
         auth,
+        root: options
+            .root
+            .as_deref()
+            .map(|r| r.trim_end_matches('/').to_string())
+            .unwrap_or_default(),
     };
     let mut data = Router::new()
         .route(
@@ -526,15 +649,6 @@ pub async fn serve_until_with(
             tracing::info!("shutdown signal received; draining in-flight requests");
         })
         .await
-}
-
-/// Normalize a URL-tail path to an absolute origofs path.
-fn abspath(p: &str) -> String {
-    if p.starts_with('/') {
-        p.to_string()
-    } else {
-        format!("/{p}")
-    }
 }
 
 // --- error mapping ----------------------------------------------------------
@@ -858,7 +972,8 @@ fn parse_range(headers: &HeaderMap, size: u64) -> Option<std::result::Result<(u6
 }
 
 async fn read_file(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
+    auth: MaybeAuth,
     Path(path): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
@@ -867,7 +982,10 @@ async fn read_file(
     // directory) is still a clean error here, before any bytes are streamed — and
     // it yields the size, which `Content-Length`, `Content-Range` and `416` all
     // need before the first byte.
-    let p = abspath(&path);
+    let p = ws.scoped(&path)?;
+    // Before `open_for_range`, so an unreadable path is indistinguishable from a
+    // missing one — both are 404, and neither reveals the file's size.
+    auth.may_read(&ws, &p).await?;
     let (manifest, size) = ws.open_for_range(&p).await?;
     let ctype = content_type_for(&p);
 
@@ -985,12 +1103,12 @@ impl Drop for CountedRead {
 }
 
 async fn write_file(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Auth(principal): Auth,
     Path(path): Path<String>,
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let p = abspath(&path);
+    let p = ws.scoped(&path)?;
     let ctx = principal.write_ctx();
     // Attribution comes only from the authenticated principal — never the request.
     // Governed by the principal's write policy: a propose-only actor's edit is
@@ -1007,11 +1125,11 @@ async fn write_file(
 }
 
 async fn delete_file(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Auth(principal): Auth,
     Path(path): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let p = abspath(&path);
+    let p = ws.scoped(&path)?;
     // Policy-governed like `PUT`: a propose-only actor's delete is queued for
     // review, not applied. Otherwise it could destroy a file it was refused
     // permission to overwrite (issue #78).
@@ -1033,28 +1151,45 @@ struct EntryDto {
     kind: String,
 }
 
-async fn list_path(ws: &Workspace, path: &str) -> ApiResult<Json<Vec<EntryDto>>> {
-    let entries = ws
-        .ls(path)
-        .await?
-        .into_iter()
-        .map(|e| EntryDto {
-            name: e.name,
-            kind: e.kind.as_str().to_string(),
-        })
-        .collect();
-    Ok(Json(entries))
+fn entry_dtos(entries: Vec<origofs_core::DirEntry>) -> Json<Vec<EntryDto>> {
+    Json(
+        entries
+            .into_iter()
+            .map(|e| EntryDto {
+                name: e.name,
+                kind: e.kind.as_str().to_string(),
+            })
+            .collect(),
+    )
 }
 
-async fn list_root(State(ws): State<Shared>) -> ApiResult<Json<Vec<EntryDto>>> {
-    list_path(&ws, "/").await
+/// List `path`, gated by the caller's read grants when the caller is identified.
+///
+/// `ls_as` filters unreadable *children* out of the listing rather than failing,
+/// and requires the directory itself to be readable — otherwise its existence and
+/// shape leak. An anonymous caller on a router that allows anonymous reads is not
+/// subject to any actor's grants, because there is no actor.
+async fn list_path(ws: &ScopedWs, auth: &MaybeAuth, path: &str) -> ApiResult<Json<Vec<EntryDto>>> {
+    Ok(entry_dtos(match auth.0 {
+        Some(p) => ws.ls_as(p.write_ctx(), path).await?,
+        None => ws.ls(path).await?,
+    }))
+}
+
+async fn list_root(State(ws): State<ScopedWs>, auth: MaybeAuth) -> ApiResult<Json<Vec<EntryDto>>> {
+    // "The root" means *this router's* root. On an unscoped router that is `/`;
+    // on a scoped one, listing the workspace root here would be the whole point
+    // of the scope defeated by the one route that takes no path.
+    let root = ws.scoped("/")?;
+    list_path(&ws, &auth, &root).await
 }
 
 async fn list_dir(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
+    auth: MaybeAuth,
     Path(path): Path<String>,
 ) -> ApiResult<Json<Vec<EntryDto>>> {
-    list_path(&ws, &abspath(&path)).await
+    list_path(&ws, &auth, &ws.scoped(&path)?).await
 }
 
 /// `POST /v1/dirs` — the root directory.
@@ -1068,11 +1203,11 @@ async fn make_root(State(_ws): State<Shared>, _auth: Auth) -> ApiResult<Json<ser
 }
 
 async fn make_dir(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Auth(principal): Auth,
     Path(path): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let p = abspath(&path);
+    let p = ws.scoped(&path)?;
     ws.mkdir_as(principal.write_ctx(), &p).await?;
     Ok(Json(json!({ "created": p })))
 }
@@ -1088,8 +1223,14 @@ struct InodeDto {
     ctime: i64,
 }
 
-async fn stat(State(ws): State<Shared>, Path(path): Path<String>) -> ApiResult<Json<InodeDto>> {
-    let i = ws.stat(&abspath(&path)).await?;
+async fn stat(
+    State(ws): State<ScopedWs>,
+    auth: MaybeAuth,
+    Path(path): Path<String>,
+) -> ApiResult<Json<InodeDto>> {
+    let p = ws.scoped(&path)?;
+    auth.may_read(&ws, &p).await?;
+    let i = ws.stat(&p).await?;
     Ok(Json(InodeDto {
         ino: i.ino,
         kind: i.kind.as_str().to_string(),
@@ -1108,13 +1249,14 @@ struct RenameReq {
 }
 
 async fn rename(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Auth(principal): Auth,
     Json(req): Json<RenameReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    ws.rename_as(principal.write_ctx(), &req.from, &req.to)
-        .await?;
-    Ok(Json(json!({ "from": req.from, "to": req.to })))
+    // Both sides, so a scoped caller cannot rename out of (or into) its root.
+    let (from, to) = (ws.scoped(&req.from)?, ws.scoped(&req.to)?);
+    ws.rename_as(principal.write_ctx(), &from, &to).await?;
+    Ok(Json(json!({ "from": from, "to": to })))
 }
 
 // --- versioning -------------------------------------------------------------
@@ -1206,13 +1348,15 @@ struct DiffEntryDto {
 /// `GET /diff?from=main&to=feature` — the changed-path list between two
 /// refs/commits (compared by content address).
 async fn diff(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<Vec<DiffEntryDto>>> {
     let out = ws
         .diff(&q.from, &q.to)
         .await?
         .into_iter()
+        // A changed path outside the root is not this router's to report.
+        .filter(|d| ws.in_scope(Some(&d.path)))
         .map(|d| DiffEntryDto {
             path: d.path,
             status: match d.status {
@@ -1241,11 +1385,12 @@ struct DiffFileDto {
 /// `GET /diff/file?from=main&to=feature&path=/x` — a unified line diff of one
 /// path (empty `diff` when unchanged on both sides).
 async fn diff_file(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Query(q): Query<DiffFileQuery>,
 ) -> ApiResult<Json<DiffFileDto>> {
-    let diff = ws.diff_file(&q.from, &q.to, &q.path).await?;
-    Ok(Json(DiffFileDto { path: q.path, diff }))
+    let path = ws.scoped(&q.path)?;
+    let diff = ws.diff_file(&q.from, &q.to, &path).await?;
+    Ok(Json(DiffFileDto { path, diff }))
 }
 
 // --- agent-suggestion review queue ------------------------------------------
@@ -1301,18 +1446,17 @@ struct CreateSuggestQuery {
 /// `&delete=true` and an empty body to propose a deletion). The proposing actor
 /// is the authenticated principal, never a request field.
 async fn create_suggestion(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Auth(principal): Auth,
     Query(q): Query<CreateSuggestQuery>,
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ctx = principal.write_ctx();
+    let path = ws.scoped(&q.path)?;
     let id = if q.delete {
-        ws.suggest_delete(ctx, &q.path, q.summary.as_deref())
-            .await?
+        ws.suggest_delete(ctx, &path, q.summary.as_deref()).await?
     } else {
-        ws.suggest(ctx, &q.path, &body, q.summary.as_deref())
-            .await?
+        ws.suggest(ctx, &path, &body, q.summary.as_deref()).await?
     };
     Ok(Json(json!({ "id": id })))
 }
@@ -1324,7 +1468,7 @@ struct ListSuggestQuery {
 }
 
 async fn list_suggestions(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Query(q): Query<ListSuggestQuery>,
 ) -> ApiResult<Json<Vec<SuggestionDto>>> {
     let status = match q.status.as_deref() {
@@ -1334,48 +1478,66 @@ async fn list_suggestions(
         ),
         None => None,
     };
+    // A path filter is resolved inside the root, and the results are filtered
+    // again: an unfiltered listing would otherwise enumerate every tenant's queue.
+    let filter = q.path.as_deref().map(|p| ws.scoped(p)).transpose()?;
     let out = ws
-        .list_suggestions(status, q.path.as_deref())
+        .list_suggestions(status, filter.as_deref())
         .await?
         .into_iter()
+        .filter(|s| ws.in_scope(Some(&s.path)))
         .map(SuggestionDto::from)
         .collect();
     Ok(Json(out))
 }
 
 async fn get_suggestion(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<SuggestionDto>> {
+    let s = suggestion_in_scope(&ws, id).await?;
+    Ok(Json(s.into()))
+}
+
+/// Fetch a suggestion, refusing one outside this router's root as **404**.
+///
+/// Not 403: a scoped caller must not be able to tell "this suggestion exists but
+/// belongs to someone else" from "no such suggestion" — the id space is shared
+/// across the workspace, so an id probe would otherwise enumerate neighbours.
+async fn suggestion_in_scope(ws: &ScopedWs, id: i64) -> ApiResult<crate::Suggestion> {
     let s = ws
         .get_suggestion(id)
         .await?
         .ok_or_else(|| crate::OrigoFSError::NotFound(format!("suggestion #{id}")))?;
-    Ok(Json(s.into()))
+    ws.require_in_scope(Some(&s.path))?;
+    Ok(s)
 }
 
 async fn suggestion_diff(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    suggestion_in_scope(&ws, id).await?;
     let diff = ws.suggestion_diff(id).await?;
     Ok(Json(json!({ "id": id, "diff": diff })))
 }
 
 async fn accept_suggestion(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Auth(principal): Auth,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    suggestion_in_scope(&ws, id).await?;
     ws.accept_suggestion(id, principal.write_ctx()).await?;
     Ok(Json(json!({ "accepted": id })))
 }
 
 async fn reject_suggestion(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Auth(principal): Auth,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    suggestion_in_scope(&ws, id).await?;
     ws.reject_suggestion(id, principal.write_ctx()).await?;
     Ok(Json(json!({ "rejected": id })))
 }
@@ -1454,14 +1616,34 @@ struct RevertReq {
 /// caller. The caller's own identity still has to clear the write policy — a
 /// propose-only actor cannot revert anyone, including itself.
 async fn revert_session(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Auth(principal): Auth,
     Json(req): Json<RevertReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     ws.ensure_may_write(principal.write_ctx(), "revert a session")
         .await?;
+    // A scoped router reverts only inside its root. Without this, an unqualified
+    // revert would undo a neighbour's edits across the whole workspace — the most
+    // destructive thing this API can do.
+    //
+    // The prefix must still be **absolute**, as it was before scoping existed. A
+    // URL tail is relative by nature, so `scoped` makes one absolute for the
+    // `/files/…` routes; a body field is not a URL tail, and quietly reading
+    // `"tenant-a"` as `/tenant-a` would guess at the caller's intent on the one
+    // operation where guessing wrong destroys work.
+    let prefix = match req.path_prefix.as_deref() {
+        Some(p) if !p.starts_with('/') => {
+            return Err(crate::OrigoFSError::InvalidArgument(format!(
+                "path_prefix must be absolute (start with '/'); got {p:?}"
+            ))
+            .into());
+        }
+        Some(p) => Some(ws.scoped(p)?),
+        None if !ws.root.is_empty() => Some(ws.root.clone()),
+        None => None,
+    };
     let paths = ws
-        .revert_session(req.actor, req.session, req.path_prefix.as_deref())
+        .revert_session(req.actor, req.session, prefix.as_deref())
         .await?;
     Ok(Json(json!({
         "actor": req.actor,
@@ -1493,11 +1675,16 @@ struct BlameDto {
 }
 
 async fn blame(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
+    auth: MaybeAuth,
     Path(path): Path<String>,
 ) -> ApiResult<Json<Vec<BlameDto>>> {
+    // Its own gate rather than riding on the file's: blame answers *who wrote
+    // which lines*, a disclosure about people as much as about content.
+    let p = ws.scoped(&path)?;
+    auth.may_read(&ws, &p).await?;
     let out = ws
-        .blame(&abspath(&path))
+        .blame(&p)
         .await?
         .into_iter()
         .map(|r| BlameDto {
@@ -1537,7 +1724,7 @@ struct EventsQuery {
 }
 
 async fn events(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<Vec<EventDto>>> {
     let limit = q.limit.unwrap_or(1000).min(1000);
@@ -1549,6 +1736,11 @@ async fn events(
             Some(b) => e.branch.as_deref() == Some(b.as_str()),
             None => true,
         })
+        // The change feed names paths, sizes and timing — a scoped reader watching
+        // it unfiltered would learn every neighbour's activity without ever
+        // reading a byte. An event naming no path is dropped too, for the same
+        // reason an idle presence row is.
+        .filter(|e| ws.in_scope(Some(e.path.as_str())))
         .take(limit)
         .map(|e| EventDto {
             seq: e.seq,
@@ -1580,13 +1772,16 @@ struct PresenceQuery {
 }
 
 async fn presence(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Query(q): Query<PresenceQuery>,
 ) -> ApiResult<Json<Vec<PresenceDto>>> {
     let out = ws
         .presence(q.window.unwrap_or(60))
         .await?
         .into_iter()
+        // A row naming no path still tells a scoped reader that a neighbour
+        // exists, which is the lesson `origofs.fastapi` records in `_under`.
+        .filter(|p| ws.in_scope(p.path.as_deref()))
         .map(|p| PresenceDto {
             session_id: p.session_id,
             actor_id: p.actor_id,
@@ -1622,7 +1817,7 @@ struct PresenceBeatReq {
 /// and would make the presence list a directory of connections rather than of
 /// working sessions.
 async fn heartbeat_presence(
-    State(ws): State<Shared>,
+    State(ws): State<ScopedWs>,
     Auth(principal): Auth,
     body: Option<Json<PresenceBeatReq>>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -1639,7 +1834,8 @@ async fn heartbeat_presence(
         .as_deref()
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(abspath);
+        .map(|p| ws.scoped(p))
+        .transpose()?;
     ws.touch(principal.actor, session, path.as_deref()).await?;
     Ok(Json(json!({
         "session_id": session,

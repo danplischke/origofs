@@ -1192,6 +1192,79 @@ impl Workspace {
         self.fs.grants(actor).await
     }
 
+    // --- permission-checked reads (`docs/PERMISSIONS.md` §3c, issue #124) ---
+    //
+    // The `*_as` counterparts of the plain reads. A denial is `NotFound`, not
+    // `Denied`: a 403 on a path confirms the path exists, which is the leak a read
+    // grant closes. The plain reads stay ungated — they are what checkout, merge,
+    // gc and the mounts are built on.
+
+    /// [`read`](Self::read), refused as `NotFound` unless `ctx` may read `path`.
+    pub async fn read_as(&self, ctx: WriteCtx, path: &str) -> Result<bytes::Bytes> {
+        self.fs.read_as(ctx, path).await
+    }
+
+    /// [`read_range`](Self::read_range), permission-checked.
+    pub async fn read_range_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        off: u64,
+        len: u64,
+    ) -> Result<bytes::Bytes> {
+        self.fs.read_range_as(ctx, path, off, len).await
+    }
+
+    /// [`stat`](Self::stat), permission-checked.
+    pub async fn stat_as(&self, ctx: WriteCtx, path: &str) -> Result<Inode> {
+        self.fs.stat_as(ctx, path).await
+    }
+
+    /// [`ls`](Self::ls), with unreadable children omitted rather than erroring.
+    pub async fn ls_as(&self, ctx: WriteCtx, path: &str) -> Result<Vec<DirEntry>> {
+        self.fs.ls_as(ctx, path).await
+    }
+
+    /// [`blame`](Self::blame), permission-checked. Its own gate rather than
+    /// `read`'s: blame answers *who wrote which lines*, a disclosure about people
+    /// as much as about content.
+    pub async fn blame_as(&self, ctx: WriteCtx, path: &str) -> Result<Vec<BlameRange>> {
+        self.fs.blame_as(ctx, path).await
+    }
+
+    /// [`status`](Self::status), filtered to the paths `ctx` may read.
+    pub async fn status_as(&self, ctx: WriteCtx) -> Result<Vec<DiffEntry>> {
+        self.fs.status_as(ctx).await
+    }
+
+    /// [`diff`](Self::diff), filtered to the paths `ctx` may read.
+    pub async fn diff_as(&self, ctx: WriteCtx, from: &str, to: &str) -> Result<Vec<DiffEntry>> {
+        self.fs.diff_as(ctx, from, to).await
+    }
+
+    /// [`diff_file`](Self::diff_file), permission-checked.
+    pub async fn diff_file_as(
+        &self,
+        ctx: WriteCtx,
+        from: &str,
+        to: &str,
+        path: &str,
+    ) -> Result<String> {
+        self.fs.diff_file_as(ctx, from, to, path).await
+    }
+
+    /// `NotFound` unless `ctx` may read `path`. For a surface gating a collection
+    /// the engine does not model.
+    pub async fn ensure_readable(&self, ctx: WriteCtx, path: &str) -> Result<()> {
+        self.fs.ensure_readable(ctx, path).await
+    }
+
+    /// Whether `ctx` may read `path`, as a boolean — for filtering an enumeration
+    /// where an unreadable entry must be omitted rather than fail the whole call.
+    pub async fn may_read(&self, ctx: WriteCtx, path: &str) -> Result<bool> {
+        self.fs.may_read(ctx, path).await
+    }
+
     /// Submit an edit to `path` governed by the actor's write policy: a `Direct`
     /// actor writes straight to the working tree ([`WriteOutcome::Wrote`]); a
     /// `Propose` actor's edit is queued as a suggestion for review

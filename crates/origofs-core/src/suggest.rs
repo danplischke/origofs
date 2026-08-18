@@ -282,6 +282,47 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         }))
     }
 
+    /// **The read gate** (`docs/PERMISSIONS.md` §3c, issue #124). Refuse `op` on
+    /// `path` unless `ctx`'s actor holds [`Perms::READ`] there.
+    ///
+    /// The read counterpart of
+    /// [`ensure_may_write_at`](Self::ensure_may_write_at), and the reason the
+    /// `*_as` read variants exist at all. The unattributed reads
+    /// ([`read`](crate::Fs::read), [`ls`](crate::Fs::ls), …) stay ungated by
+    /// construction: they are what checkout, merge, gc and recovery are built on,
+    /// and gating them would make internal machinery depend on whose request
+    /// happened to trigger it.
+    ///
+    /// A denial says only that access is denied. It deliberately does **not**
+    /// distinguish "this path does not exist" from "you may not see it" — that is
+    /// what [`Fs::read_as`](crate::Fs::read_as) and friends map to `NotFound` for,
+    /// following the same rule `origofs.fastapi` follows for its scoped records.
+    pub async fn ensure_may_read_at(&self, ctx: WriteCtx, op: &str, path: &str) -> Result<()> {
+        if self
+            .effective_perms(ctx.actor, path)
+            .await?
+            .contains(Perms::READ)
+        {
+            return Ok(());
+        }
+        Err(OrigoFSError::Denied(format!(
+            "actor {} may not {op} at {path}",
+            ctx.actor
+        )))
+    }
+
+    /// Whether `ctx`'s actor may read `path`, as a boolean rather than an error.
+    ///
+    /// For **filtering** an enumeration — a directory listing, the suggestion
+    /// queue, the change feed — where an unreadable entry must be omitted rather
+    /// than turned into a failure for the whole call.
+    pub async fn may_read(&self, ctx: WriteCtx, path: &str) -> Result<bool> {
+        Ok(self
+            .effective_perms(ctx.actor, path)
+            .await?
+            .contains(Perms::READ))
+    }
+
     /// Grant `actor` `perms` at and below `prefix`, replacing any grant already
     /// recorded for that exact prefix.
     pub async fn grant(&self, actor: i64, prefix: &str, perms: Perms) -> Result<()> {

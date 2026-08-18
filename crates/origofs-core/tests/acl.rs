@@ -22,7 +22,6 @@ use origofs_core::{
     SuggestionStatus, WriteCtx, WriteOutcome, WritePolicy,
 };
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 async fn fs() -> Fs<Arc<dyn MetadataStore>, Arc<MemStore>> {
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
@@ -411,24 +410,26 @@ fn dsn() -> Option<String> {
     std::env::var("ORIGOFS_PG_TEST_URL").ok()
 }
 
-fn pg_lock() -> &'static tokio::sync::Mutex<()> {
-    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
-async fn reset(dsn: &str) {
-    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
-        .await
-        .expect("connect for reset");
-    let handle = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-        .await
-        .expect("reset schema");
-    drop(client);
-    let _ = handle.await;
+/// A Postgres-backed `Fs` on its **own workspace** inside the shared test database.
+///
+/// Deliberately *not* `DROP SCHEMA public CASCADE`. `cargo test` runs test binaries
+/// concurrently against one `ORIGOFS_PG_TEST_URL`, so a reset here tears the schema
+/// out from under whatever else is mid-run — which is exactly how this file made
+/// `fuse_mount_sees_remote_write_over_postgres` and the co-edit cluster test fail
+/// while passing in isolation. A fresh workspace gives the same isolation for the
+/// inode, grant and ref space without touching anyone else's rows.
+async fn pg_fs(dsn: &str, workspace: &str) -> Fs<Arc<dyn MetadataStore>, Arc<MemStore>> {
+    let base: Arc<dyn MetadataStore> = Arc::new(PostgresMetadataStore::connect(dsn).await.unwrap());
+    base.init().await.unwrap(); // migrations are idempotent
+    let root_fs = Fs::new(base.clone(), Arc::new(MemStore::new()));
+    root_fs.init().await.unwrap();
+    let (id, root) = match base.lookup_workspace(workspace).await.unwrap() {
+        Some(w) => w,
+        None => base.create_workspace(workspace).await.unwrap(),
+    };
+    let fs = root_fs.rebind(base.with_workspace(id), root);
+    fs.init().await.unwrap();
+    fs
 }
 
 #[tokio::test]
@@ -437,16 +438,7 @@ async fn postgres_grants_resolve_and_enforce_the_same_way() {
         eprintln!("skipping: ORIGOFS_PG_TEST_URL unset");
         return;
     };
-    let _guard = pg_lock().lock().await;
-    reset(&dsn).await;
-
-    let meta = PostgresMetadataStore::connect(&dsn).await.unwrap();
-    meta.init().await.unwrap();
-    let fs = Fs::new(
-        Arc::new(meta) as Arc<dyn MetadataStore>,
-        Arc::new(MemStore::new()),
-    );
-    fs.init().await.unwrap();
+    let fs = pg_fs(&dsn, "acl-test").await;
     let a = agent(&fs).await;
 
     // Fallback, before any grant exists.
@@ -494,4 +486,124 @@ async fn postgres_grants_resolve_and_enforce_the_same_way() {
     assert!(fs.revoke(a.actor, "/src").await.unwrap());
     assert!(!fs.revoke(a.actor, "/src").await.unwrap());
     assert_eq!(fs.grants(a.actor).await.unwrap().len(), 2);
+}
+
+// --- reads (#124) ---------------------------------------------------------
+
+#[tokio::test]
+async fn a_read_denial_is_not_found_not_denied() {
+    // A 403 on a path confirms the path exists, which is the leak a read grant
+    // closes: an actor that may not see /secret must not be able to tell it from a
+    // path that was never there.
+    let fs = fs().await;
+    let a = agent(&fs).await;
+    fs.mkdir_p("/secret").await.unwrap();
+    fs.write("/secret/x", b"classified").await.unwrap();
+    fs.grant(a.actor, "/", Perms::NONE).await.unwrap();
+
+    for e in [
+        fs.read_as(a, "/secret/x").await.unwrap_err(),
+        fs.stat_as(a, "/secret/x").await.unwrap_err(),
+        fs.blame_as(a, "/secret/x").await.unwrap_err(),
+        fs.read_range_as(a, "/secret/x", 0, 4).await.unwrap_err(),
+    ] {
+        assert!(
+            matches!(e, OrigoFSError::NotFound(_)),
+            "a read denial must be indistinguishable from absence, got {e:?}"
+        );
+    }
+
+    // And a path that genuinely does not exist answers identically.
+    let missing = fs.read_as(a, "/secret/never").await.unwrap_err();
+    assert_eq!(missing.code(), "not_found");
+}
+
+#[tokio::test]
+async fn the_write_denial_stays_denied() {
+    // Deliberately the opposite of the read case: a writer that can *read* the path
+    // already knows it exists, so "denied" is more useful than pretending it
+    // vanished.
+    let fs = fs().await;
+    let a = agent(&fs).await;
+    fs.write("/f", b"x").await.unwrap();
+    fs.grant(a.actor, "/", Perms::READ).await.unwrap();
+
+    assert_denied(fs.write_as(a, "/f", b"y").await.unwrap_err(), "write_as");
+    // …and the same actor can still read it.
+    assert_eq!(&fs.read_as(a, "/f").await.unwrap()[..], b"x");
+}
+
+#[tokio::test]
+async fn a_listing_omits_unreadable_children_rather_than_failing() {
+    // An erroring `ls` would itself signal that something unreadable is in there.
+    let fs = fs().await;
+    let a = agent(&fs).await;
+    fs.mkdir_p("/proj/mine").await.unwrap();
+    fs.mkdir_p("/proj/theirs").await.unwrap();
+    fs.write("/proj/readme", b"x").await.unwrap();
+
+    fs.grant(a.actor, "/", Perms::NONE).await.unwrap();
+    fs.grant(a.actor, "/proj", Perms::READ).await.unwrap();
+    fs.grant(a.actor, "/proj/theirs", Perms::NONE)
+        .await
+        .unwrap();
+
+    let mut names: Vec<String> = fs
+        .ls_as(a, "/proj")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["mine", "readme"], "theirs must be omitted");
+
+    // The directory itself has to be readable, or its shape leaks.
+    assert!(fs.ls_as(a, "/proj/theirs").await.is_err());
+}
+
+#[tokio::test]
+async fn a_diff_is_filtered_to_the_paths_the_actor_may_read() {
+    let fs = fs().await;
+    let a = agent(&fs).await;
+    fs.mkdir_p("/mine").await.unwrap();
+    fs.mkdir_p("/theirs").await.unwrap();
+    fs.write("/mine/f", b"one").await.unwrap();
+    fs.write("/theirs/f", b"one").await.unwrap();
+    fs.commit("alice", "base").await.unwrap();
+    fs.write("/mine/f", b"two").await.unwrap();
+    fs.write("/theirs/f", b"two").await.unwrap();
+
+    fs.grant(a.actor, "/", Perms::NONE).await.unwrap();
+    fs.grant(a.actor, "/mine", Perms::READ).await.unwrap();
+
+    let paths: Vec<String> = fs
+        .status_as(a)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.path)
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["/mine/f"],
+        "a neighbour's change must not appear"
+    );
+
+    // The unattributed status still sees everything — internal machinery is exempt.
+    assert_eq!(fs.status().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn the_unattributed_reads_stay_ungated() {
+    // They are what checkout, merge, gc, recovery and the mounts are built on.
+    let fs = fs().await;
+    let a = agent(&fs).await;
+    fs.write("/f", b"x").await.unwrap();
+    fs.grant(a.actor, "/", Perms::NONE).await.unwrap();
+
+    assert_eq!(&fs.read("/f").await.unwrap()[..], b"x");
+    assert!(fs.stat("/f").await.is_ok());
+    assert!(fs.ls("/").await.is_ok());
+    assert!(fs.blame("/f").await.is_ok());
 }

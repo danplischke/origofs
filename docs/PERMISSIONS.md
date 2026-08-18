@@ -1,13 +1,18 @@
 # Permissions in origofs — what exists, and how to add them
 
-> Status: **mostly implemented.** Taken against `adb6ec8` (2026-08-18).
+> Status: **implemented**, except the mount bypass (§5). Taken against
+> `adb6ec8` (2026-08-18).
 >
 > * **§3a ownership** (#121/#122) — shipped. Migration V17 adds `inode.uid`/`gid`;
 >   both mounts apply mode and ownership instead of discarding them.
 > * **§3b write ACLs** (#123) — shipped. Migration V18 adds path-scoped grants,
 >   enforced in the engine by `ensure_may_write_at`.
-> * **§3c read ACLs** (#124) — still a proposal, and still recommended against
->   until there is a concrete requirement.
+> * **§3c read ACLs** (#124) — shipped, as additive `*_as` read variants rather
+>   than the breaking change originally feared. Denials are `NotFound`, not
+>   `Denied`.
+> * **§1g surface parity** (#125) — shipped. `ApiOptions::root` gives the Rust API
+>   the scoping the Python router already had, and both now share
+>   `origofs_core::acl`.
 >
 > §1 is kept as the record of what the baseline was, marked where it no longer
 > holds.
@@ -28,8 +33,10 @@ apart deliberately (§2):
   in the engine checks it. An actor with no covering grant falls back to its
   workspace-wide write policy, so grants are purely additive.
 
-What is still missing is **read** enforcement (§3c): reads carry no actor context
-anywhere, so a grant restricts writing, not seeing.
+Reads are enforced too, through `*_as` variants (§3c): the plain reads stay
+ungated because internal machinery is built on them, and a surface that knows its
+caller uses the checked twin. What is left is the **mount bypass** (§5) — a mount
+has no actor context, so grants govern every surface except FUSE/NFS.
 
 That is a defensible place to have started: the write policy plus the workspace
 wall covers "an untrusted agent can't land edits without review" and "project A
@@ -148,7 +155,13 @@ and attribution tables, per-workspace root inodes, per-workspace blame.
 
 Nothing in the engine does that, and no surface offers a hook for it.
 
-### 1g. One real per-path control exists, and it is Python-only ([#125](https://github.com/danplischke/origofs/issues/125))
+### 1g. Per-path control was Python-only — **now shared** ([#125](https://github.com/danplischke/origofs/issues/125))
+
+> **Resolved.** The matching rules moved into `origofs_core::acl` (`scope_path`,
+> `in_scope`, `covers`) and the Rust API gained `ApiOptions::root`, so both
+> surfaces resolve through one implementation instead of one having it and the
+> other not. What follows describes what the Python router got right, which is why
+> it was the one worth porting rather than reinventing.
 
 `origofs.fastapi`'s root-scoping (`fastapi.py:215`–`:268`) is the only working
 path-level access control in the repository, and it is well built:
@@ -162,9 +175,11 @@ path-level access control in the repository, and it is well built:
 - `_require_in_scope` refuses with **404, not 403**, so a caller cannot distinguish
   "exists but is not yours" from "does not exist".
 
-The Rust `api` module has no equivalent: `Principal` is `{actor, session}`
-(`api/mod.rs:85`) and `gate_reads` defaults to `false` (`:254`), so reads are open
-unless the embedder opts in.
+The Rust `api` module had no equivalent. It does now — with one caveat worth
+stating: `gate_reads` still defaults to `false`, so an **anonymous** request is
+subject to no actor's grants, because there is no actor. A deployment relying on
+read grants must set `gate_reads: true`. Root scoping applies either way, since it
+is a property of the router rather than of the caller.
 
 ---
 
@@ -259,7 +274,23 @@ Notes on the shape:
   sides; checking only the source lets an actor move a file it controls into a tree
   it does not.
 
-### 3c. Read ACLs — the expensive half, staged separately ([#124](https://github.com/danplischke/origofs/issues/124))
+### 3c. Read ACLs — **shipped**, and cheaper than feared ([#124](https://github.com/danplischke/origofs/issues/124))
+
+> **Implemented** in `crates/origofs-core/src/read_acl.rs`. The analysis below —
+> written before the work — expected a breaking change threading a read context
+> through every signature. It was not needed: adding `*_as` counterparts alongside
+> the existing reads is the same split the write path has used since M4, so nothing
+> existing changed and internal machinery stayed exempt by construction. The side
+> doors below are all closed; the note on `log` is now the honest residue.
+>
+> Two rules the build settled that the sketch did not state:
+>
+> * **A read denial is `NotFound`, not `Denied`.** A 403 confirms the path exists,
+>   which is the leak the grant closes. Writes keep returning `Denied`, because a
+>   writer that can read the path already knows it is there.
+> * **Enumerations filter; they do not fail.** An erroring `ls` would itself signal
+>   that something unreadable is in there.
+
 
 Writes are cheap because `ensure_may_write` already exists. Reads have no
 equivalent: `read`, `read_range`, `ls`, `stat`, `blame` take **no actor context at
@@ -270,23 +301,33 @@ whole project.
 Worse, the front door is not the only door. A read ACL that gates `read` but not
 these leaks the same information:
 
-| Side door | Leaks |
-|---|---|
-| `blame` | who wrote which lines of a file you cannot read |
-| `list_suggestions` | pending content and paths |
-| `events_since` (change feed) | paths, sizes, timing |
-| `active_presence` | that a path exists and is being edited |
-| `log` / `diff` | committed paths and contents |
-| `list_locks`, `list_conflicts` | paths |
+| Side door | Leaks | Now |
+|---|---|---|
+| `blame` | who wrote which lines of a file you cannot read | `blame_as` |
+| `list_suggestions` | pending content and paths | scope-filtered on the API |
+| `events_since` (change feed) | paths, sizes, timing | scope-filtered on the API |
+| `active_presence` | that a path exists and is being edited | scope-filtered on the API |
+| `diff` | committed paths and contents | `diff_as` / `status_as` / `diff_file_as` |
+| `log` | commit messages, authors | **still open** — no paths to gate on |
+| `list_locks`, `list_conflicts` | paths | **still open** |
+
+Two rows are honestly still open. `log` carries no paths, so there is nothing for a
+per-path grant to match on; a commit *message* that names a path is a disclosure
+this design was never going to police. `list_locks`/`list_conflicts` do carry paths
+and could be filtered the same way the API filters the others — they are simply
+not yet, and are listed here rather than quietly omitted.
 
 The Python router already learned this and filters presence rows explicitly. Any
 Rust-side read ACL must cover this whole set on day one, or it is decoration.
 
-**Recommendation: do not build this until there is a concrete requirement.** Write
-ACLs (§3b) plus the workspace wall cover the realistic multi-agent threat — a
-misbehaving agent damaging things — while read confidentiality between actors
-inside one workspace is a much stronger claim that the architecture does not
-currently support anywhere.
+**Resolved: built, with one gap named rather than papered over.** `log` returns
+commit metadata — hash, author, message, timestamp — and no paths, so it has no
+`_as` twin. A commit *message* can of course mention a path; that is a disclosure a
+per-path grant was never going to police, and claiming otherwise would be worse
+than saying so. The same holds for branch names.
+
+The workspace boundary remains the stronger tool for genuine confidentiality: it
+is a structural wall, where a read grant is a filter on a shared tree.
 
 ---
 
@@ -352,13 +393,17 @@ the half of it that already landed.
 | 0 | ~~`chmod`/`chown` stop silently no-oping (§1d)~~ — **done** | #121 | — | tiny |
 | 1 | ~~`uid`/`gid` + working `chmod`/`chown` + honest mount attrs (§3a)~~ — **done** | #122 | V17 | small |
 | 2 | ~~Path-scoped write ACLs (§3b) + the mount ruling (§5)~~ — **done** | #123 | V18 | medium |
-| 3 | Surface parity: port the Python router's scoping to the Rust API, extend the MCP classification test | #125 | — | medium |
-| 4 | Read ACLs (§3c) — only against a real requirement | #124 | V19 | large |
+| 3 | ~~Surface parity: port the Python router's scoping to the Rust API~~ — **done** | #125 | — | medium |
+| 4 | ~~Read ACLs (§3c)~~ — **done**, additively; no migration needed | #124 | — | medium |
 
-Phase 2 is the one that changes what the product can claim: it turns a global
+Phase 2 was the one that changed what the product can claim: it turned a global
 binary trust flag into "this agent may write under `/src/parser` and nowhere
-else", which is the thing anyone pointing several agents at one workspace will ask
-for first.
+else". Phases 3 and 4 followed because a write gate whose side doors leak the same
+information is decoration.
+
+**What remains is §5.** Grants govern the SDK, the HTTP API, MCP, the CLI and the
+Python bindings. A FUSE/NFS mount has no actor context and is unrestricted — a
+trusted surface, by ruling rather than by oversight.
 
 Phases 0 and 1 shipped together: they are one code path (`setattr`), and doing #121
 alone would have been superseded by #122 within a commit. Phase 2 is the next

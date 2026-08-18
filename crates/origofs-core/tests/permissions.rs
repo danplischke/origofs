@@ -25,7 +25,6 @@ use origofs_core::{
     Fs, LocalCasStore, MemStore, MetadataStore, PostgresMetadataStore, SqliteMetadataStore,
 };
 use std::sync::Arc;
-use std::sync::OnceLock;
 use tempfile::TempDir;
 
 const S_IFREG: u32 = 0o100000;
@@ -164,25 +163,26 @@ fn dsn() -> Option<String> {
     std::env::var("ORIGOFS_PG_TEST_URL").ok()
 }
 
-/// Serializes the PG tests: they share one database and each resets the schema.
-fn pg_lock() -> &'static tokio::sync::Mutex<()> {
-    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
-async fn reset(dsn: &str) {
-    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
-        .await
-        .expect("connect for reset");
-    let handle = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-        .await
-        .expect("reset schema");
-    drop(client);
-    let _ = handle.await;
+/// A Postgres-backed `Fs` on its **own workspace** inside the shared test database.
+///
+/// Deliberately *not* `DROP SCHEMA public CASCADE`. `cargo test` runs test binaries
+/// concurrently against one `ORIGOFS_PG_TEST_URL`, so a reset here tears the schema
+/// out from under whatever else is mid-run — which is exactly how this file made
+/// `fuse_mount_sees_remote_write_over_postgres` and the co-edit cluster test fail
+/// while passing in isolation. A fresh workspace gives the same isolation for the
+/// inode, grant and ref space without touching anyone else's rows.
+async fn pg_fs(dsn: &str, workspace: &str) -> Fs<Arc<dyn MetadataStore>, Arc<MemStore>> {
+    let base: Arc<dyn MetadataStore> = Arc::new(PostgresMetadataStore::connect(dsn).await.unwrap());
+    base.init().await.unwrap(); // migrations are idempotent
+    let root_fs = Fs::new(base.clone(), Arc::new(MemStore::new()));
+    root_fs.init().await.unwrap();
+    let (id, root) = match base.lookup_workspace(workspace).await.unwrap() {
+        Some(w) => w,
+        None => base.create_workspace(workspace).await.unwrap(),
+    };
+    let fs = root_fs.rebind(base.with_workspace(id), root);
+    fs.init().await.unwrap();
+    fs
 }
 
 #[tokio::test]
@@ -191,13 +191,7 @@ async fn postgres_chmod_and_chown_match_the_sqlite_behaviour() {
         eprintln!("skipping: ORIGOFS_PG_TEST_URL unset");
         return;
     };
-    let _guard = pg_lock().lock().await;
-    reset(&dsn).await;
-
-    let meta = PostgresMetadataStore::connect(&dsn).await.unwrap();
-    meta.init().await.unwrap();
-    let fs = Fs::new(Arc::new(meta), Arc::new(MemStore::new()));
-    fs.init().await.unwrap();
+    let fs = pg_fs(&dsn, "permissions-test").await;
 
     fs.write("/build.sh", b"#!/bin/sh\n").await.unwrap();
     let st = fs.stat("/build.sh").await.unwrap();

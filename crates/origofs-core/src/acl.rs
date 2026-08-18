@@ -201,6 +201,58 @@ pub fn normalize_prefix(prefix: &str) -> Result<String> {
     })
 }
 
+/// Resolve a caller-supplied path **inside** `root` (`docs/PERMISSIONS.md` §1g,
+/// issue #125).
+///
+/// The caller's path is always relative to the root, so a client cannot address
+/// anything outside its scope by asking for one — there is no representable request
+/// for `/other-tenant/secrets`, because the root is **prepended** rather than
+/// compared against. That is the property that makes surface scoping robust, and it
+/// is why this is not simply a `covers` check after the fact.
+///
+/// A `..` component is refused outright. [`crate::engine::validate_component`]
+/// already refuses to *store* one, but that is a different guarantee: it stops a
+/// poisoned name being persisted, not a path being resolved out of its scope here.
+///
+/// Ported from `origofs.fastapi`'s `_scoped`, which was the only working
+/// implementation in the tree, so both surfaces now share one rather than each
+/// re-deriving it.
+pub fn scope_path(root: &str, path: &str) -> Result<String> {
+    let p = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if p.split('/').any(|c| c == "..") {
+        return Err(OrigoFSError::InvalidArgument(
+            "path may not contain '..'".into(),
+        ));
+    }
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return Ok(p);
+    }
+    Ok(if p == "/" {
+        root.to_string()
+    } else {
+        format!("{root}{p}")
+    })
+}
+
+/// Whether a record naming `path` is visible within `root`.
+///
+/// A `None` path is **not** in scope. A record that names no path — an idle
+/// presence row — still tells a scoped reader that a neighbour exists, which is
+/// exactly what a scope is for. `origofs.fastapi` learned this one the hard way and
+/// documents it; keeping the rule here means the Rust surfaces cannot rediscover it
+/// independently.
+pub fn in_scope(root: &str, path: Option<&str>) -> bool {
+    match path {
+        Some(p) => covers(root, p),
+        None => root.trim_end_matches('/').is_empty(),
+    }
+}
+
 /// Pick the grant that governs `path`: the longest covering prefix.
 ///
 /// Returns `None` when no grant covers the path, which is the caller's signal to
@@ -280,6 +332,41 @@ mod tests {
         // Normalizing this to `/etc` would widen a grant written narrowly.
         assert!(normalize_prefix("/src/../etc").is_err());
         assert!(normalize_prefix("/src/./x").is_err());
+    }
+
+    #[test]
+    fn a_scoped_path_is_prepended_not_compared() {
+        // The property: out-of-scope paths are unrepresentable, not rejected.
+        assert_eq!(
+            scope_path("/tenant-a", "/notes.txt").unwrap(),
+            "/tenant-a/notes.txt"
+        );
+        assert_eq!(
+            scope_path("/tenant-a", "notes.txt").unwrap(),
+            "/tenant-a/notes.txt"
+        );
+        assert_eq!(scope_path("/tenant-a", "/").unwrap(), "/tenant-a");
+        // A client asking for another tenant just gets it under its own root.
+        assert_eq!(
+            scope_path("/tenant-a", "/tenant-b/secrets").unwrap(),
+            "/tenant-a/tenant-b/secrets"
+        );
+        // Traversal is the one way out, and it is refused.
+        assert!(scope_path("/tenant-a", "/../tenant-b/secrets").is_err());
+        // An empty root is the whole workspace.
+        assert_eq!(scope_path("", "/x").unwrap(), "/x");
+        assert_eq!(scope_path("/", "/x").unwrap(), "/x");
+    }
+
+    #[test]
+    fn a_record_naming_no_path_is_out_of_scope() {
+        assert!(in_scope("/tenant-a", Some("/tenant-a/x")));
+        assert!(!in_scope("/tenant-a", Some("/tenant-abc/x")));
+        // An idle presence row tells a scoped reader a neighbour exists.
+        assert!(!in_scope("/tenant-a", None));
+        // …but an unscoped reader sees everything, including path-less records.
+        assert!(in_scope("", None));
+        assert!(in_scope("/", None));
     }
 
     #[test]

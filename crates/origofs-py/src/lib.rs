@@ -1592,6 +1592,86 @@ impl Workspace {
         })
     }
 
+    /// ``read`` attributed to ``ctx``: refused as ``FileNotFoundError`` unless the
+    /// actor may read ``path`` (``docs/PERMISSIONS.md`` §3c).
+    ///
+    /// Not a ``PermissionError``: a 403-shaped answer confirms the path exists,
+    /// which is the leak a read grant closes. The plain :meth:`read` stays ungated.
+    fn read_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let bytes = ws.read_as(c, &path).await.map_err(to_pyerr)?;
+            Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
+        })
+    }
+
+    /// ``stat`` attributed to ``ctx``; see :meth:`read_as`.
+    fn stat_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let inode = ws.stat_as(c, &path).await.map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// ``ls`` attributed to ``ctx``, with unreadable children **omitted** rather
+    /// than erroring — an erroring listing would itself signal that something
+    /// unreadable is in there. The directory itself must be readable.
+    fn ls_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let entries = ws.ls_as(c, &path).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                let out = PyList::empty(py);
+                for e in &entries {
+                    out.append(dir_entry_dict(py, e)?)?;
+                }
+                Ok(out.into_any().unbind())
+            })
+        })
+    }
+
+    /// ``blame`` attributed to ``ctx``. Its own gate rather than ``read``'s: blame
+    /// answers *who wrote which lines*, a disclosure about people as much as about
+    /// content.
+    fn blame_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let ranges = ws.blame_as(c, &path).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                let out = PyList::empty(py);
+                for r in &ranges {
+                    out.append(blame_dict(py, r)?)?;
+                }
+                Ok(out.into_any().unbind())
+            })
+        })
+    }
+
     /// Grant `actor` access at and below `prefix` (``docs/PERMISSIONS.md`` §3b).
     ///
     /// `perms` is comma-separated: ``"read"``, ``"write"``, ``"propose"``, or
