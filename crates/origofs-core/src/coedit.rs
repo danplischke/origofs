@@ -52,10 +52,26 @@ pub(crate) fn author_attrs(ctx: WriteCtx) -> Attrs {
 /// `(1, 2)` and compare equal to a legitimate stamp. Comparing raw normalises
 /// every malformed variant into "not what the server would have written".
 pub(crate) fn raw_author(attrs: Option<&Attrs>) -> Option<Arc<str>> {
-    match attrs.and_then(|a| a.get(AUTHOR_KEY)) {
+    raw_attr(attrs, AUTHOR_KEY)
+}
+
+/// The raw string value of formatting attribute `key`, or `None` when absent or
+/// not a string. See [`raw_author`] for why the value is never parsed here.
+pub(crate) fn raw_attr(attrs: Option<&Attrs>, key: &str) -> Option<Arc<str>> {
+    match attrs.and_then(|a| a.get(key)) {
         Some(Any::String(s)) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// The attribute set putting `value` under `key` — or removing it, via
+/// `Any::Null`, when the run should carry nothing there.
+pub(crate) fn attr_or_null(key: &str, value: &Option<Arc<str>>) -> (Arc<str>, Any) {
+    let any = match value {
+        Some(v) => Any::String(v.clone()),
+        None => Any::Null,
+    };
+    (Arc::from(key), any)
 }
 
 /// The attribute set that puts `value` under [`AUTHOR_KEY`] — or **removes** the
@@ -924,47 +940,6 @@ pub struct SyncReply {
 #[inline]
 pub(crate) fn doc_len(s: &str) -> u32 {
     s.len() as u32
-}
-
-/// The `(index, len)` ranges — in document units (UTF-8 bytes, see
-/// [`doc_len`]), so they feed `yrs` formatting directly — that appear in `after`
-/// but not `before`: the text this update inserted. A character-level diff so
-/// multi-cursor and batched edits each attribute to their exact range rather than
-/// one coarse span.
-pub(crate) fn inserted_ranges(before: &str, after: &str) -> Vec<(u32, u32)> {
-    let diff = TextDiff::from_chars(before, after);
-    let mut ranges = Vec::new();
-    let mut idx: u32 = 0; // byte offset into `after`
-    let mut run: Option<(u32, u32)> = None; // (start, len) of the open insert run
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Equal => {
-                if let Some(r) = run.take() {
-                    ranges.push(r);
-                }
-                idx += doc_len(change.value());
-            }
-            ChangeTag::Insert => {
-                let len = doc_len(change.value());
-                match &mut run {
-                    Some((_, l)) => *l += len,
-                    None => run = Some((idx, len)),
-                }
-                idx += len;
-            }
-            // Deleted characters are absent from `after`, so they neither advance
-            // the offset nor extend an insert run.
-            ChangeTag::Delete => {
-                if let Some(r) = run.take() {
-                    ranges.push(r);
-                }
-            }
-        }
-    }
-    if let Some(r) = run.take() {
-        ranges.push(r);
-    }
-    ranges
 }
 
 /// Hidden directory holding persisted co-edit CRDT sidecars.

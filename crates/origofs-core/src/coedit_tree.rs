@@ -44,6 +44,14 @@
 //! node, because it cannot read the host's serializer. That is the price of not
 //! owning the schema, and it is the whole trade.
 //!
+//! Say the residue precisely, because it is a different trust relationship from
+//! the one [`apply_update_as`](CoeditTreeDoc::apply_update_as) closes: a
+//! *client* cannot name an author, but a **malicious host** can cite a
+//! legitimately-issued node id for the wrong byte range and origofs will believe
+//! it. Closing that would mean parsing the host's serialization, which is exactly
+//! what this module declines to do. The host is trusted; the clients editing
+//! through it are not.
+//!
 //! Bytes no span covers (a Markdown `- ` bullet marker, a fence, the blank line
 //! between paragraphs — punctuation the *serializer* emitted rather than a person)
 //! are attributed to the checkpointing actor, the same fallback
@@ -65,8 +73,9 @@
 
 use crate::attribution::WriteCtx;
 use crate::coedit::{
-    AUTHOR_KEY, COEDIT_SIDECAR_DIR, SyncReply, author_attrs, author_value, drive_sync,
-    inserted_ranges, parse_author,
+    AUTHOR_KEY, COEDIT_SIDECAR_DIR, SyncReply, attr_or_null, author_attrs, author_value,
+    diverging_runs, doc_range, drive_sync, intended_stamps, parse_author, raw_attr, raw_author,
+    scan_runs, stamp_tiling,
 };
 use crate::content::ContentStore;
 use crate::engine::Fs;
@@ -75,8 +84,9 @@ use crate::metadata::MetadataStore;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use yrs::types::Attrs;
 use yrs::types::text::YChange;
-use yrs::types::xml::{Xml, XmlFragment, XmlFragmentRef, XmlOut, XmlTextRef};
+use yrs::types::xml::{Xml, XmlElementRef, XmlFragment, XmlFragmentRef, XmlOut, XmlTextRef};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{
@@ -88,9 +98,11 @@ use yrs::{
 ///
 /// On a text run it is a Yjs *formatting* attribute (so it survives splits and is
 /// visible in `ytext.toDelta()`); on an element it is an XML attribute
-/// (`element.getAttribute("n")`). Server-assigned, always: a client-supplied value
-/// on newly inserted content is overwritten, and one origofs never issued resolves
-/// to no author at all.
+/// (`element.getAttribute("n")`). Server-assigned, always — and now *actually*
+/// always: every apply re-asserts it, not merely the one that created the node,
+/// so a client can neither label its own content nor re-point an existing run at
+/// another id. An id origofs never issued therefore appears nowhere in
+/// [`authors`](CoeditTreeDoc::authors) and resolves to no author at all.
 pub const NODE_KEY: &str = "n";
 
 /// The default `XmlFragment` root name, matching the flat path's `"content"`.
@@ -313,7 +325,7 @@ impl CoeditTreeDoc {
             .apply_update(update)
             .map_err(|e| OrigoFSError::InvalidArgument(format!("apply co-edit update: {e}")))?;
 
-        self.stamp(ctx, &before);
+        self.reconcile(ctx, &before);
 
         if self.doc.transact().state_vector() == sv_before {
             return Ok(Vec::new()); // nothing new — don't relay a no-op
@@ -342,9 +354,27 @@ impl CoeditTreeDoc {
     /// Every node id this document has stamped, mapped to the `(actor, session)`
     /// that authored it. This is what a host's span map is resolved against; an id
     /// origofs never issued is simply absent.
+    ///
+    /// An id carried by two runs with **conflicting** authors is dropped rather
+    /// than resolved to whichever came last in document order. Enforcement stops
+    /// the server ever minting such a duplicate, but a replica merge or a sidecar
+    /// written by an older build still can, and silently crediting one of the two
+    /// claimants is the one outcome worse than crediting nobody: `tile_spans`
+    /// falls back to the checkpointer for an unresolved id, which is honest.
+    /// The same author on two ranges is legitimate — a repair splits a run
+    /// without changing who wrote it — and must not poison.
     pub fn authors(&self) -> HashMap<String, (i64, i64)> {
         let txn = self.doc.transact();
-        let mut out = HashMap::new();
+        let mut out: HashMap<String, (i64, i64)> = HashMap::new();
+        let mut poisoned: HashSet<String> = HashSet::new();
+        let mut claim = |id: String, author: (i64, i64)| match out.get(&id) {
+            Some(prev) if *prev != author => {
+                poisoned.insert(id);
+            }
+            _ => {
+                out.insert(id, author);
+            }
+        };
         for node in self.frag.successors(&txn) {
             match node {
                 XmlOut::Text(text) => {
@@ -358,18 +388,21 @@ impl CoeditTreeDoc {
                         let Some(Any::String(author)) = attrs.get(AUTHOR_KEY) else {
                             continue;
                         };
-                        out.insert(id.to_string(), parse_author(author));
+                        claim(id.to_string(), parse_author(author));
                     }
                 }
                 XmlOut::Element(el) => {
                     if let Some(id) = el.get_attribute(&txn, NODE_KEY)
                         && let Some(author) = el.get_attribute(&txn, AUTHOR_KEY)
                     {
-                        out.insert(id, parse_author(&author));
+                        claim(id, parse_author(&author));
                     }
                 }
                 XmlOut::Fragment(_) => {} // nested fragments carry no attributes
             }
+        }
+        for id in poisoned {
+            out.remove(&id);
         }
         out
     }
@@ -430,77 +463,156 @@ impl CoeditTreeDoc {
         format!("{:x}.{:x}", self.doc.client_id(), n)
     }
 
-    /// The pre-image an [`apply_update_as`](Self::apply_update_as) diffs against:
-    /// every text node's raw string, and the set of nodes that already existed.
+    /// The pre-image an [`apply_update_as`](Self::apply_update_as) reconciles
+    /// against: every text node's string *and its stamp tiling*, plus every
+    /// element's stamp attributes.
+    ///
+    /// The stamps, not merely the strings, are what make enforcement total — see
+    /// [`reconcile`](Self::reconcile).
     fn scan(&self) -> PreImage {
         let txn = self.doc.transact();
         let mut texts = HashMap::new();
-        let mut nodes = HashSet::new();
+        let mut elements = HashMap::new();
         for node in self.frag.successors(&txn) {
             let id = node.id();
-            if let XmlOut::Text(text) = &node {
-                texts.insert(id.clone(), raw_text(text, &txn));
+            match &node {
+                XmlOut::Text(text) => {
+                    let (flat, runs) = scan_runs(text, &txn, tree_stamp);
+                    texts.insert(id, (flat, stamp_tiling(&runs)));
+                }
+                XmlOut::Element(el) => {
+                    elements.insert(
+                        id,
+                        (
+                            el.get_attribute(&txn, AUTHOR_KEY),
+                            el.get_attribute(&txn, NODE_KEY),
+                        ),
+                    );
+                }
+                XmlOut::Fragment(_) => {} // nested fragments carry no attributes
             }
-            nodes.insert(id);
         }
-        PreImage { texts, nodes }
+        PreImage { texts, elements }
     }
 
-    /// Stamp everything an update introduced, given the pre-image from before it.
-    fn stamp(&self, ctx: WriteCtx, before: &PreImage) {
+    /// Re-assert the authorship of **every** node, given the pre-image from
+    /// before the update.
+    ///
+    /// This replaces a pass that stamped only fresh elements and text ranges a
+    /// content diff called inserted. That left three knobs a client could turn on
+    /// content it did not write — re-stamp `a` on an existing run, re-point `n`
+    /// on an existing run (including onto a victim's id, which the `authors()`
+    /// map then resolved to the victim), and rewrite either attribute on an
+    /// existing element — because an existing node was never looked at again.
+    /// The bail-out when nothing looked new was the tree half of the flat
+    /// shape's forgery, and it is gone: every node is reconciled on every apply.
+    fn reconcile(&self, ctx: WriteCtx, before: &PreImage) {
         // Collect under a read transaction, mutate under a write one: `successors`
         // borrows the transaction for the walk, and formatting needs a mutable one.
-        let mut runs: Vec<(XmlTextRef, Vec<(u32, u32)>)> = Vec::new();
-        let mut fresh_elements = Vec::new();
+        let mut text_fixes: Vec<(XmlTextRef, Vec<TextFix>)> = Vec::new();
+        let mut element_fixes: Vec<(XmlElementRef, TreeStamp)> = Vec::new();
+        let empty: (String, Vec<(TreeStamp, u64)>) = (String::new(), Vec::new());
         {
             let txn = self.doc.transact();
             for node in self.frag.successors(&txn) {
                 let id = node.id();
                 match node {
                     XmlOut::Text(text) => {
-                        let after = raw_text(&text, &txn);
-                        let was = before.texts.get(&id).map(String::as_str).unwrap_or("");
-                        let ranges = inserted_ranges(was, &after);
-                        if !ranges.is_empty() {
-                            runs.push((text, ranges));
+                        let (after, after_runs) = scan_runs(&text, &txn, tree_stamp);
+                        // A text node absent from the pre-image is entirely new,
+                        // so it scans as empty and every character is an insert.
+                        let (was, was_tiling) = before.texts.get(&id).unwrap_or(&empty);
+                        let want = intended_stamps(was, was_tiling, &after, &(None, None), || {
+                            (
+                                Some(Arc::from(author_value(ctx))),
+                                Some(Arc::from(self.fresh_node_id())),
+                            )
+                        });
+                        let fixes: Vec<TextFix> = diverging_runs(&want, &stamp_tiling(&after_runs))
+                            .into_iter()
+                            .filter_map(|(b0, blen, stamp)| {
+                                doc_range(&after_runs, b0, blen).map(|(i, l)| (i, l, stamp.clone()))
+                            })
+                            .collect();
+                        if !fixes.is_empty() {
+                            text_fixes.push((text, fixes));
                         }
                     }
                     XmlOut::Element(el) => {
-                        if !before.nodes.contains(&id) {
-                            fresh_elements.push(el);
+                        let want = match before.elements.get(&id) {
+                            // Existing: its stamps must still be what they were.
+                            Some((a, n)) => {
+                                (a.as_deref().map(Arc::from), n.as_deref().map(Arc::from))
+                            }
+                            // New: stamped with this connection, unconditionally,
+                            // so a value the client wrote is overwritten.
+                            None => (
+                                Some(Arc::from(author_value(ctx))),
+                                Some(Arc::from(self.fresh_node_id())),
+                            ),
+                        };
+                        let have: TreeStamp = (
+                            el.get_attribute(&txn, AUTHOR_KEY).as_deref().map(Arc::from),
+                            el.get_attribute(&txn, NODE_KEY).as_deref().map(Arc::from),
+                        );
+                        // Compare before writing: `insert_attribute` with an
+                        // identical value still creates a CRDT item, so blind
+                        // re-assertion would churn the document on every keystroke
+                        // and grow the sidecar without bound.
+                        if have != want {
+                            element_fixes.push((el, want));
                         }
                     }
                     XmlOut::Fragment(_) => {}
                 }
             }
         }
-        if runs.is_empty() && fresh_elements.is_empty() {
-            return;
+        if text_fixes.is_empty() && element_fixes.is_empty() {
+            return; // authorship already agrees — the common case, writes nothing
         }
         let mut txn = self.doc.transact_mut();
-        for (text, ranges) in runs {
-            for (index, len) in ranges {
-                let mut attrs = author_attrs(ctx);
-                attrs.insert(NODE_KEY.into(), Any::from(self.fresh_node_id()));
+        for (text, fixes) in text_fixes {
+            for (index, len, (author, node)) in fixes {
+                let attrs = Attrs::from([
+                    attr_or_null(AUTHOR_KEY, &author),
+                    attr_or_null(NODE_KEY, &node),
+                ]);
                 text.format(&mut txn, index, len, attrs);
             }
         }
-        for el in fresh_elements {
-            // Unconditional, so an author a client wrote onto its own new element
-            // is overwritten rather than believed.
-            el.insert_attribute(&mut txn, AUTHOR_KEY, author_value(ctx));
-            el.insert_attribute(&mut txn, NODE_KEY, self.fresh_node_id());
+        for (el, (author, node)) in element_fixes {
+            match &author {
+                Some(v) => el.insert_attribute(&mut txn, AUTHOR_KEY, v.to_string()),
+                None => el.remove_attribute(&mut txn, &AUTHOR_KEY),
+            }
+            match &node {
+                Some(v) => el.insert_attribute(&mut txn, NODE_KEY, v.to_string()),
+                None => el.remove_attribute(&mut txn, &NODE_KEY),
+            }
         }
     }
 }
 
-/// The state of a document immediately before an update was applied: enough to tell
-/// what that update introduced.
+/// A node's `(author, node-id)` stamp, as the raw attribute values the CRDT
+/// holds. Raw rather than parsed for the reason given on [`raw_author`].
+type TreeStamp = (Option<Arc<str>>, Option<Arc<str>>);
+
+/// One repair to apply to a text node: the `(index, len)` document range and the
+/// stamp it must end up carrying.
+type TextFix = (u32, u32, TreeStamp);
+
+/// Pull a text run's `(author, node-id)` stamp off its formatting attributes.
+fn tree_stamp(attrs: Option<&Attrs>) -> TreeStamp {
+    (raw_author(attrs), raw_attr(attrs, NODE_KEY))
+}
+
+/// The state of a document immediately before an update was applied: enough to
+/// re-assert what its authorship must be afterwards.
 struct PreImage {
-    /// Each text node's raw string, keyed by node identity.
-    texts: HashMap<BranchID, String>,
-    /// Every node that already existed.
-    nodes: HashSet<BranchID>,
+    /// Each text node's raw string and its `(stamp, byte_len)` tiling.
+    texts: HashMap<BranchID, (String, Vec<(TreeStamp, u64)>)>,
+    /// Each element's `(author, node-id)` attributes.
+    elements: HashMap<BranchID, (Option<String>, Option<String>)>,
 }
 
 /// An `XmlText` node's raw string, with no formatting markup.
