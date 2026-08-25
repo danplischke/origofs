@@ -11,12 +11,10 @@
 # 1.85 *language* floor, but the code uses let-chains, stabilized in 1.88). Keep
 # this in step with .github/workflows/ci.yml's `msrv` job.
 FROM rust:1.88-slim AS build
-# The CLI enables origofs-sdk's `full` features; the FUSE surface (the `fuser`
-# crate) links libfuse3 via pkg-config. The object-store TLS stack is rustls, so
-# no OpenSSL dev headers are needed.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libfuse3-dev \
-    && rm -rf /var/lib/apt/lists/*
+# The CLI enables origofs-sdk's `full` features, including FUSE — but `fuser`'s
+# `libfuse`/`libfuse3` features are off by default (see release.yml), so on Linux
+# it takes the pure-Rust mount path and links no C library at build time. The
+# object-store TLS stack is rustls, so no OpenSSL dev headers are needed either.
 WORKDIR /src
 COPY . .
 # --locked builds against the committed Cargo.lock. Installs both binaries
@@ -26,9 +24,12 @@ RUN cargo install --path crates/origofs-cli --root /out --locked
 # --- runtime stage -----------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 # ca-certificates: TLS to object storage. curl: the container HEALTHCHECK.
-# libfuse3-3: the runtime lib the binary is dynamically linked against.
+# fuse3: not a link-time dependency (fuser's pure-Rust path links nothing), but
+# `origofs mount` execs the setuid `fusermount3` helper at runtime for an
+# unprivileged mount, and that helper — not just libfuse3's shared library —
+# is what the `fuse3` package provides.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl libfuse3-3 \
+        ca-certificates curl fuse3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/bin/origofs /usr/local/bin/origofs
 COPY --from=build /out/bin/git-remote-origofs /usr/local/bin/git-remote-origofs

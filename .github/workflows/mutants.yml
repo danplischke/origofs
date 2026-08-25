@@ -46,8 +46,9 @@ jobs:
           tool: cargo-mutants, nextest
 
       # Mutate origofs-core; catch survivors with nextest on the SQLite path.
-      # `-p origofs-core` scopes the build so the FUSE-only crates never enter
-      # it. No Postgres service on purpose: cargo-mutants runs several test
+      # `-p origofs-core` scopes the build so the access-surface features
+      # (api/mcp/sandbox/git/fuse/nfs — feature-gated modules of origofs-sdk)
+      # never enter it. No Postgres service on purpose: cargo-mutants runs several test
       # processes at once (`--jobs`), which would race on one shared database
       # (the PG suites reset it wholesale between tests), so the PG-backed
       # modules aren't exercised here — their mutants show as missed and are
