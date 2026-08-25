@@ -79,7 +79,9 @@ use yrs::types::text::YChange;
 use yrs::types::xml::{Xml, XmlFragment, XmlFragmentRef, XmlOut, XmlTextRef};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Any, BranchID, Doc, Out, ReadTxn, StateVector, Text, Transact, Update};
+use yrs::{
+    Any, BranchID, Doc, OffsetKind, Options, Out, ReadTxn, StateVector, Text, Transact, Update,
+};
 
 /// The attribute key under which origofs keeps each stamped run's / element's
 /// **node id** — the token a host puts in its span map at checkpoint time.
@@ -166,8 +168,15 @@ const _: fn() = || {
 
 impl CoeditTreeDoc {
     /// A fresh, empty document rooted at the `XmlFragment` named `root`.
+    ///
+    /// Byte offsets, explicitly, for the same reason as [`CoeditDoc::new`]: every
+    /// index this module computes is a byte offset, and the two shapes must agree
+    /// because they share `intended_stamps`/`diverging_runs`.
     pub fn new(root: &str) -> Self {
-        let doc = Doc::new();
+        let doc = Doc::with_options(Options {
+            offset_kind: OffsetKind::Bytes,
+            ..Default::default()
+        });
         let frag = doc.get_or_insert_xml_fragment(root);
         Self {
             doc,
@@ -236,7 +245,7 @@ impl CoeditTreeDoc {
         let run = el.push_back(&mut txn, yrs::types::xml::XmlTextPrelim::new(text));
         let mut attrs = author_attrs(ctx);
         attrs.insert(NODE_KEY.into(), Any::from(node.clone()));
-        run.format(&mut txn, 0, crate::coedit::utf16_len(text), attrs);
+        run.format(&mut txn, 0, crate::coedit::doc_len(text), attrs);
         el.insert_attribute(&mut txn, AUTHOR_KEY, author_value(ctx));
         el.insert_attribute(&mut txn, NODE_KEY, self.fresh_node_id());
         node

@@ -414,3 +414,113 @@ async fn coedit_open_existing_file_preserves_prior_authorship() {
     assert_eq!(b.len(), 1);
     assert_eq!(b[0].actor.id, alice);
 }
+
+// --- document index units (UTF-8 bytes, not UTF-16) -------------------------
+//
+// `yrs` picks its index unit per document (`OffsetKind`), and origofs pins it to
+// bytes because every consumer downstream — snapshot spans, the blame index,
+// `write_as_blamed` — speaks bytes. These tests exist because the two units are
+// indistinguishable on ASCII: the whole suite was green while non-ASCII text was
+// being misattributed, and a `yrs` default flip would be just as silent.
+
+// Pin the unit itself. Formatting `0..6` must cover exactly "héllo" (6 UTF-8
+// bytes, 5 UTF-16 code units) — if the document ever indexes UTF-16 again, this
+// range would reach into the following space instead.
+#[test]
+fn coedit_indices_are_utf8_bytes() {
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(1, 1), 0, "héllo world");
+    let (_, spans) = doc.snapshot();
+    assert_eq!(
+        spans,
+        vec![(1, 1, 12)],
+        "the whole string is one authored run"
+    );
+
+    // A second author appends at the end. The end is byte 12, not UTF-16 unit 11
+    // — passing 11 here lands the "!" before the "d", which is precisely the
+    // off-by-one a UTF-16 index produces against this byte-indexed document.
+    doc.insert(WriteCtx::session(2, 2), 12, "!");
+    let (text, spans) = doc.snapshot();
+    assert_eq!(text, "héllo world!");
+    assert_eq!(spans, vec![(1, 1, 12), (2, 2, 1)]);
+}
+
+// The user-visible consequence, through the real Yjs-client path: two authors
+// typing non-ASCII must be credited their exact byte counts, with nothing
+// orphaned to actor 0. Before the unit fix this produced [(1,1,5), (2,2,5),
+// (0,0,1)] — alice short by a byte, and that byte attributed to nobody (which a
+// checkpoint then silently credits to whoever happened to checkpoint).
+#[test]
+fn coedit_non_ascii_authorship_is_byte_exact() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, GetString, ReadTxn, Text, Transact, Update};
+
+    let alice = WriteCtx::session(1, 1);
+    let bob = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    let client = Doc::new();
+    let ctext = client.get_or_insert_text("content");
+
+    let sv = client.transact().state_vector();
+    ctext.insert(&mut client.transact_mut(), 0, "héllo"); // 6 bytes, 5 UTF-16 units
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    let relay = server.apply_update_as(alice, &u).unwrap();
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&relay).unwrap())
+        .unwrap();
+
+    let sv = client.transact().state_vector();
+    let end = ctext.get_string(&client.transact()).len() as u32;
+    ctext.insert(&mut client.transact_mut(), end, "wörld"); // 6 bytes too
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(bob, &u).unwrap();
+
+    let (text, spans) = server.snapshot();
+    assert_eq!(text, "héllowörld");
+    assert_eq!(
+        spans,
+        vec![(1, 1, 6), (2, 2, 6)],
+        "each author must own exactly the bytes they typed, with none orphaned"
+    );
+}
+
+// `from_blamed` reconstructs by inserting at byte offsets; with a UTF-16 cursor
+// every span after the first non-ASCII one landed at the wrong index.
+#[test]
+fn coedit_from_blamed_round_trips_non_ascii() {
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(1, 10), 0, "héllo ");
+    doc.insert(WriteCtx::session(2, 20), 7, "wörld");
+    doc.insert(WriteCtx::session(3, 30), 13, " 🎉"); // astral: 4 UTF-8 bytes, 2 UTF-16
+    let (text, spans) = doc.snapshot();
+    assert_eq!(text, "héllo wörld 🎉");
+
+    let rebuilt = CoeditDoc::from_blamed(&text, &spans).unwrap();
+    assert_eq!(rebuilt.text(), text);
+    assert_eq!(rebuilt.snapshot(), (text, spans));
+}
+
+// `reconcile_with` folds an out-of-band write into a live doc by applying the
+// difference as attributed CRDT ops — same indexing hazard, different direction.
+#[test]
+fn coedit_reconcile_with_handles_non_ascii() {
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(1, 1), 0, "héllo wörld");
+
+    // An out-of-band write replaced a multibyte word.
+    let target = "héllo 🌍";
+    doc.reconcile_with(target, &[(1, 1, 7), (2, 2, 4)]).unwrap();
+
+    assert_eq!(doc.text(), target);
+    let (text, spans) = doc.snapshot();
+    assert_eq!(text, target);
+    let total: u64 = spans.iter().map(|s| s.2).sum();
+    assert_eq!(
+        total,
+        target.len() as u64,
+        "spans must tile the text exactly"
+    );
+}

@@ -24,7 +24,10 @@ use yrs::types::Attrs;
 use yrs::types::text::YChange;
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{Any, Doc, GetString, Out, ReadTxn, StateVector, Text, TextRef, Transact, Update};
+use yrs::{
+    Any, Doc, GetString, OffsetKind, Options, Out, ReadTxn, StateVector, Text, TextRef, Transact,
+    Update,
+};
 
 /// The formatting-attribute key under which each run's `"actor,session"` is kept.
 /// Shared with [`crate::coedit_tree`], which stamps the same key on tree nodes.
@@ -64,9 +67,20 @@ pub(crate) fn parse_author(value: &str) -> (i64, i64) {
 /// [`snapshot`](Self::snapshot) yields the current text plus its per-span
 /// authorship — the input to [`Fs::checkpoint_coedit`].
 ///
-/// Character indices are `yrs` code-unit offsets (UTF-16), as in Yjs; the
-/// authorship spans returned by [`snapshot`](Self::snapshot) are in *bytes*, which
-/// is what the blame index stores.
+/// **Document indices here are UTF-8 byte offsets, not UTF-16 code units.** That
+/// is `yrs`'s `OffsetKind::Bytes`, which [`new`](Self::new) selects explicitly.
+/// Vanilla Yjs indexes UTF-16, so this differs from the JS API — but the choice is
+/// local to *this process's* index arguments and never reaches the wire: `yrs`
+/// splits blocks with a hardcoded `OffsetKind::Utf16` internally, so block clocks
+/// and lengths (the things an update actually encodes) are UTF-16 regardless. A
+/// browser client is unaffected.
+///
+/// Bytes are the right unit here because every consumer of this module speaks
+/// bytes: [`snapshot`](Self::snapshot)'s spans, the blame index, and
+/// [`Fs::write_as_blamed`] all do. Mixing the two silently misattributes non-ASCII
+/// text — `utf16_len` offsets fed to a byte-indexed document credited a 6-byte
+/// "héllo" as 5 bytes and orphaned the 6th — so the units are now stated at the
+/// boundary and identical throughout.
 pub struct CoeditDoc {
     doc: Doc,
     text: TextRef,
@@ -89,8 +103,16 @@ const _: fn() = || {
 
 impl CoeditDoc {
     /// A fresh, empty document.
+    ///
+    /// `offset_kind` is set explicitly rather than left to `Doc::new`'s default.
+    /// It *is* the default today, but every index in this module is a byte offset
+    /// and a `yrs` bump that flipped the default would silently misindex every
+    /// `format`/`insert`/`remove_range` call rather than failing to compile.
     pub fn new() -> Self {
-        let doc = Doc::new();
+        let doc = Doc::with_options(Options {
+            offset_kind: OffsetKind::Bytes,
+            ..Default::default()
+        });
         let text = doc.get_or_insert_text("content");
         Self { doc, text }
     }
@@ -239,8 +261,11 @@ impl CoeditDoc {
     pub fn from_blamed(text: &str, spans: &[(i64, i64, u64)]) -> Result<Self> {
         let this = Self::new();
         let mut txn = this.doc.transact_mut();
+        // One cursor, not two: the document indexes in bytes (see [`CoeditDoc`]),
+        // so the byte offset into `text` *is* the insert index. These were
+        // previously tracked separately — a byte offset and a UTF-16 one — which
+        // silently diverged on any non-ASCII span.
         let mut byte_off = 0usize;
-        let mut u16_idx = 0u32;
         for &(actor, session, byte_len) in spans {
             let end = byte_off + byte_len as usize;
             let piece = text.get(byte_off..end).ok_or_else(|| {
@@ -249,12 +274,11 @@ impl CoeditDoc {
             if actor != 0 {
                 let attrs = author_attrs(WriteCtx::session(actor, session));
                 this.text
-                    .insert_with_attributes(&mut txn, u16_idx, piece, attrs);
+                    .insert_with_attributes(&mut txn, byte_off as u32, piece, attrs);
             } else {
-                this.text.insert(&mut txn, u16_idx, piece);
+                this.text.insert(&mut txn, byte_off as u32, piece);
             }
             byte_off = end;
-            u16_idx += utf16_len(piece);
         }
         drop(txn);
         Ok(this)
@@ -281,7 +305,7 @@ impl CoeditDoc {
         }
         let diff = TextDiff::from_chars(before.as_str(), text);
         let mut txn = self.doc.transact_mut();
-        let mut idx: u32 = 0; // UTF-16 offset into the document, as we mutate it
+        let mut idx: u32 = 0; // byte offset into the document, as we mutate it
         let mut authors = SpanCursor::new(spans);
         // The open insert run: its author and the text accumulated so far. Runs are
         // batched so a word typed by one author is one CRDT insert, not N.
@@ -298,7 +322,7 @@ impl CoeditDoc {
                     } else {
                         self.text.insert(&mut txn, idx, &piece);
                     }
-                    idx += utf16_len(&piece);
+                    idx += doc_len(&piece);
                 }
             };
         }
@@ -308,14 +332,14 @@ impl CoeditDoc {
             match change.tag() {
                 ChangeTag::Equal => {
                     flush!();
-                    idx += utf16_len(value);
+                    idx += doc_len(value);
                     authors.advance(value.len());
                 }
                 // Present in the document, absent from `text`: delete it. The
                 // document shrinks under `idx`, so `idx` does not move.
                 ChangeTag::Delete => {
                     flush!();
-                    self.text.remove_range(&mut txn, idx, utf16_len(value));
+                    self.text.remove_range(&mut txn, idx, doc_len(value));
                 }
                 ChangeTag::Insert => {
                     let author = authors.author();
@@ -550,19 +574,27 @@ pub struct SyncReply {
     pub content_changed: bool,
 }
 
-/// UTF-16 code-unit length of `s` — the unit `yrs`/Yjs index text in.
-pub(crate) fn utf16_len(s: &str) -> u32 {
-    s.chars().map(|c| c.len_utf16() as u32).sum()
+/// Document-index length of `s`: its UTF-8 **byte** length.
+///
+/// This is the unit a `CoeditDoc`/`CoeditTreeDoc` indexes in — see
+/// [`CoeditDoc`]'s type docs for why, and `coedit_indices_are_utf8_bytes` in
+/// `tests/coedit.rs`, which pins it so a `yrs` change cannot flip it silently.
+/// It is named rather than inlined as `s.len()` so every index computation in
+/// this module points at that one explanation.
+#[inline]
+pub(crate) fn doc_len(s: &str) -> u32 {
+    s.len() as u32
 }
 
-/// The `(index, len)` ranges — in UTF-16 code units, so they feed `yrs`
-/// formatting directly — that appear in `after` but not `before`: the text this
-/// update inserted. A character-level diff so multi-cursor and batched edits each
-/// attribute to their exact range rather than one coarse span.
+/// The `(index, len)` ranges — in document units (UTF-8 bytes, see
+/// [`doc_len`]), so they feed `yrs` formatting directly — that appear in `after`
+/// but not `before`: the text this update inserted. A character-level diff so
+/// multi-cursor and batched edits each attribute to their exact range rather than
+/// one coarse span.
 pub(crate) fn inserted_ranges(before: &str, after: &str) -> Vec<(u32, u32)> {
     let diff = TextDiff::from_chars(before, after);
     let mut ranges = Vec::new();
-    let mut idx: u32 = 0; // UTF-16 offset into `after`
+    let mut idx: u32 = 0; // byte offset into `after`
     let mut run: Option<(u32, u32)> = None; // (start, len) of the open insert run
     for change in diff.iter_all_changes() {
         match change.tag() {
@@ -570,10 +602,10 @@ pub(crate) fn inserted_ranges(before: &str, after: &str) -> Vec<(u32, u32)> {
                 if let Some(r) = run.take() {
                     ranges.push(r);
                 }
-                idx += utf16_len(change.value());
+                idx += doc_len(change.value());
             }
             ChangeTag::Insert => {
-                let len = utf16_len(change.value());
+                let len = doc_len(change.value());
                 match &mut run {
                     Some((_, l)) => *l += len,
                     None => run = Some((idx, len)),
