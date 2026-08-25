@@ -18,6 +18,7 @@ use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
 use similar::{ChangeTag, TextDiff};
+use std::sync::Arc;
 use yrs::encoding::read::Cursor;
 use yrs::sync::{Message, MessageReader, SyncMessage};
 use yrs::types::Attrs;
@@ -41,6 +42,30 @@ pub(crate) fn author_value(ctx: WriteCtx) -> String {
 /// The author formatting attribute for `ctx`, as a `yrs` attribute set.
 pub(crate) fn author_attrs(ctx: WriteCtx) -> Attrs {
     Attrs::from([(AUTHOR_KEY.into(), Any::from(author_value(ctx)))])
+}
+
+/// The **raw** `AUTHOR_KEY` value a run carries, or `None` when it carries none
+/// (or a non-string one, which the server never writes).
+///
+/// Deliberately unparsed: enforcement compares stamps against the server's own
+/// string, and a malformed value like `"1,2,junk"` would parse to a plausible
+/// `(1, 2)` and compare equal to a legitimate stamp. Comparing raw normalises
+/// every malformed variant into "not what the server would have written".
+pub(crate) fn raw_author(attrs: Option<&Attrs>) -> Option<Arc<str>> {
+    match attrs.and_then(|a| a.get(AUTHOR_KEY)) {
+        Some(Any::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// The attribute set that puts `value` under [`AUTHOR_KEY`] — or **removes** the
+/// key, via `Any::Null`, when the run is meant to carry no author at all.
+pub(crate) fn author_attr(value: &Option<Arc<str>>) -> Attrs {
+    let any = match value {
+        Some(v) => Any::String(v.clone()),
+        None => Any::Null,
+    };
+    Attrs::from([(AUTHOR_KEY.into(), any)])
 }
 
 /// Parse an `(actor, session)` pair from an author attribute's string value.
@@ -168,46 +193,67 @@ impl CoeditDoc {
     /// actor — server-side, never trusting any author the client may name.
     ///
     /// A generic client speaks the Yjs binary protocol and knows nothing about
-    /// our authorship attribute, so we recover it ourselves: capture the text,
-    /// apply the update, diff before/after to find the inserted ranges, and stamp
-    /// those ranges with the connection's actor via CRDT formatting. The stamp is
-    /// itself a CRDT change, so it persists in the sidecar and rides the returned
-    /// delta out to every peer and worker.
+    /// our authorship attribute, so we recover it ourselves: capture the text and
+    /// its authorship, apply the update, then **re-assert the authorship of the
+    /// whole document** — every surviving character keeps the author it had, and
+    /// every introduced character takes `ctx`. Runs that disagree are repaired by
+    /// CRDT formatting. The repair is itself a CRDT change, so it persists in the
+    /// sidecar and rides the returned delta out to every peer and worker.
+    ///
+    /// **Enforcement is total, not insert-only.** Stamping only what a *text*
+    /// diff called inserted meant a formatting-only update — no text change, so
+    /// no ranges — left the client's own `a` attribute standing, and it flowed
+    /// into the durable blame index with the file bytes and their content hash
+    /// unchanged. See the module's enforcement section for the read rule this
+    /// establishes and why nothing on the byte axis could have caught it.
     ///
     /// Returns the update to relay to peers — the client's content *plus* our
     /// attribution — or an empty vector if the update changed nothing (already
     /// seen). This, not the raw inbound bytes, is what a room must broadcast, so
-    /// authorship always travels with the content.
+    /// authorship always travels with the content, already repaired.
     pub fn apply_update_as(&self, ctx: WriteCtx, update: &[u8]) -> Result<Vec<u8>> {
         let update = Update::decode_v1(update)
             .map_err(|e| OrigoFSError::InvalidArgument(format!("bad co-edit update: {e}")))?;
 
-        // Pin the pre-image: the text (to diff against) and the state vector (to
-        // encode exactly this update's effect — content + our stamp — for relay).
-        let before = self.text();
-        let sv_before = self.doc.transact().state_vector();
+        // Apply and repair in one transaction, so no observer and no concurrent
+        // reader can ever see the un-normalised intermediate state. (The room
+        // lock already serialises this against the checkpoint sweeper; this
+        // removes the class rather than the instance.)
+        let mut txn = self.doc.transact_mut();
 
-        self.doc
-            .transact_mut()
-            .apply_update(update)
+        // Pin the pre-image: its authorship (to carry across survivors) and its
+        // state vector (to encode exactly this update's effect for relay).
+        let sv_before = txn.state_vector();
+        let (before, before_runs) = scan_runs(&self.text, &txn, raw_author);
+
+        txn.apply_update(update)
             .map_err(|e| OrigoFSError::InvalidArgument(format!("apply co-edit update: {e}")))?;
 
-        // Stamp each newly-inserted range with the real author. Formatting after
-        // the apply means our attribute overwrites any the client tried to forge.
-        let after = self.text();
-        let ranges = inserted_ranges(&before, &after);
-        if !ranges.is_empty() {
-            let attrs = author_attrs(ctx);
-            let mut txn = self.doc.transact_mut();
-            for (index, len) in ranges {
-                self.text.format(&mut txn, index, len, attrs.clone());
-            }
+        let (after, after_runs) = scan_runs(&self.text, &txn, raw_author);
+        let mine: Option<Arc<str>> = Some(Arc::from(author_value(ctx)));
+        let want = intended_stamps(
+            &before,
+            &stamp_tiling(&before_runs),
+            &after,
+            // Text with no pre-image author stays unattributed rather than being
+            // adopted by whoever next touched the document; `checkpoint_coedit`
+            // resolves that to the checkpointer.
+            &None,
+            || mine.clone(),
+        );
+        for (byte_start, byte_len, stamp) in diverging_runs(&want, &stamp_tiling(&after_runs)) {
+            let Some((index, len)) = doc_range(&after_runs, byte_start, byte_len) else {
+                continue; // unreachable for a range from this document's own runs
+            };
+            self.text.format(&mut txn, index, len, author_attr(&stamp));
         }
 
-        if self.doc.transact().state_vector() == sv_before {
+        // Encode before the transaction commits: `TransactionMut` reads the store
+        // it has already written, so this sees the repair.
+        if txn.state_vector() == sv_before {
             return Ok(Vec::new()); // nothing new — don't relay a no-op
         }
-        Ok(self.doc.transact().encode_state_as_update_v1(&sv_before))
+        Ok(txn.encode_state_as_update_v1(&sv_before))
     }
 
     /// Merge a y-sync frame relayed from another worker — content another replica
@@ -367,20 +413,325 @@ impl CoeditDoc {
     /// checkpointer.
     pub fn snapshot(&self) -> (String, Vec<(i64, i64, u64)>) {
         let txn = self.doc.transact();
-        let chunks = self.text.diff(&txn, YChange::identity);
-        let mut text = String::new();
-        let mut spans = Vec::new();
-        for chunk in chunks {
-            // Co-edit docs are plain text; skip any embedded (non-text) value.
-            let Out::Any(Any::String(piece)) = &chunk.insert else {
-                continue;
-            };
-            let (actor, session) = author_of(chunk.attributes.as_deref());
-            text.push_str(piece);
-            spans.push((actor, session, piece.len() as u64));
+        let (text, runs) = scan_runs(&self.text, &txn, raw_author);
+        // Adjacent runs by the same author are coalesced, so a document's
+        // authorship has one canonical spelling. Repairs and Yjs's own block
+        // splitting both fragment runs without changing who wrote what, and an
+        // un-coalesced tiling would make `from_blamed`'s round trip depend on
+        // that incidental fragmentation.
+        let mut spans: Vec<(i64, i64, u64)> = Vec::new();
+        for run in &runs {
+            if run.byte_len == 0 {
+                continue; // an embed contributes no bytes to the file
+            }
+            let (actor, session) = run
+                .stamp
+                .as_deref()
+                .map_or((0, 0), |v: &str| parse_author(v));
+            match spans.last_mut() {
+                Some(last) if last.0 == actor && last.1 == session => last.2 += run.byte_len,
+                _ => spans.push((actor, session, run.byte_len)),
+            }
         }
         (text, spans)
     }
+}
+
+// ─── server-owned authorship: the enforcement machinery ──────────────────────
+//
+// Stamping only the ranges a *text* diff calls inserted left every other
+// character's author attribute writable by the client: a formatting-only update
+// changes no text, so it produced no ranges, and whatever `a` the client wrote
+// stood — flowing through `snapshot` into the durable blame index with the file
+// bytes and their content hash unchanged. Nothing on the byte axis moves, so no
+// downstream check can catch it, and for a co-edited file the CRDT attribute is
+// the only record of authorship there is.
+//
+// So stop asking "what did this update insert?" and instead compute, for the
+// whole document, what the authorship *must* be, then repair every run that
+// disagrees. Authorship becomes a total function of (pre-image authorship, text
+// diff, connection identity) rather than something a diff opts into stamping.
+//
+// The read rule this buys, stated as an induction: `AUTHOR_KEY` may be believed
+// as truth exactly on a document no un-normalised client apply has touched. The
+// base cases are all server-written (`new`, `insert`, `from_blamed`, `load`,
+// `reconcile_with`, `apply_relayed` — the last carrying a peer's already-repaired
+// delta), and `apply_update_as` is the inductive step. Totality is what makes the
+// step hold; insert-only stamping did not.
+//
+// The helpers are generic over the stamp because `coedit_tree` enforces the same
+// rule over `(author, node-id)` pairs.
+
+/// One run of a co-edited text as the CRDT currently holds it: the stamp it
+/// carries, plus its length in the two units that differ.
+///
+/// `byte_len` is its contribution to the flat string (0 for an embed, which is
+/// not text); `doc_len` is its contribution to the *document index space* (1 for
+/// an embed). They coincide for ordinary text — the document indexes UTF-8
+/// bytes, see [`doc_len`] — and keeping both is what converts a byte range
+/// computed over the string back into the index range `format` wants, even in a
+/// document containing embeds.
+#[derive(Debug, Clone)]
+pub(crate) struct DocRun<S> {
+    pub stamp: S,
+    pub byte_len: u64,
+    pub doc_len: u32,
+}
+
+/// Walk a text node once, returning its flat string and its runs.
+///
+/// This is the **single** place a stamp is read off a chunk. `extract` pulls the
+/// caller's stamp type out of a chunk's formatting attributes — the *raw*
+/// attribute value, never a parsed one: a malformed `a` like `"1,2,junk"` parses
+/// to a plausible `(1, 2)` and would then compare equal to a legitimate stamp,
+/// whereas comparing raw strings against the server's own value normalises every
+/// malformed variant away.
+pub(crate) fn scan_runs<T: ReadTxn, R: Text, S>(
+    text: &R,
+    txn: &T,
+    extract: impl Fn(Option<&Attrs>) -> S,
+) -> (String, Vec<DocRun<S>>) {
+    let mut flat = String::new();
+    let mut runs = Vec::new();
+    for chunk in text.diff(txn, YChange::identity) {
+        let stamp = extract(chunk.attributes.as_deref());
+        match &chunk.insert {
+            Out::Any(Any::String(piece)) => {
+                flat.push_str(piece);
+                runs.push(DocRun {
+                    stamp,
+                    byte_len: piece.len() as u64,
+                    doc_len: piece.len() as u32,
+                });
+            }
+            // An embed (an image, a custom object) is not text: it contributes
+            // nothing to the flat string but still occupies one document index,
+            // so a `format` range computed over the string would be off by one
+            // per preceding embed without this.
+            _ => runs.push(DocRun {
+                stamp,
+                byte_len: 0,
+                doc_len: 1,
+            }),
+        }
+    }
+    (flat, runs)
+}
+
+/// The `(stamp, byte_len)` tiling of a run list — what the diff walk and the
+/// divergence comparison operate on, with embeds (zero bytes) dropped.
+pub(crate) fn stamp_tiling<S: Clone + PartialEq>(runs: &[DocRun<S>]) -> Vec<(S, u64)> {
+    let mut out = Vec::new();
+    for r in runs {
+        push_run(&mut out, r.stamp.clone(), r.byte_len);
+    }
+    out
+}
+
+/// Append `(stamp, len)`, merging into the previous run when the stamp matches,
+/// so every tiling this module builds is canonical. Without this the same
+/// authorship could be expressed as two different tilings and the divergence
+/// walk would report repairs that change nothing.
+fn push_run<S: PartialEq>(out: &mut Vec<(S, u64)>, stamp: S, len: u64) {
+    if len == 0 {
+        return;
+    }
+    match out.last_mut() {
+        Some((s, l)) if *s == stamp => *l += len,
+        _ => out.push((stamp, len)),
+    }
+}
+
+/// A forward-only cursor over a `(stamp, byte_len)` tiling.
+struct TilingCursor<'a, S> {
+    runs: &'a [(S, u64)],
+    at: usize,
+    used: u64,
+}
+
+impl<'a, S: Clone + PartialEq> TilingCursor<'a, S> {
+    fn new(runs: &'a [(S, u64)]) -> Self {
+        Self {
+            runs,
+            at: 0,
+            used: 0,
+        }
+    }
+
+    /// Consume `bytes`, appending the stamps they were tiled by to `out`. Past
+    /// the end of the tiling — which a tiling taken from the document never
+    /// reaches, but a hand-supplied one can — `fallback` is used.
+    fn carry(&mut self, mut bytes: u64, out: &mut Vec<(S, u64)>, fallback: &S) {
+        while bytes > 0 {
+            let Some((stamp, len)) = self.runs.get(self.at) else {
+                push_run(out, fallback.clone(), bytes);
+                return;
+            };
+            let take = bytes.min(len - self.used);
+            push_run(out, stamp.clone(), take);
+            self.used += take;
+            bytes -= take;
+            if self.used == *len {
+                self.at += 1;
+                self.used = 0;
+            }
+        }
+    }
+
+    /// Advance past `bytes` without emitting — text this update deleted.
+    fn skip(&mut self, mut bytes: u64) {
+        while bytes > 0 {
+            let Some((_, len)) = self.runs.get(self.at) else {
+                return;
+            };
+            let take = bytes.min(len - self.used);
+            self.used += take;
+            bytes -= take;
+            if self.used == *len {
+                self.at += 1;
+                self.used = 0;
+            }
+        }
+    }
+}
+
+/// The authorship the document **must** have after this update: every character
+/// that survived from the pre-image keeps the stamp it had there, and every
+/// character the update introduced takes a fresh stamp from `fresh`.
+///
+/// `fresh` is called once per maximal inserted run, so such a run gets one node
+/// id rather than one per diff hunk (which matters only for the tree shape; the
+/// flat shape mints the same value every time).
+///
+/// The result tiles `after` exactly. Note what totality makes load-bearing: the
+/// alignment is `similar`'s *character* diff, not CRDT item identity, so moved
+/// text is credited to the mover, and text retyped identically to text already
+/// present may align as surviving. That was already true of the insert-only
+/// stamping this replaces — it is now the explicit rule rather than an emergent
+/// one. Making it identity-correct needs `yrs` item ids the public API does not
+/// expose.
+pub(crate) fn intended_stamps<S: Clone + PartialEq>(
+    before: &str,
+    before_tiling: &[(S, u64)],
+    after: &str,
+    unattributed: &S,
+    mut fresh: impl FnMut() -> S,
+) -> Vec<(S, u64)> {
+    let mut out: Vec<(S, u64)> = Vec::new();
+    let mut cursor = TilingCursor::new(before_tiling);
+    // The stamp for the run of inserts currently open, minted lazily so `fresh`
+    // is called once per maximal run rather than once per diff hunk.
+    let mut open_insert: Option<S> = None;
+
+    for change in TextDiff::from_chars(before, after).iter_all_changes() {
+        let len = change.value().len() as u64;
+        match change.tag() {
+            ChangeTag::Equal => {
+                open_insert = None;
+                cursor.carry(len, &mut out, unattributed);
+            }
+            ChangeTag::Delete => {
+                open_insert = None;
+                cursor.skip(len);
+            }
+            ChangeTag::Insert => {
+                let stamp = match &open_insert {
+                    Some(s) => s.clone(),
+                    None => {
+                        let s = fresh();
+                        open_insert = Some(s.clone());
+                        s
+                    }
+                };
+                push_run(&mut out, stamp, len);
+            }
+        }
+    }
+    out
+}
+
+/// The maximal `(byte_start, byte_len, intended_stamp)` regions where `observed`
+/// disagrees with `intended`. Both must tile the same text.
+///
+/// An empty result means the update left authorship exactly as the server would
+/// have written it — the overwhelmingly common case, and why enforcement writes
+/// nothing at all on an honest edit.
+pub(crate) fn diverging_runs<S: Clone + PartialEq>(
+    intended: &[(S, u64)],
+    observed: &[(S, u64)],
+) -> Vec<(u64, u64, S)> {
+    let mut out: Vec<(u64, u64, S)> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut i_used, mut j_used) = (0u64, 0u64);
+    let mut pos = 0u64;
+
+    while i < intended.len() && j < observed.len() {
+        let (want, wlen) = (&intended[i].0, intended[i].1);
+        let (have, hlen) = (&observed[j].0, observed[j].1);
+        let step = (wlen - i_used).min(hlen - j_used);
+        if step == 0 {
+            // A zero-length run on either side: step past it rather than spin.
+            if wlen == i_used {
+                i += 1;
+                i_used = 0;
+            }
+            if hlen == j_used {
+                j += 1;
+                j_used = 0;
+            }
+            continue;
+        }
+        if want != have {
+            match out.last_mut() {
+                // Extend the open region when it abuts and wants the same stamp.
+                Some((s, l, st)) if *s + *l == pos && *st == *want => *l += step,
+                _ => out.push((pos, step, want.clone())),
+            }
+        }
+        pos += step;
+        i_used += step;
+        j_used += step;
+        if i_used == wlen {
+            i += 1;
+            i_used = 0;
+        }
+        if j_used == hlen {
+            j += 1;
+            j_used = 0;
+        }
+    }
+    out
+}
+
+/// The document index at byte offset `byte_off`, stepping over embeds (zero
+/// bytes, one index). `None` for an offset past the end of the text.
+fn doc_index_at<S>(runs: &[DocRun<S>], byte_off: u64) -> Option<u32> {
+    let (mut byte_pos, mut idx) = (0u64, 0u32);
+    for run in runs {
+        if byte_off < byte_pos + run.byte_len {
+            return Some(idx + (byte_off - byte_pos) as u32);
+        }
+        byte_pos += run.byte_len;
+        idx += run.doc_len;
+    }
+    (byte_off == byte_pos).then_some(idx)
+}
+
+/// Convert a byte range over the flat string into the `(index, len)` document
+/// range [`Text::format`] takes.
+///
+/// `None` for a range that does not land inside the document — which a range
+/// derived from the document's own run list cannot produce, but `format`
+/// *panics* on an out-of-range index and runs here behind a shared room lock, so
+/// a bad range must never reach it.
+pub(crate) fn doc_range<S>(
+    runs: &[DocRun<S>],
+    byte_start: u64,
+    byte_len: u64,
+) -> Option<(u32, u32)> {
+    let start = doc_index_at(runs, byte_start)?;
+    let end = doc_index_at(runs, byte_start + byte_len)?;
+    (end >= start).then_some((start, end - start))
 }
 
 /// A forward-only cursor over a `(actor, session, byte_len)` span tiling, for
@@ -426,17 +777,6 @@ impl<'a> SpanCursor<'a> {
             }
         }
     }
-}
-
-/// Parse an `(actor, session)` pair from a run's author attribute, or `(0, 0)`.
-fn author_of(attrs: Option<&Attrs>) -> (i64, i64) {
-    let Some(Any::String(s)) = attrs.and_then(|a| a.get(AUTHOR_KEY)) else {
-        return (0, 0);
-    };
-    let mut it = s.split(',');
-    let actor = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    let session = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    (actor, session)
 }
 
 /// Merge a y-sync frame relayed from another worker into `doc` — content another

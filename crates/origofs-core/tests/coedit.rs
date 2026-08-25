@@ -524,3 +524,241 @@ fn coedit_reconcile_with_handles_non_ascii() {
         "spans must tile the text exactly"
     );
 }
+
+// --- the server owns authorship, on every apply ------------------------------
+//
+// `coedit_ysync_attributes_client_content_server_side` above covers the case
+// where a client's forged author rides in the SAME update as its insert: the
+// text diff sees the insert, so the stamp is overwritten. That is the only shape
+// the suite tested, and it is not the shape an attacker uses.
+//
+// A client can instead send a SECOND, content-free update that only *formats*
+// existing text with a different author. No characters change, so an insert-only
+// stamping pass produced no ranges and the forged value stood — then flowed
+// through `snapshot` into the durable blame index with the file bytes and their
+// content hash unchanged. No byte-level check can see it, and for a co-edited
+// file the CRDT attribute is the only record of authorship there is.
+
+/// A vanilla Yjs client that formats `content[start..end]` with `a = value` and
+/// nothing else — the forgery, as ~46 bytes on the wire.
+fn forge_author_frame(client: &yrs::Doc, start: u32, end: u32, value: &str) -> Vec<u8> {
+    use yrs::{ReadTxn, Text, Transact};
+    let text = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        let attrs = yrs::types::Attrs::from([("a".into(), yrs::Any::from(value.to_string()))]);
+        text.format(&mut txn, start, end - start, attrs);
+    }
+    client.transact().encode_state_as_update_v1(&sv)
+}
+
+#[test]
+fn coedit_a_format_only_update_cannot_restamp_text_the_client_did_not_write() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, Text, Transact, Update};
+
+    let mallory = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    let client = Doc::new();
+    let ctext = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    ctext.insert(&mut client.transact_mut(), 0, "evil");
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    let relay = server.apply_update_as(mallory, &u).unwrap();
+    // The client catches up on the server's stamp, as a real socket would.
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&relay).unwrap())
+        .unwrap();
+    assert_eq!(server.snapshot().1, vec![(2, 2, 4)], "mallory typed it");
+
+    // Now the forgery: content-free, claiming alice (actor 1, session 1).
+    let forge = forge_author_frame(&client, 0, 4, "1,1");
+    let out = server.apply_update_as(mallory, &forge).unwrap();
+
+    assert_eq!(server.text(), "evil", "the text must be untouched");
+    assert_eq!(
+        server.snapshot().1,
+        vec![(2, 2, 4)],
+        "authorship must survive a format-only update from the same socket"
+    );
+
+    // The repair has to travel with the delta, or peers keep the forged value
+    // and diverge from the server on the next checkpoint.
+    assert!(!out.is_empty(), "the repair must be relayed");
+    let peer = CoeditDoc::new();
+    peer.apply_update(&server.state_update()).unwrap();
+    assert_eq!(peer.snapshot().1, vec![(2, 2, 4)]);
+}
+
+// The same forgery packed into ONE update alongside a real insert: the insert is
+// credited to the sender, and the forged re-stamp of the surrounding text is not.
+#[test]
+fn coedit_a_forgery_riding_with_a_real_insert_is_still_refused() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, Text, Transact, Update};
+
+    let alice = WriteCtx::session(1, 1);
+    let mallory = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    // Alice writes the base text.
+    let client = Doc::new();
+    let ctext = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    ctext.insert(&mut client.transact_mut(), 0, "alices words");
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    let relay = server.apply_update_as(alice, &u).unwrap();
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&relay).unwrap())
+        .unwrap();
+
+    // Mallory inserts AND re-stamps alice's text as his own, in one update.
+    let sv = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        ctext.insert(&mut txn, 12, "!");
+        let attrs = yrs::types::Attrs::from([("a".into(), yrs::Any::from("2,2".to_string()))]);
+        ctext.format(&mut txn, 0, 12, attrs);
+    }
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(mallory, &u).unwrap();
+
+    assert_eq!(server.text(), "alices words!");
+    assert_eq!(
+        server.snapshot().1,
+        vec![(1, 1, 12), (2, 2, 1)],
+        "mallory gets exactly the byte he typed; alice keeps hers"
+    );
+}
+
+// Laundering attempts: values the server would never write must not be believed
+// just because they parse. `"0,0"` is the unattributed sentinel (which a
+// checkpoint credits to the checkpointer), and `"1,1,junk"` parses to a
+// plausible (1,1) — a parsed comparison would accept both.
+#[test]
+fn coedit_malformed_forged_authors_are_normalised_away() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, Text, Transact, Update};
+
+    for forged in ["0,0", "1,1,junk", "", "not-a-number"] {
+        let mallory = WriteCtx::session(2, 2);
+        let server = CoeditDoc::new();
+        let client = Doc::new();
+        let ctext = client.get_or_insert_text("content");
+        let sv = client.transact().state_vector();
+        ctext.insert(&mut client.transact_mut(), 0, "mine");
+        let u = client.transact().encode_state_as_update_v1(&sv);
+        let relay = server.apply_update_as(mallory, &u).unwrap();
+        client
+            .transact_mut()
+            .apply_update(Update::decode_v1(&relay).unwrap())
+            .unwrap();
+
+        let forge = forge_author_frame(&client, 0, 4, forged);
+        server.apply_update_as(mallory, &forge).unwrap();
+        assert_eq!(
+            server.snapshot().1,
+            vec![(2, 2, 4)],
+            "forged value {forged:?} was believed"
+        );
+    }
+}
+
+// Deleting a victim's text and retyping different text credits the retyper —
+// they did type those bytes — and never lets an arbitrary actor be named.
+#[test]
+fn coedit_delete_and_reinsert_credits_the_reinserter() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, Text, Transact, Update};
+
+    let alice = WriteCtx::session(1, 1);
+    let mallory = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    let client = Doc::new();
+    let ctext = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    ctext.insert(&mut client.transact_mut(), 0, "aaaaaa");
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    let relay = server.apply_update_as(alice, &u).unwrap();
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&relay).unwrap())
+        .unwrap();
+
+    // Replace it with text sharing no characters, so the diff cannot align any
+    // of it as surviving (see the caveat test below).
+    let sv = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        ctext.remove_range(&mut txn, 0, 6);
+        ctext.insert(&mut txn, 0, "XYZXYZ");
+    }
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(mallory, &u).unwrap();
+
+    assert_eq!(server.text(), "XYZXYZ");
+    assert_eq!(server.snapshot().1, vec![(2, 2, 6)]);
+}
+
+// The limitation this design does NOT close, pinned so it is a known property
+// rather than a surprise.
+//
+// Authorship is carried across an update by `similar`'s *character* diff, not by
+// CRDT item identity — `yrs` does not expose the item ids that would make it
+// identity-correct. So characters the attacker types that happen to align with
+// characters already present read as "surviving" and keep the previous author.
+// Here mallory replaces alice's "alices" with "mallory"; the shared "al" aligns
+// and stays credited to alice.
+//
+// This is unchanged from the insert-only stamping that preceded total
+// enforcement — `inserted_ranges` used the same diff — so it is neither
+// introduced nor worsened here. It is strictly weaker than the forgery this
+// commit closes: an attacker cannot *name* an actor, only cause a victim to be
+// credited for characters that coincide with the victim's own. Closing it needs
+// item-identity tracking; see the note on `apply_update_as`.
+#[test]
+fn coedit_authorship_carries_by_text_diff_not_crdt_identity() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, Text, Transact, Update};
+
+    let alice = WriteCtx::session(1, 1);
+    let mallory = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    let client = Doc::new();
+    let ctext = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    ctext.insert(&mut client.transact_mut(), 0, "alices");
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    let relay = server.apply_update_as(alice, &u).unwrap();
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&relay).unwrap())
+        .unwrap();
+
+    let sv = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        ctext.remove_range(&mut txn, 0, 6);
+        ctext.insert(&mut txn, 0, "mallory");
+    }
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(mallory, &u).unwrap();
+
+    assert_eq!(server.text(), "mallory");
+    let spans = server.snapshot().1;
+    // "m" + "al" (aligned with alice's) + "lory".
+    assert_eq!(spans, vec![(2, 2, 1), (1, 1, 2), (2, 2, 4)]);
+    // The point: alice is never credited with a run mallory *named* her for, and
+    // the bulk still lands on mallory.
+    let alice_bytes: u64 = spans.iter().filter(|s| s.0 == 1).map(|s| s.2).sum();
+    assert!(
+        alice_bytes < 3,
+        "diff alignment should be incidental, not wholesale"
+    );
+}
