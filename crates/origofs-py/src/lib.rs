@@ -688,6 +688,7 @@ impl Drop for NfsServer {
 struct CoeditSyncReply {
     reply: Vec<u8>,
     broadcast: Vec<u8>,
+    content_changed: bool,
 }
 
 #[pymethods]
@@ -704,11 +705,21 @@ impl CoeditSyncReply {
         PyBytes::new(py, &self.broadcast)
     }
 
+    /// Whether this payload changed the **document**, rather than only relaying
+    /// presence. Gate periodic checkpointing on this: awareness (cursor presence)
+    /// is broadcast too, and every real Yjs client emits it constantly without
+    /// anyone typing.
+    #[getter]
+    fn content_changed(&self) -> bool {
+        self.content_changed
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "CoeditSyncReply(reply={} bytes, broadcast={} bytes)",
+            "CoeditSyncReply(reply={} bytes, broadcast={} bytes, content_changed={})",
             self.reply.len(),
-            self.broadcast.len()
+            self.broadcast.len(),
+            self.content_changed
         )
     }
 }
@@ -817,6 +828,7 @@ impl CoeditDoc {
                     CoeditSyncReply {
                         reply: out.reply,
                         broadcast: out.broadcast,
+                        content_changed: out.content_changed,
                     },
                 )
             })
@@ -948,6 +960,7 @@ impl CoeditTreeDoc {
                     CoeditSyncReply {
                         reply: out.reply,
                         broadcast: out.broadcast,
+                        content_changed: out.content_changed,
                     },
                 )
             })

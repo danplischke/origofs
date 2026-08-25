@@ -473,6 +473,73 @@ def test_a_room_with_no_edits_is_not_rewritten():
             assert ops == [], f"the sweeper wrote {len(ops)} op-log entries for an idle room"
 
 
+def _awareness_frame(client_id: int, clock: int, state: str) -> bytes:
+    """A y-sync **awareness** message, as `y-protocols/awareness` puts on the wire.
+
+    Hand-encoded because the Python client here is a ``CoeditDoc`` (content only) —
+    presence is the browser's job, and this is the frame a browser sends. lib0
+    varints: every value below is < 128, so each is a single byte.
+
+        msg type 1 (awareness) | varuint8array( clients=1 | clientID | clock | varstring(state) )
+    """
+    body = state.encode()
+    payload = bytes([1, client_id, clock, len(body)]) + body
+    return bytes([1, len(payload)]) + payload
+
+
+def test_awareness_alone_does_not_make_a_room_due_for_checkpointing():
+    # The companion to `test_a_room_with_no_edits_is_not_rewritten`, for the case
+    # that actually occurs in a browser. That test's socket never sends anything
+    # after the handshake — but every real Yjs client publishes awareness, on each
+    # selection change and on y-protocols' periodic heartbeat. That is how a cursor
+    # exists.
+    #
+    # Awareness is broadcast (peers need it to draw carets), so gating the
+    # checkpoint sweeper on "the payload produced a broadcast" counted presence as
+    # an edit: one awareness frame, with nothing typed, wrote a zero-length op-log
+    # entry and a blame rewrite — and an open, idle tab kept doing it. Only a
+    # content delta may mark the room dirty.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+
+    async def authn(token: str = Query(...)) -> origofs.WriteCtx:
+        return ctx
+
+    app = FastAPI()
+    app.include_router(
+        build_router(
+            ws,
+            authn=authn,
+            checkpoint=CheckpointPolicy(idle_after=0.01, max_interval=0.01, tick=0.01),
+        )
+    )
+
+    with TestClient(app) as tc:
+        # Two sockets: the second is how we prove the server really *parsed* the
+        # frame as awareness and fanned it out. Without that check a malformed
+        # frame would be dropped and the no-churn assertion would pass vacuously.
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as peer:
+            peer.receive_bytes()  # the server's SyncStep1 greeting
+            with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+                sock.receive_bytes()  # ditto
+
+                sock.send_bytes(_awareness_frame(42, 1, '{"user":{"name":"alice"}}'))
+                relayed = peer.receive_bytes()
+                assert relayed[0] == 1, (
+                    "the server did not fan the awareness frame out as awareness; "
+                    "the no-churn assertion below would be vacuous"
+                )
+
+                time.sleep(0.3)  # many sweeper ticks, still nobody typing
+                ops = _run(lambda: ws.edit_ops(alice, alice_s))
+                assert ops == [], (
+                    f"cursor presence alone caused {len(ops)} durable checkpoint write(s)"
+                )
+
+
 def test_checkpointing_can_be_turned_off():
     # An embedder that drives checkpoints itself can disable both triggers, which
     # restores the checkpoint-on-last-leave-only behaviour.

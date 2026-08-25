@@ -491,3 +491,86 @@ async fn a_room_with_no_edits_is_not_rewritten() {
     );
     drop(a);
 }
+
+#[tokio::test]
+async fn awareness_alone_does_not_make_a_room_due_for_checkpointing() {
+    // The companion to the test above, for the case that actually occurs in a
+    // browser. `a_room_with_no_edits_is_not_rewritten` connects an `Awareness` with
+    // no local state, so it never emits an awareness frame — but every real Yjs
+    // client does, on each selection change and on `y-protocols`' periodic
+    // heartbeat. That is how a cursor exists.
+    //
+    // Awareness is broadcast (peers need it to draw carets), so gating the
+    // checkpoint sweeper on "the payload produced a broadcast" counted presence as
+    // an edit: one awareness frame, with nothing typed, wrote a zero-length op-log
+    // entry and a blame rewrite — and an open, idle tab kept doing it. Only a
+    // content delta may mark the room dirty.
+    use origofs_sdk::api::{ApiOptions, CheckpointPolicy, router_with};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alice = ws.create_human("alice", None).await.unwrap();
+    let alice_s = ws.create_session(alice, Some("web")).await.unwrap();
+    let auth = BearerAuth::new().with_token("tok-alice", alice, Some(alice_s));
+    let ws = Arc::new(ws);
+
+    let options = ApiOptions {
+        checkpoint: CheckpointPolicy {
+            idle_after: Some(Duration::from_millis(10)),
+            max_interval: Some(Duration::from_millis(10)),
+            tick: Duration::from_millis(10),
+        },
+        ..Default::default()
+    };
+    let app = router_with(ws.clone(), Arc::new(auth), options);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (mut a, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/v1/coedit/doc.md?token=tok-alice"))
+            .await
+            .unwrap();
+    let aware = Awareness::new(Doc::new());
+    pump(&mut a, &aware).await; // the initial sync handshake
+
+    // Publish cursor presence, exactly as a browser client does on connect — and
+    // no content edit whatsoever.
+    aware
+        .set_local_state(r#"{"user":{"name":"alice"}}"#)
+        .unwrap();
+    let presence = aware.update().unwrap();
+    a.send(Ws::Binary(frame(&[Y::Awareness(presence)])))
+        .await
+        .unwrap();
+
+    // Many sweeper ticks pass. Still nobody has typed anything.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let ops = ws.edit_ops(alice, Some(alice_s)).await.unwrap();
+    assert!(
+        ops.is_empty(),
+        "cursor presence alone caused {} durable checkpoint write(s): {ops:?}",
+        ops.len()
+    );
+
+    // …and the gate is on *presence*, not on checkpointing at all: a real edit on
+    // the same socket must still be crystallized by the sweeper, with nobody
+    // disconnecting.
+    let update = {
+        let text = aware.doc().get_or_insert_text("content");
+        let mut txn = aware.doc().transact_mut();
+        text.insert(&mut txn, 0, "hello");
+        txn.encode_update_v1()
+    };
+    a.send(Ws::Binary(frame(&[Y::Sync(SyncMessage::Update(update))])))
+        .await
+        .unwrap();
+
+    let blame = loop_until_blamed(&ws).await;
+    assert_eq!(blame[0].actor.id, alice);
+    drop(a);
+}

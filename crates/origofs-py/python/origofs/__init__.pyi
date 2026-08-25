@@ -382,6 +382,13 @@ class CoeditSyncReply:
     def broadcast(self) -> bytes:
         """Frames to fan out to the room's other connections (``b""`` if none)."""
         ...
+    @property
+    def content_changed(self) -> bool:
+        """Whether this payload changed the *document*, rather than only relaying
+        presence. Gate periodic checkpointing on this: awareness (cursor presence)
+        is broadcast too, and every real Yjs client emits it constantly without
+        anyone typing."""
+        ...
 
 class CoeditDoc:
     """A live co-edited document (roadmap M8): a Yjs-compatible CRDT whose inserts

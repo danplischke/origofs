@@ -943,10 +943,16 @@ async fn serve_socket(coord: Coordinator, ctx: WriteCtx, key: RoomKey, socket: W
                             break;
                         }
                         if !out.broadcast.is_empty() {
-                            // A frame worth broadcasting is a frame that changed
-                            // the document, which is exactly what makes the room
-                            // due for a checkpoint.
-                            room.touch_edit(coord.epoch);
+                            // Only a *content* delta makes the room due for a
+                            // checkpoint. Awareness (cursor presence) is broadcast
+                            // too — and every real Yjs client emits it on each
+                            // selection change plus a periodic heartbeat, with no
+                            // typing involved — so gating on `broadcast` alone had
+                            // an open-but-idle tab writing an op-log entry and a
+                            // blame rewrite on every sweeper tick, forever.
+                            if out.content_changed {
+                                room.touch_edit(coord.epoch);
+                            }
                             let frame = Bytes::from(out.broadcast);
                             // Local sockets first (instant), then peer workers.
                             let _ = room.tx.send((conn_id, frame.clone()));

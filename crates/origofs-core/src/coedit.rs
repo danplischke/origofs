@@ -465,6 +465,7 @@ pub(crate) fn drive_sync(
     let mut reply = EncoderV1::new();
     let mut broadcast = EncoderV1::new();
     let (mut has_reply, mut has_broadcast) = (false, false);
+    let mut content_changed = false;
 
     for msg in reader {
         let msg =
@@ -485,6 +486,7 @@ pub(crate) fn drive_sync(
                 if !delta.is_empty() {
                     Message::Sync(SyncMessage::Update(delta.clone())).encode(&mut broadcast);
                     has_broadcast = true;
+                    content_changed = true;
                     // Echo it to the sender too. Attributing the edit adds CRDT
                     // items (the author marks) to our doc that the sender's doc
                     // lacks — it never saw them, since the sender doesn't get the
@@ -521,6 +523,7 @@ pub(crate) fn drive_sync(
         } else {
             Vec::new()
         },
+        content_changed,
     })
 }
 
@@ -534,6 +537,17 @@ pub struct SyncReply {
     pub reply: Vec<u8>,
     /// Frames to fan out to every other connection in the room.
     pub broadcast: Vec<u8>,
+    /// Whether this payload actually changed the **document** — i.e. it carried a
+    /// content delta, not only relayed presence.
+    ///
+    /// A caller driving durability (the WebSocket routes' checkpoint sweeper) must
+    /// gate on this rather than on `broadcast` being non-empty. Awareness — cursor
+    /// presence — is broadcast too, and every real Yjs client emits it constantly:
+    /// on each selection change and on `y-protocols`' periodic heartbeat, with no
+    /// typing involved. Treating that as an edit marks the room dirty, so an open
+    /// but idle tab writes an op-log entry and a blame rewrite on every sweeper
+    /// tick, forever — churn with nothing to crystallize.
+    pub content_changed: bool,
 }
 
 /// UTF-16 code-unit length of `s` — the unit `yrs`/Yjs index text in.
