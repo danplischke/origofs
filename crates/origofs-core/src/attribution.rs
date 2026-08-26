@@ -21,7 +21,7 @@ use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
 use crate::types::{Hash, Ino};
 use similar::{ChangeTag, TextDiff};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Whether an actor is a person, an autonomous agent, or the system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +256,16 @@ struct BlameRun {
     len: u64,
 }
 
+/// Ceiling on the per-contributor op-log rows one co-edit checkpoint writes.
+///
+/// A checkpoint's contributor runs are bounded in practice by how many times
+/// authorship alternates in the document, which is small — but the bound is not
+/// structural, and an op-log row per alternation on a pathologically interleaved
+/// document is a write-amplification hazard rather than useful provenance. Past
+/// the cap the excess is dropped with a `warn!` rather than silently, so a
+/// truncated record is visible as truncated.
+const COEDIT_OP_ROWS_MAX: usize = 256;
+
 /// A file's byte-range authorship map (`docs/DESIGN.md` §5 — blame is
 /// per-byte-range, not per-line), stored as `actor,session,len;...`. Ordinary
 /// line-based writes produce runs whose spans align to line boundaries; a
@@ -290,6 +300,32 @@ impl BlameMap {
     /// Total number of bytes this map covers.
     fn total(&self) -> u64 {
         self.runs.iter().map(|r| r.len).sum()
+    }
+
+    /// The `(byte_start, run)` pairs of `self` that do not appear, at the same
+    /// offset with the same author and length, in `prior` — the authorship this
+    /// write actually introduced.
+    ///
+    /// Deliberately conservative: an insert near the start shifts everything after
+    /// it, so every downstream run reads as changed. That over-records, which
+    /// costs rows; under-recording would lose a contributor from the op-log and is
+    /// the failure this exists to prevent.
+    fn changed_since(&self, prior: &BlameMap) -> Vec<(u64, BlameRun)> {
+        let mut seen: HashSet<(u64, i64, i64, u64)> = HashSet::new();
+        let mut at = 0u64;
+        for r in &prior.runs {
+            seen.insert((at, r.actor, r.session, r.len));
+            at += r.len;
+        }
+        let mut out = Vec::new();
+        let mut at = 0u64;
+        for r in &self.runs {
+            if !seen.contains(&(at, r.actor, r.session, r.len)) {
+                out.push((at, *r));
+            }
+            at += r.len;
+        }
+        out
     }
 
     /// The `(actor, session, len)` spans covering byte range `[start, start+len)`,
@@ -694,6 +730,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 // The CRDT checkpoint path — see `write_as_blamed`.
                 WriteBase::Clobber => tx.set_content(ino, mhash, size).await?,
             }
+            let ts = self.now_secs();
             tx.append_edit_op(EditOpInit {
                 session_id: ctx.session,
                 actor_id: ctx.actor,
@@ -705,9 +742,62 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 byte_len: data.len() as i64,
                 pre_hash: pre_hash.map(|h| h.to_hex()),
                 post_hash: mhash.map(|h| h.to_hex()),
-                ts: self.now_secs(),
+                ts,
             })
             .await?;
+
+            // A co-edit checkpoint carries authorship for people who are not the
+            // caller, and the row above names only the caller. Record one row per
+            // contributor whose bytes this write introduced, so co-edited
+            // authorship gets the independent, append-only ground truth every
+            // other write path already has.
+            //
+            // Without these, the CRDT's own attribute was the *only* record of who
+            // wrote which bytes of a co-edited file — nothing to rebuild blame
+            // from, and nothing to cross-check it against. It also left
+            // `revert_session` unable to find a contributor's work at all: it
+            // discovers files through `list_edit_ops`, so an author who never
+            // checkpointed had no rows and reverting their session was silently a
+            // no-op, despite the co-editing sockets opening a session per
+            // connection precisely so it would work (#98).
+            //
+            // Gated on an explicit blame map, which is the co-edit checkpoint's
+            // signature (`write_as_blamed`): an ordinary write's authorship is
+            // wholly the caller's, so the row above already says everything.
+            if blame_override.is_some() {
+                let changed = blame.changed_since(&old_map);
+                let capped = changed.len() > COEDIT_OP_ROWS_MAX;
+                if capped {
+                    tracing::warn!(
+                        path,
+                        runs = changed.len(),
+                        cap = COEDIT_OP_ROWS_MAX,
+                        "coedit checkpoint: recording only the first {COEDIT_OP_ROWS_MAX} \
+                         contributor runs in the op-log",
+                    );
+                }
+                for (byte_start, run) in changed.into_iter().take(COEDIT_OP_ROWS_MAX) {
+                    tx.append_edit_op(EditOpInit {
+                        session_id: (run.session != 0).then_some(run.session),
+                        actor_id: run.actor,
+                        // The checkpoint is one tool call; the runs inside it are
+                        // not, so they carry the caller's.
+                        tool_call_id: ctx.tool_call,
+                        ino,
+                        path: path.to_string(),
+                        // A distinct verb: these rows describe authorship the
+                        // caller did not perform, so a reader must be able to tell
+                        // them from the whole-file write above.
+                        op: "coedit".to_string(),
+                        byte_start: byte_start as i64,
+                        byte_len: run.len as i64,
+                        pre_hash: pre_hash.map(|h| h.to_hex()),
+                        post_hash: mhash.map(|h| h.to_hex()),
+                        ts,
+                    })
+                    .await?;
+                }
+            }
             tx.commit().await?;
             return Ok(());
         }

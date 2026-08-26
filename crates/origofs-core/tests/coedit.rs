@@ -762,3 +762,120 @@ fn coedit_authorship_carries_by_text_diff_not_crdt_identity() {
         "diff alignment should be incidental, not wholesale"
     );
 }
+
+// --- co-edit authorship reaches the op-log, not only the blame index ---------
+//
+// A checkpoint used to record exactly one op-log row: a whole-file "write" by
+// whoever ran it. Every other contributor got none. That left the CRDT's own
+// attribute as the *only* record of who wrote which bytes of a co-edited file —
+// nothing to rebuild blame from and nothing to cross-check it against — and it
+// left `revert_session`, which discovers files through the op-log, unable to
+// find a contributor's work at all.
+
+#[tokio::test]
+async fn coedit_checkpoint_records_a_row_for_every_contributor() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let claude = fs.create_agent("claude", "m", Some(alice)).await.unwrap();
+    let s_a = fs.create_session(alice, None).await.unwrap();
+    let s_c = fs.create_session(claude, None).await.unwrap();
+
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(alice, s_a), 0, "hello ");
+    doc.insert(WriteCtx::session(claude, s_c), 6, "world");
+
+    // Claude checkpoints; alice never does.
+    fs.checkpoint_coedit(WriteCtx::session(claude, s_c), "/doc", &doc)
+        .await
+        .unwrap();
+
+    let a_ops = fs.edit_ops(alice, Some(s_a)).await.unwrap();
+    assert_eq!(a_ops.len(), 1, "alice authored bytes but has no op-log row");
+    assert_eq!(a_ops[0].op, "coedit");
+    assert_eq!(a_ops[0].path, "/doc");
+    assert_eq!((a_ops[0].byte_start, a_ops[0].byte_len), (0, 6));
+
+    // The checkpointer keeps their whole-file row *and* gains a precise one.
+    let c_ops = fs.edit_ops(claude, Some(s_c)).await.unwrap();
+    assert!(c_ops.iter().any(|o| o.op == "write" && o.byte_start == 0));
+    assert!(
+        c_ops
+            .iter()
+            .any(|o| o.op == "coedit" && (o.byte_start, o.byte_len) == (6, 5))
+    );
+}
+
+// The headline consequence: a co-editor who never ran a checkpoint can now be
+// reverted. Before this, `revert_session` returned Ok(vec![]) and changed
+// nothing — silently — even though the co-editing sockets deliberately open a
+// session per connection so that reverting one would work (#98).
+#[tokio::test]
+async fn coedit_a_contributor_who_never_checkpointed_can_be_reverted() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let claude = fs.create_agent("claude", "m", Some(alice)).await.unwrap();
+    let s_a = fs.create_session(alice, None).await.unwrap();
+    let s_c = fs.create_session(claude, None).await.unwrap();
+
+    // Whole lines, because `revert_session` keeps any line with mixed authorship
+    // rather than splitting it (#33) — that limitation is separate from this one.
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(alice, s_a), 0, "alice line\n");
+    doc.insert(WriteCtx::session(claude, s_c), 11, "claude line\n");
+
+    fs.checkpoint_coedit(WriteCtx::session(claude, s_c), "/doc", &doc)
+        .await
+        .unwrap();
+    assert_eq!(
+        &fs.read("/doc").await.unwrap()[..],
+        b"alice line\nclaude line\n"
+    );
+
+    let changed = fs.revert_session(alice, s_a, None).await.unwrap();
+    assert_eq!(
+        changed,
+        vec!["/doc".to_string()],
+        "alice's file was not found"
+    );
+    assert_eq!(
+        &fs.read("/doc").await.unwrap()[..],
+        b"claude line\n",
+        "alice's contribution was not removed"
+    );
+}
+
+// The sweeper writes on a timer, so a checkpoint that introduces no new
+// authorship must add no rows — otherwise an open document accrues op-log rows
+// forever.
+#[tokio::test]
+async fn coedit_a_repeat_checkpoint_records_no_new_rows() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let s_a = fs.create_session(alice, None).await.unwrap();
+
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(alice, s_a), 0, "stable");
+    let ctx = WriteCtx::session(alice, s_a);
+    fs.checkpoint_coedit(ctx, "/doc", &doc).await.unwrap();
+    let after_first = fs.edit_ops(alice, Some(s_a)).await.unwrap().len();
+
+    for _ in 0..3 {
+        fs.checkpoint_coedit(ctx, "/doc", &doc).await.unwrap();
+    }
+    let after_repeats = fs.edit_ops(alice, Some(s_a)).await.unwrap().len();
+
+    // The whole-file "write" row is unconditional (it records that a checkpoint
+    // ran); the per-contributor rows must not repeat.
+    let coedit_rows = fs
+        .edit_ops(alice, Some(s_a))
+        .await
+        .unwrap()
+        .iter()
+        .filter(|o| o.op == "coedit")
+        .count();
+    assert_eq!(
+        coedit_rows, 1,
+        "unchanged authorship re-recorded per checkpoint"
+    );
+    assert_eq!(after_repeats - after_first, 3, "only the write rows repeat");
+}
