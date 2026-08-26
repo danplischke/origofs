@@ -154,7 +154,7 @@ impl Importer<'_> {
                 message: c.message.trim_end_matches('\n').to_string(),
                 timestamp: c.timestamp,
             };
-            let hash = self.ws.fs().put_object(&commit.encode()).await?;
+            let hash = self.ws.fs().put_object(&commit.encode()?).await?;
             self.commits.insert(oid, hash);
             head = Some(hash);
         }
@@ -219,7 +219,7 @@ impl Importer<'_> {
             entries.push(entry);
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
-        let hash = self.ws.fs().put_object(&Tree { entries }.encode()).await?;
+        let hash = self.ws.fs().put_object(&Tree { entries }.encode()?).await?;
         self.trees.insert(oid_hex.to_string(), hash);
         Ok(hash)
     }

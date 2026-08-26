@@ -206,9 +206,9 @@ pointed at a network target. A `TieredStore` composes a fast local **cache tier*
 remote backend, with read-through, write-back batching, and **prefetch** of a manifest's chunks on open.
 
 **GC.** Chunks and objects are immutable and shared across branches, so deletion is **mark-and-sweep with
-refcounting from live refs**: roots = all branch/tag/HEAD refs + reflog + retained snapshots; walk commits→
-trees→blobs→chunks to build the live set; sweep unreferenced content after a grace period. GC takes a ref-set
-snapshot and never deletes anything reachable from a ref created during the sweep (see §7 race note).
+refcounting from live refs**: roots = all branch/tag/HEAD refs (incl. `MERGE_HEAD`), the live working tree of
+every workspace, pending suggestions, and each workspace's ref-mirror snapshot; walk commits→trees→blobs→chunks
+to build the live set; sweep unreferenced content after a grace period (see §7 race note).
 
 **At rest.** Per-chunk optional **zstd** compression and opt-in **XChaCha20-Poly1305** encryption (default off; a
 256-bit AEAD keyed by a raw 32-byte key or an **Argon2id**-derived passphrase key with a per-store salt — §7).
@@ -306,8 +306,11 @@ snapshots are O(change), not O(repo).
 
 ```
 ref(name TEXT PK, kind ENUM['branch','tag','head'], target_hash, updated_at, updated_by_actor)
-reflog(ref_name, old_hash, new_hash, actor_id, op, ts)   -- audit of ref moves
 ```
+
+There is **no reflog**. Ref moves are not separately journalled: `commit` and `merge` are already recorded in
+the change feed (`fs_event`) and in the op-log that produced them, and the ref table's own history is
+recoverable from the commit DAG. Adding one would be a new table and a new GC root; nothing depends on it today.
 
 Branch/tag creation = insert a ref pointing at a commit. `HEAD` per session points at a branch. Branch updates
 use **compare-and-swap** (`cas_ref`) so concurrent committers can't lose writes.
@@ -555,8 +558,6 @@ whiteout(workspace_id, branch, path TEXT, parent_path TEXT, created_at BIGINT,
 -- version control (refs mutable; commits/trees/blobs immutable in content store)
 ref(workspace_id BIGINT, name TEXT, kind TEXT, target_hash BYTEA, updated_at BIGINT,
     updated_by BIGINT, PRIMARY KEY(workspace_id, name));
-reflog(id BIGINT PK, workspace_id, ref_name TEXT, old_hash BYTEA, new_hash BYTEA,
-       actor_id BIGINT, op TEXT, ts BIGINT);
 lock(workspace_id, path TEXT, actor_id BIGINT, acquired_at BIGINT, expires_at BIGINT,
      PRIMARY KEY(workspace_id, path));   -- LFS-style binary locks
 conflict(id BIGINT PK, workspace_id, merge_ref TEXT, path TEXT, state TEXT, detail JSONB);
@@ -612,8 +613,9 @@ chunk  = raw bytes (in S3/local/inline)
    build new `blob` manifest → `set_manifest(ino, blob_hash, size)`. Bytes are now durable; history is not yet.
 
 **Commit:** walk dirty inodes → finalize manifests → build `tree` objects bottom-up (reuse unchanged subtrees)
-→ write `commit(root, parent=HEAD, author=actor)` → `cas_ref(branch, HEAD, commit)` → finalize `blame` for each
-changed blob version from `edit_op`s → append `reflog`.
+→ write `commit(root, parent=HEAD, author=actor)` → **flush the content store** (the C4 durability barrier: the
+commit and its trees must be durable before any ref can name them) → `cas_ref(branch, HEAD, commit)` → finalize
+`blame` for each changed blob version from `edit_op`s.
 
 **Create branch:** `cas_ref(new_name, None, current_commit)`; the working tree for the new branch starts as an
 overlay whose base is that commit (zero copy).
@@ -665,9 +667,13 @@ Either kind lands **attributed to the original author** with the approver record
 - **Postgres contention on a hot FS:** the only global-ish serialization is per-inode flush (advisory lock) and
   per-branch ref CAS. Directory and content writes ride MVCC. Read replicas absorb read load; `LISTEN/NOTIFY`
   avoids polling. This scales to many writers as long as they touch different inodes — the common case.
-- **GC racing live refs across branches:** GC snapshots the full ref-set (incl. reflog + retained snapshots)
-  under a marker; any ref created mid-sweep pins its closure; only content unreferenced *before* the marker and
-  past the grace period is swept. New chunks written during a sweep are pinned by an in-progress-write table.
+- **GC racing live refs across branches:** solved by an **age gate** rather than by the marker/pin-table scheme
+  originally sketched here, which was never built and is not needed. Content is written before the metadata
+  referencing it, so a write in flight is legitimately unreferenced; the sweep therefore skips anything younger
+  than the grace period, a deduplicating `put` refreshes an object that has gone stale (so a writer deduping
+  onto old content pulls it back inside the gate), and the sweep re-checks each object's age at the moment it
+  deletes it — a pass over a large store runs for minutes, and acting on the age it listed with would reopen
+  the same race with the sweep's own duration as the window. An advisory lease serializes collections.
 - **Immutable objects vs mutable inodes:** resolved by the index/working-tree materialization (§3) — mutation
   lives in the working tree, immutability in the object store, commit is the bridge.
 - **Metadata-DB loss (recovery):** the content store already holds a self-describing Merkle DAG
@@ -759,7 +765,7 @@ each write is, and a storage engine that agents point at untrusted code and untr
 | **M0 — Skeleton** | `MetadataStore` + `ContentStore` traits; SQLite + `LocalCasStore` impls; inode/dentry working tree; basic `read`/`write`/`ls` via SDK | A working in-DB-metadata / on-disk-content FS; proves the metadata↔content split |
 | **M1 — Content addressing + large files** | BLAKE3 + FastCDC chunking; blob manifests; dedup; range reads; **S3 backend** + tiered cache | **Object storage + large/remote files** (goal 1) |
 | **M2 — Postgres backend** | `MetadataStore` for Postgres; dialect layer; migrations; pooling; `LISTEN/NOTIFY` | **Pluggable DB + multi-writer** foundation (goal 2) |
-| **M3 — Versioning core (opt-in)** | commit/tree/blob objects; refs + reflog; `commit`/`log`/`checkout`/`diff`; overlay working tree over a base commit; per-workspace `versioning = off \| native \| git` switch | Real history + branches, opt-in (goal 3, part 1) |
+| **M3 — Versioning core (opt-in)** | commit/tree/blob objects; refs; `commit`/`log`/`checkout`/`diff`; overlay working tree over a base commit; per-workspace `versioning = off \| native \| git` switch | Real history + branches, opt-in (goal 3, part 1) |
 | **M4 — Merge** | merge base (LCA); diff3 text merge; conflict model; binary lock/both-kept policy; rebase/squash | **Gitflow branch + three-way merge** (goal 3, part 2) |
 | **M5 — Git interoperability (opt-in)** | git-compatible object mode (SHA-256 git objects); `git-remote-origofs` remote helper; git-LFS pointer bridge to the chunk store; import/export a real `.git` | **Drive origofs with the actual `git` CLI + GitHub** (goal 3, interop) |
 | **M6 — Attribution** | actor/session registry; `edit_op` capture wired through the write path; `blame` index; blame API + xattr; merge/rebase blame survival | **Per-actor attribution + blame** (goal 4) |

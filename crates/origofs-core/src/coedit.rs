@@ -881,11 +881,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     async fn put_opaque(&self, blob: &[u8]) -> Result<String> {
         Ok(match self.store_body(blob).await?.0 {
             Some(h) => h.to_hex(),
-            None => self
-                .content
-                .put(&crate::chunk::Manifest::default().encode()?)
-                .await?
-                .to_hex(),
+            // `store_empty_manifest` puts *and* flushes, so this path keeps the
+            // same durability barrier `store_body` gives the other one.
+            None => self.store_empty_manifest().await?.to_hex(),
         })
     }
 

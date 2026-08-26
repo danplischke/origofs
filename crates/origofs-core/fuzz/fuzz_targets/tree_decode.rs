@@ -11,7 +11,9 @@ use origofs_core::Tree;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(t) = Tree::decode(data) {
-        let re = t.encode();
+        // Anything that decoded came from bytes whose fields already fit the
+        // format, so re-encoding it cannot overflow a length field.
+        let re = t.encode().expect("a decoded tree must re-encode");
         let t2 = Tree::decode(&re).expect("re-encoded tree must decode");
         assert_eq!(t, t2, "tree encode→decode must be idempotent");
     }

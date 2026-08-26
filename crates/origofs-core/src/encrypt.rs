@@ -92,7 +92,23 @@ impl EncryptedStore {
         self.cipher
             .decrypt(&self.nonce_for(storage_key), ciphertext)
             .map_err(|_| {
-                OrigoFSError::Content(format!(
+                // `Corrupt`, not a generic `Content` error. A failed AEAD tag is an
+                // integrity failure on a stored object — the same event
+                // `VerifyingStore` reports as `Corrupt` — and the encrypted recipes
+                // deliberately do not stack a `VerifyingStore` (the AEAD already
+                // authenticates), so this is the *only* place an encrypted stack can
+                // report one. Reporting it as a plain content error put it in a
+                // different `code()`/`class()` bucket than the identical failure on
+                // every other stack, so an operator filtering for corruption saw
+                // nothing.
+                //
+                // A wrong key produces the same tag failure, hence the message: the
+                // two are cryptographically indistinguishable here.
+                tracing::warn!(
+                    hash = %storage_key.to_hex(),
+                    "content failed authenticated decryption"
+                );
+                OrigoFSError::Corrupt(format!(
                     "decryption failed for {storage_key} (wrong key or corrupt data)"
                 ))
             })
@@ -203,6 +219,16 @@ impl ContentStore for EncryptedStore {
     /// sweep's grace period (`ContentStore::touch`).
     async fn touch(&self, hash: &Hash) -> Result<()> {
         self.inner.touch(hash).await
+    }
+
+    /// Forwarded alongside `list_with_age`/`touch`: all three have to agree on one
+    /// clock, or the sweep's age gate reads a different one than it acts on.
+    async fn age_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        self.inner.age_of(hash).await
+    }
+
+    async fn delete_if_older_than(&self, hash: &Hash, min_age_secs: u64) -> Result<Option<u64>> {
+        self.inner.delete_if_older_than(hash, min_age_secs).await
     }
 
     /// Forwarded **unencrypted**, and necessarily so: the salt stored here is what

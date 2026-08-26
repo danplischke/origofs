@@ -9,7 +9,9 @@ use origofs_core::Commit;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(c) = Commit::decode(data) {
-        let re = c.encode();
+        // Anything that decoded came from bytes whose fields already fit the
+        // format, so re-encoding it cannot overflow a length field.
+        let re = c.encode().expect("a decoded commit must re-encode");
         let c2 = Commit::decode(&re).expect("re-encoded commit must decode");
         assert_eq!(c, c2, "commit encode→decode must be idempotent");
     }

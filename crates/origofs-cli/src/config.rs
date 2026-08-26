@@ -221,13 +221,13 @@ impl Config {
         }
 
         let ws = match (&self.metadata, &self.content) {
+            // Unencrypted from here down: the `enc` branch above returns for every
+            // backend combination, so re-checking it here was dead code that read
+            // as if this arm still handled encryption.
             (Metadata::Sqlite { path }, Content::Local { path: cas }) => {
                 let db = path.clone().unwrap_or_else(|| workspace.join("meta.db"));
                 let cas = cas.clone().unwrap_or_else(|| workspace.join("cas"));
-                match &enc {
-                    Some(k) => Workspace::open_local_encrypted(&db, &cas, k).await?,
-                    None => Workspace::open_local(&db, &cas).await?,
-                }
+                Workspace::open_local(&db, &cas).await?
             }
             (Metadata::Sqlite { .. }, Content::S3(s3)) => {
                 if s3.packed {

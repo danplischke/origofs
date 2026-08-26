@@ -42,7 +42,8 @@ async fn commit_bytes(store: &MemStore, message: &str) -> Vec<u8> {
                     hash: manifest,
                 }],
             }
-            .encode(),
+            .encode()
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -54,6 +55,7 @@ async fn commit_bytes(store: &MemStore, message: &str) -> Vec<u8> {
         timestamp: 1,
     }
     .encode()
+    .unwrap()
 }
 
 /// Rewrite an object's format-version byte, simulating a write by a future origofs.
@@ -223,7 +225,8 @@ async fn a_chunk_that_merely_starts_with_a_tag_is_not_counted() {
         message: "orphan".into(),
         timestamp: 1,
     }
-    .encode();
+    .encode()
+    .unwrap();
     store.put(&orphan).await.unwrap();
 
     let fs = fresh(store).await;

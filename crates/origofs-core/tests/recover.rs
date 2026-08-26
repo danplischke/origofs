@@ -38,7 +38,8 @@ async fn rebuild_infers_head_when_no_mirror() {
                     hash: manifest,
                 }],
             }
-            .encode(),
+            .encode()
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -51,7 +52,8 @@ async fn rebuild_infers_head_when_no_mirror() {
                 message: "c1".into(),
                 timestamp: 1,
             }
-            .encode(),
+            .encode()
+            .unwrap(),
         )
         .await
         .unwrap();
