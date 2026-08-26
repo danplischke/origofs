@@ -6,7 +6,6 @@
 //! These are the stable seams it uses; everything git-specific (object encoding,
 //! packfiles, LFS) lives in the `origofs-sdk` `git` module so origofs-core stays free of git deps.
 
-use crate::chunk::Manifest;
 use crate::content::ContentStore;
 use crate::engine::Fs;
 use crate::error::Result;
@@ -42,7 +41,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub async fn store_blob_bytes(&self, data: &[u8]) -> Result<Hash> {
         match self.store_body(data).await? {
             (Some(h), _) => Ok(h),
-            (None, _) => self.content.put(&Manifest::default().encode()?).await,
+            // Empty body: `store_empty_manifest` puts *and* flushes, so this path
+            // keeps the same durability barrier `store_body` gives the other one.
+            (None, _) => self.store_empty_manifest().await,
         }
     }
 
@@ -65,10 +66,30 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .and_then(|v| Hash::from_hex(&v)))
     }
 
-    /// Point a branch ref at `hash` (creating the ref if absent).
+    /// Point a branch ref at `hash` (creating the ref if absent), and refresh the
+    /// content-store ref mirror.
+    ///
+    /// The mirror refresh is not optional bookkeeping: `mirror_refs` is documented
+    /// as running after *every* ref-advancing operation, and it is what lets
+    /// `fsck --rebuild` recover branch names and tips from the bucket alone. This
+    /// used to skip it — the one in-tree caller (`git import`) was rescued by the
+    /// `checkout` on the next line, but any other caller left the mirror at its
+    /// previous generation, so a rebuild after a metadata-DB loss silently restored
+    /// a stale tip or dropped the branch outright.
+    ///
+    /// The C4 durability barrier is taken here rather than left to the caller.
+    /// This is the seam an importer uses after putting fresh commit and tree
+    /// objects through [`put_object`](Self::put_object), which does not flush — so
+    /// on a batching backend the history being named still lived in `PackStore`'s
+    /// in-memory buffer. Flushing inside the one operation that publishes a ref
+    /// makes the barrier impossible to forget, and it is a cheap no-op on every
+    /// backend that writes through.
     pub async fn set_branch(&self, branch: &str, hash: Hash) -> Result<()> {
         crate::engine::validate_ref_name(branch)?;
-        self.meta.set_ref(branch, &hash.to_hex()).await
+        self.content.flush().await?;
+        self.meta.set_ref(branch, &hash.to_hex()).await?;
+        // The ref has already advanced; see `mirror_refs_post_commit`.
+        self.mirror_refs_post_commit().await
     }
 
     /// Compare-and-swap a branch onto `new`, expecting it to currently be at

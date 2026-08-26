@@ -39,14 +39,18 @@ fn pack_bytes(chunks: &[&[u8]], version: u8) -> Vec<u8> {
     buf
 }
 
-/// Hand-build an index entry at an arbitrary version, likewise.
+/// Hand-build an index entry at an arbitrary version, likewise. v1 entries end
+/// after the body; v2 appends the addressing flag (0 = content-addressed).
 fn index_entry(pack: Hash, offset: u32, len: u32, version: u8) -> Vec<u8> {
-    let mut e = Vec::with_capacity(45);
+    let mut e = Vec::with_capacity(46);
     e.extend_from_slice(b"ORGI");
     e.push(version);
     e.extend_from_slice(pack.as_bytes());
     e.extend_from_slice(&offset.to_le_bytes());
     e.extend_from_slice(&len.to_le_bytes());
+    if version >= 2 {
+        e.push(0);
+    }
     e
 }
 
@@ -66,8 +70,12 @@ async fn sealed_packs_and_index_entries_are_tagged() {
     );
 
     let entry = index.get(&chunk).await.unwrap();
-    assert_eq!(&entry[..5], b"ORGI\x01", "index entry header");
-    assert_eq!(entry.len(), 45, "5-byte header + the 40-byte body");
+    assert_eq!(&entry[..5], b"ORGI\x02", "index entry header");
+    assert_eq!(entry.len(), 46, "5-byte header + the 41-byte body");
+    assert_eq!(
+        entry[45], 0,
+        "a chunk written through `put` is content-addressed"
+    );
 }
 
 /// The read path is a ranged GET at the recorded offset, so the footer must not
@@ -151,7 +159,7 @@ async fn a_too_new_index_entry_is_refused() {
     let a = b"a chunk".as_slice();
     let pack = data.put(&pack_bytes(&[a], 1)).await.unwrap();
     index
-        .put_keyed(&Hash::of(a), &index_entry(pack, 0, a.len() as u32, 2))
+        .put_keyed(&Hash::of(a), &index_entry(pack, 0, a.len() as u32, 3))
         .await
         .unwrap();
 
@@ -168,8 +176,9 @@ async fn a_too_new_index_entry_is_refused() {
 #[tokio::test]
 async fn an_untagged_or_short_index_entry_is_malformed() {
     let a = b"a chunk".as_slice();
-    // 40 zero bytes: the body with no header at all. 45 with a wrong tag. 41: short.
-    for entry in [vec![0u8; 40], vec![0u8; 45], vec![0u8; 41]] {
+    // 40 zero bytes: the body with no header at all. 46 with a wrong tag. 41:
+    // a v2-length body behind no header.
+    for entry in [vec![0u8; 40], vec![0u8; 46], vec![0u8; 41]] {
         let (store, _data, index) = packed(1 << 20);
         index.put_keyed(&Hash::of(a), &entry).await.unwrap();
 
@@ -184,4 +193,128 @@ async fn an_untagged_or_short_index_entry_is_malformed() {
         );
         assert_eq!(err.code(), "content_error");
     }
+}
+
+/// A **keyed** value — one a transforming layer stored under an address that is
+/// deliberately not its hash, as `EncryptedStore` does with ciphertext — survives
+/// a repack instead of being reported as corruption.
+///
+/// This is the encrypted+packed composition `origofs-cli` builds whenever
+/// `ORIGOFS_ENCRYPTION_KEY` is set alongside `packed = true`. Repack used to
+/// re-hash every survivor and refuse a mismatch, which is true of every chunk in
+/// that stack, so the first partially-dead pack failed the whole operation with a
+/// `Corrupt` error and its dead space was unreclaimable for good.
+#[tokio::test]
+async fn a_repack_keeps_values_whose_key_is_not_their_hash() {
+    let (store, data, _index) = packed(1 << 20);
+    let keep = Hash::of(b"address of the kept value");
+    let drop = Hash::of(b"address of the dropped value");
+
+    // Ciphertext-shaped: the bytes do not hash to the key they are stored under.
+    store
+        .put_keyed(&keep, b"opaque bytes for keep")
+        .await
+        .unwrap();
+    store
+        .put_keyed(&drop, b"opaque bytes for drop")
+        .await
+        .unwrap();
+    store.flush().await.unwrap();
+    assert_eq!(data.list().await.unwrap().len(), 1, "one sealed pack");
+
+    // Drop one so the pack is partially dead — the branch that rewrites survivors.
+    store.delete(&drop).await.unwrap();
+    store.repack().await.unwrap();
+
+    assert_eq!(
+        &store.get(&keep).await.unwrap()[..],
+        b"opaque bytes for keep",
+        "the surviving keyed value must still read back"
+    );
+    assert!(
+        store.get(&drop).await.is_err(),
+        "the dropped value must be gone"
+    );
+}
+
+/// The flag round-trips: a keyed value's index entry records that it is *not*
+/// content-addressed, which is what tells a later repack to skip re-hashing it.
+#[tokio::test]
+async fn an_index_entry_records_how_its_value_is_addressed() {
+    let (store, _data, index) = packed(1 << 20);
+    let content = store.put(b"addressed by its own hash").await.unwrap();
+    let keyed = Hash::of(b"some other address");
+    store
+        .put_keyed(&keyed, b"bytes that hash to something else")
+        .await
+        .unwrap();
+    store.flush().await.unwrap();
+
+    assert_eq!(
+        index.get(&content).await.unwrap()[45],
+        0,
+        "content-addressed"
+    );
+    assert_eq!(index.get(&keyed).await.unwrap()[45], 1, "keyed");
+}
+
+/// A **v1** entry whose bytes do not hash to its key leaves the pack alone rather
+/// than failing the whole repack.
+///
+/// v1 carries no addressing flag, so this is either corruption or a keyed value
+/// written before the flag existed — indistinguishable. Skipping is the one action
+/// that is safe under both readings: nothing is laundered into a fresh pack and no
+/// evidence is deleted, which is what the integrity check exists for. It also
+/// un-breaks legacy encrypted+packed stores, whose every entry looks like this.
+#[tokio::test]
+async fn a_v1_entry_that_cannot_be_verified_leaves_its_pack_alone() {
+    let (store, data, index) = packed(1 << 20);
+    // Two chunks in a pack, indexed under keys that are *not* their hashes.
+    let a = b"opaque bytes one".as_slice();
+    let b = b"opaque bytes two".as_slice();
+    let key_a = Hash::of(b"address of a");
+    let key_b = Hash::of(b"address of b");
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(a);
+    buf.extend_from_slice(b);
+    let body_len = buf.len();
+    for (k, c) in [(key_a, a), (key_b, b)] {
+        buf.extend_from_slice(k.as_bytes());
+        buf.extend_from_slice(&(c.len() as u32).to_le_bytes());
+    }
+    let tlen = (buf.len() - body_len) as u32;
+    buf.extend_from_slice(&tlen.to_le_bytes());
+    buf.extend_from_slice(b"ORGP");
+    buf.push(1);
+    let pack = data.put(&buf).await.unwrap();
+
+    index
+        .put_keyed(&key_a, &index_entry(pack, 0, a.len() as u32, 1))
+        .await
+        .unwrap();
+    index
+        .put_keyed(
+            &key_b,
+            &index_entry(pack, a.len() as u32, b.len() as u32, 1),
+        )
+        .await
+        .unwrap();
+
+    // Kill one so the pack is partially dead — the branch that verifies survivors.
+    store.delete(&key_a).await.unwrap();
+    store
+        .repack()
+        .await
+        .expect("an unverifiable v1 entry must not fail the whole repack");
+
+    assert!(
+        data.has(&pack).await.unwrap(),
+        "the pack must be left in place, not deleted"
+    );
+    assert_eq!(
+        &store.get(&key_b).await.unwrap()[..],
+        b,
+        "the surviving value must still read back"
+    );
 }

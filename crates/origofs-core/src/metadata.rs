@@ -4,7 +4,7 @@
 
 use crate::attribution::{Actor, ActorInit, EditOp, EditOpInit, ToolCallInit, WritePolicy};
 use crate::collab::{Event, EventInit, LiveDoc, Presence};
-use crate::error::Result;
+use crate::error::{OrigoFSError, Result};
 use crate::suggest::{Suggestion, SuggestionInit, SuggestionStatus};
 use crate::types::{DirEntry, Hash, Ino, Inode, InodeInit};
 use async_trait::async_trait;
@@ -21,6 +21,16 @@ pub trait MetadataStore: Send + Sync {
     /// The highest migration version currently applied to this store (0 if it has
     /// never been initialized). Compare with [`crate::latest_schema_version`] to
     /// tell whether a `migrate`/`init` would advance the schema.
+    ///
+    /// After a **failed or interrupted** `init` the two backends legitimately
+    /// differ, and a caller comparing versions should expect it: SQLite commits
+    /// each migration in its own transaction, so it reports the last one that
+    /// succeeded, while Postgres runs the whole bootstrap as one transaction and
+    /// reports the pre-`init` value. Both are internally consistent — every
+    /// reported version is fully applied — and the difference is only in how much
+    /// of a partial run survives. Per-migration commits are deliberate on SQLite:
+    /// a long chain in one transaction is what a slow, single-connection store can
+    /// least afford to retry from scratch.
     async fn schema_version(&self) -> Result<i64>;
 
     /// A cheap liveness probe of the metadata backend, for the readiness endpoint
@@ -280,6 +290,11 @@ pub trait MetadataStore: Send + Sync {
     /// Append an event to the change feed, returning its monotonic `seq`.
     async fn append_event(&self, ev: EventInit, ts: i64) -> Result<i64>;
     /// Events strictly after `after_seq`, oldest first, capped at `limit`.
+    ///
+    /// A negative `limit` is a caller bug and returns
+    /// [`OrigoFSError::InvalidArgument`] on every backend. Left undefined it was a
+    /// live divergence: SQLite reads a negative `LIMIT` as *unbounded* and returned
+    /// the entire feed, while Postgres rejected the query outright.
     async fn events_since(&self, after_seq: i64, limit: i64) -> Result<Vec<Event>>;
     /// Upsert a session's presence heartbeat (and current path).
     async fn touch_presence(
@@ -745,4 +760,19 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
             .resolve_suggestion(id, status, resolved_by, ts)
             .await
     }
+}
+
+/// Reject a negative row limit, so both backends answer a caller bug the same way.
+///
+/// The two dialects disagree natively: SQLite treats a negative `LIMIT` as
+/// unbounded and returns every row, Postgres refuses the query with a backend
+/// error. Neither is a contract, so the trait names one — see
+/// [`MetadataStore::events_since`].
+pub(crate) fn reject_negative_limit(limit: i64) -> Result<()> {
+    if limit < 0 {
+        return Err(OrigoFSError::InvalidArgument(format!(
+            "row limit must not be negative (got {limit})"
+        )));
+    }
+    Ok(())
 }

@@ -100,11 +100,25 @@ pub(crate) const PACK: ObjectKind = ObjectKind {
 };
 
 /// Pack index entry ([`crate::pack::PackStore`]).
+///
+/// v2 appends an addressing flag: whether the value stored under this key is
+/// `BLAKE3(value)` (so `repack` can re-hash it) or was written by a transforming
+/// layer that owns the address ([`EncryptedStore`](crate::encrypt::EncryptedStore)
+/// storing ciphertext under the plaintext hash). v1 entries carry no flag and are
+/// decoded as *unknown* — see `pack.rs`.
+///
+/// Rule 3 ("ship the reader before the writer") is deliberately taken in one step
+/// here, unlike the object-graph kinds. A pack index is a private detail of one
+/// backend — excluded from [`GRAPH_KINDS`] for exactly that reason — and it is
+/// node-local rather than shared through the bucket, so there is no mixed-version
+/// fleet reading one another's entries. An older binary that does meet a v2 entry
+/// reports `UnsupportedVersion` ("upgrade origofs"), never corruption, and v1
+/// entries stay readable forever.
 pub(crate) const PACK_INDEX: ObjectKind = ObjectKind {
     tag: b"ORGI",
     name: "pack index entry",
-    write_version: 1,
-    max_read_version: 1,
+    write_version: 2,
+    max_read_version: 2,
 };
 
 /// Every object kind whose version a *store* has to account for. Excludes the

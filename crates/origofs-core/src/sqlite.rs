@@ -123,6 +123,47 @@ fn is_duplicate_column(e: &rusqlite::Error) -> bool {
     e.to_string().contains("duplicate column name")
 }
 
+/// Split a migration's SQL into individual statements.
+///
+/// The runner tolerates a duplicate-column error so a re-applied `ADD COLUMN` is a
+/// no-op (SQLite has no `IF NOT EXISTS` for it). That tolerance has to be
+/// **per statement**: `execute_batch` stops at the first failing statement, so
+/// swallowing the error there and stamping the version recorded a migration as
+/// applied while everything after the duplicate column had silently not run. V11
+/// is the dangerous shape — it adds a column *before* rebuilding four tables to
+/// widen their primary keys — so the re-apply the tolerance exists for left `ref`
+/// on its old `name`-only key while claiming V11 was done, and every later
+/// `set_ref`/`cas_ref` (`ON CONFLICT(workspace_id, name)`) failed. Postgres, whose
+/// statements each carry `IF NOT EXISTS`, self-heals the same state.
+///
+/// Splitting is on `;` outside single-quoted strings; toggling on each quote also
+/// handles SQLite's doubled-quote escape (`''` toggles off then straight back on).
+/// These are DDL migrations authored in this file — no dollar-quoting, no
+/// semicolons in identifiers.
+fn sql_statements(sql: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut in_quote = false;
+    let mut start = 0;
+    for (i, c) in sql.char_indices() {
+        match c {
+            '\'' => in_quote = !in_quote,
+            ';' if !in_quote => {
+                let stmt = sql[start..i].trim();
+                if !stmt.is_empty() {
+                    out.push(stmt);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
 /// Clear only workspace `ws`'s working tree (checkout/merge/rebuild). `dentry` and
 /// `symlink` carry no `workspace_id`, so they are cleared via inode ownership; the
 /// workspace's own root inode is kept. Blame (keyed by content hash) is untouched.
@@ -168,13 +209,17 @@ impl MetadataStore for SqliteMetadataStore {
                 // can never leave a migration half-applied (its bookkeeping absent),
                 // which would brick the next `init` on a non-idempotent step.
                 let tx = conn.transaction()?;
-                match tx.execute_batch(m.sqlite) {
-                    Ok(()) => {}
-                    // Idempotency for a re-applied `ADD COLUMN` (SQLite lacks
-                    // `IF NOT EXISTS`): the column is already present, so the schema
-                    // is correct — record the version and continue.
-                    Err(e) if is_duplicate_column(&e) => {}
-                    Err(e) => return Err(e.into()),
+                for stmt in sql_statements(m.sqlite) {
+                    match tx.execute_batch(stmt) {
+                        Ok(()) => {}
+                        // Idempotency for a re-applied `ADD COLUMN` (SQLite lacks
+                        // `IF NOT EXISTS`): the column is already present, so this
+                        // statement's work is done — skip it and run the rest of the
+                        // migration. Per statement, not per migration: see
+                        // `sql_statements`.
+                        Err(e) if is_duplicate_column(&e) => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 tx.execute(
                     "INSERT INTO schema_meta(version, applied_at) VALUES (?1, ?2)",
@@ -365,10 +410,21 @@ impl MetadataStore for SqliteMetadataStore {
     async fn set_content(&self, ino: Ino, content: Option<Hash>, size: u64) -> Result<()> {
         blocking_section(move || {
             let conn = self.lock();
-            conn.execute(
+            let n = conn.execute(
                 "UPDATE inode SET content_hash = ?1, size = ?2, mtime = ?3, ctime = ?3 WHERE ino = ?4",
                 params![content.map(|h| h.to_hex()), size as i64, now_secs(), ino],
             )?;
+            // A zero-row update means the inode was unlinked while the content was
+            // being written, and reporting that as success loses the write
+            // silently. Both `MetaTxn::set_content` implementations already checked
+            // this and so did the Postgres store; this one returned `Ok(())`
+            // unconditionally, so the same race was an error on one backend and an
+            // acknowledged-but-lost write on the other.
+            if n == 0 {
+                return Err(OrigoFSError::NotFound(format!(
+                    "inode {ino} was removed before its content could be written"
+                )));
+            }
             Ok(())
         })
     }
@@ -679,14 +735,29 @@ impl MetadataStore for SqliteMetadataStore {
         blocking_section(move || {
             let conn = self.lock();
             // One atomic upsert: create at 1, else increment the stored integer.
-            let v: i64 = conn.query_row(
-                "INSERT INTO config(workspace_id, key, value) VALUES (?1, ?2, '1')
-                 ON CONFLICT(workspace_id, key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
-                 RETURNING CAST(value AS INTEGER)",
-                params![self.workspace_id, key],
-                |r| r.get(0),
-            )?;
-            Ok(v)
+            //
+            // The `WHERE` is what keeps this honest on a non-integer value.
+            // SQLite's `CAST` never fails — it takes the numeric prefix and yields
+            // 0 for text — so a key holding `"abc"` silently reset the counter to 1
+            // and `"3.7"` became 4, while Postgres's `value::bigint` raised. The
+            // round-trip comparison admits exactly the values this method itself
+            // writes (a plain decimal integer) and rejects the rest, leaving the
+            // row untouched and returning no row.
+            let v: Option<i64> = conn
+                .query_row(
+                    "INSERT INTO config(workspace_id, key, value) VALUES (?1, ?2, '1')
+                     ON CONFLICT(workspace_id, key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+                       WHERE CAST(CAST(value AS INTEGER) AS TEXT) = value
+                     RETURNING CAST(value AS INTEGER)",
+                    params![self.workspace_id, key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            v.ok_or_else(|| {
+                OrigoFSError::InvalidArgument(format!(
+                    "config key {key:?} does not hold an integer, so it cannot be used as a counter"
+                ))
+            })
         })
     }
 
@@ -1137,6 +1208,9 @@ impl MetadataStore for SqliteMetadataStore {
     }
 
     async fn events_since(&self, after_seq: i64, limit: i64) -> Result<Vec<Event>> {
+        // SQLite reads a negative LIMIT as unbounded; rejecting it here keeps the
+        // two backends answering the same way. See the trait.
+        crate::metadata::reject_negative_limit(limit)?;
         blocking_section(move || {
             let conn = self.lock();
             let mut stmt = conn.prepare(

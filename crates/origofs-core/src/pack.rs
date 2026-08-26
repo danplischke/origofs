@@ -14,6 +14,14 @@
 //! storage: small index local, big packed data remote — the layout restic, borg,
 //! and git packfiles use.
 //!
+//! **One index per data store.** The index is what makes a chunk reachable, so two
+//! `PackStore`s sharing a bucket with separate indexes do not see each other's
+//! chunks — and, worse, each reads the other's packs as garbage, because a pack no
+//! index entry points into is exactly how `repack` recognizes dead space. The
+//! packed recipes in `origofs-sdk` state the constraint; [`PackStore::owns_data_store`]
+//! enforces the destructive half of it, so a second index cannot delete the
+//! first's packs even if a deployment gets it wrong.
+//!
 //! # What batching actually buys, and where it stops
 //!
 //! Batching is **within a write, not across writes**, and it is worth being precise
@@ -56,11 +64,61 @@ use crate::types::Hash;
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Default target size for a sealed pack (4 MiB).
 pub const DEFAULT_PACK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Sidecar name under which a pack index claims its data store — see
+/// [`PackStore::owns_data_store`]. Written to both stores: in the index it is this
+/// index's identity, in the data store it is the identity of the index that owns
+/// it.
+const PACK_OWNER_SIDECAR: &str = "packowner";
+
+/// How the value stored under an index key relates to that key — i.e. whether
+/// [`PackStore::do_repack`] may re-hash the bytes to check them.
+///
+/// `put_keyed` exists for transforming layers that own the addressing invariant
+/// themselves: [`EncryptedStore`](crate::encrypt::EncryptedStore) stores
+/// *ciphertext* under the *plaintext* hash so dedup survives encryption. A pack
+/// index therefore holds two kinds of entry, and repack's integrity check applies
+/// to exactly one of them. Assuming every entry was content-addressed made
+/// `repack` fail with a spurious `Corrupt` on the first partially-dead pack of any
+/// encrypted+packed store — the composition `origofs-cli` builds whenever
+/// `ORIGOFS_ENCRYPTION_KEY` is set alongside `packed = true`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Addressing {
+    /// `key == BLAKE3(value)`. Re-hashable, so a mismatch on repack is corruption.
+    Content,
+    /// A transforming layer owns the address. Not re-hashable here; its own
+    /// integrity check (an AEAD tag) runs when the value is read back through it.
+    Keyed,
+    /// A v1 entry, written before the flag existed. A mismatch could be either of
+    /// the above, so repack cannot call it corruption — see `do_repack`.
+    Legacy,
+}
+
+impl Addressing {
+    /// Classify by the one thing that actually decides it. Exact: ciphertext
+    /// hashing to its plaintext key would be a BLAKE3 preimage.
+    fn of(key: &Hash, bytes: &[u8]) -> Self {
+        if key == &Hash::of(bytes) {
+            Self::Content
+        } else {
+            Self::Keyed
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            // `Legacy` is a decode-only state: v1 entries have no flag byte, and
+            // nothing writes v1 any more.
+            Self::Content | Self::Legacy => 0,
+            Self::Keyed => 1,
+        }
+    }
+}
 
 /// Where a chunk lives inside a pack.
 #[derive(Clone, Copy)]
@@ -68,29 +126,46 @@ struct PackLoc {
     pack: Hash,
     offset: u32,
     len: u32,
+    addressing: Addressing,
 }
 
-/// Body of an index entry: `pack(32) ‖ offset(4) ‖ len(4)`.
-const LOC_BODY: usize = 40;
-/// A whole entry: the body behind an `ORGI ‖ version` header.
-const LOC_ENTRY: usize = format::HEADER_LEN + LOC_BODY;
+/// Body of a v1 index entry: `pack(32) ‖ offset(4) ‖ len(4)`.
+const LOC_BODY_V1: usize = 40;
+/// Body of a v2 entry: v1's body plus the addressing flag.
+const LOC_BODY_V2: usize = LOC_BODY_V1 + 1;
+/// A whole v1 entry: the body behind an `ORGI ‖ version` header.
+const LOC_ENTRY_V1: usize = format::HEADER_LEN + LOC_BODY_V1;
+/// A whole v2 entry.
+const LOC_ENTRY_V2: usize = format::HEADER_LEN + LOC_BODY_V2;
 
 impl PackLoc {
-    /// `ORGI ‖ version ‖ pack(32) ‖ offset(4) ‖ len(4)`.
-    fn encode(&self) -> [u8; LOC_ENTRY] {
-        let mut out = [0u8; LOC_ENTRY];
+    /// `ORGI ‖ version ‖ pack(32) ‖ offset(4) ‖ len(4) ‖ addressing(1)`.
+    fn encode(&self) -> [u8; LOC_ENTRY_V2] {
+        let mut out = [0u8; LOC_ENTRY_V2];
         out[..format::HEADER_LEN].copy_from_slice(&format::PACK_INDEX.header());
         let body = &mut out[format::HEADER_LEN..];
         body[..32].copy_from_slice(self.pack.as_bytes());
         body[32..36].copy_from_slice(&self.offset.to_le_bytes());
         body[36..40].copy_from_slice(&self.len.to_le_bytes());
+        body[40] = self.addressing.code();
         out
     }
 
     fn decode(b: &[u8]) -> Result<Self> {
-        let body = match format::PACK_INDEX.version_of(b)? {
-            1 if b.len() == LOC_ENTRY => &b[format::HEADER_LEN..],
-            1 => return Err(format::PACK_INDEX.malformed()),
+        // v1 entries stay readable forever (format rule 2); they simply cannot say
+        // which kind of value they point at.
+        let (body, addressing) = match format::PACK_INDEX.version_of(b)? {
+            1 if b.len() == LOC_ENTRY_V1 => (&b[format::HEADER_LEN..], Addressing::Legacy),
+            2 if b.len() == LOC_ENTRY_V2 => {
+                let body = &b[format::HEADER_LEN..];
+                let addressing = match body[40] {
+                    0 => Addressing::Content,
+                    1 => Addressing::Keyed,
+                    _ => return Err(format::PACK_INDEX.malformed()),
+                };
+                (body, addressing)
+            }
+            1 | 2 => return Err(format::PACK_INDEX.malformed()),
             v => return Err(format::PACK_INDEX.unsupported(v)),
         };
         let mut pack = [0u8; 32];
@@ -99,16 +174,37 @@ impl PackLoc {
             pack: Hash::from_array(pack),
             offset: u32::from_le_bytes(body[32..36].try_into().unwrap()),
             len: u32::from_le_bytes(body[36..40].try_into().unwrap()),
+            addressing,
         })
     }
+}
+
+/// A chunk buffered in the open pack, with the addressing its index entry will
+/// record when the pack is sealed.
+struct Staged {
+    bytes: Bytes,
+    addressing: Addressing,
 }
 
 /// The open, not-yet-sealed pack.
 #[derive(Default)]
 struct Pending {
     order: Vec<Hash>,
-    resident: HashMap<Hash, Bytes>,
+    resident: HashMap<Hash, Staged>,
     size: usize,
+}
+
+/// What a `stage` call should do when the key is already known.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StageMode {
+    /// Skip the write if the chunk is already buffered or already indexed,
+    /// refreshing its recency instead. The normal write path.
+    Dedup,
+    /// Write it even though the index already has an entry — the repack path,
+    /// which is deliberately moving a chunk that is already indexed elsewhere.
+    Force,
+    /// Overwrite whatever is there. See [`ContentStore::replace_keyed`].
+    Replace,
 }
 
 /// A content store that packs many chunks into few objects (see module docs).
@@ -141,14 +237,20 @@ impl PackStore {
         }
     }
 
-    async fn stage(&self, key: Hash, bytes: &[u8], dedup: bool) -> Result<()> {
-        {
+    async fn stage(
+        &self,
+        key: Hash,
+        bytes: &[u8],
+        mode: StageMode,
+        addressing: Addressing,
+    ) -> Result<()> {
+        if mode != StageMode::Replace {
             let p = self.pending.lock();
             if p.resident.contains_key(&key) {
                 return Ok(());
             }
         }
-        if dedup && self.index.has(&key).await? {
+        if mode == StageMode::Dedup && self.index.has(&key).await? {
             // Deduplicated onto a chunk that is already packed. Its liveness for
             // GC is its *index entry's* age (see `list_with_age`), so refresh
             // that entry — otherwise a sweep can reclaim the pack holding a chunk
@@ -159,11 +261,18 @@ impl PackStore {
         }
         let full = {
             let mut p = self.pending.lock();
-            if p.resident.contains_key(&key) {
-                return Ok(());
+            let staged = Staged {
+                bytes: Bytes::copy_from_slice(bytes),
+                addressing,
+            };
+            match p.resident.insert(key, staged) {
+                // Replacing a buffered chunk: it keeps its place in `order`, and
+                // only the size delta needs accounting.
+                Some(old) => {
+                    p.size = p.size.saturating_sub(old.bytes.len());
+                }
+                None => p.order.push(key),
             }
-            p.resident.insert(key, Bytes::copy_from_slice(bytes));
-            p.order.push(key);
             p.size += bytes.len();
             p.size >= self.target
         };
@@ -183,7 +292,13 @@ impl PackStore {
                 return Ok(());
             }
             let order = p.order.clone();
-            let chunks: Vec<Bytes> = order.iter().map(|h| p.resident[h].clone()).collect();
+            let chunks: Vec<(Bytes, Addressing)> = order
+                .iter()
+                .map(|h| {
+                    let s = &p.resident[h];
+                    (s.bytes.clone(), s.addressing)
+                })
+                .collect();
             (order, chunks)
         };
 
@@ -211,15 +326,15 @@ impl PackStore {
             ))
         };
         let mut buf = Vec::new();
-        let mut locs: Vec<(Hash, u32, u32)> = Vec::with_capacity(order.len());
-        for (h, b) in order.iter().zip(&chunks) {
+        let mut locs: Vec<(Hash, u32, u32, Addressing)> = Vec::with_capacity(order.len());
+        for (h, (b, addressing)) in order.iter().zip(&chunks) {
             let offset = u32::try_from(buf.len()).map_err(|_| too_large("offset", buf.len()))?;
             let len = u32::try_from(b.len()).map_err(|_| too_large("chunk", b.len()))?;
             buf.extend_from_slice(b);
-            locs.push((*h, offset, len));
+            locs.push((*h, offset, len, *addressing));
         }
         let body_len = buf.len();
-        for (h, _, len) in &locs {
+        for (h, _, len, _) in &locs {
             buf.extend_from_slice(h.as_bytes());
             buf.extend_from_slice(&len.to_le_bytes());
         }
@@ -229,11 +344,12 @@ impl PackStore {
         buf.extend_from_slice(&format::PACK.header());
 
         let pack = self.data.put(&buf).await?;
-        for (h, offset, len) in &locs {
+        for (h, offset, len, addressing) in &locs {
             let loc = PackLoc {
                 pack,
                 offset: *offset,
                 len: *len,
+                addressing: *addressing,
             };
             // `replace_keyed`, not `put_keyed`: on a repack this chunk already has
             // an index entry pointing into the *old* pack, and insert-if-absent
@@ -244,10 +360,10 @@ impl PackStore {
         // Drop the sealed chunks; keep anything appended during the seal.
         let mut p = self.pending.lock();
         for h in &order {
-            if let Some(b) = p.resident.remove(h) {
+            if let Some(s) = p.resident.remove(h) {
                 // Saturating: a bookkeeping slip must not panic while holding
                 // the buffer lock.
-                p.size = p.size.saturating_sub(b.len());
+                p.size = p.size.saturating_sub(s.bytes.len());
             }
         }
         let Pending {
@@ -265,14 +381,87 @@ impl PackStore {
         }
     }
 
+    /// This pack index's stable identity, created on first use and kept in the
+    /// **index** store's sidecar namespace (invisible to `list`, so GC cannot
+    /// sweep it).
+    async fn index_identity(&self) -> Result<Option<Vec<u8>>> {
+        // A token, not a secret: it only has to differ between two index
+        // directories, and it is written once and then read back forever after. So
+        // it is derived from the things that separate two live creators — wall
+        // clock, process, and a per-call counter — rather than pulling a CSPRNG
+        // into a crate that otherwise needs none.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut h = blake3::Hasher::new();
+        h.update(&nanos.to_le_bytes());
+        h.update(&std::process::id().to_le_bytes());
+        h.update(
+            &SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_le_bytes(),
+        );
+        let fresh = *h.finalize().as_bytes();
+
+        match self
+            .index
+            .put_sidecar_if_absent(PACK_OWNER_SIDECAR, &fresh)
+            .await
+        {
+            Ok(id) => Ok(Some(id)),
+            // A custom index backend without sidecar support cannot answer the
+            // ownership question either way; the caller falls back to the historical
+            // assumption that it is the only writer.
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Whether this pack store is the **only** one addressing its data store, and
+    /// so may delete a pack that its index no longer references.
+    ///
+    /// `repack` reclaims a pack by observing that no index entry points into it.
+    /// That inference holds only if this index is the sole index over this data
+    /// store. The packed recipes already require that ("single-writer-per-index"),
+    /// but they frame it as a dedup-visibility caveat — two nodes simply not seeing
+    /// each other's chunks — when the sharper consequence is here: a pack written
+    /// by node B has no entry in node A's index, so A's repack reads it as garbage
+    /// and deletes it from the shared bucket.
+    ///
+    /// So the constraint is checked rather than assumed. The index claims the data
+    /// store by writing its identity into a create-if-absent sidecar; if the claim
+    /// comes back as someone else's, this store is shared and pack deletion is off.
+    /// An unclaimed store (every store that predates this) is claimed on the first
+    /// repack, which is correct for the single-writer deployments that are the norm.
+    async fn owns_data_store(&self) -> Result<bool> {
+        let Some(id) = self.index_identity().await? else {
+            return Ok(true);
+        };
+        match self
+            .data
+            .put_sidecar_if_absent(PACK_OWNER_SIDECAR, &id)
+            .await
+        {
+            Ok(claim) => Ok(claim == id),
+            // Same fallback as above: a backend that cannot answer keeps the
+            // historical behaviour rather than silently disabling reclamation.
+            Err(_) => Ok(true),
+        }
+    }
+
     async fn do_repack(&self) -> Result<u64> {
         self.seal().await?;
+        let exclusive = self.owns_data_store().await?;
 
-        // pack -> the chunks the index still points into it.
-        let mut live_by_pack: HashMap<Hash, HashSet<Hash>> = HashMap::new();
+        // pack -> the chunks the index still points into it, and how each is
+        // addressed (which decides whether repack may re-hash it).
+        let mut live_by_pack: HashMap<Hash, HashMap<Hash, Addressing>> = HashMap::new();
         for chunk in self.index.list().await? {
             if let Some(loc) = self.locate(&chunk).await? {
-                live_by_pack.entry(loc.pack).or_default().insert(chunk);
+                live_by_pack
+                    .entry(loc.pack)
+                    .or_default()
+                    .insert(chunk, loc.addressing);
             }
         }
 
@@ -283,7 +472,22 @@ impl PackStore {
             let live = live_by_pack.remove(&pack).unwrap_or_default();
 
             if live.is_empty() {
-                reclaimed += self.data.delete(&pack).await?; // fully dead
+                // Fully dead *according to this index*, which is the same thing as
+                // fully dead only when no other index addresses these packs — see
+                // `owns_data_store`. A pack another node wrote has no entry here
+                // and is indistinguishable from garbage, so deleting on this
+                // evidence alone is what destroys it.
+                if !exclusive {
+                    tracing::warn!(
+                        pack = %pack.to_hex(),
+                        members = members.len(),
+                        "not reclaiming a pack with no live chunks: this data store is claimed \
+                         by a different pack index, so the pack may belong to another node \
+                         rather than being garbage"
+                    );
+                    continue;
+                }
+                reclaimed += self.data.delete(&pack).await?;
             } else if live.len() < members.len() {
                 // Partially dead: move survivors into a fresh pack, then drop the
                 // old one.
@@ -304,15 +508,49 @@ impl PackStore {
                 // pointers untouched; a crash after it leaves the old pack
                 // unreferenced, which the next repack reclaims. Every intermediate
                 // state keeps each live chunk reachable.
+                //
+                // Verification runs over every survivor *before* any of them is
+                // staged, so a pack that cannot be verified is left untouched
+                // rather than half-moved.
+                let mut survivors: Vec<(Hash, Bytes, Addressing)> = Vec::with_capacity(live.len());
+                let mut unverifiable = false;
                 for (h, offset, len) in &members {
-                    if live.contains(h) {
-                        let slice = bytes.slice(*offset as usize..(*offset + *len) as usize);
-                        // Verify-on-repack: never launder a corrupt chunk into a
-                        // fresh pack and then delete the evidence. Pack chunks are
-                        // content-addressed, so re-hash and refuse a mismatch
-                        // (audit M1).
+                    let Some(&addressing) = live.get(h) else {
+                        continue;
+                    };
+                    let slice = bytes.slice(*offset as usize..(*offset + *len) as usize);
+                    // Verify-on-repack: never launder a corrupt chunk into a fresh
+                    // pack and then delete the evidence (audit M1). This is only
+                    // meaningful for a chunk whose key *is* its hash. A value stored
+                    // through `put_keyed` by a transforming layer deliberately does
+                    // not hash to its key — `EncryptedStore` keeps the plaintext
+                    // hash as the address and stores ciphertext — so re-hashing it
+                    // proves nothing, and treating the mismatch as corruption made
+                    // `repack` fail outright on every encrypted+packed store.
+                    if addressing != Addressing::Keyed {
                         let actual = Hash::of(&slice);
                         if actual != *h {
+                            if addressing == Addressing::Legacy {
+                                // A v1 entry: no flag, so this is either corruption
+                                // or a keyed value written before the flag existed.
+                                // Both are possible and they are indistinguishable,
+                                // so do the one thing that is safe under either —
+                                // leave the pack exactly as it is. Nothing is
+                                // laundered and no evidence is deleted, which is
+                                // what the check exists for; the cost is only that
+                                // this pack's dead space waits for entries to be
+                                // rewritten as v2.
+                                tracing::warn!(
+                                    pack = %pack.to_hex(),
+                                    chunk = %h.to_hex(),
+                                    "leaving a pack unrepacked: a v1 index entry's bytes do not \
+                                     hash to its key, which is either corruption or a value \
+                                     written by a transforming layer before the addressing flag \
+                                     existed"
+                                );
+                                unverifiable = true;
+                                break;
+                            }
                             return Err(OrigoFSError::Corrupt(format!(
                                 "pack {} chunk {} failed its integrity check during repack (got {})",
                                 pack.to_hex(),
@@ -320,8 +558,14 @@ impl PackStore {
                                 actual.to_hex()
                             )));
                         }
-                        self.stage(*h, &slice, false).await?;
                     }
+                    survivors.push((*h, slice, addressing));
+                }
+                if unverifiable {
+                    continue;
+                }
+                for (h, slice, addressing) in &survivors {
+                    self.stage(*h, slice, StageMode::Force, *addressing).await?;
                 }
                 self.seal().await?;
                 reclaimed += self.data.delete(&pack).await?;
@@ -376,16 +620,27 @@ fn parse_trailer(pack: &[u8]) -> Result<Vec<(Hash, u32, u32)>> {
 impl ContentStore for PackStore {
     async fn put(&self, bytes: &[u8]) -> Result<Hash> {
         let hash = Hash::of(bytes);
-        self.stage(hash, bytes, true).await?;
+        // Content-addressed by construction — we just computed the address.
+        self.stage(hash, bytes, StageMode::Dedup, Addressing::Content)
+            .await?;
         Ok(hash)
     }
 
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
-        self.stage(*key, bytes, true).await
+        self.stage(*key, bytes, StageMode::Dedup, Addressing::of(key, bytes))
+            .await
     }
 
+    /// A genuine replace, per the trait contract.
+    ///
+    /// This used to delegate to the deduplicating path, which returns early when
+    /// the index already holds the key — i.e. it was insert-if-absent, silently
+    /// dropping exactly the update the method exists to deliver. Harmless in the
+    /// compositions shipped here (nothing puts a `PackStore` behind another one's
+    /// index), but the contract this violates is the one written for that case.
     async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
-        self.stage(*key, bytes, true).await
+        self.stage(*key, bytes, StageMode::Replace, Addressing::of(key, bytes))
+            .await
     }
 
     /// Slots go to the **data** backend — that's the one that travels with the
@@ -401,8 +656,8 @@ impl ContentStore for PackStore {
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         {
             let p = self.pending.lock();
-            if let Some(b) = p.resident.get(hash) {
-                return Ok(b.clone());
+            if let Some(s) = p.resident.get(hash) {
+                return Ok(s.bytes.clone());
             }
         }
         match self.locate(hash).await? {
@@ -418,10 +673,10 @@ impl ContentStore for PackStore {
     async fn get_range(&self, hash: &Hash, off: u64, len: u64) -> Result<Bytes> {
         {
             let p = self.pending.lock();
-            if let Some(b) = p.resident.get(hash) {
-                let start = (off as usize).min(b.len());
-                let end = start.saturating_add(len as usize).min(b.len());
-                return Ok(b.slice(start..end));
+            if let Some(s) = p.resident.get(hash) {
+                let start = (off as usize).min(s.bytes.len());
+                let end = start.saturating_add(len as usize).min(s.bytes.len());
+                return Ok(s.bytes.slice(start..end));
             }
         }
         match self.locate(hash).await? {
@@ -486,6 +741,17 @@ impl ContentStore for PackStore {
         self.index.touch(hash).await
     }
 
+    /// A chunk's age is its index entry's, matching `list_with_age`; a chunk still
+    /// buffered in the open pack is age 0 there and must be here too, or the
+    /// sweep's conditional delete would resolve it against the index (where it does
+    /// not exist yet) and treat it as undatable.
+    async fn age_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        if self.pending.lock().resident.contains_key(hash) {
+            return Ok(Some(0));
+        }
+        self.index.age_of(hash).await
+    }
+
     async fn ping(&self) -> Result<()> {
         // The data store is the (possibly remote) backend whose reachability
         // gates readiness; the index is a local sidecar.
@@ -495,12 +761,12 @@ impl ContentStore for PackStore {
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         let staged = {
             let mut p = self.pending.lock();
-            if let Some(b) = p.resident.remove(hash) {
+            if let Some(s) = p.resident.remove(hash) {
                 p.order.retain(|h| h != hash);
                 // Saturating: a bookkeeping slip must not panic while holding
                 // the buffer lock.
-                p.size = p.size.saturating_sub(b.len());
-                Some(b.len() as u64)
+                p.size = p.size.saturating_sub(s.bytes.len());
+                Some(s.bytes.len() as u64)
             } else {
                 None
             }

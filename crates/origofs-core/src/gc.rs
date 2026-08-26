@@ -41,6 +41,15 @@
 //! stays free. [`Fs::gc_with_grace`] rejects a grace below
 //! that floor, because the band between the two is precisely where the race lives.
 //!
+//! **And the gate has to hold at the moment of deletion, not only at listing.**
+//! Ages come from a listing taken at the start of the pass, and a pass over a
+//! large store runs for minutes. Deleting on that reading is check-then-act: a
+//! writer that dedups onto an object mid-sweep refreshes it and commits a
+//! reference, and the sweep deletes it anyway — the same failure, with the sweep's
+//! own duration as the window. So the sweep deletes through
+//! [`ContentStore::delete_if_older_than`], which re-reads the age at the moment it
+//! acts and declines anything that has been refreshed since.
+//!
 //! This is not a substitute for running GC when the workspace is calm — it is what
 //! makes doing so on a *live, shared* workspace safe, which is the only option in
 //! a workspace agents are always writing to.
@@ -93,6 +102,12 @@ pub struct GcStats {
     /// Objects deleted because nothing referenced them.
     pub deleted: usize,
     /// Bytes freed by the deletions.
+    ///
+    /// **Zero on a packed store even when `deleted` is not.** Deleting a chunk from
+    /// a [`PackStore`](crate::PackStore) drops its index entry; the bytes stay
+    /// inside the pack until [`repack`](crate::ContentStore::repack) rewrites it,
+    /// and that is where they are reported. Read `deleted` for what the sweep
+    /// reclaimed logically, and `repack`'s own return value for space.
     pub bytes_freed: u64,
     /// Unreferenced objects left alone because they were younger than the grace
     /// period — a write in flight, or recent churn that the next pass will take.
@@ -254,8 +269,24 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
             match age {
                 Some(secs) if secs >= grace_secs => {
-                    stats.bytes_freed += self.content.delete(&hash).await?;
-                    stats.deleted += 1;
+                    // Conditional, not unconditional. The ages above were read at
+                    // the start of the pass, and a pass over a large store runs for
+                    // minutes — so between listing and deleting, a writer can dedup
+                    // onto this object, refresh its recency (`ContentStore::touch`)
+                    // and commit a reference to it. Deleting on the stale reading
+                    // reintroduces exactly the `ContentMissing`-after-commit the
+                    // grace period exists to prevent, with the sweep's own duration
+                    // as the window. `delete_if_older_than` re-reads the age at the
+                    // moment of deletion, so a refreshed object survives.
+                    match self.content.delete_if_older_than(&hash, grace_secs).await? {
+                        Some(freed) => {
+                            stats.bytes_freed += freed;
+                            stats.deleted += 1;
+                        }
+                        // Refreshed under us — a live write, not garbage. The next
+                        // pass takes it if it really is garbage.
+                        None => stats.skipped_young += 1,
+                    }
                 }
                 Some(_) => stats.skipped_young += 1,
                 None => stats.skipped_undated += 1,

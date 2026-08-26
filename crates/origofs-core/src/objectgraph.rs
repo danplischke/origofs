@@ -8,7 +8,7 @@
 //!
 //! [`ContentStore`]: crate::ContentStore
 
-use crate::error::Result;
+use crate::error::{OrigoFSError, Result};
 use crate::format;
 use crate::types::Hash;
 
@@ -59,18 +59,39 @@ impl Tree {
     ///
     /// The bytes are the object's address, so this encoding is frozen for v1 —
     /// see the format-evolution rules in [`crate::format`].
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(&format::TREE.header());
-        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        let count = u32::try_from(self.entries.len()).map_err(|_| {
+            OrigoFSError::TooLarge(format!(
+                "tree has {} entries, more than the format's u32 count field can hold",
+                self.entries.len()
+            ))
+        })?;
+        out.extend_from_slice(&count.to_le_bytes());
         for e in &self.entries {
+            // `name.len() as u16` wrapped silently past 65535 while the full name
+            // bytes were still written, so the object became undecodable from this
+            // entry onward — on a commit that *succeeded* and advanced a branch.
+            // Nothing caps a name's length: `validate_component` rejects traversal
+            // and NUL but not size, and tree entries also arrive from outside it
+            // entirely (a `git import` builds them straight from a foreign
+            // repository's names). Same "guarded coming in, unguarded going out"
+            // asymmetry already fixed in `Manifest::encode` and `PackLoc::encode`.
+            let name_len = u16::try_from(e.name.len()).map_err(|_| {
+                OrigoFSError::TooLarge(format!(
+                    "tree entry name is {} bytes, past the {} the format can address",
+                    e.name.len(),
+                    u16::MAX
+                ))
+            })?;
             out.push(e.kind.code());
             out.extend_from_slice(&e.mode.to_le_bytes());
-            out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&name_len.to_le_bytes());
             out.extend_from_slice(e.name.as_bytes());
             out.extend_from_slice(e.hash.as_bytes());
         }
-        out
+        Ok(out)
     }
 
     /// Decode a tree, dispatching on its header's format version. An object
@@ -142,20 +163,42 @@ impl Commit {
     ///
     /// The bytes are the object's address, so this encoding is frozen for v1 —
     /// see the format-evolution rules in [`crate::format`].
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(&format::COMMIT.header());
         out.extend_from_slice(self.tree.as_bytes());
-        out.extend_from_slice(&(self.parents.len() as u32).to_le_bytes());
+        let parents = u32::try_from(self.parents.len()).map_err(|_| {
+            OrigoFSError::TooLarge(format!(
+                "commit has {} parents, more than the format's u32 count field can hold",
+                self.parents.len()
+            ))
+        })?;
+        out.extend_from_slice(&parents.to_le_bytes());
         for p in &self.parents {
             out.extend_from_slice(p.as_bytes());
         }
         out.extend_from_slice(&self.timestamp.to_le_bytes());
-        out.extend_from_slice(&(self.author.len() as u16).to_le_bytes());
+        // See `Tree::encode`: the author is a caller-supplied string with no length
+        // rule, and a wrapped `author_len` writes a commit nothing can decode.
+        let author_len = u16::try_from(self.author.len()).map_err(|_| {
+            OrigoFSError::TooLarge(format!(
+                "commit author is {} bytes, past the {} the format can address",
+                self.author.len(),
+                u16::MAX
+            ))
+        })?;
+        out.extend_from_slice(&author_len.to_le_bytes());
         out.extend_from_slice(self.author.as_bytes());
-        out.extend_from_slice(&(self.message.len() as u32).to_le_bytes());
+        let msg_len = u32::try_from(self.message.len()).map_err(|_| {
+            OrigoFSError::TooLarge(format!(
+                "commit message is {} bytes, past the {} the format can address",
+                self.message.len(),
+                u32::MAX
+            ))
+        })?;
+        out.extend_from_slice(&msg_len.to_le_bytes());
         out.extend_from_slice(self.message.as_bytes());
-        out
+        Ok(out)
     }
 
     /// Decode a commit, dispatching on its header's format version. An object

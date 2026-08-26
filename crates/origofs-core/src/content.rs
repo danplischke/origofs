@@ -35,6 +35,36 @@ pub const DEDUP_REFRESH_AFTER_SECS: u64 = 60;
 
 /// A content-addressed blob store. Writes are idempotent: storing identical
 /// bytes yields the same [`Hash`] and does not duplicate storage.
+///
+/// # Consistency contract
+///
+/// A backend must be **strongly consistent per key**: a completed `put` is
+/// immediately visible to `get`/`has`/`get_range`, a completed `delete` is
+/// immediately reflected by `has`/`head`, and `put_sidecar_if_absent` is a
+/// genuinely atomic create-if-absent. Every supported backend provides this —
+/// S3 (strongly consistent since 2020), GCS, R2, Azure, MinIO, and the local
+/// filesystem — so it is an assumption the engine leans on rather than a
+/// property it defends:
+///
+/// * the durability barrier is put + flush **then** metadata commit, so a reader
+///   resolving a fresh hash expects the object to be there — a stale 404 would
+///   surface as a terminal [`ContentMissing`](crate::OrigoFSError::ContentMissing)
+///   (deliberately not retryable, because on a conforming backend "missing"
+///   means really missing);
+/// * the deduplicating `put` skips the upload when the object exists, so a
+///   stale positive after a delete would commit a reference to bytes that are
+///   gone;
+/// * garbage collection's age gate reads `last_modified` via HEAD/LIST and
+///   re-checks it at deletion time, which only helps if that metadata is fresh.
+///
+/// What is deliberately **not** required: staleness of reads of an *existing*
+/// object is harmless (a key has exactly one possible value, ever — the only
+/// overwrites are identical-byte recency rewrites), and LIST completeness is
+/// never load-bearing (nothing user-facing lists the store; the sweep, repack,
+/// and rebuild all fail safe on omission). An eventually-consistent
+/// S3-compatible endpoint — an async-replicated bucket read from the far
+/// region, a CDN-fronted endpoint, an older gateway — is outside this contract
+/// and can produce dangling references or unsound collection.
 #[async_trait]
 pub trait ContentStore: Send + Sync {
     /// Store `bytes` and return their content address.
@@ -211,6 +241,63 @@ pub trait ContentStore: Send + Sync {
     /// absent hash succeeds and frees `0`.
     async fn delete(&self, hash: &Hash) -> Result<u64>;
 
+    /// Delete `hash` **only if** it is still at least `min_age_secs` old, by the
+    /// same clock [`list_with_age`](Self::list_with_age) reports.
+    ///
+    /// `Some(bytes_freed)` when it deleted, `None` when it declined because the
+    /// object had been refreshed. The two are distinguished by more than the byte
+    /// count on purpose: a [`PackStore`](crate::PackStore) delete frees `0` bytes
+    /// even on success (it drops an index entry; the bytes come back from
+    /// `repack`), so `0` cannot mean "didn't delete".
+    ///
+    /// This is the second half of the age gate, and without it the gate is
+    /// check-then-act. [`list_with_age`](Self::list_with_age) makes a sweep safe by
+    /// skipping anything younger than the grace period, and
+    /// [`touch`](Self::touch) keeps a deduplicated-onto object out of that band —
+    /// but a sweep decides on the ages it read at the *start* of the pass and then
+    /// deletes unconditionally, and a pass over a large store runs for minutes. A
+    /// writer that dedups onto an object in that window refreshes its recency and
+    /// commits a reference to it, and the sweep deletes it anyway: exactly the
+    /// `ContentMissing`-after-commit the grace period exists to prevent, just with
+    /// a wider window than the one that was closed.
+    ///
+    /// Re-reading the age at the moment of deletion closes it. The check is not
+    /// atomic with the delete on every backend — a filesystem `stat`+`unlink` and
+    /// an object-store `head`+`delete` both have a gap — but the gap shrinks from
+    /// "the length of the sweep" to "two adjacent calls", far inside any valid
+    /// grace period.
+    ///
+    /// The default implements the check generically; backends that can do better
+    /// (a conditional request) may override it.
+    async fn delete_if_older_than(&self, hash: &Hash, min_age_secs: u64) -> Result<Option<u64>> {
+        // `0` means the caller opted out of the age gate entirely (a quiesced
+        // store), so skip the re-read rather than paying for it.
+        if min_age_secs > 0 {
+            match self.age_of(hash).await? {
+                Some(age) if age >= min_age_secs => {}
+                // Refreshed under us, or the backend stopped being able to date it:
+                // either way this is no longer something the gate says is safe.
+                _ => return Ok(None),
+            }
+        }
+        self.delete(hash).await.map(Some)
+    }
+
+    /// The age in seconds of a single object, by the same clock
+    /// [`list_with_age`](Self::list_with_age) uses — `None` when the backend cannot
+    /// tell or the object is absent.
+    ///
+    /// The default derives it from `list_with_age`, which is correct but scans the
+    /// whole store; every backend here overrides it with a single stat/head.
+    async fn age_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        Ok(self
+            .list_with_age()
+            .await?
+            .into_iter()
+            .find(|(h, _)| h == hash)
+            .and_then(|(_, age)| age))
+    }
+
     /// Flush any buffered writes to durable storage. Most backends write
     /// immediately, so the default is a no-op; batching layers such as
     /// [`PackStore`] override it to seal the open pack.
@@ -252,7 +339,13 @@ fn sidecar_file(name: &str) -> Result<String> {
         || name.contains('/')
         || name.contains('\\')
         || name.contains('\0')
+        // The two subdirectories `LocalCasStore` owns under its root: `objects/`
+        // holds the content-addressed blobs and `meta/` holds the named slots. A
+        // sidecar is a *file* at the root, so either name would collide with a
+        // directory — `meta` was missing here even though `put_meta` has written to
+        // `<root>/meta/` since slots were added.
         || name == "objects"
+        || name == "meta"
     {
         return Err(OrigoFSError::InvalidPath(format!(
             "invalid sidecar name: {name:?}"
@@ -496,6 +589,11 @@ impl ContentStore for LocalCasStore {
         Ok(Self::exists(&self.path_for(hash)).await)
     }
 
+    /// One `stat`, from the same mtime `list_with_age` reports.
+    async fn age_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        Ok(Self::age_secs(&self.path_for(hash)).await)
+    }
+
     async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
         match tokio::fs::read(self.root.join(sidecar_file(name)?)).await {
             Ok(v) => Ok(Some(v)),
@@ -507,17 +605,50 @@ impl ContentStore for LocalCasStore {
     async fn put_sidecar_if_absent(&self, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         let path = self.root.join(sidecar_file(name)?);
         tokio::fs::create_dir_all(&self.root).await?;
-        // `create_new` is the exclusive-create: exactly one racing writer wins and
-        // the loser re-reads the winner's value.
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await
-        {
-            Ok(mut f) => {
-                f.write_all(bytes).await?;
-                f.flush().await?;
+        // A sidecar holds the encryption salt, so it gets the same discipline as an
+        // object: write a uniquely-named temp, fsync it, then link it into place.
+        //
+        // This used to be `create_new` + `write_all` + `flush` directly at `path`,
+        // which is the one write in this store with neither durability nor atomic
+        // visibility, and both gaps are reachable. A second process opening the same
+        // fresh store can `read` the file between the create and the write and get a
+        // *torn* (usually empty) salt, then derive a different key — a split-brain
+        // store where neither writer can read the other's objects. And with no
+        // fsync, a crash can leave an empty salt file behind after objects were
+        // already written under the real one.
+        //
+        // `hard_link` rather than `rename`: rename would overwrite a salt another
+        // writer had already established, which is exactly what create-if-absent
+        // exists to prevent. Linking fails with `AlreadyExists` instead, and that
+        // loser re-reads the winner's complete value.
+        let tmp = path.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            self.tmp_seq.fetch_add(1, Ordering::Relaxed)
+        ));
+        let write_tmp = async {
+            let mut f = tokio::fs::File::create(&tmp).await?;
+            f.write_all(bytes).await?;
+            f.sync_all().await?;
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+        if let Err(e) = write_tmp {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
+        self.syncs.fetch_add(1, Ordering::Relaxed);
+        let linked = tokio::fs::hard_link(&tmp, &path).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        match linked {
+            Ok(()) => {
+                #[cfg(unix)]
+                if let Some(parent) = path.parent()
+                    && let Ok(dir) = tokio::fs::File::open(parent).await
+                {
+                    let _ = dir.sync_all().await;
+                    self.syncs.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(bytes.to_vec())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -662,8 +793,17 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
     async fn touch(&self, hash: &Hash) -> Result<()> {
         (**self).touch(hash).await
     }
+    async fn age_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        (**self).age_of(hash).await
+    }
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         (**self).delete(hash).await
+    }
+    // Forwarded for the same reason `replace_keyed` is: it has a default body, so
+    // omitting it silently downgrades every backend reached through an `Arc` to
+    // the generic whole-store scan instead of its own single stat/head.
+    async fn delete_if_older_than(&self, hash: &Hash, min_age_secs: u64) -> Result<Option<u64>> {
+        (**self).delete_if_older_than(hash, min_age_secs).await
     }
     async fn flush(&self) -> Result<()> {
         (**self).flush().await
@@ -762,9 +902,21 @@ impl ContentStore for MemStore {
             .collect())
     }
 
+    async fn age_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        if !self.map.lock().contains_key(hash) {
+            return Ok(None);
+        }
+        Ok(self.born.lock().get(hash).map(|t| t.elapsed().as_secs()))
+    }
+
     async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         self.map.lock().insert(*key, Bytes::copy_from_slice(bytes));
-        self.touch_born(*key);
+        // A replaced value is a *new* write, so it gets a new birth stamp.
+        // `touch_born` only fills in a missing one, so an existing key kept the old
+        // entry's age — reporting a just-written value as ancient, where the local
+        // and object backends both report it as fresh (their replace rewrites the
+        // file/object, moving its mtime).
+        self.born.lock().insert(*key, std::time::Instant::now());
         Ok(())
     }
 
@@ -926,6 +1078,11 @@ impl ContentStore for TieredStore {
         self.backend.touch(hash).await
     }
 
+    /// From the backend, which is where `list_with_age` reports ages from.
+    async fn age_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        self.backend.age_of(hash).await
+    }
+
     /// Forwarded to the backend, which is the authoritative store. Without this
     /// the trait's no-op default silently swallows a batching backend's seal — a
     /// `PackStore` behind a cache tier would never make its buffered chunks
@@ -950,6 +1107,19 @@ impl ContentStore for TieredStore {
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         let freed = self.backend.delete(hash).await?;
         let _ = self.cache.delete(hash).await; // best-effort cache eviction
+        Ok(freed)
+    }
+
+    /// The conditional delete has to reach the backend's own check, and the cache
+    /// entry has to go with it — but only if the backend actually deleted.
+    async fn delete_if_older_than(&self, hash: &Hash, min_age_secs: u64) -> Result<Option<u64>> {
+        let freed = self
+            .backend
+            .delete_if_older_than(hash, min_age_secs)
+            .await?;
+        if freed.is_some() {
+            let _ = self.cache.delete(hash).await; // best-effort cache eviction
+        }
         Ok(freed)
     }
 
@@ -1063,6 +1233,16 @@ impl ContentStore for VerifyingStore {
     /// sweep's grace period (`ContentStore::touch`).
     async fn touch(&self, hash: &Hash) -> Result<()> {
         self.inner.touch(hash).await
+    }
+
+    /// Forwarded alongside `list_with_age`/`touch`: all three have to agree on one
+    /// clock, or the sweep's age gate is reading a different one than it acts on.
+    async fn age_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        self.inner.age_of(hash).await
+    }
+
+    async fn delete_if_older_than(&self, hash: &Hash, min_age_secs: u64) -> Result<Option<u64>> {
+        self.inner.delete_if_older_than(hash, min_age_secs).await
     }
 
     async fn get_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>> {
