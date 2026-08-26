@@ -685,8 +685,27 @@ impl<'a, S: Clone + PartialEq> TilingCursor<'a, S> {
 /// text is credited to the mover, and text retyped identically to text already
 /// present may align as surviving. That was already true of the insert-only
 /// stamping this replaces — it is now the explicit rule rather than an emergent
-/// one. Making it identity-correct needs `yrs` item ids the public API does not
-/// expose.
+/// one.
+///
+/// **Why it is still a text diff.** `yrs` *does* expose the CRDT's own answer:
+/// `Text::diff_range(txn, Some(hi), Some(lo), …)` marks every chunk not visible
+/// in the `lo` snapshot as [`ChangeKind::Added`](yrs::types::text::ChangeKind),
+/// which is exactly "the items this update introduced" — no character alignment
+/// involved. Driving the stamp from that closes the gap outright, and it does
+/// not even need `skip_gc`, since only the added side is consulted.
+///
+/// It is unusable on `yrs` 0.23.5: `diff_range` panics (`index out of bounds`,
+/// `block_store.rs:51`, from `split_by_snapshot`) as soon as a **second client**
+/// has contributed to the document. A single-client document is fine, which is
+/// why it looks workable until it is tried — and a co-editing room always has
+/// more than one client. This runs behind the shared room lock, so a panic there
+/// takes down every socket on the document: strictly worse than the
+/// misattribution it would prevent. Reproducible in a dozen lines of pure `yrs`.
+///
+/// So the gap stays, bounded and tested (`coedit_authorship_carries_by_text_diff
+/// _not_crdt_identity`): an attacker cannot *name* an actor, only cause a victim
+/// to keep credit for characters that coincide with the victim's own. Revisit
+/// when the upstream panic is fixed — the replacement is about ten lines.
 pub(crate) fn intended_stamps<S: Clone + PartialEq>(
     before: &str,
     before_tiling: &[(S, u64)],

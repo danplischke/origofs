@@ -278,10 +278,16 @@ impl McpServer {
                          surrounding context to make it unique"
                     )));
                 }
-                // Yjs indexes in UTF-16 code units, not bytes.
-                let byte_idx = text.find(old).unwrap_or(0);
-                let index = text[..byte_idx].encode_utf16().count() as u32;
-                doc.remove(index, old.encode_utf16().count() as u32);
+                // `CoeditDoc` indexes UTF-8 bytes, not UTF-16 code units — see its
+                // type docs. Converting to UTF-16 here placed every edit in a
+                // non-ASCII document at the wrong offset and with the wrong
+                // length, so the replacement straddled the match: replacing
+                // "world" in "ééééé world" spliced at byte 6 instead of 11 and
+                // removed 5 of the 11 bytes it should have, producing
+                // "éééorigofsworld" — reported as a successful suggestion, and
+                // corrupt once accepted.
+                let index = text.find(old).unwrap_or(0) as u32;
+                doc.remove(index, old.len() as u32);
                 doc.insert(self.ctx(), index, new);
                 let id = self.ws.suggest_coedit(self.ctx(), p, &doc, summary).await?;
                 // Restore the marker to what we found. Only if it is still *ours*:
