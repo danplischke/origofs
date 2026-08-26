@@ -752,7 +752,8 @@ impl CoeditDoc {
         }
     }
 
-    /// Insert `chunk` at character `index` (UTF-16 offset, as in Yjs), attributed
+    /// Insert `chunk` at `index`, a UTF-8 **byte** offset (not UTF-16 as in Yjs:
+    /// the document indexes bytes, matching what blame stores), attributed
     /// to `ctx`.
     fn insert<'py>(
         &self,
@@ -769,7 +770,7 @@ impl CoeditDoc {
         })
     }
 
-    /// Remove `length` characters starting at `index` (UTF-16 offsets).
+    /// Remove `length` bytes starting at `index` (UTF-8 byte offsets).
     #[pyo3(signature = (index, length))]
     fn remove<'py>(&self, py: Python<'py>, index: u32, length: u32) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
