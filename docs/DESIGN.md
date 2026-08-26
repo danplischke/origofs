@@ -205,6 +205,17 @@ layer** batches many small chunks into large objects rather than using S3 multip
 pointed at a network target. A `TieredStore` composes a fast local **cache tier** (LRU on disk) in front of a
 remote backend, with read-through, write-back batching, and **prefetch** of a manifest's chunks on open.
 
+**Consistency the backend must provide.** The content store must be **strongly consistent per key**:
+read-after-write for new objects, immediate delete visibility on HEAD/GET, and an atomic conditional create
+(the encryption-salt bootstrap). S3 (since 2020), GCS, R2, Azure, MinIO, and local disk all qualify. The design
+never needs more than that: stale reads of an existing key are harmless (content-addressed keys have exactly one
+possible value, and the only overwrites are identical-byte recency refreshes), and LIST freshness is never
+load-bearing (the read path resolves hashes from the metadata DB and never lists the bucket; GC's mark walks
+objects by `get` and fails closed, and the sweep/repack/rebuild all fail safe on an incomplete listing). An
+eventually-consistent endpoint — an async-replicated bucket read from the lagging region, a CDN in front of the
+bucket — is unsupported: a stale 404 after the durability barrier breaks the read path, and a stale "exists" on
+the dedup HEAD can commit a reference to deleted bytes.
+
 **GC.** Chunks and objects are immutable and shared across branches, so deletion is **mark-and-sweep with
 refcounting from live refs**: roots = all branch/tag/HEAD refs (incl. `MERGE_HEAD`), the live working tree of
 every workspace, pending suggestions, and each workspace's ref-mirror snapshot; walk commits→trees→blobs→chunks

@@ -35,6 +35,36 @@ pub const DEDUP_REFRESH_AFTER_SECS: u64 = 60;
 
 /// A content-addressed blob store. Writes are idempotent: storing identical
 /// bytes yields the same [`Hash`] and does not duplicate storage.
+///
+/// # Consistency contract
+///
+/// A backend must be **strongly consistent per key**: a completed `put` is
+/// immediately visible to `get`/`has`/`get_range`, a completed `delete` is
+/// immediately reflected by `has`/`head`, and `put_sidecar_if_absent` is a
+/// genuinely atomic create-if-absent. Every supported backend provides this —
+/// S3 (strongly consistent since 2020), GCS, R2, Azure, MinIO, and the local
+/// filesystem — so it is an assumption the engine leans on rather than a
+/// property it defends:
+///
+/// * the durability barrier is put + flush **then** metadata commit, so a reader
+///   resolving a fresh hash expects the object to be there — a stale 404 would
+///   surface as a terminal [`ContentMissing`](crate::OrigoFSError::ContentMissing)
+///   (deliberately not retryable, because on a conforming backend "missing"
+///   means really missing);
+/// * the deduplicating `put` skips the upload when the object exists, so a
+///   stale positive after a delete would commit a reference to bytes that are
+///   gone;
+/// * garbage collection's age gate reads `last_modified` via HEAD/LIST and
+///   re-checks it at deletion time, which only helps if that metadata is fresh.
+///
+/// What is deliberately **not** required: staleness of reads of an *existing*
+/// object is harmless (a key has exactly one possible value, ever — the only
+/// overwrites are identical-byte recency rewrites), and LIST completeness is
+/// never load-bearing (nothing user-facing lists the store; the sweep, repack,
+/// and rebuild all fail safe on omission). An eventually-consistent
+/// S3-compatible endpoint — an async-replicated bucket read from the far
+/// region, a CDN-fronted endpoint, an older gateway — is outside this contract
+/// and can produce dangling references or unsound collection.
 #[async_trait]
 pub trait ContentStore: Send + Sync {
     /// Store `bytes` and return their content address.
