@@ -831,3 +831,115 @@ async fn postgres_rmdir_racing_mkdir_never_orphans_a_dentry() {
         );
     }
 }
+
+/// The **transaction-level** `append_event` carries the same two guarantees as
+/// the store-level one: it serializes on the feed advisory lock (so `seq` commits
+/// in assignment order and a `seq > cursor` tailer can never skip a committed
+/// event), and it NOTIFYs on commit (so a push subscriber wakes for it).
+///
+/// It used to have neither — a bare `INSERT … RETURNING seq` — which was latent
+/// only because no in-tree caller used the txn variant yet: any new caller would
+/// silently have gotten droppable events on exactly the multi-writer backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_txn_append_event_locks_and_notifies() {
+    let Some(dsn) = dsn() else {
+        eprintln!(
+            "skipping postgres_txn_append_event_locks_and_notifies: ORIGOFS_PG_TEST_URL unset"
+        );
+        return;
+    };
+    let _guard = pg_lock().lock().await;
+    reset(&dsn).await;
+    let meta = Arc::new(PostgresMetadataStore::connect(&dsn).await.unwrap());
+    meta.init().await.unwrap();
+
+    let ev = |path: &str| EventInit {
+        actor_id: None,
+        session_id: None,
+        kind: "write".to_string(),
+        path: path.to_string(),
+        detail: None,
+        branch: None,
+    };
+
+    // --- half 1: the txn append takes the feed lock --------------------------
+    // Hold the feed advisory lock in a side transaction; a txn-level append must
+    // block on it rather than assign a seq that could commit out of order.
+    let (blocker, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let blocker_conn = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    blocker.batch_execute("BEGIN").await.unwrap();
+    blocker
+        .execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&origofs_core::postgres::FEED_LOCK_KEY],
+        )
+        .await
+        .unwrap();
+
+    let m = meta.clone();
+    let append = tokio::spawn(async move {
+        let mut txn = m.begin().await?;
+        let seq = txn.append_event(ev_owned("/txn-a"), 1).await?;
+        txn.commit().await?;
+        Ok::<i64, origofs_core::OrigoFSError>(seq)
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !append.is_finished(),
+        "a txn-level append_event must block while the feed lock is held (H6)"
+    );
+
+    blocker.batch_execute("COMMIT").await.unwrap();
+    let seq = timeout(Duration::from_secs(5), append)
+        .await
+        .expect("txn append did not finish after the feed lock was released")
+        .unwrap()
+        .unwrap();
+    assert!(seq >= 1);
+    drop(blocker);
+    let _ = blocker_conn.await;
+
+    // --- half 2: the txn append NOTIFYs on commit -----------------------------
+    // Subscribe, then append through a transaction only. With no store-level
+    // append to piggyback on, the wakeup can only come from the txn's own NOTIFY.
+    let mut sub = meta.subscribe(seq, None).await.unwrap();
+    let mut txn = meta.begin().await.unwrap();
+    txn.append_event(ev("/txn-b"), 2).await.unwrap();
+    txn.commit().await.unwrap();
+
+    let batch = recv_batch(&mut sub).await;
+    assert_eq!(batch.len(), 1, "the committed txn event is pushed");
+    assert_eq!(batch[0].path, "/txn-b");
+
+    // And a rolled-back txn's event is neither delivered nor a hole a tailer
+    // trips on: the identity gap it burns is permanent, which readers skip.
+    let mut txn = meta.begin().await.unwrap();
+    txn.append_event(ev("/txn-rolled-back"), 3).await.unwrap();
+    txn.rollback().await.unwrap();
+    let mut txn = meta.begin().await.unwrap();
+    txn.append_event(ev("/txn-c"), 4).await.unwrap();
+    txn.commit().await.unwrap();
+    let batch = recv_batch(&mut sub).await;
+    let paths: Vec<&str> = batch.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["/txn-c"],
+        "rollback delivers nothing, later events still flow"
+    );
+}
+
+/// `ev` for a spawned task that needs `'static` ownership.
+fn ev_owned(path: &str) -> EventInit {
+    EventInit {
+        actor_id: None,
+        session_id: None,
+        kind: "write".to_string(),
+        path: path.to_string(),
+        detail: None,
+        branch: None,
+    }
+}
