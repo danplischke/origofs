@@ -334,3 +334,47 @@ async fn gcs_backend() {
     };
     suite(ObjectContentStore::gcs(cfg).unwrap()).await;
 }
+
+/// Object ages against a **real** bucket are sane: a freshly-put object reports a
+/// small age from both `list_with_age` and `age_of`, and the age-gated
+/// `delete_if_older_than` respects it.
+///
+/// This is the leg the in-memory adapter can't model. Ages used to be computed as
+/// local-now minus the bucket's `last_modified` — two different clocks — so a GC
+/// host running fast inflated every age and could sweep a concurrent writer's
+/// in-flight content. Now the store measures its offset against the bucket once
+/// (a probe PUT + HEAD) and expresses every age on the bucket's own clock; this
+/// asserts the probe and the arithmetic hold against a real S3 implementation,
+/// with its second-granularity timestamps.
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint; set ORIGOFS_S3_TEST_* to run"]
+async fn s3_ages_are_measured_on_the_bucket_clock() {
+    let prefix = unique_prefix("ages");
+    let store = ObjectContentStore::s3(s3_cfg_from_env(prefix)).unwrap();
+
+    let h = store.put(b"age me").await.unwrap();
+
+    // A just-written object is inside any sane grace period, on either reading.
+    let age = store
+        .age_of(&h)
+        .await
+        .unwrap()
+        .expect("a real bucket can date its objects");
+    assert!(age <= 120, "fresh object reported {age}s old");
+    let listed = store
+        .list_with_age()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(hash, _)| *hash == h)
+        .and_then(|(_, a)| a)
+        .expect("the object is listed with a known age");
+    assert!(listed <= 120, "fresh object listed as {listed}s old");
+
+    // The age-gated delete declines a fresh object and leaves it in place …
+    assert_eq!(store.delete_if_older_than(&h, 600).await.unwrap(), None);
+    assert!(store.has(&h).await.unwrap());
+    // … and deletes it once the gate is waived.
+    assert!(store.delete_if_older_than(&h, 0).await.unwrap().is_some());
+    assert!(!store.has(&h).await.unwrap());
+}

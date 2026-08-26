@@ -958,6 +958,22 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// actor's removal for review instead of refusing it outright.
     pub async fn remove_as(&self, ctx: WriteCtx, path: &str) -> Result<()> {
         self.ensure_may_write(ctx, "remove files").await?;
+        self.remove_as_unchecked(ctx, path).await
+    }
+
+    /// [`remove_as`](Self::remove_as) without the write-policy check — the removal
+    /// counterpart of [`write_as_expecting`](Self::write_as_expecting), and exempt
+    /// for the same reason.
+    ///
+    /// Applying an **accepted suggestion** needs exactly this: the edit is
+    /// attributed to the actor who proposed it, who is typically propose-only, and
+    /// gating on their policy here would refuse the deletion a reviewer just
+    /// approved. That path used to call the raw, unattributed `remove` instead —
+    /// so accepting a proposed *deletion* wrote no `edit_op` at all: the op-log,
+    /// which is the ground truth attribution is rebuilt from, held a file removal
+    /// with no author and no `pre_hash` naming what was destroyed, and
+    /// `revert_session` for the proposer's session could not see it.
+    pub(crate) async fn remove_as_unchecked(&self, ctx: WriteCtx, path: &str) -> Result<()> {
         // Capture identity and content *before* the removal: afterwards the inode
         // is gone and the op-log could not name what was destroyed.
         let inode = self.stat(path).await?;

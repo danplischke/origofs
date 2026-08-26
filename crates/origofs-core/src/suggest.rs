@@ -324,12 +324,9 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             // manifest and reference it — otherwise `proposed_hash == None` would
             // be indistinguishable from `suggest_delete` and remove the file on
             // accept.
-            None => Some(
-                self.content
-                    .put(&crate::chunk::Manifest::default().encode()?)
-                    .await?
-                    .to_hex(),
-            ),
+            // `store_empty_manifest` puts *and* flushes, so this path keeps the
+            // same durability barrier `store_body` gives the other one.
+            None => Some(self.store_empty_manifest().await?.to_hex()),
         };
         self.record_suggestion(
             ctx,
@@ -634,9 +631,16 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 }
             }
             None => {
-                // Proposed deletion. (The staleness pre-check above guards it; a
-                // conditional delete would close its narrower remaining window.)
-                self.remove(&s.path).await
+                // Proposed deletion, attributed to the actor who proposed it —
+                // exactly as the byte arm above attributes its write. This used to
+                // call the raw `remove`, so an accepted deletion left no trace in
+                // the op-log at all. `_unchecked` because the proposer is typically
+                // propose-only: the reviewer's acceptance is the authorization, and
+                // re-checking the author's policy here would refuse it.
+                //
+                // (The staleness pre-check above guards it; a conditional delete
+                // would close its narrower remaining window.)
+                self.remove_as_unchecked(author, &s.path).await
             }
         }
     }

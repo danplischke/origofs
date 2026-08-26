@@ -282,7 +282,7 @@ async fn hostile_tree_entry_names_are_rejected_on_materialize() {
                 hash: mhash,
             }],
         };
-        let tree_hash = fs.put_object(&tree.encode()).await.unwrap();
+        let tree_hash = fs.put_object(&tree.encode().unwrap()).await.unwrap();
         let commit = Commit {
             tree: tree_hash,
             parents: vec![],
@@ -290,7 +290,7 @@ async fn hostile_tree_entry_names_are_rejected_on_materialize() {
             message: "poisoned tree".into(),
             timestamp: 0,
         };
-        let chash = fs.put_object(&commit.encode()).await.unwrap();
+        let chash = fs.put_object(&commit.encode().unwrap()).await.unwrap();
         fs.set_branch("evil", chash).await.unwrap();
 
         let err = fs.checkout("evil").await;
@@ -343,7 +343,7 @@ fn objectgraph_decoders_reject_hostile_counts_without_oom() {
 
     // honest objects still round-trip.
     let tree = Tree { entries: vec![] };
-    assert_eq!(Tree::decode(&tree.encode()).unwrap(), tree);
+    assert_eq!(Tree::decode(&tree.encode().unwrap()).unwrap(), tree);
 }
 
 // H1: concurrent merges must not both "succeed" — a merge that loses the ref
@@ -415,7 +415,7 @@ async fn checkout_rolls_back_and_keeps_the_tree_on_a_missing_object() {
             hash: missing,
         }],
     };
-    let tree_hash = fs.content.put(&tree.encode()).await.unwrap();
+    let tree_hash = fs.content.put(&tree.encode().unwrap()).await.unwrap();
     let commit = Commit {
         tree: tree_hash,
         parents: vec![],
@@ -423,7 +423,7 @@ async fn checkout_rolls_back_and_keeps_the_tree_on_a_missing_object() {
         message: "broken".to_string(),
         timestamp: 0,
     };
-    let commit_hash = fs.content.put(&commit.encode()).await.unwrap();
+    let commit_hash = fs.content.put(&commit.encode().unwrap()).await.unwrap();
     fs.meta
         .set_ref("broken", &commit_hash.to_hex())
         .await

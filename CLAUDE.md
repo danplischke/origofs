@@ -86,7 +86,7 @@ cross-check catches every `cfg`-shaped break, and only linking differs.
   *manifest*, not raw bytes; `tree`; `commit`) that form a Merkle DAG. Immutable,
   deduplicated, integrity-verified on read.
 - **`MetadataStore`** holds the *names and versions*: inodes, dentries, symlinks,
-  refs/reflog, the attribution op-log and blame index, the audit log, the change
+  refs, the attribution op-log and blame index, the audit log, the change
   feed, and presence. It stores content only as `manifest_hash` references —
   **it must never hold large file bytes.**
 
@@ -250,9 +250,18 @@ compiling at all until #107.
   itself contain network-reachable resources. Either way the delta is captured and
   imported the same. Keep the default's "not-a-security-sandbox" caveat loud.
 - **Content is immutable and never overwritten**, so churn leaves orphaned
-  chunks. `gc` (mark-and-sweep from live refs) reclaims them and is **not** safe
-  alongside active writers; packed stores additionally need `repack` to reclaim
-  space. Content writes are idempotent (content-addressed), so retries are safe.
+  chunks. `gc` (mark-and-sweep from live refs) reclaims them; packed stores
+  additionally need `repack` to reclaim space. Content writes are idempotent
+  (content-addressed), so retries are safe.
+  **GC is safe alongside active writers, by an age gate rather than by quiescing
+  the store** — content is written before the metadata referencing it, so every
+  write has a window where its chunks are unreferenced, and reachability alone
+  would sweep exactly those. Three parts make it hold, and all three are load-
+  bearing: the sweep skips anything younger than the grace period
+  (`list_with_age`), a deduplicating `put` refreshes an object that has gone stale
+  (`touch`), and the sweep re-checks an object's age at the moment it deletes it
+  (`delete_if_older_than`) so a long pass cannot act on an age it read minutes
+  earlier. A backend that cannot date its objects collects nothing.
 - **The content store can rebuild the DB, but not attribution.** It is a
   self-describing Merkle DAG with a mirrored ref table, so `origofs fsck --rebuild`
   (SDK `rebuild`/`scan`) restores committed files, dirs, symlinks, and branches

@@ -586,6 +586,26 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok((Some(mhash), manifest.size))
     }
 
+    /// Store the canonical **empty** manifest and make it durable, returning its
+    /// hash.
+    ///
+    /// [`store_body`](Self::store_body) returns `None` for an empty body — an inode
+    /// with no content hash — so the callers that need an empty *file* to have a
+    /// real manifest (a merge result, a suggestion's proposed bytes, a git-imported
+    /// blob) put one themselves. Each of them used a bare `content.put`, which
+    /// skips the durability barrier `store_body` pays on every non-empty body: on a
+    /// batching backend the manifest lived only in `PackStore`'s in-memory buffer
+    /// while the metadata referencing it committed, so a crash in that window left
+    /// a row pointing at content that was never sealed (`ContentMissing`).
+    ///
+    /// One helper rather than four flushes, so a new empty-body caller inherits the
+    /// barrier instead of having to remember it.
+    pub(crate) async fn store_empty_manifest(&self) -> Result<Hash> {
+        let hash = self.content.put(&Manifest::default().encode()?).await?;
+        self.content.flush().await?;
+        Ok(hash)
+    }
+
     pub(crate) async fn load_manifest(&self, mhash: &Hash) -> Result<Manifest> {
         let bytes = self.content.get(mhash).await?;
         Manifest::decode(&bytes)

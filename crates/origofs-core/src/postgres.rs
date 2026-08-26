@@ -1565,6 +1565,9 @@ impl MetadataStore for PostgresMetadataStore {
     }
 
     async fn events_since(&self, after_seq: i64, limit: i64) -> Result<Vec<Event>> {
+        // Postgres would reject this itself, as a backend error; raising it here
+        // makes it the same typed `InvalidArgument` SQLite returns. See the trait.
+        crate::metadata::reject_negative_limit(limit)?;
         let c = self.client().await?;
         let rows = c
             .query(
@@ -2094,6 +2097,20 @@ impl MetaTxn for PostgresTxn {
 
     async fn append_event(&mut self, ev: EventInit, ts: i64) -> Result<i64> {
         let ws = self.workspace_id;
+        // The same two guarantees the store-level `append_event` documents, and for
+        // the same reasons — this variant had neither.
+        //
+        // The advisory lock is held to *this* transaction's commit, so a lower seq
+        // is always visible before a higher one is assigned; without it two
+        // concurrent transactions could commit seq 11 before seq 10, and any
+        // `seq > cursor` reader (`events_since`, `EventSubscription::drain`) would
+        // advance past 10 and drop it permanently once it landed. SQLite's txn
+        // variant needs no equivalent only because `begin` holds the global
+        // connection mutex and `BEGIN IMMEDIATE`'s write lock, which serializes
+        // assignment and commit together.
+        self.conn()
+            .execute("SELECT pg_advisory_xact_lock($1)", &[&FEED_LOCK_KEY])
+            .await?;
         let row = self
             .conn()
             .query_one(
@@ -2111,7 +2128,17 @@ impl MetaTxn for PostgresTxn {
                 ],
             )
             .await?;
-        Ok(row.get(0))
+        let seq: i64 = row.get(0);
+        // NOTIFY inside the transaction: Postgres queues it and delivers on commit,
+        // discarding it on rollback. Omitting it left a `subscribe()` push
+        // subscriber asleep until some unrelated store-level append happened to
+        // notify — so a transactionally appended event was in the table but never
+        // pushed.
+        let payload = seq.to_string();
+        self.conn()
+            .execute("SELECT pg_notify($1, $2)", &[&EVENT_CHANNEL, &payload])
+            .await?;
+        Ok(seq)
     }
 
     async fn resolve_suggestion(

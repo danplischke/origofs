@@ -100,7 +100,7 @@ async fn commit_with_missing_content(fs: &AnyFs, parents: Vec<Hash>) -> Hash {
             hash: Hash::of(b"a manifest that was never stored"),
         }],
     };
-    let tree_hash = fs.content.put(&tree.encode()).await.unwrap();
+    let tree_hash = fs.content.put(&tree.encode().unwrap()).await.unwrap();
     let commit = Commit {
         tree: tree_hash,
         parents,
@@ -108,7 +108,7 @@ async fn commit_with_missing_content(fs: &AnyFs, parents: Vec<Hash>) -> Hash {
         message: "unmaterializable".to_string(),
         timestamp: 0,
     };
-    fs.content.put(&commit.encode()).await.unwrap()
+    fs.content.put(&commit.encode().unwrap()).await.unwrap()
 }
 
 /// A fast-forward that fails while materializing must not leave the branch

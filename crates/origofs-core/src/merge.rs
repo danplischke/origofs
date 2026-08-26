@@ -16,7 +16,6 @@
 //! path is therefore merging bytes that may lag. [`Fs::merge_live`] reports those
 //! paths alongside the outcome, and [`Fs::merge`] logs them.
 
-use crate::chunk::Manifest;
 use crate::collab::LiveDoc;
 use crate::content::ContentStore;
 use crate::engine::Fs;
@@ -27,7 +26,11 @@ use crate::types::Hash;
 use async_recursion::async_recursion;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-const MERGE_HEAD: &str = "MERGE_HEAD";
+/// The ref naming the commit being merged in while a conflicted merge is
+/// unresolved. Shared with `version.rs`, which both consumes it (a commit picks it
+/// up as a second parent) and clears it (commit resolves the merge, checkout
+/// abandons it).
+pub(crate) const MERGE_HEAD: &str = "MERGE_HEAD";
 
 /// A single unresolved conflict from a merge.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,7 +212,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     async fn write_body(&self, data: &[u8]) -> Result<Hash> {
         match self.store_body(data).await? {
             (Some(h), _) => Ok(h),
-            (None, _) => self.content.put(&Manifest::default().encode()?).await,
+            // Empty body: `store_empty_manifest` puts *and* flushes, so this path
+            // keeps the same durability barrier `store_body` gives the other one.
+            (None, _) => self.store_empty_manifest().await,
         }
     }
 
@@ -355,7 +360,19 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 message: message.to_string(),
                 timestamp: self.now_secs(),
             };
-            let commit_hash = self.content.put(&commit.encode()).await?;
+            let commit_hash = self.content.put(&commit.encode()?).await?;
+            // Durability barrier (C4) before the branch can name this commit —
+            // the same one `commit_attempt` pays, and for the same reason. The
+            // merged trees and the merge commit are put straight through
+            // `content.put`, so on a batching backend they live only in
+            // `PackStore`'s in-memory buffer until something seals it. Advancing
+            // the ref first meant a crash in that window left the branch
+            // permanently naming a commit that was never written: `log`,
+            // `checkout`, and GC's `mark_commit` all fail with `ContentMissing`,
+            // and `fsck --rebuild` drops the branch entirely. The flush that used
+            // to cover this was the incidental one inside `mirror_refs`, which
+            // runs *after* the transaction below.
+            self.content.flush().await?;
             let plan = self.plan_materialize(merged_tree).await?;
             // Ref advance + working tree in one transaction. The CAS is still
             // first, so a concurrent branch move aborts before anything is
@@ -561,7 +578,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
         }
         merged.sort_by(|a, b| a.name.cmp(&b.name));
-        self.content.put(&Tree { entries: merged }.encode()).await
+        self.content.put(&Tree { entries: merged }.encode()?).await
     }
 
     /// Three-way merge of a single file. Text uses line-level diff3; binary uses

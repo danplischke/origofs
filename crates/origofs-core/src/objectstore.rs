@@ -126,6 +126,9 @@ impl std::fmt::Debug for GcsConfig {
 pub struct ObjectContentStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    /// Seconds to add to a local clock reading to get the bucket's — see
+    /// [`ObjectContentStore::clock_offset`]. Measured once, lazily.
+    clock_offset: tokio::sync::OnceCell<i64>,
 }
 
 /// Retry and timeout policy for every object-store backend.
@@ -179,6 +182,7 @@ impl ObjectContentStore {
         Self {
             store,
             prefix: prefix.into(),
+            clock_offset: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -299,16 +303,77 @@ impl ObjectContentStore {
         OsPath::from(format!("{}.meta/{}", self.prefix, name))
     }
 
-    /// Whether an already-stored object is stale enough that a deduplicating write
-    /// onto it must refresh its recency (see [`ContentStore::touch`]). Uses the
-    /// same epoch-seconds arithmetic as `list_with_age`, so the write path and the
-    /// sweep agree on what "old" means. A future-dated object (clock skew) reports
-    /// as young here and as unknown-age there — both leave it alone.
-    fn refresh_needed(meta: &object_store::ObjectMeta) -> bool {
-        let now = std::time::SystemTime::now()
+    /// This process's local clock, in epoch seconds.
+    fn local_now() -> i64 {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+
+    /// Seconds to add to a local clock reading to express it on the **bucket's**
+    /// clock. Measured once per store handle; `0` if it cannot be measured.
+    ///
+    /// Object ages are `now - last_modified`, and `last_modified` is stamped by the
+    /// object store while `now` came from whichever host happened to run the sweep.
+    /// That is two clocks, which the [`ContentStore::list_with_age`] contract
+    /// explicitly says it is not ("measured by the backend's own clock"). The gap
+    /// is not cosmetic: a GC host whose clock runs N minutes fast inflates every
+    /// object's age by N, and once N exceeds the slack between the grace period and
+    /// the real write-to-commit window, the sweep reclaims content another writer
+    /// still has in flight — on the multi-writer Postgres+S3 shape, the one
+    /// deployment where the sweep and the writer are usually different machines.
+    ///
+    /// Measuring it costs one PUT and one HEAD of a tiny probe object, once, and
+    /// makes every later age a single-clock quantity. The probe lives in the slot
+    /// namespace (a sibling prefix), so `list` never returns it and GC cannot sweep
+    /// it.
+    ///
+    /// A handle held for weeks can still drift against the bucket, but only by
+    /// whatever NTP lets the two drift apart after the offset was taken — bounded
+    /// and small, where the raw skew it replaces is unbounded.
+    async fn clock_offset(&self) -> i64 {
+        *self
+            .clock_offset
+            .get_or_init(|| async {
+                let path = self.slot_path("clockprobe");
+                let before = Self::local_now();
+                let probe = self
+                    .store
+                    .put(&path, PutPayload::from(before.to_string().into_bytes()))
+                    .await;
+                let stamped = match probe {
+                    Ok(_) => self.store.head(&path).await.ok().map(|m| m.last_modified),
+                    Err(_) => None,
+                };
+                match stamped {
+                    // Midpoint of the request window, so the round trip does not
+                    // count entirely against the offset.
+                    Some(t) => t.timestamp() - (before + Self::local_now()) / 2,
+                    None => {
+                        tracing::debug!(
+                            "could not measure this object store's clock offset; object ages \
+                             fall back to the local clock, so a skewed host may date objects \
+                             wrongly for garbage collection"
+                        );
+                        0
+                    }
+                }
+            })
+            .await
+    }
+
+    /// "Now", expressed on the bucket's clock.
+    async fn store_now(&self) -> i64 {
+        Self::local_now() + self.clock_offset().await
+    }
+
+    /// Whether an already-stored object is stale enough that a deduplicating write
+    /// onto it must refresh its recency (see [`ContentStore::touch`]). Uses the
+    /// same bucket-clock arithmetic as `list_with_age`, so the write path and the
+    /// sweep agree on what "old" means. A future-dated object reports as young here
+    /// and as unknown-age there — both leave it alone.
+    fn refresh_needed(now: i64, meta: &object_store::ObjectMeta) -> bool {
         u64::try_from(now - meta.last_modified.timestamp())
             .is_ok_and(|age| age >= crate::content::DEDUP_REFRESH_AFTER_SECS)
     }
@@ -336,7 +401,7 @@ impl ContentStore for ObjectContentStore {
         // is what decides whether this dedup needs a recency refresh, so the
         // common case costs no extra request (see `refresh_needed`).
         if let Ok(meta) = self.store.head(&path).await {
-            if Self::refresh_needed(&meta) {
+            if Self::refresh_needed(self.store_now().await, &meta) {
                 self.rewrite(&path, bytes).await?;
             }
             return Ok(hash);
@@ -352,7 +417,7 @@ impl ContentStore for ObjectContentStore {
         Self::check_put_size(bytes)?;
         let path = self.path_for(key);
         if let Ok(meta) = self.store.head(&path).await {
-            if Self::refresh_needed(&meta) {
+            if Self::refresh_needed(self.store_now().await, &meta) {
                 self.rewrite(&path, bytes).await?;
             }
             return Ok(());
@@ -375,12 +440,20 @@ impl ContentStore for ObjectContentStore {
     ///
     /// Unlike the `put` paths, this has no bytes in hand and must read them back
     /// first — one extra GET, on the rare path. `PackStore` calls it on its index.
+    ///
+    /// The GET and the re-PUT are not atomic, so a concurrent `replace_keyed` on
+    /// the same key could be undone by the rewrite. That is safe for every key this
+    /// store actually holds: content-addressed objects have exactly one possible
+    /// value, so the rewrite is a no-op whichever copy it read. It would not be safe
+    /// for a *mutable* keyed store — a `PackStore` index, whose entry moves on
+    /// repack — which is why that index is a `LocalCasStore` (an atomic
+    /// rename) rather than an object store.
     async fn touch(&self, hash: &Hash) -> Result<()> {
         let path = self.path_for(hash);
         let Ok(meta) = self.store.head(&path).await else {
             return Ok(()); // gone already; nothing to keep alive
         };
-        if !Self::refresh_needed(&meta) {
+        if !Self::refresh_needed(self.store_now().await, &meta) {
             return Ok(());
         }
         let bytes = self
@@ -395,6 +468,10 @@ impl ContentStore for ObjectContentStore {
     }
 
     async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
+        // Same single-PUT ceiling as `put`/`put_keyed`; without the check this one
+        // path reached the provider with an oversized body and failed there, after
+        // the transfer, with an error naming nothing origofs knows about.
+        Self::check_put_size(bytes)?;
         // An object PUT replaces atomically: readers see the old object or the
         // new one, never neither.
         self.store
@@ -517,11 +594,9 @@ impl ContentStore for ObjectContentStore {
         use futures::StreamExt;
         // Epoch seconds on both sides, so this needs no date-time crate of its own
         // (`last_modified` is a chrono type from `object_store`, but `.timestamp()`
-        // is all we want from it).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // is all we want from it) — and both sides are the *bucket's* clock, which
+        // is what the trait promises. See `clock_offset`.
+        let now = self.store_now().await;
         let prefix = OsPath::from(self.prefix.clone());
         let mut stream = self.store.list(Some(&prefix));
         let mut out = Vec::new();
@@ -538,6 +613,18 @@ impl ContentStore for ObjectContentStore {
             }
         }
         Ok(out)
+    }
+
+    /// One HEAD, dated on the same bucket clock as `list_with_age`.
+    async fn age_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        let meta = match self.store.head(&self.path_for(hash)).await {
+            Ok(m) => m,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(OrigoFSError::from(e)),
+        };
+        // A future-dated object reports `None` (unknown), which the sweep treats as
+        // "don't touch" — same rule as `list_with_age`.
+        Ok(u64::try_from(self.store_now().await - meta.last_modified.timestamp()).ok())
     }
 
     async fn delete(&self, hash: &Hash) -> Result<u64> {

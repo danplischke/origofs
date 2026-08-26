@@ -127,14 +127,14 @@ proptest! {
     /// `decode(encode(t)) == t` for arbitrary trees.
     #[test]
     fn tree_roundtrips(t in arb_tree()) {
-        let back = Tree::decode(&t.encode()).expect("a tree must decode");
+        let back = Tree::decode(&t.encode().expect("a tree must encode")).expect("a tree must decode");
         prop_assert_eq!(back, t);
     }
 
     /// `decode(encode(c)) == c` for arbitrary commits.
     #[test]
     fn commit_roundtrips(c in arb_commit()) {
-        let back = Commit::decode(&c.encode()).expect("a commit must decode");
+        let back = Commit::decode(&c.encode().expect("a commit must encode")).expect("a commit must decode");
         prop_assert_eq!(back, c);
     }
 

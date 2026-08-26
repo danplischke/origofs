@@ -11,6 +11,7 @@ use crate::chunk::Manifest;
 use crate::content::ContentStore;
 use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
+use crate::merge::MERGE_HEAD;
 use crate::metadata::{MetaTxn, MetadataStore};
 use crate::objectgraph::{
     Commit, CommitInfo, DiffEntry, DiffStatus, RefSnapshot, Tree, TreeEntry, TreeKind,
@@ -239,7 +240,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // A merge in progress contributes the incoming commit as a second parent.
         let merge_head = self
             .meta
-            .get_ref("MERGE_HEAD")
+            .get_ref(MERGE_HEAD)
             .await?
             .and_then(|s| Hash::from_hex(&s));
         let mut parents: Vec<Hash> = parent.iter().copied().collect();
@@ -257,7 +258,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             message: message.to_string(),
             timestamp: self.now_secs(),
         };
-        let commit_hash = self.content.put(&commit.encode()).await?;
+        let commit_hash = self.content.put(&commit.encode()?).await?;
         // Durability barrier: seal any open pack so the whole snapshot is
         // persisted before the branch ref advances to it (no-op unless the
         // content store batches writes).
@@ -279,7 +280,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             ));
         }
         if merge_head.is_some() {
-            txn.delete_ref("MERGE_HEAD").await?;
+            txn.delete_ref(MERGE_HEAD).await?;
             txn.clear_conflicts().await?;
         }
         txn.commit().await?;
@@ -289,6 +290,22 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Recursively snapshot directory `dir_ino` into a tree object; returns its hash.
     #[async_recursion]
+    /// Snapshot directory `dir_ino` and its descendants into tree objects.
+    ///
+    /// **The walk is not transactional, and that is a deliberate tradeoff.** It
+    /// reads `list_dir`/`get_inode` outside any transaction or snapshot; the only
+    /// concurrency control on a commit is the branch-tip CAS. So on the
+    /// multi-writer Postgres deployment, a writer that touches two files while this
+    /// walk is in flight can be captured half-applied — file A pre-write, file B
+    /// post-write — in a commit that then becomes permanent history.
+    ///
+    /// Git's index has exactly the same property (`git commit -a` races a
+    /// concurrent editor), and the alternative — holding a repeatable-read snapshot
+    /// across a walk of the entire tree — would make every commit a long-lived
+    /// reader against the working tree that agents are continuously writing to.
+    /// Attribution is unaffected either way: blame is keyed by content hash, so
+    /// whichever version is captured carries its own correct authorship. Single
+    /// writer (SQLite) cannot hit it at all.
     async fn build_tree(&self, dir_ino: Ino) -> Result<Hash> {
         let mut entries = Vec::new();
         for de in self.meta.list_dir(dir_ino).await? {
@@ -302,7 +319,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 FileKind::File => {
                     let h = match inode.content {
                         Some(h) => h,
-                        None => self.content.put(&Manifest::default().encode()?).await?,
+                        // Puts *and* flushes: this manifest is about to be named by
+                        // a tree the branch will point at.
+                        None => self.store_empty_manifest().await?,
                     };
                     (TreeKind::File, h)
                 }
@@ -322,7 +341,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
-        self.content.put(&Tree { entries }.encode()).await
+        self.content.put(&Tree { entries }.encode()?).await
     }
 
     /// Create a branch at the current HEAD commit.
@@ -409,6 +428,20 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // silently force-overwriting the branch you came from.
         let mut txn = self.meta.begin().await?;
         self.replace_working_tree_in(&mut *txn, &plan).await?;
+        // Leaving a branch abandons any merge that was in progress on it, so the
+        // merge state goes with the tree it described — in the same transaction, so
+        // there is no window where one is switched and the other is not.
+        //
+        // `commit` used to be the only place that cleared these, which made
+        // checkout the way *out* of a conflicted merge (there is no merge-abort) and
+        // left `MERGE_HEAD` and the old branch's conflict rows pointing at content
+        // no longer in the tree. The next commit on the new branch then picked up
+        // that stale `MERGE_HEAD` as a second parent and recorded a merge that never
+        // happened, while `conflicts()` reported paths from the abandoned one. Git
+        // refuses checkout mid-merge for the same reason; origofs cannot refuse it,
+        // because it is the only way out — so it resolves it instead.
+        txn.delete_ref(MERGE_HEAD).await?;
+        txn.clear_conflicts().await?;
         txn.set_ref(HEAD, &format!("ref:{branch}")).await?;
         txn.commit().await?;
         self.mirror_refs_post_commit().await?;
