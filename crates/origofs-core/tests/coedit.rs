@@ -414,3 +414,513 @@ async fn coedit_open_existing_file_preserves_prior_authorship() {
     assert_eq!(b.len(), 1);
     assert_eq!(b[0].actor.id, alice);
 }
+
+// --- document index units (UTF-8 bytes, not UTF-16) -------------------------
+//
+// `yrs` picks its index unit per document (`OffsetKind`), and origofs pins it to
+// bytes because every consumer downstream — snapshot spans, the blame index,
+// `write_as_blamed` — speaks bytes. These tests exist because the two units are
+// indistinguishable on ASCII: the whole suite was green while non-ASCII text was
+// being misattributed, and a `yrs` default flip would be just as silent.
+
+// Pin the unit itself. Formatting `0..6` must cover exactly "héllo" (6 UTF-8
+// bytes, 5 UTF-16 code units) — if the document ever indexes UTF-16 again, this
+// range would reach into the following space instead.
+#[test]
+fn coedit_indices_are_utf8_bytes() {
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(1, 1), 0, "héllo world");
+    let (_, spans) = doc.snapshot();
+    assert_eq!(
+        spans,
+        vec![(1, 1, 12)],
+        "the whole string is one authored run"
+    );
+
+    // A second author appends at the end. The end is byte 12, not UTF-16 unit 11
+    // — passing 11 here lands the "!" before the "d", which is precisely the
+    // off-by-one a UTF-16 index produces against this byte-indexed document.
+    doc.insert(WriteCtx::session(2, 2), 12, "!");
+    let (text, spans) = doc.snapshot();
+    assert_eq!(text, "héllo world!");
+    assert_eq!(spans, vec![(1, 1, 12), (2, 2, 1)]);
+}
+
+// The user-visible consequence, through the real Yjs-client path: two authors
+// typing non-ASCII must be credited their exact byte counts, with nothing
+// orphaned to actor 0. Before the unit fix this produced [(1,1,5), (2,2,5),
+// (0,0,1)] — alice short by a byte, and that byte attributed to nobody (which a
+// checkpoint then silently credits to whoever happened to checkpoint).
+#[test]
+fn coedit_non_ascii_authorship_is_byte_exact() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, GetString, ReadTxn, Text, Transact, Update};
+
+    let alice = WriteCtx::session(1, 1);
+    let bob = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    let client = Doc::new();
+    let ctext = client.get_or_insert_text("content");
+
+    let sv = client.transact().state_vector();
+    ctext.insert(&mut client.transact_mut(), 0, "héllo"); // 6 bytes, 5 UTF-16 units
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    let relay = server.apply_update_as(alice, &u).unwrap();
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&relay).unwrap())
+        .unwrap();
+
+    let sv = client.transact().state_vector();
+    let end = ctext.get_string(&client.transact()).len() as u32;
+    ctext.insert(&mut client.transact_mut(), end, "wörld"); // 6 bytes too
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(bob, &u).unwrap();
+
+    let (text, spans) = server.snapshot();
+    assert_eq!(text, "héllowörld");
+    assert_eq!(
+        spans,
+        vec![(1, 1, 6), (2, 2, 6)],
+        "each author must own exactly the bytes they typed, with none orphaned"
+    );
+}
+
+// `from_blamed` reconstructs by inserting at byte offsets; with a UTF-16 cursor
+// every span after the first non-ASCII one landed at the wrong index.
+#[test]
+fn coedit_from_blamed_round_trips_non_ascii() {
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(1, 10), 0, "héllo ");
+    doc.insert(WriteCtx::session(2, 20), 7, "wörld");
+    doc.insert(WriteCtx::session(3, 30), 13, " 🎉"); // astral: 4 UTF-8 bytes, 2 UTF-16
+    let (text, spans) = doc.snapshot();
+    assert_eq!(text, "héllo wörld 🎉");
+
+    let rebuilt = CoeditDoc::from_blamed(&text, &spans).unwrap();
+    assert_eq!(rebuilt.text(), text);
+    assert_eq!(rebuilt.snapshot(), (text, spans));
+}
+
+// `reconcile_with` folds an out-of-band write into a live doc by applying the
+// difference as attributed CRDT ops — same indexing hazard, different direction.
+#[test]
+fn coedit_reconcile_with_handles_non_ascii() {
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(1, 1), 0, "héllo wörld");
+
+    // An out-of-band write replaced a multibyte word.
+    let target = "héllo 🌍";
+    doc.reconcile_with(target, &[(1, 1, 7), (2, 2, 4)]).unwrap();
+
+    assert_eq!(doc.text(), target);
+    let (text, spans) = doc.snapshot();
+    assert_eq!(text, target);
+    let total: u64 = spans.iter().map(|s| s.2).sum();
+    assert_eq!(
+        total,
+        target.len() as u64,
+        "spans must tile the text exactly"
+    );
+}
+
+// --- the server owns authorship, on every apply ------------------------------
+//
+// `coedit_ysync_attributes_client_content_server_side` above covers the case
+// where a client's forged author rides in the SAME update as its insert: the
+// text diff sees the insert, so the stamp is overwritten. That is the only shape
+// the suite tested, and it is not the shape an attacker uses.
+//
+// A client can instead send a SECOND, content-free update that only *formats*
+// existing text with a different author. No characters change, so an insert-only
+// stamping pass produced no ranges and the forged value stood — then flowed
+// through `snapshot` into the durable blame index with the file bytes and their
+// content hash unchanged. No byte-level check can see it, and for a co-edited
+// file the CRDT attribute is the only record of authorship there is.
+
+/// A vanilla Yjs client that formats `content[start..end]` with `a = value` and
+/// nothing else — the forgery, as ~46 bytes on the wire.
+fn forge_author_frame(client: &yrs::Doc, start: u32, end: u32, value: &str) -> Vec<u8> {
+    use yrs::{ReadTxn, Text, Transact};
+    let text = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        let attrs = yrs::types::Attrs::from([("a".into(), yrs::Any::from(value.to_string()))]);
+        text.format(&mut txn, start, end - start, attrs);
+    }
+    client.transact().encode_state_as_update_v1(&sv)
+}
+
+#[test]
+fn coedit_a_format_only_update_cannot_restamp_text_the_client_did_not_write() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, Text, Transact, Update};
+
+    let mallory = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    let client = Doc::new();
+    let ctext = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    ctext.insert(&mut client.transact_mut(), 0, "evil");
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    let relay = server.apply_update_as(mallory, &u).unwrap();
+    // The client catches up on the server's stamp, as a real socket would.
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&relay).unwrap())
+        .unwrap();
+    assert_eq!(server.snapshot().1, vec![(2, 2, 4)], "mallory typed it");
+
+    // Now the forgery: content-free, claiming alice (actor 1, session 1).
+    let forge = forge_author_frame(&client, 0, 4, "1,1");
+    let out = server.apply_update_as(mallory, &forge).unwrap();
+
+    assert_eq!(server.text(), "evil", "the text must be untouched");
+    assert_eq!(
+        server.snapshot().1,
+        vec![(2, 2, 4)],
+        "authorship must survive a format-only update from the same socket"
+    );
+
+    // The repair has to travel with the delta, or peers keep the forged value
+    // and diverge from the server on the next checkpoint.
+    assert!(!out.is_empty(), "the repair must be relayed");
+    let peer = CoeditDoc::new();
+    peer.apply_update(&server.state_update()).unwrap();
+    assert_eq!(peer.snapshot().1, vec![(2, 2, 4)]);
+}
+
+// The same forgery packed into ONE update alongside a real insert: the insert is
+// credited to the sender, and the forged re-stamp of the surrounding text is not.
+#[test]
+fn coedit_a_forgery_riding_with_a_real_insert_is_still_refused() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, Text, Transact, Update};
+
+    let alice = WriteCtx::session(1, 1);
+    let mallory = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    // Alice writes the base text.
+    let client = Doc::new();
+    let ctext = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    ctext.insert(&mut client.transact_mut(), 0, "alices words");
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    let relay = server.apply_update_as(alice, &u).unwrap();
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&relay).unwrap())
+        .unwrap();
+
+    // Mallory inserts AND re-stamps alice's text as his own, in one update.
+    let sv = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        ctext.insert(&mut txn, 12, "!");
+        let attrs = yrs::types::Attrs::from([("a".into(), yrs::Any::from("2,2".to_string()))]);
+        ctext.format(&mut txn, 0, 12, attrs);
+    }
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(mallory, &u).unwrap();
+
+    assert_eq!(server.text(), "alices words!");
+    assert_eq!(
+        server.snapshot().1,
+        vec![(1, 1, 12), (2, 2, 1)],
+        "mallory gets exactly the byte he typed; alice keeps hers"
+    );
+}
+
+// Laundering attempts: values the server would never write must not be believed
+// just because they parse. `"0,0"` is the unattributed sentinel (which a
+// checkpoint credits to the checkpointer), and `"1,1,junk"` parses to a
+// plausible (1,1) — a parsed comparison would accept both.
+#[test]
+fn coedit_malformed_forged_authors_are_normalised_away() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, Text, Transact, Update};
+
+    for forged in ["0,0", "1,1,junk", "", "not-a-number"] {
+        let mallory = WriteCtx::session(2, 2);
+        let server = CoeditDoc::new();
+        let client = Doc::new();
+        let ctext = client.get_or_insert_text("content");
+        let sv = client.transact().state_vector();
+        ctext.insert(&mut client.transact_mut(), 0, "mine");
+        let u = client.transact().encode_state_as_update_v1(&sv);
+        let relay = server.apply_update_as(mallory, &u).unwrap();
+        client
+            .transact_mut()
+            .apply_update(Update::decode_v1(&relay).unwrap())
+            .unwrap();
+
+        let forge = forge_author_frame(&client, 0, 4, forged);
+        server.apply_update_as(mallory, &forge).unwrap();
+        assert_eq!(
+            server.snapshot().1,
+            vec![(2, 2, 4)],
+            "forged value {forged:?} was believed"
+        );
+    }
+}
+
+// Deleting a victim's text and retyping different text credits the retyper —
+// they did type those bytes — and never lets an arbitrary actor be named.
+#[test]
+fn coedit_delete_and_reinsert_credits_the_reinserter() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, Text, Transact, Update};
+
+    let alice = WriteCtx::session(1, 1);
+    let mallory = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    let client = Doc::new();
+    let ctext = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    ctext.insert(&mut client.transact_mut(), 0, "aaaaaa");
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    let relay = server.apply_update_as(alice, &u).unwrap();
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&relay).unwrap())
+        .unwrap();
+
+    // Replace it with text sharing no characters, so the diff cannot align any
+    // of it as surviving (see the caveat test below).
+    let sv = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        ctext.remove_range(&mut txn, 0, 6);
+        ctext.insert(&mut txn, 0, "XYZXYZ");
+    }
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(mallory, &u).unwrap();
+
+    assert_eq!(server.text(), "XYZXYZ");
+    assert_eq!(server.snapshot().1, vec![(2, 2, 6)]);
+}
+
+// The limitation this design does NOT close, pinned so it is a known property
+// rather than a surprise.
+//
+// Authorship is carried across an update by `similar`'s *character* diff, not by
+// CRDT item identity — `yrs` does not expose the item ids that would make it
+// identity-correct. So characters the attacker types that happen to align with
+// characters already present read as "surviving" and keep the previous author.
+// Here mallory replaces alice's "alices" with "mallory"; the shared "al" aligns
+// and stays credited to alice.
+//
+// This is unchanged from the insert-only stamping that preceded total
+// enforcement — `inserted_ranges` used the same diff — so it is neither
+// introduced nor worsened here. It is strictly weaker than the forgery this
+// commit closes: an attacker cannot *name* an actor, only cause a victim to be
+// credited for characters that coincide with the victim's own. Closing it needs
+// item-identity tracking; see the note on `apply_update_as`.
+#[test]
+fn coedit_authorship_carries_by_text_diff_not_crdt_identity() {
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, Text, Transact, Update};
+
+    let alice = WriteCtx::session(1, 1);
+    let mallory = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    let client = Doc::new();
+    let ctext = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    ctext.insert(&mut client.transact_mut(), 0, "alices");
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    let relay = server.apply_update_as(alice, &u).unwrap();
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&relay).unwrap())
+        .unwrap();
+
+    let sv = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        ctext.remove_range(&mut txn, 0, 6);
+        ctext.insert(&mut txn, 0, "mallory");
+    }
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(mallory, &u).unwrap();
+
+    assert_eq!(server.text(), "mallory");
+    let spans = server.snapshot().1;
+    // "m" + "al" (aligned with alice's) + "lory".
+    assert_eq!(spans, vec![(2, 2, 1), (1, 1, 2), (2, 2, 4)]);
+    // The point: alice is never credited with a run mallory *named* her for, and
+    // the bulk still lands on mallory.
+    let alice_bytes: u64 = spans.iter().filter(|s| s.0 == 1).map(|s| s.2).sum();
+    assert!(
+        alice_bytes < 3,
+        "diff alignment should be incidental, not wholesale"
+    );
+}
+
+// --- co-edit authorship reaches the op-log, not only the blame index ---------
+//
+// A checkpoint used to record exactly one op-log row: a whole-file "write" by
+// whoever ran it. Every other contributor got none. That left the CRDT's own
+// attribute as the *only* record of who wrote which bytes of a co-edited file —
+// nothing to rebuild blame from and nothing to cross-check it against — and it
+// left `revert_session`, which discovers files through the op-log, unable to
+// find a contributor's work at all.
+
+#[tokio::test]
+async fn coedit_checkpoint_records_a_row_for_every_contributor() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let claude = fs.create_agent("claude", "m", Some(alice)).await.unwrap();
+    let s_a = fs.create_session(alice, None).await.unwrap();
+    let s_c = fs.create_session(claude, None).await.unwrap();
+
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(alice, s_a), 0, "hello ");
+    doc.insert(WriteCtx::session(claude, s_c), 6, "world");
+
+    // Claude checkpoints; alice never does.
+    fs.checkpoint_coedit(WriteCtx::session(claude, s_c), "/doc", &doc)
+        .await
+        .unwrap();
+
+    let a_ops = fs.edit_ops(alice, Some(s_a)).await.unwrap();
+    assert_eq!(a_ops.len(), 1, "alice authored bytes but has no op-log row");
+    assert_eq!(a_ops[0].op, "coedit");
+    assert_eq!(a_ops[0].path, "/doc");
+    assert_eq!((a_ops[0].byte_start, a_ops[0].byte_len), (0, 6));
+
+    // The checkpointer keeps their whole-file row *and* gains a precise one.
+    let c_ops = fs.edit_ops(claude, Some(s_c)).await.unwrap();
+    assert!(c_ops.iter().any(|o| o.op == "write" && o.byte_start == 0));
+    assert!(
+        c_ops
+            .iter()
+            .any(|o| o.op == "coedit" && (o.byte_start, o.byte_len) == (6, 5))
+    );
+}
+
+// The headline consequence: a co-editor who never ran a checkpoint can now be
+// reverted. Before this, `revert_session` returned Ok(vec![]) and changed
+// nothing — silently — even though the co-editing sockets deliberately open a
+// session per connection so that reverting one would work (#98).
+#[tokio::test]
+async fn coedit_a_contributor_who_never_checkpointed_can_be_reverted() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let claude = fs.create_agent("claude", "m", Some(alice)).await.unwrap();
+    let s_a = fs.create_session(alice, None).await.unwrap();
+    let s_c = fs.create_session(claude, None).await.unwrap();
+
+    // Whole lines, because `revert_session` keeps any line with mixed authorship
+    // rather than splitting it (#33) — that limitation is separate from this one.
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(alice, s_a), 0, "alice line\n");
+    doc.insert(WriteCtx::session(claude, s_c), 11, "claude line\n");
+
+    fs.checkpoint_coedit(WriteCtx::session(claude, s_c), "/doc", &doc)
+        .await
+        .unwrap();
+    assert_eq!(
+        &fs.read("/doc").await.unwrap()[..],
+        b"alice line\nclaude line\n"
+    );
+
+    let changed = fs.revert_session(alice, s_a, None).await.unwrap();
+    assert_eq!(
+        changed,
+        vec!["/doc".to_string()],
+        "alice's file was not found"
+    );
+    assert_eq!(
+        &fs.read("/doc").await.unwrap()[..],
+        b"claude line\n",
+        "alice's contribution was not removed"
+    );
+}
+
+// The sweeper writes on a timer, so a checkpoint that introduces no new
+// authorship must add no rows — otherwise an open document accrues op-log rows
+// forever.
+#[tokio::test]
+async fn coedit_a_repeat_checkpoint_records_no_new_rows() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let s_a = fs.create_session(alice, None).await.unwrap();
+
+    let doc = CoeditDoc::new();
+    doc.insert(WriteCtx::session(alice, s_a), 0, "stable");
+    let ctx = WriteCtx::session(alice, s_a);
+    fs.checkpoint_coedit(ctx, "/doc", &doc).await.unwrap();
+    let after_first = fs.edit_ops(alice, Some(s_a)).await.unwrap().len();
+
+    for _ in 0..3 {
+        fs.checkpoint_coedit(ctx, "/doc", &doc).await.unwrap();
+    }
+    let after_repeats = fs.edit_ops(alice, Some(s_a)).await.unwrap().len();
+
+    // The whole-file "write" row is unconditional (it records that a checkpoint
+    // ran); the per-contributor rows must not repeat.
+    let coedit_rows = fs
+        .edit_ops(alice, Some(s_a))
+        .await
+        .unwrap()
+        .iter()
+        .filter(|o| o.op == "coedit")
+        .count();
+    assert_eq!(
+        coedit_rows, 1,
+        "unchanged authorship re-recorded per checkpoint"
+    );
+    assert_eq!(after_repeats - after_first, 3, "only the write rows repeat");
+}
+
+// A string-valued embed must not be mistaken for text.
+//
+// `Text::diff` renders `ItemContent::Embed(Any::String(s))` as
+// `Out::Any(Any::String(s))` — byte-for-byte the shape real text has — while yrs
+// indexes *every* embed as exactly one position. Counting such a chunk's bytes as
+// its index length inflated every index after it, so the repair landed past its
+// target and a forged stamp survived all the way into durable blame. It also put
+// the embed's bytes into the file, which `text()` (GetString) excludes — so
+// `snapshot()` and `text()` disagreed. Reachable from a stock Yjs client through
+// `ytext.insertEmbed(index, "a string", attrs)`.
+#[test]
+fn coedit_a_string_embed_cannot_carry_a_forged_author() {
+    use yrs::{Any, Doc, OffsetKind, Options, ReadTxn, Text, Transact};
+
+    let bob = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    let client = Doc::with_options(Options {
+        offset_kind: OffsetKind::Bytes,
+        ..Default::default()
+    });
+    let ct = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        // A 20-byte string embed, then text stamped as the victim (actor 1).
+        let mine = yrs::types::Attrs::from([("a".into(), Any::from("2,2".to_string()))]);
+        ct.insert_embed_with_attributes(&mut txn, 0, Any::from("XXXXXXXXXXXXXXXXXXXX"), mine);
+        let victim = yrs::types::Attrs::from([("a".into(), Any::from("1,1".to_string()))]);
+        ct.insert_with_attributes(&mut txn, 1, "FORGED", victim);
+    }
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(bob, &u).unwrap();
+
+    let (text, spans) = server.snapshot();
+    // The embed contributes no bytes, exactly as `GetString` reports.
+    assert_eq!(text, "FORGED");
+    assert_eq!(text, server.text(), "snapshot() and text() must agree");
+    assert_eq!(
+        spans,
+        vec![(2, 2, 6)],
+        "the victim was credited bob's bytes"
+    );
+}

@@ -473,6 +473,73 @@ def test_a_room_with_no_edits_is_not_rewritten():
             assert ops == [], f"the sweeper wrote {len(ops)} op-log entries for an idle room"
 
 
+def _awareness_frame(client_id: int, clock: int, state: str) -> bytes:
+    """A y-sync **awareness** message, as `y-protocols/awareness` puts on the wire.
+
+    Hand-encoded because the Python client here is a ``CoeditDoc`` (content only) —
+    presence is the browser's job, and this is the frame a browser sends. lib0
+    varints: every value below is < 128, so each is a single byte.
+
+        msg type 1 (awareness) | varuint8array( clients=1 | clientID | clock | varstring(state) )
+    """
+    body = state.encode()
+    payload = bytes([1, client_id, clock, len(body)]) + body
+    return bytes([1, len(payload)]) + payload
+
+
+def test_awareness_alone_does_not_make_a_room_due_for_checkpointing():
+    # The companion to `test_a_room_with_no_edits_is_not_rewritten`, for the case
+    # that actually occurs in a browser. That test's socket never sends anything
+    # after the handshake — but every real Yjs client publishes awareness, on each
+    # selection change and on y-protocols' periodic heartbeat. That is how a cursor
+    # exists.
+    #
+    # Awareness is broadcast (peers need it to draw carets), so gating the
+    # checkpoint sweeper on "the payload produced a broadcast" counted presence as
+    # an edit: one awareness frame, with nothing typed, wrote a zero-length op-log
+    # entry and a blame rewrite — and an open, idle tab kept doing it. Only a
+    # content delta may mark the room dirty.
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+
+    async def authn(token: str = Query(...)) -> origofs.WriteCtx:
+        return ctx
+
+    app = FastAPI()
+    app.include_router(
+        build_router(
+            ws,
+            authn=authn,
+            checkpoint=CheckpointPolicy(idle_after=0.01, max_interval=0.01, tick=0.01),
+        )
+    )
+
+    with TestClient(app) as tc:
+        # Two sockets: the second is how we prove the server really *parsed* the
+        # frame as awareness and fanned it out. Without that check a malformed
+        # frame would be dropped and the no-churn assertion would pass vacuously.
+        with tc.websocket_connect("/coedit/doc.md?token=alice-token") as peer:
+            peer.receive_bytes()  # the server's SyncStep1 greeting
+            with tc.websocket_connect("/coedit/doc.md?token=alice-token") as sock:
+                sock.receive_bytes()  # ditto
+
+                sock.send_bytes(_awareness_frame(42, 1, '{"user":{"name":"alice"}}'))
+                relayed = peer.receive_bytes()
+                assert relayed[0] == 1, (
+                    "the server did not fan the awareness frame out as awareness; "
+                    "the no-churn assertion below would be vacuous"
+                )
+
+                time.sleep(0.3)  # many sweeper ticks, still nobody typing
+                ops = _run(lambda: ws.edit_ops(alice, alice_s))
+                assert ops == [], (
+                    f"cursor presence alone caused {len(ops)} durable checkpoint write(s)"
+                )
+
+
 def test_checkpointing_can_be_turned_off():
     # An embedder that drives checkpoints itself can disable both triggers, which
     # restores the checkpoint-on-last-leave-only behaviour.
@@ -517,3 +584,72 @@ def test_checkpointing_can_be_turned_off():
                 break
             time.sleep(0.05)
     assert body == b"only on last leave"
+
+
+def test_a_coedit_contributor_who_never_checkpointed_can_be_reverted():
+    """Co-edit authorship reaches the op-log, not only the blame index.
+
+    A checkpoint used to record exactly one op-log row: a whole-file write by
+    whoever ran it. Every other contributor got none, which left the CRDT's own
+    attribute as the only record of who wrote which bytes — and left
+    ``revert_session``, which discovers files through the op-log, unable to find
+    a contributor's work at all. It returned ``[]`` and changed nothing, even
+    though the co-editing sockets open a session per connection precisely so
+    that reverting one works.
+    """
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    claude = _run(lambda: ws.create_agent("claude", "m", alice))
+    claude_s = _run(lambda: ws.create_session(claude, "agent"))
+    a_ctx = origofs.WriteCtx.session(alice, alice_s)
+    c_ctx = origofs.WriteCtx.session(claude, claude_s)
+
+    # Whole lines: revert keeps any line with mixed authorship rather than
+    # splitting it, which is a separate limitation from the one under test.
+    doc = origofs.CoeditDoc()
+    _run(lambda: doc.insert(a_ctx, 0, "alice line\n"))
+    _run(lambda: doc.insert(c_ctx, 11, "claude line\n"))
+
+    # Claude checkpoints; alice never does.
+    _run(lambda: ws.checkpoint_coedit(c_ctx, "/doc", doc))
+    assert bytes(_run(lambda: ws.read("/doc"))) == b"alice line\nclaude line\n"
+
+    # Alice authored bytes, so she must have an op-log row naming her.
+    a_ops = _run(lambda: ws.edit_ops(alice, alice_s))
+    assert a_ops, "alice authored bytes but has no op-log row"
+    assert any(o["op"] == "coedit" and o["path"] == "/doc" for o in a_ops)
+
+    changed = _run(lambda: ws.revert_session(alice, alice_s, None))
+    assert changed == ["/doc"], f"alice's file was not discovered: {changed}"
+    assert bytes(_run(lambda: ws.read("/doc"))) == b"claude line\n"
+
+
+def test_coedit_indices_are_byte_offsets_not_utf16():
+    """The document indexes UTF-8 bytes, matching what blame stores.
+
+    The two units coincide on ASCII, so non-ASCII text was silently
+    misattributed while every test stayed green: a 6-byte "héllo" was credited
+    as 5 bytes with the sixth orphaned to actor 0.
+    """
+    d = tempfile.mkdtemp()
+    ws = _run(lambda: origofs.Workspace.open_local(os.path.join(d, "meta.db"), os.path.join(d, "cas")))
+    alice = _run(lambda: ws.create_human("alice", None))
+    alice_s = _run(lambda: ws.create_session(alice, "web"))
+    bob = _run(lambda: ws.create_human("bob", None))
+    bob_s = _run(lambda: ws.create_session(bob, "web"))
+    a_ctx = origofs.WriteCtx.session(alice, alice_s)
+    b_ctx = origofs.WriteCtx.session(bob, bob_s)
+
+    doc = origofs.CoeditDoc()
+    _run(lambda: doc.insert(a_ctx, 0, "héllo"))  # 6 bytes, 5 UTF-16 units
+    _run(lambda: doc.insert(b_ctx, 6, "wörld"))  # appended at the BYTE offset
+    assert _run(lambda: doc.text()) == "héllowörld"
+
+    _run(lambda: ws.checkpoint_coedit(a_ctx, "/doc", doc))
+    blame = _run(lambda: ws.blame("/doc"))
+    spans = [(b["actor"]["id"], b["byte_start"], b["byte_end"]) for b in blame]
+    assert spans == [(alice, 0, 6), (bob, 6, 12)], (
+        f"non-ASCII authorship is not byte-exact: {spans}"
+    )

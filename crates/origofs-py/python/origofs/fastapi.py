@@ -1467,10 +1467,14 @@ async def _serve_coedit(
             if reply.reply:
                 conn.out.put_nowait(reply.reply)
             if reply.broadcast:
-                # A frame worth broadcasting is a frame that changed the
-                # document, which is exactly what makes the room due for a
-                # checkpoint.
-                room.touch_edit()
+                # Only a *content* delta makes the room due for a checkpoint.
+                # Awareness (cursor presence) is broadcast too — and every real
+                # Yjs client emits it on each selection change plus a periodic
+                # heartbeat, with no typing involved — so gating on `broadcast`
+                # alone had an open-but-idle tab writing an op-log entry and a
+                # blame rewrite on every sweeper tick, forever.
+                if reply.content_changed:
+                    room.touch_edit()
                 room.fanout(conn, reply.broadcast)  # local sockets
                 await rooms.publish(key, reply.broadcast)  # peer workers
     except WebSocketDisconnect:

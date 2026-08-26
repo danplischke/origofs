@@ -382,6 +382,13 @@ class CoeditSyncReply:
     def broadcast(self) -> bytes:
         """Frames to fan out to the room's other connections (``b""`` if none)."""
         ...
+    @property
+    def content_changed(self) -> bool:
+        """Whether this payload changed the *document*, rather than only relaying
+        presence. Gate periodic checkpointing on this: awareness (cursor presence)
+        is broadcast too, and every real Yjs client emits it constantly without
+        anyone typing."""
+        ...
 
 class CoeditDoc:
     """A live co-edited document (roadmap M8): a Yjs-compatible CRDT whose inserts
@@ -394,10 +401,13 @@ class CoeditDoc:
         """A fresh, empty document (for a Python-side agent or a test client)."""
         ...
     async def insert(self, ctx: WriteCtx, index: int, chunk: str) -> None:
-        """Insert ``chunk`` at character ``index`` (UTF-16 offset), attributed to ``ctx``."""
+        """Insert ``chunk`` at ``index``, a UTF-8 **byte** offset, attributed to ``ctx``.
+
+        Not a UTF-16 offset: the document indexes bytes, matching the byte ranges
+        blame stores. The two coincide for ASCII and diverge for anything else."""
         ...
     async def remove(self, index: int, length: int) -> None:
-        """Remove ``length`` characters starting at ``index`` (UTF-16 offsets)."""
+        """Remove ``length`` bytes starting at ``index`` (UTF-8 byte offsets)."""
         ...
     async def sync_start(self) -> bytes:
         """The y-sync ``SyncStep1`` frame to greet a new client with."""

@@ -59,10 +59,9 @@ pytest tests/          # some tests also gate on ORIGOFS_PG_TEST_URL
 
 ### Toolchain note
 
-There is no `rust-toolchain` file. **`origofs-core`, `origofs-sdk`, and `origofs-cli`
-use `edition = "2024"`** (edition 2024 itself sets a Rust ≥ 1.85 *language* floor);
-`origofs-py` inherits `edition = "2021"` from the workspace. The **effective MSRV is
-1.88**, though — the code uses `let`-chains (stabilized in 1.88) and the dependency
+There is no `rust-toolchain` file. **All four crates use `edition = "2024"`**,
+inherited from `[workspace.package]` (edition 2024 itself sets a Rust ≥ 1.85
+*language* floor). The **effective MSRV is 1.88**, though — the code uses `let`-chains (stabilized in 1.88) and the dependency
 graph (`icu`, via `url`/`object_store`) needs ≥ 1.86 — and the `msrv` CI job pins it
 so an accidental newer-stdlib use or a dependency MSRV bump is caught. CI lives at
 `.github/workflows/ci.yml` (fmt + clippy + tests, an explicit `coedit` pass, and the
@@ -199,7 +198,7 @@ opt-in, feature-gated **modules of `origofs-sdk`** (default-off, so a plain
 | `origofs-core` | The engine. Both trait abstractions, all content backends, chunking, versioning, merge, attribution, gc, recovery, migrations. Everything else depends on it. (`edition 2024`) |
 | `origofs-sdk` | `Workspace` — the ergonomic façade over `origofs-core::Fs`, **plus every access surface as a feature-gated module** (table below). The library every other surface calls. (`edition 2024`) |
 | `origofs-cli` | The `origofs` binary **and** the `git-remote-origofs` helper (clap). A thin shell over `origofs-sdk` with all surfaces (`full`) enabled; the best index of what the system can do. (`edition 2024`) |
-| `origofs-py` | pyo3/maturin bindings: async-native (`await` every I/O), a FastAPI router (`origofs.fastapi`), and overlay orchestration (`origofs.overlay`). Enables `origofs-sdk`'s `coedit` (always) + `fuse`/`nfs` (on Unix). |
+| `origofs-py` | pyo3/maturin bindings: async-native (`await` every I/O), a FastAPI router (`origofs.fastapi`), and overlay orchestration (`origofs.overlay`). Enables `origofs-sdk`'s `coedit` (always), `nfs` (on Unix), and `fuse` (Linux only — narrower than Unix, since macFUSE is a kernel extension a wheel can't carry; macOS mounts over NFSv3 instead). |
 
 ### `origofs-sdk` access-surface features
 

@@ -262,3 +262,41 @@ async fn live_tool_reports_the_flag_for_a_path_and_lists_live_documents() {
         .unwrap();
     assert!(text(&r).contains("not live"), "{}", text(&r));
 }
+
+// The same tool over a **non-ASCII** document.
+//
+// `CoeditDoc` indexes UTF-8 bytes; this tool converted to UTF-16 code units
+// first, so on any document containing multi-byte characters the splice landed
+// at the wrong offset and removed the wrong number of bytes — replacing "world"
+// in "ééééé world\n" spliced at byte 6 instead of 11 and cut 5 bytes instead of
+// 11, yielding "éééorigofsworld\nééééé world\n". The tool reported success, the
+// suggestion was reviewable, and accepting it corrupted the file. This is the
+// only production caller that indexes a co-edit document directly.
+#[tokio::test]
+async fn suggest_coedit_splices_at_the_right_offset_in_a_non_ascii_document() {
+    let (s, ws) = server_and_ws().await;
+
+    let dan = ws.create_human("dan", None).await.unwrap();
+    let dan_s = ws.create_session(dan, Some("editor")).await.unwrap();
+    let h = WriteCtx::session(dan, dan_s);
+    let doc = ws.open_coedit(h, "/notes.md").await.unwrap();
+    doc.insert(h, 0, "ééééé world\n"); // 5 two-byte chars: byte 11 != UTF-16 6
+    ws.checkpoint_coedit(h, "/notes.md", &doc).await.unwrap();
+    ws.end_coedit("/notes.md").await.unwrap();
+
+    let r = s
+        .handle(call(
+            "origofs_suggest_coedit",
+            json!({"path": "/notes.md", "old": "world", "new": "origofs", "summary": "rename"}),
+        ))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+
+    let pending = ws.list_suggestions(None, Some("/notes.md")).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    ws.accept_suggestion(pending[0].id, h).await.unwrap();
+
+    let after = String::from_utf8(ws.read("/notes.md").await.unwrap().to_vec()).unwrap();
+    assert_eq!(after, "ééééé origofs\n");
+}

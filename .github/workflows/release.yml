@@ -79,7 +79,9 @@ jobs:
           working-directory: crates/origofs-py
 
       # A wheel that imports is the minimum bar for publishing one. Skipped where
-      # the wheel can't run on the runner (the cross-built aarch64 legs).
+      # the wheel can't run on the runner: linux-aarch64 is cross-compiled and
+      # can't execute here, and macos-latest runners are arm64 so their Python
+      # can't import the cross-built macos-x86_64 wheel.
       #
       # The script is shared with ci.yml's `windows` job rather than inlined here,
       # so the check that runs on every PR and the check that gates a release

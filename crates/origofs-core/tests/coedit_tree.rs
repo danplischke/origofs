@@ -425,3 +425,191 @@ async fn the_y_sync_handshake_drives_a_tree_room() {
     let again = doc.handle_sync(ctx, &frame).unwrap();
     assert!(again.broadcast.is_empty());
 }
+
+// --- authorship is re-asserted on every apply, not only on insert ------------
+//
+// `a_client_cannot_name_the_author_of_its_own_content` above covers the case
+// where the forged author rides in the SAME update as the insert that created
+// the node: the content diff sees the insert, so the stamp is overwritten. That
+// was the only shape covered, and it is not the shape an attacker uses.
+//
+// The tree shape had THREE knobs a later, content-free update could turn on
+// content the client did not write — re-stamp `a` on an existing run, re-point
+// `n` on an existing run (including onto a victim's id, which `authors()` then
+// resolved to the victim), and rewrite either attribute on an existing element.
+// None was re-checked after the insert that created the node.
+
+/// Sync a fresh vanilla client to `server`'s state and return it.
+fn client_synced_to(server: &CoeditTreeDoc) -> Doc {
+    let client = Doc::new();
+    client
+        .transact_mut()
+        .apply_update(Update::decode_v1(&server.state_update()).unwrap())
+        .unwrap();
+    client
+}
+
+#[test]
+fn a_later_format_only_update_cannot_re_author_or_re_label_existing_content() {
+    let alice = WriteCtx::session(1, 1);
+    let mallory = WriteCtx::session(2, 2);
+
+    let server = CoeditTreeDoc::new(ROOT);
+    let node = server.append_text(mallory, "p", "rm -rf /");
+    assert_eq!(server.runs()[0].actor, 2, "mallory typed it");
+
+    // A content-free update re-stamping BOTH keys on the existing run, and both
+    // XML attributes on the existing element.
+    let client = client_synced_to(&server);
+    let cfrag = client.get_or_insert_xml_fragment(ROOT);
+    let sv = client.transact().state_vector();
+    {
+        let txn = client.transact();
+        let nodes: Vec<XmlOut> = cfrag.successors(&txn).collect();
+        drop(txn);
+        let mut txn = client.transact_mut();
+        for n in nodes {
+            match n {
+                XmlOut::Text(t) => {
+                    let attrs = yrs::types::Attrs::from([
+                        ("a".into(), Any::from("1,1".to_string())),
+                        ("n".into(), Any::from("mallory-chosen-id".to_string())),
+                    ]);
+                    t.format(&mut txn, 0, 8, attrs);
+                }
+                XmlOut::Element(el) => {
+                    el.insert_attribute(&mut txn, "a", "1,1");
+                    el.insert_attribute(&mut txn, "n", "mallory-chosen-el");
+                }
+                XmlOut::Fragment(_) => {}
+            }
+        }
+    }
+    let forge = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(mallory, &forge).unwrap();
+
+    assert_eq!(server.plain_text(), "rm -rf /", "text must be untouched");
+    let runs = server.runs();
+    assert_eq!(runs[0].actor, 2, "the run's author must survive");
+    assert_eq!(runs[0].session, 2);
+    assert_eq!(
+        runs[0].node.as_deref(),
+        Some(&*node),
+        "the run's node id must survive, so a span map still resolves it"
+    );
+    // Neither client-chosen id may appear anywhere in the resolvable map.
+    let authors = server.authors();
+    assert!(!authors.contains_key("mallory-chosen-id"));
+    assert!(!authors.contains_key("mallory-chosen-el"));
+    assert_eq!(authors.get(&node), Some(&(2, 2)));
+    let _ = alice;
+}
+
+// The end-to-end shape of the reproduction: after the forgery, a host checkpoints
+// citing the node id, and durable blame must still credit the real author.
+#[tokio::test]
+async fn a_forged_tree_stamp_does_not_reach_durable_blame() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let mallory = fs.create_human("mallory", None).await.unwrap();
+    let carol = fs.create_human("carol", None).await.unwrap();
+    let s_m = fs.create_session(mallory, None).await.unwrap();
+    let s_c = fs.create_session(carol, None).await.unwrap();
+    let m_ctx = WriteCtx::session(mallory, s_m);
+
+    let doc = CoeditTreeDoc::new(ROOT);
+    let node = doc.append_text(m_ctx, "p", "rm -rf /");
+
+    let client = client_synced_to(&doc);
+    let cfrag = client.get_or_insert_xml_fragment(ROOT);
+    let sv = client.transact().state_vector();
+    {
+        let txn = client.transact();
+        let target = cfrag.successors(&txn).find_map(|n| match n {
+            XmlOut::Text(t) => Some(t),
+            _ => None,
+        });
+        drop(txn);
+        let mut txn = client.transact_mut();
+        let attrs = yrs::types::Attrs::from([("a".into(), Any::from(format!("{alice},{}", 0)))]);
+        target.unwrap().format(&mut txn, 0, 8, attrs);
+    }
+    let forge = client.transact().encode_state_as_update_v1(&sv);
+    doc.apply_update_as(m_ctx, &forge).unwrap();
+
+    // Carol checkpoints, citing the node id for the whole body.
+    fs.checkpoint_coedit_tree(
+        WriteCtx::session(carol, s_c),
+        "/x.md",
+        &doc,
+        b"rm -rf /",
+        &[TreeSpan::new(0, 8, node)],
+    )
+    .await
+    .unwrap();
+
+    let b = fs.blame("/x.md").await.unwrap();
+    assert_eq!(b.len(), 1);
+    assert_eq!(
+        b[0].actor.id, mallory,
+        "durable blame credited {} for bytes mallory wrote",
+        b[0].actor.display_name
+    );
+}
+
+// A node id claimed by two runs with conflicting authors resolves to nobody, so
+// a span map citing it falls back to the checkpointer rather than silently
+// crediting whichever claimant happened to come last in document order.
+#[tokio::test]
+async fn a_node_id_claimed_by_two_authors_resolves_to_nobody() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let carol = fs.create_human("carol", None).await.unwrap();
+    let s_a = fs.create_session(alice, None).await.unwrap();
+    let s_c = fs.create_session(carol, None).await.unwrap();
+
+    // Build the conflict directly — enforcement stops the server minting one, but
+    // a replica merge or an older sidecar still can.
+    let doc = CoeditTreeDoc::new(ROOT);
+    let first = doc.append_text(WriteCtx::session(alice, s_a), "p", "alice text");
+    {
+        let d = doc.doc();
+        let frag = d.get_or_insert_xml_fragment(ROOT);
+        let txn = d.transact();
+        let second = frag
+            .successors(&txn)
+            .filter_map(|n| match n {
+                XmlOut::Text(t) => Some(t),
+                _ => None,
+            })
+            .last();
+        drop(txn);
+        let mut txn = d.transact_mut();
+        let attrs = yrs::types::Attrs::from([
+            ("a".into(), Any::from(format!("{carol},{s_c}"))),
+            ("n".into(), Any::from(first.clone())),
+        ]);
+        second.unwrap().format(&mut txn, 0, 5, attrs);
+    }
+
+    assert!(
+        !doc.authors().contains_key(&first),
+        "a contested node id must not resolve to either claimant"
+    );
+
+    fs.checkpoint_coedit_tree(
+        WriteCtx::session(carol, s_c),
+        "/y.md",
+        &doc,
+        b"alice text",
+        &[TreeSpan::new(0, 10, first)],
+    )
+    .await
+    .unwrap();
+
+    let b = fs.blame("/y.md").await.unwrap();
+    assert_eq!(
+        b[0].actor.id, carol,
+        "an unresolved id falls back to the checkpointer"
+    );
+}

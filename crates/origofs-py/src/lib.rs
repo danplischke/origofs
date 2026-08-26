@@ -688,6 +688,7 @@ impl Drop for NfsServer {
 struct CoeditSyncReply {
     reply: Vec<u8>,
     broadcast: Vec<u8>,
+    content_changed: bool,
 }
 
 #[pymethods]
@@ -704,11 +705,21 @@ impl CoeditSyncReply {
         PyBytes::new(py, &self.broadcast)
     }
 
+    /// Whether this payload changed the **document**, rather than only relaying
+    /// presence. Gate periodic checkpointing on this: awareness (cursor presence)
+    /// is broadcast too, and every real Yjs client emits it constantly without
+    /// anyone typing.
+    #[getter]
+    fn content_changed(&self) -> bool {
+        self.content_changed
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "CoeditSyncReply(reply={} bytes, broadcast={} bytes)",
+            "CoeditSyncReply(reply={} bytes, broadcast={} bytes, content_changed={})",
             self.reply.len(),
-            self.broadcast.len()
+            self.broadcast.len(),
+            self.content_changed
         )
     }
 }
@@ -741,7 +752,8 @@ impl CoeditDoc {
         }
     }
 
-    /// Insert `chunk` at character `index` (UTF-16 offset, as in Yjs), attributed
+    /// Insert `chunk` at `index`, a UTF-8 **byte** offset (not UTF-16 as in Yjs:
+    /// the document indexes bytes, matching what blame stores), attributed
     /// to `ctx`.
     fn insert<'py>(
         &self,
@@ -758,7 +770,7 @@ impl CoeditDoc {
         })
     }
 
-    /// Remove `length` characters starting at `index` (UTF-16 offsets).
+    /// Remove `length` bytes starting at `index` (UTF-8 byte offsets).
     #[pyo3(signature = (index, length))]
     fn remove<'py>(&self, py: Python<'py>, index: u32, length: u32) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -817,6 +829,7 @@ impl CoeditDoc {
                     CoeditSyncReply {
                         reply: out.reply,
                         broadcast: out.broadcast,
+                        content_changed: out.content_changed,
                     },
                 )
             })
@@ -948,6 +961,7 @@ impl CoeditTreeDoc {
                     CoeditSyncReply {
                         reply: out.reply,
                         broadcast: out.broadcast,
+                        content_changed: out.content_changed,
                     },
                 )
             })
