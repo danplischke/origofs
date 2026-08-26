@@ -879,3 +879,48 @@ async fn coedit_a_repeat_checkpoint_records_no_new_rows() {
     );
     assert_eq!(after_repeats - after_first, 3, "only the write rows repeat");
 }
+
+// A string-valued embed must not be mistaken for text.
+//
+// `Text::diff` renders `ItemContent::Embed(Any::String(s))` as
+// `Out::Any(Any::String(s))` — byte-for-byte the shape real text has — while yrs
+// indexes *every* embed as exactly one position. Counting such a chunk's bytes as
+// its index length inflated every index after it, so the repair landed past its
+// target and a forged stamp survived all the way into durable blame. It also put
+// the embed's bytes into the file, which `text()` (GetString) excludes — so
+// `snapshot()` and `text()` disagreed. Reachable from a stock Yjs client through
+// `ytext.insertEmbed(index, "a string", attrs)`.
+#[test]
+fn coedit_a_string_embed_cannot_carry_a_forged_author() {
+    use yrs::{Any, Doc, OffsetKind, Options, ReadTxn, Text, Transact};
+
+    let bob = WriteCtx::session(2, 2);
+    let server = CoeditDoc::new();
+
+    let client = Doc::with_options(Options {
+        offset_kind: OffsetKind::Bytes,
+        ..Default::default()
+    });
+    let ct = client.get_or_insert_text("content");
+    let sv = client.transact().state_vector();
+    {
+        let mut txn = client.transact_mut();
+        // A 20-byte string embed, then text stamped as the victim (actor 1).
+        let mine = yrs::types::Attrs::from([("a".into(), Any::from("2,2".to_string()))]);
+        ct.insert_embed_with_attributes(&mut txn, 0, Any::from("XXXXXXXXXXXXXXXXXXXX"), mine);
+        let victim = yrs::types::Attrs::from([("a".into(), Any::from("1,1".to_string()))]);
+        ct.insert_with_attributes(&mut txn, 1, "FORGED", victim);
+    }
+    let u = client.transact().encode_state_as_update_v1(&sv);
+    server.apply_update_as(bob, &u).unwrap();
+
+    let (text, spans) = server.snapshot();
+    // The embed contributes no bytes, exactly as `GetString` reports.
+    assert_eq!(text, "FORGED");
+    assert_eq!(text, server.text(), "snapshot() and text() must agree");
+    assert_eq!(
+        spans,
+        vec![(2, 2, 6)],
+        "the victim was credited bob's bytes"
+    );
+}

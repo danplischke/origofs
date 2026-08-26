@@ -240,25 +240,35 @@ impl CoeditDoc {
         // Pin the pre-image: its authorship (to carry across survivors) and its
         // state vector (to encode exactly this update's effect for relay).
         let sv_before = txn.state_vector();
-        let (before, before_runs) = scan_runs(&self.text, &txn, raw_author);
+        let plain = self.text.get_string(&txn);
+        let before = scan_runs(&self.text, &txn, Some(&plain), raw_author);
 
         txn.apply_update(update)
             .map_err(|e| OrigoFSError::InvalidArgument(format!("apply co-edit update: {e}")))?;
 
-        let (after, after_runs) = scan_runs(&self.text, &txn, raw_author);
+        let plain = self.text.get_string(&txn);
+        let after = scan_runs(&self.text, &txn, Some(&plain), raw_author);
+        // `plain` is authoritative here, so this can only fail on a document the
+        // server itself put out of shape. Refusing beats repairing off a run map
+        // whose indices do not address the content they claim to.
+        if !after.indexable {
+            return Err(OrigoFSError::InvalidArgument(
+                "co-edit update left the document unindexable; refusing to attribute it".into(),
+            ));
+        }
         let mine: Option<Arc<str>> = Some(Arc::from(author_value(ctx)));
         let want = intended_stamps(
-            &before,
-            &stamp_tiling(&before_runs),
-            &after,
+            &before.flat,
+            &stamp_tiling(&before.runs),
+            &after.flat,
             // Text with no pre-image author stays unattributed rather than being
             // adopted by whoever next touched the document; `checkpoint_coedit`
             // resolves that to the checkpointer.
             &None,
             || mine.clone(),
         );
-        for (byte_start, byte_len, stamp) in diverging_runs(&want, &stamp_tiling(&after_runs)) {
-            let Some((index, len)) = doc_range(&after_runs, byte_start, byte_len) else {
+        for (byte_start, byte_len, stamp) in diverging_runs(&want, &stamp_tiling(&after.runs)) {
+            let Some((index, len)) = doc_range(&after.runs, byte_start, byte_len) else {
                 continue; // unreachable for a range from this document's own runs
             };
             self.text.format(&mut txn, index, len, author_attr(&stamp));
@@ -429,7 +439,12 @@ impl CoeditDoc {
     /// checkpointer.
     pub fn snapshot(&self) -> (String, Vec<(i64, i64, u64)>) {
         let txn = self.doc.transact();
-        let (text, runs) = scan_runs(&self.text, &txn, raw_author);
+        // `GetString` is authoritative for the bytes: an embed is not text and
+        // must never reach the file or the blame index, whatever `diff` renders
+        // it as.
+        let plain = self.text.get_string(&txn);
+        let Scan { runs, .. } = scan_runs(&self.text, &txn, Some(&plain), raw_author);
+        let text = plain;
         // Adjacent runs by the same author are coalesced, so a document's
         // authorship has one canonical spelling. Repairs and Yjs's own block
         // splitting both fragment runs without changing who wrote what, and an
@@ -494,6 +509,28 @@ pub(crate) struct DocRun<S> {
     pub doc_len: u32,
 }
 
+/// The result of walking a text node's runs.
+pub(crate) struct Scan<S> {
+    /// The node's plain text — embeds contribute nothing.
+    pub flat: String,
+    /// Its runs, in document order.
+    pub runs: Vec<DocRun<S>>,
+    /// Whether the run list's index accounting agrees with the document's own
+    /// length, i.e. whether a byte range over [`flat`](Self::flat) can be mapped
+    /// back to a `format` index range at all.
+    ///
+    /// False means a **string-valued embed** is present that could not be told
+    /// apart from text. `Text::diff` renders `ItemContent::Embed(Any::String(s))`
+    /// as `Out::Any(Any::String(s))` — byte-for-byte the shape real text has —
+    /// while `yrs` indexes *every* embed as exactly one position. Counting such a
+    /// chunk's bytes as its index length inflates every index after it, so a
+    /// repair silently lands past its target and a forged stamp survives. A
+    /// caller that cannot establish the mapping must refuse the update rather
+    /// than attempt the repair: a refusal is recoverable, a silent
+    /// misattribution is not.
+    pub indexable: bool,
+}
+
 /// Walk a text node once, returning its flat string and its runs.
 ///
 /// This is the **single** place a stamp is read off a chunk. `extract` pulls the
@@ -502,17 +539,33 @@ pub(crate) struct DocRun<S> {
 /// to a plausible `(1, 2)` and would then compare equal to a legitimate stamp,
 /// whereas comparing raw strings against the server's own value normalises every
 /// malformed variant away.
+///
+/// `plain` is the node's authoritative plain text when the caller can obtain one
+/// independently of `diff` — `GetString` for a flat `Y.Text`, which excludes
+/// embeds. Given it, a string embed is told apart from text exactly, by matching
+/// each chunk against the text still to be consumed. Without it (a `Y.XmlText`,
+/// whose `GetString` renders formatting as XML tags and so is not the plain
+/// text), a string embed is indistinguishable and [`Scan::indexable`] reports
+/// false so the caller refuses.
 pub(crate) fn scan_runs<T: ReadTxn, R: Text, S>(
     text: &R,
     txn: &T,
+    plain: Option<&str>,
     extract: impl Fn(Option<&Attrs>) -> S,
-) -> (String, Vec<DocRun<S>>) {
+) -> Scan<S> {
     let mut flat = String::new();
     let mut runs = Vec::new();
     for chunk in text.diff(txn, YChange::identity) {
         let stamp = extract(chunk.attributes.as_deref());
+        // A chunk is text iff it continues the authoritative plain text. An embed
+        // never does, because `plain` excludes embeds entirely.
+        let is_text = match (&chunk.insert, plain) {
+            (Out::Any(Any::String(piece)), Some(p)) => p[flat.len()..].starts_with(&**piece),
+            (Out::Any(Any::String(_)), None) => true,
+            _ => false,
+        };
         match &chunk.insert {
-            Out::Any(Any::String(piece)) => {
+            Out::Any(Any::String(piece)) if is_text => {
                 flat.push_str(piece);
                 runs.push(DocRun {
                     stamp,
@@ -520,10 +573,10 @@ pub(crate) fn scan_runs<T: ReadTxn, R: Text, S>(
                     doc_len: piece.len() as u32,
                 });
             }
-            // An embed (an image, a custom object) is not text: it contributes
-            // nothing to the flat string but still occupies one document index,
-            // so a `format` range computed over the string would be off by one
-            // per preceding embed without this.
+            // An embed (an image, a custom object, or a bare string) is not text:
+            // it contributes nothing to the flat string but still occupies one
+            // document index, so a `format` range computed over the string would
+            // be off by one per preceding embed without this.
             _ => runs.push(DocRun {
                 stamp,
                 byte_len: 0,
@@ -531,7 +584,15 @@ pub(crate) fn scan_runs<T: ReadTxn, R: Text, S>(
             }),
         }
     }
-    (flat, runs)
+    // The invariant that makes `doc_range` sound. It holds by construction when
+    // `plain` was supplied, and is the only detector when it was not.
+    let claimed: u64 = runs.iter().map(|r| r.doc_len as u64).sum();
+    let indexable = claimed == text.len(txn) as u64 && plain.is_none_or(|p| p == flat);
+    Scan {
+        flat,
+        runs,
+        indexable,
+    }
 }
 
 /// The `(stamp, byte_len)` tiling of a run list — what the diff walk and the

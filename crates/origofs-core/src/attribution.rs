@@ -766,17 +766,38 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             // wholly the caller's, so the row above already says everything.
             if blame_override.is_some() {
                 let changed = blame.changed_since(&old_map);
-                let capped = changed.len() > COEDIT_OP_ROWS_MAX;
-                if capped {
+                // The cap must never cost a *contributor*, only detail. Taking
+                // the first N runs by byte offset would drop anyone whose work
+                // sits past the cut — and permanently, because their run is
+                // unchanged at the next checkpoint and `changed_since` filters it
+                // out, so it is never offered again. That is exactly the silent
+                // `revert_session` no-op this block exists to end, reintroduced
+                // through the cap. So give every distinct `(actor, session)` its
+                // first run before spending the remaining budget in byte order.
+                let mut seen: HashSet<(i64, i64)> = HashSet::new();
+                let (mut first, mut rest): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
+                for entry in changed {
+                    if seen.insert((entry.1.actor, entry.1.session)) {
+                        first.push(entry);
+                    } else {
+                        rest.push(entry);
+                    }
+                }
+                let budget = COEDIT_OP_ROWS_MAX.saturating_sub(first.len());
+                if rest.len() > budget {
                     tracing::warn!(
                         path,
-                        runs = changed.len(),
+                        contributors = first.len(),
+                        dropped = rest.len() - budget,
                         cap = COEDIT_OP_ROWS_MAX,
-                        "coedit checkpoint: recording only the first {COEDIT_OP_ROWS_MAX} \
-                         contributor runs in the op-log",
+                        "coedit checkpoint: op-log rows capped; every contributor is \
+                         still recorded, but some of their individual runs are not",
                     );
                 }
-                for (byte_start, run) in changed.into_iter().take(COEDIT_OP_ROWS_MAX) {
+                // Every contributor first, then as much per-run detail as fits.
+                // A contributor beyond the cap loses detail, never discoverability.
+                let rows = first.into_iter().chain(rest.into_iter().take(budget));
+                for (byte_start, run) in rows {
                     tx.append_edit_op(EditOpInit {
                         session_id: (run.session != 0).then_some(run.session),
                         actor_id: run.actor,

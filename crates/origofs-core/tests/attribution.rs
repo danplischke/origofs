@@ -810,3 +810,52 @@ async fn revert_session_removes_exactly_that_actors_lines_under_interleaving() {
         }
     }
 }
+
+// The per-contributor op-log cap must cost detail, never a contributor.
+//
+// Taking the first N runs by byte offset dropped anyone whose work sat past the
+// cut — and permanently: their run is unchanged at the next checkpoint, so
+// `changed_since` filters it out and it is never offered again. Blame credited
+// them while the op-log did not, which is the silent `revert_session` no-op the
+// per-contributor rows exist to end.
+#[tokio::test]
+async fn a_contributor_past_the_op_log_cap_is_still_recorded() {
+    let fs = fixture().await;
+    let alice = fs.create_human("alice", None).await.unwrap();
+    let bob = fs.create_human("bob", None).await.unwrap();
+    let carol = fs.create_human("carol", None).await.unwrap();
+    let sa = fs.create_session(alice, None).await.unwrap();
+    let sb = fs.create_session(bob, None).await.unwrap();
+    let sc = fs.create_session(carol, None).await.unwrap();
+
+    // 300 alternating runs — past the 256-row cap — then carol at the very end.
+    // One line each, so the revert is not blocked by mixed-authorship lines (#33).
+    let mut text = String::new();
+    let mut spans: Vec<(i64, i64, u64)> = Vec::new();
+    for i in 0..300 {
+        text.push_str("x\n");
+        let (a, s) = if i % 2 == 0 { (alice, sa) } else { (bob, sb) };
+        spans.push((a, s, 2));
+    }
+    text.push_str("carol\n");
+    spans.push((carol, sc, 6));
+
+    fs.write_as_blamed(
+        WriteCtx::session(alice, sa),
+        "/doc",
+        text.as_bytes(),
+        &spans,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !fs.edit_ops(carol, Some(sc)).await.unwrap().is_empty(),
+        "carol authored bytes past the cap and has no op-log row"
+    );
+    assert_eq!(
+        fs.revert_session(carol, sc, None).await.unwrap(),
+        vec!["/doc".to_string()],
+        "carol's file was not discoverable through the op-log"
+    );
+}

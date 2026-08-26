@@ -477,8 +477,8 @@ impl CoeditTreeDoc {
             let id = node.id();
             match &node {
                 XmlOut::Text(text) => {
-                    let (flat, runs) = scan_runs(text, &txn, tree_stamp);
-                    texts.insert(id, (flat, stamp_tiling(&runs)));
+                    let scan = scan_runs(text, &txn, None, tree_stamp);
+                    texts.insert(id, (scan.flat, stamp_tiling(&scan.runs)));
                 }
                 XmlOut::Element(el) => {
                     elements.insert(
@@ -518,20 +518,35 @@ impl CoeditTreeDoc {
                 let id = node.id();
                 match node {
                     XmlOut::Text(text) => {
-                        let (after, after_runs) = scan_runs(&text, &txn, tree_stamp);
+                        let after = scan_runs(&text, &txn, None, tree_stamp);
+                        // A `Y.XmlText` has no plain-text authority to check
+                        // against (`GetString` renders formatting as XML tags),
+                        // so a string-valued embed cannot be told apart from
+                        // text here. Skip the node rather than repair off a run
+                        // map whose indices do not address what they claim to —
+                        // a missed repair on one node is recoverable, a
+                        // misdirected `format` is not.
+                        if !after.indexable {
+                            tracing::warn!(
+                                "coedit-tree: node holds an embed that cannot be \
+                                 indexed for attribution; leaving it unreconciled"
+                            );
+                            continue;
+                        }
                         // A text node absent from the pre-image is entirely new,
                         // so it scans as empty and every character is an insert.
                         let (was, was_tiling) = before.texts.get(&id).unwrap_or(&empty);
-                        let want = intended_stamps(was, was_tiling, &after, &(None, None), || {
-                            (
-                                Some(Arc::from(author_value(ctx))),
-                                Some(Arc::from(self.fresh_node_id())),
-                            )
-                        });
-                        let fixes: Vec<TextFix> = diverging_runs(&want, &stamp_tiling(&after_runs))
+                        let want =
+                            intended_stamps(was, was_tiling, &after.flat, &(None, None), || {
+                                (
+                                    Some(Arc::from(author_value(ctx))),
+                                    Some(Arc::from(self.fresh_node_id())),
+                                )
+                            });
+                        let fixes: Vec<TextFix> = diverging_runs(&want, &stamp_tiling(&after.runs))
                             .into_iter()
                             .filter_map(|(b0, blen, stamp)| {
-                                doc_range(&after_runs, b0, blen).map(|(i, l)| (i, l, stamp.clone()))
+                                doc_range(&after.runs, b0, blen).map(|(i, l)| (i, l, stamp.clone()))
                             })
                             .collect();
                         if !fixes.is_empty() {
