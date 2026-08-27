@@ -1,14 +1,32 @@
 [workspace]
 resolver = "2"
-members = ["crates/origo-core", "crates/origo-sdk", "crates/origo-cli", "crates/origo-sandbox", "crates/origo-fuse", "crates/origo-mcp", "crates/origo-git", "crates/origo-api", "crates/origo-nfs", "crates/origo-py"]
+members = ["crates/origofs-core", "crates/origofs-sdk", "crates/origofs-cli", "crates/origofs-py"]
 
 [workspace.package]
-version = "0.0.0"
-edition = "2021"
+# One version for the whole workspace. It was `0.0.0` here while origofs-core/-sdk/
+# -cli each hardcoded `0.1.0` — so `origofs-py`, the only crate that inherited it,
+# built a wheel that `pip` saw as version 0.0.0.
+version = "0.1.0"
+# `2021` here was likewise inherited only by origofs-py, leaving it a language
+# edition behind the three crates that set `2024` explicitly.
+edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/danplischke/origo"
-description = "origo — an agent-and-human filesystem: content-addressed storage, pluggable metadata DB, opt-in Git-style versioning, and per-actor edit attribution"
+repository = "https://github.com/danplischke/origofs"
+description = "origofs — an agent-and-human filesystem: content-addressed storage, pluggable metadata DB, opt-in Git-style versioning, and per-actor edit attribution"
+keywords = ["filesystem", "content-addressed", "versioning", "attribution", "agents"]
+categories = ["filesystem", "database-implementations"]
 
 # Milestone M0: skeleton + core traits (MetadataStore, ContentStore),
 # a SQLite metadata backend, a local content-addressed store, and the
 # working-tree engine. See docs/DESIGN.md and issue #1.
+
+# Debug info dominates target/ size (tens of GiB across the test binaries) and is
+# not what these profiles are for: `cargo test` needs symbol names for a backtrace,
+# not full DWARF. `line-tables-only` keeps file/line in panics and backtraces while
+# cutting the artifacts by roughly an order of magnitude.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

@@ -1,4 +1,4 @@
-// Session context: the origo client, the signed-in principal, and the actor
+// Session context: the origofs client, the signed-in principal, and the actor
 // directory used to resolve the `actor_id` in events/suggestions to a name.
 //
 // This is a *demo* sign-in — it picks one of the server's hardcoded tokens. A
@@ -13,14 +13,14 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { OrigoClient } from "./lib/origoClient";
+import { OrigoFSClient } from "./lib/origofsClient";
 import { actorColor, type ActorColor } from "./lib/colors";
 import type { ActorKind, AppConfig, DirectoryActor, Me } from "./lib/types";
 
-const TOKEN_KEY = "origo-web.token";
+const TOKEN_KEY = "origofs-web.token";
 
 interface SessionValue {
-  client: OrigoClient;
+  client: OrigoFSClient;
   config: AppConfig | null;
   token: string | null;
   me: Me | null;
@@ -38,7 +38,7 @@ interface SessionValue {
 const Ctx = createContext<SessionValue | null>(null);
 
 export function SessionProvider({ children }: { children: ReactNode }) {
-  const client = useMemo(() => new OrigoClient(), []);
+  const client = useMemo(() => new OrigoFSClient(), []);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [actors, setActors] = useState<DirectoryActor[]>([]);
   const [token, setToken] = useState<string | null>(() => localStorage.getItem(TOKEN_KEY));

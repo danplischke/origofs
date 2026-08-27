@@ -1,0 +1,58 @@
+[package]
+name = "origofs-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for origofs (agent filesystem)"
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+# The extension is imported as `origofs._origofs` (mixed layout: pure-Python `origofs`
+# package under python/, compiled core as its `_origofs` submodule).
+name = "_origofs"
+# cdylib -> the importable Python extension module; rlib -> lets the workspace
+# build/test it against a real libpython (extension-module is maturin-only).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+origofs-core = { version = "0.1.0", path = "../origofs-core" }
+# `coedit` is always on for the Python bindings: a wheel is one artifact, so live
+# co-editing (CoeditDoc + the y-sync surface) ships in every build rather than
+# hiding behind a Cargo feature a `pip install` couldn't select.
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk", features = ["coedit"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
+pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
+
+# NFS serving is Unix-wide; gating it here lets the extension build on Windows
+# (exposing the portable surface: files, versioning, attribution, suggestions,
+# the feed, and every backend). The serve_nfs method raises a clear error where
+# it isn't available. These are feature-gated modules of the sdk, enabled here —
+# Cargo unions these features with the base `coedit` above.
+[target.'cfg(unix)'.dependencies]
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk", features = ["nfs"] }
+
+# FUSE is **Linux-only for the wheel**, narrower than the sdk's own `cfg(unix)`
+# reach. `fuser` links `libfuse` at build time, which on macOS means the macFUSE
+# kernel extension: a system dependency `pip install` cannot provide, and one a
+# published wheel must not assume — it would make the macOS wheel unbuildable in
+# CI and unimportable without a kext. This is not a reduction in intent: the
+# design puts macOS on NFSv3 rather than FUSE (`docs/DESIGN.md`, and the `macos`
+# CI job already excludes FUSE for exactly this reason), so macOS keeps
+# `serve_nfs` and loses only a mount path it could never ship in a wheel.
+# `Workspace.mount()` raises a clear error there, as it already did on Windows.
+#
+# Building origofs-py from source on a Mac with macFUSE installed is still
+# possible — enable the sdk's `fuse` feature and the `fuser` dep by hand.
+[target.'cfg(target_os = "linux")'.dependencies]
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk", features = ["fuse"] }
+# `fuser::BackgroundSession` is held directly in a pyclass field (src/lib.rs).
+fuser = "0.17"
+
+[features]
+# Enabled only when building the wheel (see pyproject.toml). Off during
+# `cargo build/test`, so pyo3 links libpython and the workspace suite works.
+extension-module = ["pyo3/extension-module"]

@@ -1,0 +1,55 @@
+[package]
+name = "origofs-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The origofs command-line interface and the git-remote-origofs helper"
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[[bin]]
+name = "origofs"
+path = "src/main.rs"
+
+# git invokes a helper named exactly `git-remote-origofs` off PATH. Shipping it
+# from the CLI crate means a single `cargo install --path crates/origofs-cli`
+# provides both binaries; it drives the git-interop surface (sdk `git` feature).
+[[bin]]
+name = "git-remote-origofs"
+path = "src/bin/git-remote-origofs.rs"
+
+[dependencies]
+# Every access surface is now a feature-gated module of the sdk; `full` enables
+# them all (api, mcp, sandbox, git, fuse, nfs). Deliberately NOT `coedit`, so
+# `origofs serve` ships without the live co-editing WebSocket, exactly as before.
+#
+# `metrics` is enabled explicitly rather than folded into `full` (same treatment
+# as `coedit`): the library stays emit-only, and this binary is the one that
+# installs an exporter — see `init_metrics` below.
+origofs-sdk = { version = "0.1.0", path = "../origofs-sdk", features = ["full", "metrics"] }
+anyhow = "1.0.104"
+clap = { version = "4.6.4", features = ["derive"] }
+# Config-file backend selection (`--config`): pick Postgres/S3/GCS for the
+# shipped `serve`/`nfs`/`mcp`/`mount` daemons instead of only local SQLite.
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+# The CLI is the binary that installs a tracing subscriber for the library's
+# spans/events; writes to stderr so `origofs mcp` keeps stdout for JSON-RPC.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# …and the binary that installs the metrics recorder, for the same reason. Only
+# `origofs serve --metrics` installs it; `default-features = false` drops the
+# exporter's own HTTP listener and push-gateway (origofs serves `/metrics` from its
+# axum router instead, so it inherits the API's bind address and middleware).
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# git-remote-origofs reads a byte at a time from stdin via libc::read.
+libc = "0.2.189"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+# tests/remote.rs drives a real `git clone origofs://…` through the git-remote-origofs
+# helper binary (CARGO_BIN_EXE_git-remote-origofs) against a temp workspace.
+tempfile = "3.27.0"

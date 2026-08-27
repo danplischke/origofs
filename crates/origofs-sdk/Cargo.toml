@@ -1,0 +1,140 @@
+[package]
+name = "origofs-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ergonomic Workspace facade over origofs-core, plus every access surface (HTTP API, MCP, FUSE, NFS, git interop, sandbox) as an opt-in feature"
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+# This matters most here. Every surface this crate exists to provide — api, mcp,
+# sandbox, git, fuse, nfs, coedit, metrics — is behind a default-off feature, so
+# docs.rs would render the `Workspace` facade and nothing else.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# `default-features = false` here, with the backends re-exposed as sdk features
+# below, so a consumer can build a SQLite-only workspace without linking the
+# Postgres, object-store, and encryption trees. `full` and the default feature
+# set keep all three on, so nothing changes unless you ask.
+origofs-core = { version = "0.1.0", path = "../origofs-core", default-features = false }
+bytes = "1.12.1"
+futures = "0.3.33"
+getrandom = "0.2"
+thiserror = "2.0.19"
+tracing = "0.1"
+# The union of the tokio features every surface needs: `process` (sandbox),
+# `net`/`sync` (api, nfs), `io-std` (mcp stdio), plus the façade's own
+# `fs`/`io-util`/`rt-multi-thread`/`macros`/`time`.
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread", "macros", "fs", "io-util", "net", "sync", "process", "io-std", "time",
+    # `signal` for graceful shutdown: SIGTERM is what an orchestrator sends, and
+    # without a handler every in-flight request was severed mid-flight.
+    "signal",
+] }
+
+# ── Access-surface dependencies ─────────────────────────────────────────────
+# All optional: a default build (no features) pulls none of them. Each is
+# turned on by the matching surface feature below. FUSE/NFS are Unix-only and
+# live in the `cfg(unix)` table.
+async-trait     = { version = "0.1.91",  optional = true }  # api, nfs
+axum            = { version = "0.8.7",   optional = true }  # api
+serde           = { version = "1.0.228", features = ["derive"], optional = true } # api
+serde_json      = { version = "1.0.151", optional = true }  # api, mcp
+anyhow          = { version = "1.0.104", optional = true }  # sandbox
+async-recursion = { version = "1.1.1",   optional = true }  # git
+flate2          = { version = "1.0.35",  optional = true }  # git
+sha1            = { version = "0.10.6",  optional = true }  # git
+sha2            = { version = "0.10.9",  optional = true }  # git
+hex             = { version = "0.4.3",   optional = true }  # git
+# `limit` for the concurrency cap that provides backpressure; `timeout` (on
+# tower-http) for the per-request deadline. Without both, one wedged query or a
+# slow client holds a connection and its task indefinitely.
+tower           = { version = "0.5.2",   optional = true, features = ["limit"] }  # api (middleware stack)
+tower-http      = { version = "0.6.2",   optional = true, features = ["cors", "request-id", "trace", "limit", "timeout"] } # api
+
+[target.'cfg(unix)'.dependencies]
+fuser    = { version = "0.17",    optional = true }         # fuse
+libc     = { version = "0.2.189", optional = true }         # fuse
+nfsserve = { version = "0.11.0",  optional = true }         # nfs
+
+[features]
+# The backends origofs-core makes optional, forwarded so an `origofs-sdk` consumer
+# can turn them off too. On by default: `Workspace::open_pg*`/`open_s3*`/
+# `open_gcs*`/`open_*_encrypted` need them, and silently losing a constructor would
+# be a worse surprise than a larger build.
+default = ["postgres", "object-store", "encryption"]
+postgres = ["origofs-core/postgres"]
+object-store = ["origofs-core/object-store"]
+encryption = ["origofs-core/encryption"]
+
+# Access surfaces — each was formerly a standalone crate (origofs-{api,mcp,…}),
+# now an opt-in feature-gated module over the same `Workspace`.
+api     = ["dep:axum", "dep:serde", "dep:serde_json", "dep:async-trait", "dep:tower", "dep:tower-http"]
+mcp     = ["dep:serde_json"]
+sandbox = ["dep:anyhow"]                                    # + tokio "process" (already on)
+git     = ["dep:flate2", "dep:sha1", "dep:sha2", "dep:hex", "dep:async-recursion"]
+fuse    = ["dep:fuser", "dep:libc"]
+nfs     = ["dep:nfsserve", "dep:async-trait"]
+
+# Every surface at once — what `origofs-cli` and `origofs-py` enable. (Not
+# `coedit`, which stays separately opt-in.)
+#
+# Three of these — `fuse`, `nfs`, `sandbox` — are **Unix-only modules**: each is
+# `#[cfg(all(unix, feature = "…"))]` in `lib.rs`, because each is a kernel
+# interface Windows does not have (FUSE, NFS-as-a-mount, overlayfs whiteouts).
+# Enabling `full` on Windows is therefore *not* an error — it stays a valid,
+# buildable feature set that yields the portable surfaces (api, mcp, git) and
+# quietly omits the other three, which is what lets `origofs-cli` build there.
+# Turning any of the three on individually behaves the same way.
+full    = ["api", "mcp", "sandbox", "git", "fuse", "nfs"]
+
+# Opt-in CRDT co-editing (roadmap M8): re-exports `CoeditDoc` + the
+# `open_coedit`/`checkpoint_coedit` methods, and — when `api` is also enabled —
+# the y-sync WebSocket transport. `axum?/ws` is a weak dependency: it turns on
+# axum's `ws` feature only if `api` already pulled axum in, so a coedit build
+# without the API surface stays axum-free. The WebSocket code is `cfg`-gated on
+# `all(feature = "api", feature = "coedit")`.
+coedit  = ["origofs-core/coedit", "axum?/ws"]
+
+# Opt-in metrics (roadmap M9). Turns on the core's emit-only recording and — when
+# `api` is also enabled — the per-request instrumentation plus the `GET /metrics`
+# Prometheus exposition endpoint. Kept **out of `full`**, exactly like `coedit`,
+# so a plain surface build records nothing and pulls no extra dependency;
+# `origofs-cli` enables it explicitly. Still emit-only: no exporter is linked here,
+# the binary installs one and hands its renderer to `api::set_metrics_renderer`.
+metrics = ["origofs-core/metrics"]
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# tests/metrics.rs installs a real Prometheus recorder — the job a *binary* does —
+# so the `/metrics` test asserts against genuine exposition text. `default-features
+# = false` drops the exporter's HTTP listener / push-gateway (and their hyper +
+# rustls trees): we only need `install_recorder()` + `render()`.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# HTTP surface tests (api.rs): drive the axum router in-process.
+tower = { version = "0.5.2", features = ["util"] }
+http-body-util = "0.1.3"
+# Co-editing WebSocket tests (api_coedit_ws.rs / api_coedit_cluster.rs).
+tokio-tungstenite = "0.24"
+tokio-postgres = "0.7"
+# A genuine Yjs client for the co-editing WebSocket test: a raw `yrs::Doc` + the
+# stock y-sync `DefaultProtocol`, exactly what PlateJS / y-websocket run.
+yrs = "0.23"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+
+# git_hostile.rs hand-crafts loose git objects (a self-parenting commit, a
+# tampered object, a deep history) that the real `git` binary would refuse to
+# produce — so the importer's own bounds can be tested against them.
+flate2 = "1.0.35"
+sha1 = "0.10.6"
+hex = "0.4.3"
+
+# The NFS surface test (nfs.rs) drives nfsserve types directly; Unix-only.
+[target.'cfg(unix)'.dev-dependencies]
+nfsserve = "0.11.0"

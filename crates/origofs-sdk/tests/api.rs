@@ -1,0 +1,862 @@
+//! HTTP surface: files, versioning, attribution, and the collaboration feed,
+//! driven in-process through the router (no socket) via `tower::oneshot`.
+//!
+//! Mutations are authenticated: the fixture maps bearer tokens to actors the
+//! server pre-provisioned, so attribution is derived from the verified identity —
+//! never from the request. Reads are open.
+#![cfg(feature = "api")]
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use origofs_sdk::Workspace;
+use origofs_sdk::api::{ApiOptions, BearerAuth, router, router_with};
+use serde_json::{Value, json};
+use std::sync::Arc;
+use tower::ServiceExt;
+
+const T_ADMIN: &str = "t-admin";
+const T_AGENT: &str = "t-agent";
+const T_HUMAN: &str = "t-human";
+
+struct Fixture {
+    app: Router,
+    agent: i64,
+    human: i64,
+    session: i64,
+}
+
+async fn fixture() -> Fixture {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    // The server owns identity: actors exist in the DB and tokens map to them.
+    let admin = ws.create_human("admin", None).await.unwrap();
+    let agent = ws.create_agent("claude", "opus", None).await.unwrap();
+    let human = ws.create_human("dan", None).await.unwrap();
+    let session = ws.create_session(agent, Some("api")).await.unwrap();
+    let auth = BearerAuth::new()
+        .with_token(T_ADMIN, admin, None)
+        .with_token(T_AGENT, agent, Some(session))
+        .with_token(T_HUMAN, human, None);
+    Fixture {
+        app: router(Arc::new(ws), Arc::new(auth)),
+        agent,
+        human,
+        session,
+    }
+}
+
+// --- readiness (M9) ---------------------------------------------------------
+
+#[tokio::test]
+async fn health_is_liveness_only() {
+    // `/health` does no I/O — it reports the process is up, nothing about the
+    // backends. Open (outside the read gate) and always 200.
+    let f = fixture().await;
+    let (status, body) = send(&f.app, get("/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(as_json(&body)["status"], json!("ok"));
+}
+
+#[tokio::test]
+async fn readyz_ok_when_backends_reachable() {
+    let f = fixture().await;
+    let (status, body) = send(&f.app, get("/readyz")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = as_json(&body);
+    assert_eq!(v["ready"], json!(true));
+    assert_eq!(v["metadata"]["ok"], json!(true));
+    assert_eq!(v["content"]["ok"], json!(true));
+}
+
+/// A fully functional content store whose readiness probe reports failure — to
+/// prove `/readyz` returns 503 (not 200) when a backend is unreachable, while a
+/// healthy metadata store is still reported `ok`.
+struct ContentPingDown(Arc<dyn origofs_core::ContentStore>);
+
+#[async_trait::async_trait]
+impl origofs_core::ContentStore for ContentPingDown {
+    async fn put(&self, bytes: &[u8]) -> origofs_core::Result<origofs_core::Hash> {
+        self.0.put(bytes).await
+    }
+    async fn put_keyed(&self, key: &origofs_core::Hash, bytes: &[u8]) -> origofs_core::Result<()> {
+        self.0.put_keyed(key, bytes).await
+    }
+    async fn get(&self, hash: &origofs_core::Hash) -> origofs_core::Result<bytes::Bytes> {
+        self.0.get(hash).await
+    }
+    async fn get_range(
+        &self,
+        hash: &origofs_core::Hash,
+        off: u64,
+        len: u64,
+    ) -> origofs_core::Result<bytes::Bytes> {
+        self.0.get_range(hash, off, len).await
+    }
+    async fn has(&self, hash: &origofs_core::Hash) -> origofs_core::Result<bool> {
+        self.0.has(hash).await
+    }
+    async fn list(&self) -> origofs_core::Result<Vec<origofs_core::Hash>> {
+        self.0.list().await
+    }
+    async fn delete(&self, hash: &origofs_core::Hash) -> origofs_core::Result<u64> {
+        self.0.delete(hash).await
+    }
+    async fn ping(&self) -> origofs_core::Result<()> {
+        Err(origofs_core::OrigoFSError::Backend {
+            origin: origofs_core::BackendOrigin::Content,
+            class: origofs_core::ErrorClass::Unavailable,
+            source: Box::new(std::io::Error::other("content store down")),
+        })
+    }
+}
+
+#[tokio::test]
+async fn readyz_503_when_a_backend_is_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn origofs_core::MetadataStore> =
+        Arc::new(origofs_core::SqliteMetadataStore::open(dir.path().join("meta.db")).unwrap());
+    let inner: Arc<dyn origofs_core::ContentStore> = Arc::new(
+        origofs_core::LocalCasStore::open(dir.path().join("cas"))
+            .await
+            .unwrap(),
+    );
+    let content: Arc<dyn origofs_core::ContentStore> = Arc::new(ContentPingDown(inner));
+    let ws = Workspace::open(meta, content).await.unwrap();
+    let app = router(Arc::new(ws), Arc::new(BearerAuth::new()));
+
+    let (status, body) = send(&app, get("/readyz")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let v = as_json(&body);
+    assert_eq!(v["ready"], json!(false));
+    assert_eq!(v["content"]["ok"], json!(false));
+    // The metadata store is healthy, so it is reported ok even while content is down.
+    assert_eq!(v["metadata"]["ok"], json!(true));
+}
+
+// --- v1 versioning, error envelope, middleware ------------------------------
+
+#[tokio::test]
+async fn data_routes_are_versioned_under_v1() {
+    let f = fixture().await;
+    // The unversioned path is gone — only /v1/... serves data.
+    let raw = Request::builder()
+        .uri("/files/x")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(&f.app, raw).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The versioned path resolves (a missing-file 404, proven by the error code,
+    // not a routing 404).
+    let (status, body) = send(&f.app, get("/files/x")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(as_json(&body)["error"]["code"], json!("not_found"));
+}
+
+#[tokio::test]
+async fn error_envelope_has_code_message_and_retryable() {
+    let f = fixture().await;
+    let (status, body) = send(&f.app, get("/files/missing")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let err = &as_json(&body)["error"];
+    assert_eq!(err["code"], json!("not_found"));
+    assert_eq!(err["retryable"], json!(false));
+    assert!(err["message"].as_str().unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn request_id_is_echoed_on_the_response() {
+    let f = fixture().await;
+    let resp = f.app.clone().oneshot(get("/readyz")).await.unwrap();
+    assert!(
+        resp.headers().get("x-request-id").is_some(),
+        "the request-id middleware should echo an id on every response"
+    );
+}
+
+#[tokio::test]
+async fn log_pagination_limits_results() {
+    let f = fixture().await;
+    for i in 0..3 {
+        send(&f.app, put_as(&format!("/files/f{i}.txt"), T_HUMAN, b"x")).await;
+        send(
+            &f.app,
+            post_json_as("/commit", T_HUMAN, json!({ "message": format!("c{i}") })),
+        )
+        .await;
+    }
+    let (status, body) = send(&f.app, get("/log?limit=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(as_json(&body).as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn cors_preflight_allows_a_configured_origin() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let app = router_with(
+        Arc::new(ws),
+        Arc::new(BearerAuth::new()),
+        ApiOptions {
+            cors_origins: vec!["https://app.example.com".into()],
+            ..Default::default()
+        },
+    );
+    let preflight = Request::builder()
+        .method("OPTIONS")
+        .uri("/v1/files/x")
+        .header("origin", "https://app.example.com")
+        .header("access-control-request-method", "PUT")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(preflight).await.unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .expect("configured origin must be allowed"),
+        "https://app.example.com"
+    );
+}
+
+async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, body)
+}
+
+fn as_json(bytes: &[u8]) -> Value {
+    serde_json::from_slice(bytes).unwrap()
+}
+
+// --- read builders (open) ---------------------------------------------------
+
+/// Prefix data-route paths with the API version; liveness/readiness stay at root.
+fn v1(uri: &str) -> String {
+    if uri == "/health" || uri == "/readyz" {
+        uri.to_string()
+    } else {
+        format!("/v1{uri}")
+    }
+}
+
+fn get(uri: &str) -> Request<Body> {
+    Request::builder().uri(v1(uri)).body(Body::empty()).unwrap()
+}
+
+fn get_as(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(v1(uri))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+// --- unauthenticated mutation builders (for negative tests) -----------------
+
+fn put_bytes(uri: &str, body: &[u8]) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(v1(uri))
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+fn post_json(uri: &str, v: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(v1(uri))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&v).unwrap()))
+        .unwrap()
+}
+
+// --- authenticated mutation builders ----------------------------------------
+
+fn put_as(uri: &str, token: &str, body: &[u8]) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(v1(uri))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+fn delete_as(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(v1(uri))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn post_json_as(uri: &str, token: &str, v: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(v1(uri))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&v).unwrap()))
+        .unwrap()
+}
+
+fn post_bytes_as(uri: &str, token: &str, body: &[u8]) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(v1(uri))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+fn post_empty_as(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(v1(uri))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn files_roundtrip_and_listing() {
+    let fx = fixture().await;
+    let app = &fx.app;
+
+    // write (auto-creates the parent dir), authenticated
+    let (st, body) = send(app, put_as("/files/notes/todo.txt", T_HUMAN, b"buy milk\n")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(as_json(&body)["written"], 9);
+
+    // read it back verbatim (reads are open)
+    let (st, body) = send(app, get("/files/notes/todo.txt")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, b"buy milk\n");
+
+    // list the directory
+    let (st, body) = send(app, get("/dirs/notes")).await;
+    assert_eq!(st, StatusCode::OK);
+    let entries = as_json(&body);
+    assert_eq!(entries[0]["name"], "todo.txt");
+    assert_eq!(entries[0]["kind"], "file");
+
+    // stat
+    let (st, body) = send(app, get("/stat/notes/todo.txt")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(as_json(&body)["size"], 9);
+    assert_eq!(as_json(&body)["kind"], "file");
+
+    // delete
+    let (st, _) = send(app, delete_as("/files/notes/todo.txt", T_HUMAN)).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = send(app, get("/files/notes/todo.txt")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn missing_file_is_404_and_dir_read_is_400() {
+    let fx = fixture().await;
+    let app = &fx.app;
+    let (st, body) = send(app, get("/files/nope.txt")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(as_json(&body)["error"]["code"], json!("not_found"));
+
+    send(app, post_json_as("/dirs/adir", T_HUMAN, json!({}))).await;
+    let (st, _) = send(app, get("/files/adir")).await; // reading a directory
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn large_file_streams_back_intact() {
+    // A multi-chunk file (> MAX_CHUNK) round-trips over HTTP: the GET streams the
+    // body chunk-by-chunk (never buffering it whole server-side) and reassembles
+    // byte-for-byte. Deterministic pseudo-random bytes give real CDC boundaries.
+    let fx = fixture().await;
+    let app = &fx.app;
+
+    let mut content = Vec::with_capacity(600 * 1024);
+    let mut x: u64 = 0x1234_5678_9ABC_DEF0;
+    while content.len() < 600 * 1024 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        content.extend_from_slice(&x.to_le_bytes());
+    }
+
+    let (st, _) = send(app, put_as("/files/big.bin", T_HUMAN, &content)).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, body) = send(app, get("/files/big.bin")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, content, "streamed body reassembles byte-for-byte");
+}
+
+#[tokio::test]
+async fn versioning_over_http() {
+    let fx = fixture().await;
+    let app = &fx.app;
+    send(app, put_as("/files/a.txt", T_HUMAN, b"one")).await;
+    // the commit author is the authenticated actor, not a client-supplied field
+    let (st, body) = send(
+        app,
+        post_json_as("/commit", T_HUMAN, json!({"message": "first"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(as_json(&body)["hash"].as_str().unwrap().len() >= 12);
+
+    let (st, body) = send(app, get("/log")).await;
+    assert_eq!(st, StatusCode::OK);
+    let log = as_json(&body);
+    assert_eq!(log.as_array().unwrap().len(), 1);
+    assert_eq!(log[0]["message"], "first");
+    assert_eq!(log[0]["author"], "dan"); // derived from the T_HUMAN actor
+
+    // a branch shows up as current
+    let (_st, body) = send(app, get("/branches")).await;
+    let branches = as_json(&body);
+    assert!(
+        branches
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["name"] == "main" && b["current"] == true)
+    );
+}
+
+#[tokio::test]
+async fn suggestion_review_over_http() {
+    let fx = fixture().await;
+    let app = &fx.app;
+
+    send(app, put_as("/files/notes.txt", T_HUMAN, b"one\ntwo\n")).await;
+
+    // agent proposes an edit — attributed to the T_AGENT identity, not a query arg
+    let (st, body) = send(
+        app,
+        post_bytes_as(
+            "/suggestions?path=/notes.txt&summary=fix",
+            T_AGENT,
+            b"one\nTWO\n",
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let id = as_json(&body)["id"].as_i64().unwrap();
+
+    // it's pending and the working tree is untouched
+    let (_st, body) = send(app, get("/suggestions?status=pending")).await;
+    let list = as_json(&body);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["actor_id"], fx.agent);
+    assert_eq!(list[0]["summary"], "fix");
+    let (_st, body) = send(app, get("/files/notes.txt")).await;
+    assert_eq!(body, b"one\ntwo\n");
+
+    // its diff renders base -> proposed
+    let (_st, body) = send(app, get(&format!("/suggestions/{id}/diff"))).await;
+    let patch = as_json(&body)["diff"].as_str().unwrap().to_string();
+    assert!(patch.contains("-two") && patch.contains("+TWO"), "{patch}");
+
+    // human accepts -> applied, credited to the T_HUMAN identity
+    let (st, _) = send(
+        app,
+        post_empty_as(&format!("/suggestions/{id}/accept"), T_HUMAN),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_st, body) = send(app, get("/files/notes.txt")).await;
+    assert_eq!(body, b"one\nTWO\n");
+    let (_st, body) = send(app, get(&format!("/suggestions/{id}"))).await;
+    assert_eq!(as_json(&body)["status"], "accepted");
+    assert_eq!(as_json(&body)["resolved_by"], fx.human);
+}
+
+#[tokio::test]
+async fn diff_between_branches_over_http() {
+    let fx = fixture().await;
+    let app = &fx.app;
+    send(app, put_as("/files/edit.txt", T_HUMAN, b"one\ntwo\n")).await;
+    send(app, put_as("/files/keep.txt", T_HUMAN, b"same\n")).await;
+    send(
+        app,
+        post_json_as("/commit", T_HUMAN, json!({"message": "base"})),
+    )
+    .await;
+    send(
+        app,
+        post_json_as("/branches", T_HUMAN, json!({"name": "feature"})),
+    )
+    .await;
+    send(
+        app,
+        post_json_as("/checkout", T_HUMAN, json!({"name": "feature"})),
+    )
+    .await;
+    send(app, put_as("/files/edit.txt", T_HUMAN, b"one\nTWO\n")).await;
+    send(app, put_as("/files/new.txt", T_HUMAN, b"added\n")).await;
+    send(
+        app,
+        post_json_as("/commit", T_HUMAN, json!({"message": "work"})),
+    )
+    .await;
+
+    // changed-path list
+    let (st, body) = send(app, get("/diff?from=main&to=feature")).await;
+    assert_eq!(st, StatusCode::OK);
+    let changes = as_json(&body);
+    let arr = changes.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        2,
+        "edit.txt modified + new.txt added; keep.txt unchanged"
+    );
+    assert!(
+        arr.iter()
+            .any(|d| d["path"] == "/edit.txt" && d["status"] == "modified")
+    );
+    assert!(
+        arr.iter()
+            .any(|d| d["path"] == "/new.txt" && d["status"] == "added")
+    );
+
+    // per-file unified diff
+    let (st, body) = send(app, get("/diff/file?from=main&to=feature&path=/edit.txt")).await;
+    assert_eq!(st, StatusCode::OK);
+    let patch = as_json(&body)["diff"].as_str().unwrap().to_string();
+    assert!(patch.contains("-two") && patch.contains("+TWO"), "{patch}");
+
+    // unchanged file -> empty diff
+    let (_st, body) = send(app, get("/diff/file?from=main&to=feature&path=/keep.txt")).await;
+    assert!(as_json(&body)["diff"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn attributed_write_shows_up_in_blame_and_feed() {
+    let fx = fixture().await;
+    let app = &fx.app;
+
+    // write as the agent — identity comes from the token, not the request
+    let (st, _) = send(
+        app,
+        put_as("/files/notes.txt", T_AGENT, b"line one\nline two\n"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // blame attributes it to the agent, over the exact byte range (the ground
+    // truth the design blames by) as well as the derived line range.
+    let (st, body) = send(app, get("/blame/notes.txt")).await;
+    assert_eq!(st, StatusCode::OK);
+    let blame = as_json(&body);
+    assert_eq!(blame[0]["kind"], "agent");
+    assert_eq!(blame[0]["actor"], "claude");
+    assert_eq!(blame[0]["byte_start"], 0);
+    assert_eq!(blame[0]["byte_end"], 18); // "line one\nline two\n"
+    assert_eq!(blame[0]["line_start"], 1);
+    assert_eq!(blame[0]["line_end"], 2);
+    assert!(blame[0]["session"].is_number());
+
+    // the write is on the change feed, attributed to the token's actor + session
+    let (st, body) = send(app, get("/events")).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = as_json(&body);
+    let write = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "write")
+        .unwrap();
+    assert_eq!(write["actor_id"].as_i64(), Some(fx.agent));
+    assert_eq!(write["session_id"].as_i64(), Some(fx.session));
+}
+
+// SEC (security audit #1/#3): mutations require an authenticated principal, and
+// attribution is derived from it — a client cannot write/commit/mint-actors
+// anonymously, nor forge a different actor via the request.
+#[tokio::test]
+async fn unauthenticated_and_forged_mutations_are_rejected() {
+    let fx = fixture().await;
+    let app = &fx.app;
+
+    // no credential -> 401
+    let (st, _) = send(app, put_bytes("/files/x.txt", b"hi")).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // a bogus token -> 401
+    let (st, _) = send(app, put_as("/files/x.txt", "not-a-real-token", b"hi")).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // no anonymous identity fabrication: creating an actor requires auth
+    let (st, _) = send(app, post_json("/actors", json!({"name": "Dan (CTO)"}))).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // nothing was written by any of the above
+    let (st, _) = send(app, get("/files/x.txt")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // a leftover `?actor=` query is ignored: attribution follows the token, so a
+    // human-token write can't be booked to the agent by naming its id.
+    let uri = format!("/files/forge.txt?actor={}&session=999", fx.agent);
+    let (st, _) = send(app, put_as(&uri, T_HUMAN, b"not the agent\n")).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_st, body) = send(app, get("/blame/forge.txt")).await;
+    let blame = as_json(&body);
+    assert_eq!(
+        blame[0]["actor"], "dan",
+        "attribution must follow the token, not ?actor="
+    );
+    assert_eq!(blame[0]["kind"], "human");
+}
+
+// SEC (security audit #8): reads are open by default, but `gate_reads` requires a
+// credential for reads too — closing the full-disclosure surface for operators
+// who want it. /health stays open regardless.
+#[tokio::test]
+async fn gate_reads_requires_a_credential_for_reads() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let human = ws.create_human("dan", None).await.unwrap();
+    let auth = BearerAuth::new().with_token(T_HUMAN, human, None);
+    let app = router_with(
+        Arc::new(ws),
+        Arc::new(auth),
+        ApiOptions {
+            gate_reads: true,
+            ..Default::default()
+        },
+    );
+
+    // /health stays open even when reads are gated.
+    let (st, _) = send(&app, get("/health")).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // a read without a credential is now rejected...
+    let (st, _) = send(&app, get("/log")).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = send(&app, get("/files/anything.txt")).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // ...but works with a valid token.
+    let (st, _) = send(&app, get_as("/log", T_HUMAN)).await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+// --- presence heartbeat (issue #75 §3.1) ------------------------------------
+
+// `POST /v1/presence` lets a plain HTTP client (a browser, an agent runtime)
+// heartbeat itself into the presence list — previously only readable, so a client
+// could see everyone but never appear. Identity comes from the credential.
+#[tokio::test]
+async fn presence_heartbeat_records_the_authenticated_session() {
+    let fx = fixture().await;
+    let app = &fx.app;
+
+    // nothing is present until somebody beats
+    let (st, body) = send(app, get("/presence")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(as_json(&body).as_array().unwrap().is_empty());
+
+    // an empty body is fine — "I'm here", no current path
+    let (st, body) = send(app, post_empty_as("/presence", T_AGENT)).await;
+    assert_eq!(st, StatusCode::OK);
+    let v = as_json(&body);
+    assert_eq!(v["actor_id"].as_i64(), Some(fx.agent));
+    assert_eq!(v["session_id"].as_i64(), Some(fx.session));
+    assert_eq!(v["path"], Value::Null);
+
+    // ...and a path is recorded, normalized to an absolute workspace path
+    let (st, _) = send(
+        app,
+        post_json_as("/presence", T_AGENT, json!({"path": "notes/todo.txt"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, body) = send(app, get("/presence")).await;
+    assert_eq!(st, StatusCode::OK);
+    let list = as_json(&body);
+    let entries = list.as_array().unwrap();
+    assert_eq!(entries.len(), 1, "one session, upserted — not appended");
+    assert_eq!(entries[0]["session_id"].as_i64(), Some(fx.session));
+    assert_eq!(entries[0]["actor_id"].as_i64(), Some(fx.agent));
+    assert_eq!(entries[0]["display_name"], "claude");
+    assert_eq!(entries[0]["kind"], "agent");
+    assert_eq!(entries[0]["path"], "/notes/todo.txt");
+}
+
+// SEC: the heartbeat is a mutation, so it needs a credential — and the credential
+// is the *only* thing that decides who is recorded. A client cannot beat as
+// someone else by naming them in the body.
+#[tokio::test]
+async fn presence_heartbeat_is_authenticated_and_unforgeable() {
+    let fx = fixture().await;
+    let app = &fx.app;
+
+    // no credential -> 401, and nobody is recorded
+    let (st, _) = send(app, post_json("/presence", json!({"path": "/x"}))).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (_st, body) = send(app, get("/presence")).await;
+    assert!(as_json(&body).as_array().unwrap().is_empty());
+
+    // a bogus token -> 401
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/presence")
+        .header("authorization", "Bearer nope")
+        .body(Body::empty())
+        .unwrap();
+    let (st, _) = send(app, req).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // the agent's token beats, but the body tries to name the human and another
+    // session: both are ignored — the recorded row is the token's own identity.
+    let (st, _) = send(
+        app,
+        post_json_as(
+            "/presence",
+            T_AGENT,
+            json!({
+                "actor": fx.human,
+                "actor_id": fx.human,
+                "session_id": 4242,
+                "path": "/spoof.txt",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (_st, body) = send(app, get("/presence")).await;
+    let list = as_json(&body);
+    let entries = list.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0]["actor_id"].as_i64(),
+        Some(fx.agent),
+        "presence must follow the credential, not the request body"
+    );
+    assert_eq!(entries[0]["session_id"].as_i64(), Some(fx.session));
+    assert_eq!(entries[0]["display_name"], "claude");
+}
+
+// A credential bound to an actor but no session cannot heartbeat: presence rows
+// are keyed by session, and the server will not mint one on a client's behalf.
+#[tokio::test]
+async fn presence_heartbeat_requires_a_session_bound_credential() {
+    let fx = fixture().await;
+    let (st, body) = send(&fx.app, post_empty_as("/presence", T_HUMAN)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let v = as_json(&body);
+    assert_eq!(v["error"]["code"], "invalid_argument");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not bound to a session")
+    );
+    let (_st, body) = send(&fx.app, get("/presence")).await;
+    assert!(as_json(&body).as_array().unwrap().is_empty());
+}
+
+// --- revert-session (#94) ---------------------------------------------------
+
+// `POST /v1/revert-session` had no test at all, on a route that deletes other
+// people's work. These cover the shape and the scope together.
+
+#[tokio::test]
+async fn revert_session_reports_the_paths_it_changed() {
+    let fx = fixture().await;
+    // The agent (whose token is session-bound) writes two files.
+    for p in ["/a.txt", "/b.txt"] {
+        let (st, _) = send(&fx.app, put_as(&format!("/files{p}"), T_AGENT, b"agent\n")).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    let (st, body) = send(
+        &fx.app,
+        post_json_as(
+            "/revert-session",
+            T_ADMIN,
+            json!({ "actor": fx.agent, "session": fx.session }),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = as_json(&body);
+    assert_eq!(v["files_changed"], json!(2));
+    // Which paths, not just how many — so a caller can invalidate precisely.
+    let mut paths: Vec<&str> = v["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    paths.sort();
+    assert_eq!(paths, vec!["/a.txt", "/b.txt"]);
+    // The reviewer is recorded, and it is the caller — not the actor being undone.
+    assert!(v["reverted_by"].is_i64());
+    assert_ne!(v["reverted_by"], json!(fx.agent));
+}
+
+#[tokio::test]
+async fn a_path_prefix_bounds_what_revert_session_touches() {
+    let fx = fixture().await;
+    for p in [
+        "/tenant-a/notes.txt",
+        "/tenant-b/notes.txt",
+        "/tenant-abc/notes.txt",
+    ] {
+        let (st, _) = send(&fx.app, put_as(&format!("/files{p}"), T_AGENT, b"agent\n")).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    let (st, body) = send(
+        &fx.app,
+        post_json_as(
+            "/revert-session",
+            T_ADMIN,
+            json!({ "actor": fx.agent, "session": fx.session, "path_prefix": "/tenant-a" }),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let v = as_json(&body);
+    assert_eq!(v["paths"], json!(["/tenant-a/notes.txt"]));
+
+    // The neighbour that merely shares a textual prefix keeps its bytes.
+    let (_st, body) = send(&fx.app, get("/files/tenant-abc/notes.txt")).await;
+    assert_eq!(&body[..], b"agent\n");
+    let (_st, body) = send(&fx.app, get("/files/tenant-b/notes.txt")).await;
+    assert_eq!(&body[..], b"agent\n");
+}
+
+#[tokio::test]
+async fn a_relative_path_prefix_is_rejected() {
+    let fx = fixture().await;
+    let (st, body) = send(
+        &fx.app,
+        post_json_as(
+            "/revert-session",
+            T_ADMIN,
+            json!({ "actor": fx.agent, "session": fx.session, "path_prefix": "tenant-a" }),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(as_json(&body)["error"]["code"], "invalid_argument");
+}

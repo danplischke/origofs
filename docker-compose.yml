@@ -1,0 +1,123 @@
+# A production-shaped origofs stack for local use: the HTTP API over a Postgres
+# metadata store and a MinIO (S3) content store — the multi-writer backends the
+# shipped `origofs serve` can now front directly (see crates/origofs-cli config).
+#
+#   docker compose up --build
+#   curl localhost:8080/readyz          # -> {"ready":true,...}
+#   curl -H 'Authorization: Bearer demo-token' \
+#        -X PUT --data-binary 'hello' localhost:8080/v1/files/notes/a.txt
+#
+# Content uses the *unpacked* S3 layout so every writer's state lives entirely in
+# the bucket + database; the packed layout keeps a local per-chunk index, which a
+# multi-container deployment would need to share on a volume (or use one writer).
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: origofs
+      POSTGRES_PASSWORD: origofs
+      POSTGRES_DB: origofs
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U origofs"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - miniodata:/data
+
+  # One-shot: wait for MinIO, then create the content bucket.
+  createbucket:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin; do
+        echo 'waiting for minio...'; sleep 1;
+      done &&
+      mc mb --ignore-existing local/origofs-content &&
+      echo 'bucket ready'
+      "
+
+  # One-shot: create the demo actor. On a fresh database the first human actor is
+  # id 1, which the serve command below maps its bearer token to.
+  origofs-init:
+    image: origofs:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      createbucket:
+        condition: service_completed_successfully
+    configs:
+      - source: origofs_config
+        target: /etc/origofs/config.toml
+    entrypoint: ["origofs"]
+    command:
+      ["--workspace", "/var/lib/origofs/ws", "--config", "/etc/origofs/config.toml",
+       "actor", "demo-human"]
+
+  origofs:
+    image: origofs:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      createbucket:
+        condition: service_completed_successfully
+      origofs-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    configs:
+      - source: origofs_config
+        target: /etc/origofs/config.toml
+    # Bind a non-loopback address, so a bearer token is required (the server never
+    # exposes an unauthenticated API). demo-token -> actor 1 (created by init).
+    command:
+      ["--workspace", "/var/lib/origofs/ws", "--config", "/etc/origofs/config.toml",
+       "--log-format", "json", "serve", "--addr", "0.0.0.0:8080",
+       "--auth-token", "demo-token=1"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+configs:
+  origofs_config:
+    content: |
+      [metadata]
+      backend = "postgres"
+      dsn = "host=postgres user=origofs password=origofs dbname=origofs"
+      [content]
+      backend = "s3"
+      bucket = "origofs-content"
+      region = "us-east-1"
+      endpoint = "http://minio:9000"
+      allow_http = true
+      access_key_id = "minioadmin"
+      secret_access_key = "minioadmin"
+      packed = false
+
+volumes:
+  pgdata:
+  miniodata:

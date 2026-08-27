@@ -18,6 +18,30 @@ jobs:
   rust:
     name: Rust (clippy + test)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Exercise the Postgres (multi-writer / production) metadata backend. Without
+    # ORIGOFS_PG_TEST_URL every PG leg self-skips and only the SQLite path is
+    # tested — including the dual-backend invariant suites (atomicity.rs) and
+    # `pg_object_store.rs`, which covers the Postgres + object-store composition
+    # the `open_pg_gcs`/`open_pg_s3` constructors build. That pairing had no test
+    # at all, which is how a `gc()` that could never acquire its lease on Postgres
+    # shipped.
+    env:
+      ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: origofs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -28,29 +52,468 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # origo-py is a pyo3 extension, so building the workspace needs a Python
+      # origofs-py is a pyo3 extension, so building the workspace needs a Python
       # interpreter available for it to link against.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Format check
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          # The access surfaces (api/mcp/sandbox/git/fuse/nfs) are default-off
+          # features of origofs-sdk. `--workspace` builds their code via the CLI's
+          # `full`, but lint the surface modules + their gated tests explicitly too.
+          cargo clippy -p origofs-sdk --features full --all-targets -- -D warnings
+          # The fuzz crate is deliberately outside the workspace (cargo-fuzz needs
+          # its own nightly + sanitizer flags), so nothing above compiles it — a
+          # signature change in origofs-core breaks it invisibly until the Fuzz job
+          # gets there, minutes later and behind a sanitizer build. A plain stable
+          # `check` costs seconds and reports it as an ordinary type error.
+          cargo check --manifest-path crates/origofs-core/fuzz/Cargo.toml
 
-      # Postgres tests self-skip without ORIGO_PG_TEST_URL; the S3/GCS integration
+      # Postgres tests self-skip without ORIGOFS_PG_TEST_URL; the S3/GCS integration
       # tests are #[ignore]d; and the FUSE / NFS / overlayfs tests self-skip when
       # the needed privileges aren't present — so the suite is green on a stock
       # runner with no extra services.
+      # nextest is the primary runner (per-test hang guard + retries; see
+      # .config/nextest.toml). It doesn't run doctests, so those run via
+      # `cargo test --doc` afterward (the one executable doctest, nfs.rs, is
+      # gated by `full`).
       - name: Test
-        run: cargo test --workspace --no-fail-fast
+        run: |
+          cargo nextest run --profile ci --workspace
+          # Run the surface-gated tests (api/mcp/sandbox/git/fuse/nfs) explicitly,
+          # rather than relying on workspace feature-unification to enable them.
+          cargo nextest run --profile ci -p origofs-sdk --features full
+          cargo test --workspace --doc
+          cargo test -p origofs-sdk --features full --doc
+
+      # The opt-in `coedit` feature (yrs-backed CRDT co-editing, roadmap M8) is
+      # off by default for origofs-core and origofs-sdk, so exercise it — clippy +
+      # tests — explicitly. `-p origofs-sdk --features coedit` covers coedit without
+      # the API (proving the `axum?/ws` weak-dep stays axum-free); `full,coedit`
+      # covers the API's y-sync WebSocket + every surface. (origofs-py enables coedit
+      # unconditionally, so the default workspace build already covers its
+      # compilation; its live co-editing is tested in the Python job.)
+      - name: Test coedit feature
+        run: |
+          cargo clippy -p origofs-core --features coedit --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features coedit --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features full,coedit --all-targets -- -D warnings
+          cargo nextest run --profile ci -p origofs-core --features coedit
+          cargo nextest run --profile ci -p origofs-sdk --features coedit
+          cargo nextest run --profile ci -p origofs-sdk --features full,coedit
+
+      # The opt-in `metrics` feature (roadmap M9) is likewise off by default and
+      # out of `full`, so the feature-on build is otherwise only covered
+      # incidentally via `origofs-cli`. Exercise both states explicitly: the
+      # recording facade compiles to nothing with the feature off (so a default
+      # build must stay clean and dependency-free), and with it on the `/metrics`
+      # exposition endpoint and the per-request instrumentation must work.
+      - name: Test metrics feature
+        run: |
+          cargo clippy -p origofs-core --features metrics --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features metrics --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features full,metrics --all-targets -- -D warnings
+          cargo nextest run --profile ci -p origofs-core --features metrics
+          cargo nextest run --profile ci -p origofs-sdk --features full,metrics
+
+  # B1 (#70): code-coverage signal. Instrument the same test invocations the
+  # `rust` job runs — the default workspace suite plus the origofs-sdk `full`
+  # surfaces (api/mcp/sandbox/git/fuse/nfs are default-off features, otherwise
+  # invisible to coverage) — merge them into one lcov report, and upload to
+  # Codecov. Uses the Postgres service so the PG-gated paths count too.
+  coverage:
+    name: Coverage (llvm-cov + Codecov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: origofs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      # origofs-py is a pyo3 extension, so building the workspace needs a Python
+      # interpreter available for it to link against.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Collect coverage
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --no-report --workspace
+          cargo llvm-cov --no-report -p origofs-sdk --features full
+          cargo llvm-cov report --lcov --output-path lcov.info
+
+      # Tokenless upload works for public repos; set the CODECOV_TOKEN secret to
+      # make it reliable. A Codecov hiccup must not fail the build, so the upload
+      # is best-effort — the gate lives in codecov.yml (status checks).
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # Feature-combination coverage. `--workspace` unifies features across the graph,
+  # and origofs-cli/-py pull `full,metrics,coedit` — so every existing invocation
+  # builds the *maximal* set, and the repeatedly-stated promise that "a default
+  # build pulls none of the surface dependencies" was never actually verified.
+  # Neither was the reverse: a `cfg` that only compiles when a sibling feature
+  # happens to be on would ship undetected.
+  #
+  # `cargo hack --feature-powerset --depth 2` checks every pair, which is where
+  # these bugs live (a constructor needing *both* postgres and object-store, a
+  # weak dependency like `axum?/ws`). `check` only — this is about whether the
+  # combinations compile, and the behavioural tests live in the jobs above.
+  features:
+    name: Feature combinations (cargo-hack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
+
+      # origofs-py is a pyo3 extension; the workspace needs an interpreter to link.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The engine's own backend features (postgres / object-store / encryption)
+      # plus coedit and metrics. `--depth 2` keeps this to pairs rather than the
+      # full 2^5.
+      - name: origofs-core feature powerset
+        run: cargo hack check -p origofs-core --feature-powerset --depth 2
+
+      # The access surfaces are default-off features here, and `--each-feature`
+      # covers the single-feature builds `--features full` never exercises: an
+      # `api`-only or `nfs`-only build has to work on its own.
+      - name: origofs-sdk feature powerset
+        run: cargo hack check -p origofs-sdk --feature-powerset --depth 2
+
+      # The claim this is really here to defend: with no features, none of the
+      # surface or backend dependencies are in the tree at all.
+      # `--edges normal` matters: dev-dependencies pull several of these in for the
+      # test suite (nfsserve, tokio-postgres, yrs), and those are not what the
+      # promise is about — it is about what a *consumer* links.
+      - name: A minimal origofs-sdk build links none of the optional trees
+        run: |
+          cargo tree -p origofs-sdk --no-default-features --edges normal --prefix none \
+            | sort -u > /tmp/minimal.txt
+          failed=0
+          for dep in axum fuser nfsserve object_store tokio-postgres deadpool-postgres \
+                     rustls argon2 chacha20poly1305 yrs; do
+            if grep -q "^$dep " /tmp/minimal.txt; then
+              echo "::error::$dep is linked by a --no-default-features origofs-sdk build"
+              failed=1
+            fi
+          done
+          test "$failed" = 0
+          echo "confirmed: $(wc -l < /tmp/minimal.txt) normal dependencies, none of them optional trees"
+
+  # The FUSE mount surface, which had **zero** executed coverage.
+  #
+  # All five tests in `fuse_mount.rs` gate on `mountable()` — root plus an openable
+  # `/dev/fuse` — and a stock GitHub runner is neither, so they always skipped.
+  # `fuse.rs` is the largest single surface module and README lists FUSE as a
+  # first-class interface, so "the tests exist" was doing a lot of unearned work.
+  #
+  # A job container runs as root and, given `--device /dev/fuse` plus `SYS_ADMIN`,
+  # can actually mount. The tests are unchanged; they just finally run.
+  fuse:
+    name: FUSE mount surface
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: rust:1.88-bookworm
+      # `--device` exposes the FUSE char device; SYS_ADMIN is what `mount(2)`
+      # needs; apparmor:unconfined stops the host profile blocking the mount.
+      options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install fuse3
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends fuse3 libfuse3-dev pkg-config
+
+      # Fail loudly rather than skipping: a silent skip here is precisely the
+      # failure mode this job exists to end.
+      - name: The mount preconditions really are satisfied
+        run: |
+          test "$(id -u)" = 0 || { echo "::error::not root"; exit 1; }
+          test -c /dev/fuse   || { echo "::error::/dev/fuse missing"; exit 1; }
+          echo "root + /dev/fuse present; fuse_mount.rs will not self-skip"
+
+      - name: Run the FUSE mount suite
+        run: cargo test -p origofs-sdk --features full --test fuse_mount -- --nocapture
+
+  # The isolated sandbox (`origofs sandbox --isolate`), which had **zero** executed
+  # coverage (#103). Every case in sandbox.rs passed `isolate: false`, so the one
+  # thing origofs presents as an actual security boundary was asserted only by a
+  # unit test over the argv we hand bubblewrap — never by running it.
+  #
+  # `apt-get install bubblewrap` does NOT enable this: the `--overlay` options
+  # landed in bubblewrap 0.11.0, and ubuntu-latest (24.04) ships 0.9.0. That gap
+  # is the whole reason the feature was broken on every current LTS distro while
+  # looking fine. So build 0.11.0 — a small C project, well under a minute — and
+  # run the suite against it.
+  sandbox-isolate:
+    name: Sandbox isolation (bubblewrap)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build bubblewrap 0.11.0 (overlay support)
+        env:
+          BWRAP_VERSION: 0.11.0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends meson ninja-build libcap-dev pkg-config
+          curl -fsSL -o bwrap.tar.xz \
+            "https://github.com/containers/bubblewrap/releases/download/v${BWRAP_VERSION}/bubblewrap-${BWRAP_VERSION}.tar.xz"
+          tar xf bwrap.tar.xz
+          cd "bubblewrap-${BWRAP_VERSION}"
+          meson setup _build --prefix=/usr/local -Dselinux=disabled -Dman=disabled -Dtests=false
+          ninja -C _build
+          sudo ninja -C _build install
+
+      # Ubuntu 24.04 confines unprivileged user namespaces with an AppArmor
+      # profile, so `bwrap --unshare-user` dies on `setting up uid map: Permission
+      # denied` and `unshare -U -r` on `write failed /proc/self/uid_map`. Lifting
+      # it is what lets bubblewrap build its namespace at all — and it also
+      # un-skips the *non*-isolated overlay cases, which have been quietly
+      # skipping on every ubuntu runner for the same reason.
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
+      # Fail loudly rather than skipping, exactly as the `fuse` job does: a silent
+      # skip here is the failure mode this job exists to end.
+      #
+      # This is a *functional* probe, not a version or `--help` check: it is the
+      # whole isolated mechanism — user namespace plus overlay mount plus delta
+      # capture — so anything that would make the suite skip or fail shows up here,
+      # against a two-line reproduction rather than inside a test.
+      - name: The isolation preconditions really are satisfied
+        run: |
+          bwrap --version
+          mkdir -p probe/lower probe/upper probe/work
+          echo lower > probe/lower/a.txt
+          bwrap --unshare-user --unshare-pid --die-with-parent --new-session \
+                --proc /proc --dev /dev --tmpfs /tmp \
+                --ro-bind /usr /usr --ro-bind-try /bin /bin \
+                --ro-bind-try /lib /lib --ro-bind-try /lib64 /lib64 \
+                --overlay-src "$PWD/probe/lower" \
+                --overlay "$PWD/probe/upper" "$PWD/probe/work" /probe \
+                --chdir /probe -- /bin/sh -c 'cat a.txt && echo delta > b.txt' \
+            || { echo "::error::bubblewrap cannot build an isolated overlay here; the suite would skip"; exit 1; }
+          test -f probe/upper/b.txt \
+            || { echo "::error::the overlay captured no delta"; exit 1; }
+          echo "bubblewrap builds an isolated overlay and captures a delta; the tests will not self-skip"
+
+      # ORIGOFS_REQUIRE_BWRAP turns a would-be skip into a failure, so this job
+      # cannot silently go back to testing nothing.
+      - name: Run the sandbox suite
+        env:
+          ORIGOFS_REQUIRE_BWRAP: "1"
+        run: cargo test -p origofs-sdk --features sandbox --test sandbox -- --nocapture
+
+  # B4 (#70): supply-chain gate. RUSTSEC advisories, the license allow-list, and
+  # source pinning from deny.toml. Reads Cargo metadata only — no workspace
+  # build — so it's fast and independent of the test jobs.
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # B5 (#70): MSRV floor. edition 2024 sets a 1.85 *language* floor, but the real
+  # minimum is higher — the code uses let-chains (stabilized in 1.88), and the
+  # dependency graph (icu, via url/object_store) needs >= 1.86 — so 1.88 is the
+  # true floor. Pinning it catches an accidental newer-stdlib use (or a
+  # dependency MSRV bump) before it silently raises the minimum. `cargo check`
+  # only — compilation is what MSRV is about — and `--locked` so the committed
+  # Cargo.lock (not a fresh, newer-dep resolution) is what gets verified.
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      # origofs-py is a pyo3 extension, so building the workspace needs a Python
+      # interpreter available for it to link against.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: cargo check on the MSRV toolchain
+        run: |
+          cargo check --workspace --locked
+          # The default-off origofs-sdk surfaces (api/mcp/sandbox/git/fuse/nfs)
+          # aren't built by --workspace; check them on the MSRV toolchain too.
+          cargo check -p origofs-sdk --features full --locked
+
+  # B3 (#70): fuzz the content-addressed object decoders. Every blob/tree/commit/
+  # ref-snapshot object is parsed from untrusted bytes on read (a bare bucket, a
+  # bit-rotted or tampered store), so each `&[u8] -> Result` decoder is a
+  # hostile-input boundary with explicit anti-OOM guards. cargo-fuzz (libFuzzer)
+  # needs nightly. This is a bounded *smoke* run on every push — enough to catch
+  # panics, aborts, OOMs, and encode↔decode asymmetry; longer campaigns run
+  # out-of-band. The fuzz crate (crates/origofs-core/fuzz) is detached from the
+  # workspace, so it never enters a stable build.
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/origofs-core/fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Each target runs briefly: -runs caps iterations so fast targets exit
+      # promptly, -max_total_time bounds the rest, and -rss_limit_mb turns a
+      # runaway allocation (a defeated anti-OOM guard) into a hard failure. A
+      # crash writes a reproducer under fuzz/artifacts and fails the job.
+      - name: Fuzz each decoder (bounded)
+        working-directory: crates/origofs-core
+        run: |
+          for t in manifest_decode tree_decode commit_decode refsnapshot_decode; do
+            echo "::group::fuzz $t"
+            cargo fuzz run "$t" -- -max_total_time=45 -runs=3000000 -rss_limit_mb=2048
+            echo "::endgroup::"
+          done
+
+  # B6 (#70): exercise the real object-store backend. The S3 content-store suite
+  # in content_backends.rs is #[ignore]d (it needs an S3-compatible endpoint), so
+  # run it against MinIO — covering multipart upload of a multi-MiB blob, ranged
+  # GETs across part boundaries, the production VerifyingStore(PackStore(s3))
+  # stack, and durability that lives in the bucket (a fresh store re-reads) —
+  # semantics the in-memory object adapter can't model. MinIO runs via `docker
+  # run` rather than a service container so we can pass its `server` command and
+  # use the stable official image.
+  s3:
+    name: Object store (MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ORIGOFS_S3_TEST_BUCKET: origofs-ci
+      ORIGOFS_S3_TEST_REGION: us-east-1
+      ORIGOFS_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+      ORIGOFS_S3_TEST_ACCESS_KEY_ID: minioadmin
+      ORIGOFS_S3_TEST_SECRET_ACCESS_KEY: minioadmin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Start MinIO and create the bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          # Wait for liveness, then create the test bucket (idempotent on re-run).
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:9000/minio/health/live && break
+            sleep 2
+          done
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://origofs-ci || true
+
+      # `--run-ignored all` un-gates the #[ignore]d tests; the filterset scopes the
+      # run to just the S3 suite (not the GCS one, which needs a separate backend).
+      - name: Run the S3 content-store suite
+        run: cargo nextest run --profile ci -p origofs-core --run-ignored all -E 'test(/^s3_/)'
 
   python:
     name: Python bindings (maturin + pytest)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # The Python suite has PG-gated tests too; give it the same backend.
+    env:
+      ORIGOFS_PG_TEST_URL: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=origofs"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: origofs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -68,14 +531,405 @@ jobs:
       # exercises the object-store content path (S3/GCS config + in-memory
       # roundtrip) from Python.
       - name: Build extension and run tests
-        working-directory: crates/origo-py
+        working-directory: crates/origofs-py
         run: |
           python -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
           # fastapi + httpx are needed by tests/test_fastapi_router.py — it
-          # imports origo.fastapi (the router integration) and fastapi's TestClient,
-          # which rides on httpx. They are test-only deps, not runtime deps of origo.
-          pip install maturin pytest fastapi httpx
+          # imports origofs.fastapi (the router integration) and fastapi's TestClient,
+          # which rides on httpx. fsspec/universal_pathlib/sqlalchemy/alembic cover
+          # the other optional integrations' own test files. psycopg[binary] is the
+          # Postgres driver test_db_migrations.py's PG-gated test needs (it self
+          # -skips without ORIGOFS_PG_TEST_URL, same as the other PG-gated suites,
+          # but this job sets it and has the postgres service above). mypy is
+          # dev-only (not a runtime dep of origofs). None of these are needed to
+          # build/use origofs itself -- they're here so every test file (and the
+          # type-check below) can actually import what it needs.
+          #
+          # llama-index-core and markitdown back the `llamaindex`/`markitdown`
+          # extras. They were missing, so the four tests in test_rag.py guarded on
+          # them skipped on EVERY run and origofs/llamaindex.py (201 lines) had
+          # never been imported by a test that executed (#104). Every extra
+          # declared in pyproject.toml belongs on this line; tests/
+          # test_optional_extras.py fails if one is missing, rather than letting it
+          # go back to skipping silently.
+          pip install maturin pytest fastapi httpx fsspec universal_pathlib \
+            sqlalchemy alembic "psycopg[binary]" mypy \
+            "llama-index-core>=0.11" markitdown
           maturin develop
-          pytest -q tests
+          ORIGOFS_REQUIRE_EXTRAS=1 pytest -q tests
+
+      # The example apps ship their own test suites and neither was ever executed:
+      # the run above is scoped to `crates/origofs-py/tests`, and codecov.yml
+      # ignores `examples/**`. README points readers at both, so they can rot
+      # silently — and an example that no longer runs is worse than none.
+      - name: Example app test suites
+        working-directory: crates/origofs-py
+        run: |
+          . .venv/bin/activate
+          pytest -q ../../examples/fs-consumer ../../examples/web/server
+
+      # Type-check the test suite against python/origofs/__init__.pyi (the hand
+      # -maintained stub for the compiled _origofs extension). This is what
+      # catches the stub drifting from the real pyo3 bindings going forward --
+      # e.g. a Rust-side argument getting renamed without the .pyi following —
+      # PROVIDED the tests call with the keyword arguments the stub promises
+      # (see the `from_=` calls in test_bindings.py). Config lives in
+      # pyproject.toml's [tool.mypy] (also excludes fsspec's own test-support
+      # submodule, which ships no py.typed marker).
+      - name: Type-check (mypy)
+        working-directory: crates/origofs-py
+        run: |
+          . .venv/bin/activate
+          mypy
+
+  # B7 (#70): the macOS leg. origofs is developed on macOS as a first-class
+  # platform (its POSIX mount there is NFSv3, not FUSE), so build and test on
+  # macOS to catch platform-specific breakage the Linux jobs miss — path
+  # handling, `cfg(unix)`/`cfg(target_os)` splits, and the NFS surface. macOS
+  # runners have no Docker, so there is no Postgres or MinIO here: the SQLite
+  # metadata path carries the suite and the PG-gated tests self-skip. FUSE is
+  # excluded because `fuser` needs macFUSE (a kernel extension absent on the
+  # runner), which is also why the `full` feature set — and the CLI/Python
+  # builds that pull it — are never used on this leg; the surfaces are enabled
+  # individually minus `fuse`. The NFSv3 adapter stands in for the mount path:
+  # its test drives the NFSFileSystem methods directly plus a bind smoke test,
+  # so it needs no privileged kernel mount and runs on a stock runner.
+  macos:
+    name: macOS (SQLite + NFS surface)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Lint core and the non-fuse surfaces (the NFS module is the
+      # macOS-relevant one) with warnings denied, matching the Linux `rust` job.
+      - name: Clippy (deny warnings, non-fuse surfaces)
+        run: |
+          cargo clippy -p origofs-core --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features api,mcp,sandbox,git,nfs --all-targets -- -D warnings
+
+      # Core on the SQLite path (PG-gated tests self-skip with no
+      # ORIGOFS_PG_TEST_URL) plus the non-fuse SDK surfaces, including the NFSv3
+      # adapter (nfs.rs).
+      - name: Test
+        run: |
+          cargo nextest run --profile ci -p origofs-core
+          cargo nextest run --profile ci -p origofs-sdk --features api,mcp,sandbox,git,nfs
+
+  # The Windows leg (#107). `release.yml` builds an `x86_64-pc-windows-msvc`
+  # wheel and attaches it to the GitHub Release — but nothing in CI had ever
+  # compiled that target. The first attempt would have been inside the release
+  # job that also cuts the release, so a Windows break would have taken the whole
+  # release down at the worst possible moment to discover it. It *was* broken:
+  # `origofs-sdk`'s sandbox module used `std::os::unix` unconditionally, so
+  # `--features full` — and therefore all of `origofs-cli` — could not compile for
+  # Windows at all.
+  #
+  # Windows is also the only place the platform splits get exercised in the
+  # negative. `fuse`, `nfs` and `sandbox` are Unix-only modules of origofs-sdk, so
+  # this leg is what proves `--features full` still resolves to a buildable set
+  # with all three absent, and that `origofs-cli` degrades to a clear
+  # per-subcommand error instead of failing to build.
+  #
+  # No Docker on the Windows runner, so — exactly as on the macOS leg — there is
+  # no Postgres or MinIO here: the SQLite metadata path carries the suite and the
+  # PG-gated tests self-skip.
+  #
+  # `shell: bash` on every multi-command step is deliberate, not habit. The
+  # default shell on a Windows runner is PowerShell, where a *native* command
+  # exiting non-zero does not stop the script — only the last command's exit code
+  # is checked. A failing `cargo clippy` on the first line of a multi-line `run:`
+  # would be masked by a passing `cargo test` on the second, and the job would go
+  # green having caught nothing. That is the same silent-pass failure mode the
+  # `fuse` and `sandbox-isolate` jobs exist to end.
+  windows:
+    name: Windows (SQLite + portable surfaces + wheel)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # origofs-py is a pyo3 extension, so building the workspace needs a Python
+      # interpreter available for it to link against. It is also what runs the
+      # wheel smoke test at the foot of this job.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Lint with warnings denied, matching the Linux `rust` job. `--features full`
+      # is the interesting one here: on Windows it resolves to api + mcp + git,
+      # with fuse/nfs/sandbox compiled out, and it must still be a clean build.
+      # origofs-cli is linted too because it is the crate that consumes `full` and
+      # has to keep working with three of its surfaces missing.
+      - name: Clippy (deny warnings)
+        shell: bash
+        run: |
+          cargo clippy -p origofs-core --all-targets -- -D warnings
+          cargo clippy -p origofs-sdk --features full --all-targets -- -D warnings
+          cargo clippy -p origofs-cli --all-targets -- -D warnings
+
+      # Core on the SQLite path plus the portable SDK surfaces. This is where
+      # path handling and the file-locking / rename / delete-while-open semantics
+      # that differ most on Windows actually get executed, rather than assumed.
+      - name: Test
+        shell: bash
+        run: |
+          cargo nextest run --profile ci -p origofs-core
+          cargo nextest run --profile ci -p origofs-sdk --features full
+
+      # The artifact #107 is really about. Build the wheel the way `release.yml`
+      # builds it — same action, same target — so this is the same compile, run on
+      # every PR instead of once, at the tag, in the job that cuts the release.
+      - name: Build the Python wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist
+          sccache: "true"
+          working-directory: crates/origofs-py
+
+      # …and then run it. Building proves it compiles; this proves the wheel that
+      # would ship actually works — a workspace opens, an attributed write lands,
+      # and blame comes back naming the actor. Shared with `release.yml` so the
+      # two cannot drift.
+      - name: The wheel imports and works
+        shell: bash
+        working-directory: crates/origofs-py
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-index --find-links dist origofs
+          python ../../.github/scripts/wheel_smoke.py
+
+  # B9 (#70): benchmark-regression signal. The criterion micro-benchmarks in
+  # benches/engine.rs cover the hot paths — content-defined-chunking writes,
+  # whole-file reads, the incremental copy-on-write edit, tree/commit building,
+  # and the overhead encryption-at-rest adds. Run them with criterion's
+  # `bencher` output format (the libtest `... bench: N ns/iter` shape
+  # github-action-benchmark parses) and diff each run against a baseline kept in
+  # the Actions cache — no gh-pages branch or push token needed. Shared CI
+  # runners are too noisy to gate a merge on, so a regression is surfaced in the
+  # job summary (and flagged past 2x) rather than failing the build.
+  bench:
+    name: Benchmarks (criterion regression)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--bench engine` scopes the run to the criterion target: a bare
+      # `cargo bench` would also start the lib's libtest harness, which rejects
+      # criterion's `--output-format` flag.
+      - name: Run benchmarks
+        run: |
+          cargo bench -p origofs-core --bench engine -- --output-format bencher | tee raw.txt
+          # Criterion prints `Criterion.rs ERROR: ... base/sample.json ... No such
+          # file` on **stdout**, mid-line, whenever `target/criterion` carries no
+          # saved baseline — i.e. whenever the Rust cache didn't happen to bring
+          # one over. That splits `test NAME ... bench: N ns/iter` across two
+          # lines, github-action-benchmark then parses zero results, and the job
+          # fails with "No benchmark result was found" — on a run where the
+          # benchmarks themselves were fine. It made this job pass or fail on
+          # cache warmth rather than on anything in the diff.
+          #
+          # It is diagnostic noise in a machine-read stream, so strip it and
+          # rejoin the line. A run with no such notice passes through unchanged.
+          perl -0pe 's/ \.\.\. Criterion\.rs ERROR:[^\n]*\n/ ... /g' raw.txt > output.txt
+
+      # Restore the rolling benchmark history so the action has something to diff
+      # against. A per-run key with a shared prefix means each run saves a fresh
+      # entry the next run's restore-keys prefix match will pick up as the baseline.
+      - name: Restore benchmark baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: ./cache
+          key: bench-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            bench-${{ runner.os }}-
+
+      - name: Compare against baseline
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: origofs-core micro-benchmarks
+          tool: cargo
+          output-file-path: output.txt
+          external-data-json-path: ./cache/benchmark-data.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Flag a >2x slowdown. Kept non-failing because shared-runner variance
+          # would make a hard gate flaky; the alert lands in the job summary.
+          alert-threshold: "200%"
+          comment-on-alert: false
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Save benchmark baseline
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ./cache
+          key: bench-${{ runner.os }}-${{ github.run_id }}
+
+  # The shipped deployment artifact. Nothing else in CI builds the image, which is
+  # how it came to pin a Rust older than the workspace MSRV and stop building at
+  # all. This job compiles it and then exercises the whole production-shaped stack
+  # (Postgres metadata + MinIO content) the compose file describes, so a break in
+  # either the image or the wiring fails here rather than in someone's deploy.
+  docker:
+    name: Docker image + compose stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build once into the local image store, cached across runs, so the compose
+      # services below reuse it instead of each rebuilding from source.
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: origofs:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Binaries run and report a version
+        run: |
+          docker run --rm origofs:latest --help
+          docker run --rm --entrypoint git-remote-origofs origofs:latest --help || true
+
+      # `docker compose` builds the same Dockerfile; point it at the image just
+      # built so this step is a wiring test, not a second compile.
+      - name: Bring the stack up
+        run: |
+          docker compose up -d --wait --wait-timeout 300
+          docker compose ps
+
+      - name: Readiness probe reports both stores healthy
+        run: |
+          curl -fsS localhost:8080/readyz | tee /tmp/readyz.json
+          grep -q '"ready":true' /tmp/readyz.json
+
+      # A real write/read round-trip through the Postgres + S3 backends, and a
+      # check that the surface is actually gated: the API refuses to serve
+      # unauthenticated writes on a non-loopback bind.
+      - name: Write and read a file over the API
+        run: |
+          curl -fsS -H 'Authorization: Bearer demo-token' \
+            -X PUT --data-binary 'hello from ci' \
+            localhost:8080/v1/files/notes/a.txt
+          got=$(curl -fsS -H 'Authorization: Bearer demo-token' \
+            localhost:8080/v1/files/notes/a.txt)
+          test "$got" = "hello from ci" || { echo "read back: $got"; exit 1; }
+
+      - name: Unauthenticated writes are refused
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X PUT --data-binary 'nope' localhost:8080/v1/files/notes/b.txt)
+          test "$code" = "401" || { echo "expected 401, got $code"; exit 1; }
+
+      - name: Stack logs
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # Postgres over TLS. The `rust` job's service container serves plaintext, so the
+  # handshake path — the one that decides whether origofs can reach a managed
+  # Postgres at all — would otherwise never execute. Run one with `ssl = on` and a
+  # certificate from a private CA, which is also the shape a self-hosted deployment
+  # has.
+  pg-tls:
+    name: Postgres over TLS
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Issue a CA and a server certificate
+        run: |
+          mkdir -p /tmp/pgtls
+          cd /tmp/pgtls
+          openssl req -new -x509 -days 1 -nodes -out ca.crt -keyout ca.key \
+            -subj "/CN=origofs-ci-ca"
+          openssl req -new -nodes -out server.csr -keyout server.key \
+            -subj "/CN=localhost"
+          # CA:FALSE matters: rustls refuses to accept a CA certificate as an
+          # end-entity server certificate (`CaUsedAsEndEntity`).
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+            -days 1 -out server.crt -extfile <(printf \
+              "basicConstraints=CA:FALSE\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
+          # The server reads these as uid 999 inside the container.
+          sudo chown 999:999 server.key server.crt
+          sudo chmod 600 server.key
+
+      - name: Start Postgres with TLS
+        run: |
+          docker run -d --name pgtls \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=origofs \
+            -p 5433:5432 \
+            -v /tmp/pgtls:/certs \
+            postgres:16 \
+            -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
+          for i in $(seq 1 30); do
+            docker exec pgtls pg_isready -U postgres && break
+            sleep 2
+          done
+          # Prove the server really negotiated TLS before trusting the test result.
+          docker exec pgtls psql -U postgres -d origofs -tAc \
+            "SELECT current_setting('ssl')"
+
+      - name: Test the TLS path
+        env:
+          ORIGOFS_PG_TLS_TEST_URL: "host=localhost port=5433 user=postgres password=postgres dbname=origofs"
+          ORIGOFS_PG_TLS_TEST_CA: /tmp/pgtls/ca.crt
+        run: cargo test -p origofs-core --test pg_tls
+
+      # The rest of the Postgres suite, with origofs's connections encrypted.
+      #
+      # No explicit `sslmode`, so it defaults to `prefer`: origofs has a connector
+      # and negotiates TLS, while the suite's own schema-reset helper (which opens
+      # a raw `NoTls` connection) degrades to plaintext instead of failing. The
+      # encryption of origofs's connections is asserted directly in `pg_tls.rs`
+      # via `pg_stat_ssl`, not inferred from this job passing.
+      - name: Full Postgres suite with TLS negotiated
+        env:
+          ORIGOFS_PG_TEST_URL: "host=localhost port=5433 user=postgres password=postgres dbname=origofs"
+          ORIGOFS_PG_CA_FILE: /tmp/pgtls/ca.crt
+        run: cargo test -p origofs-core --test postgres
+
+      - name: Server logs
+        if: failure()
+        run: docker logs pgtls

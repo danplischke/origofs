@@ -1,13 +1,13 @@
 // The agent-suggestion review queue — the propose-and-review path.
 //
 // An agent (or anyone) proposes an edit; the working tree is untouched until a
-// reviewer accepts it. On accept, origo lands the edit **attributed to the
+// reviewer accepts it. On accept, origofs lands the edit **attributed to the
 // original author** while recording the approver, and refuses a stale base
 // (409) — so review is safe against concurrent edits.
 
 import { useCallback, useEffect, useState } from "react";
 import { useSession } from "../session";
-import { OrigoError } from "../lib/origoClient";
+import { OrigoFSError } from "../lib/origofsClient";
 import { relativeTime } from "../lib/time";
 import { ActorChip } from "../components/ActorBadge";
 import { DiffText } from "./DiffText";
@@ -58,7 +58,7 @@ export function SuggestionsPanel({ onApplied }: { onApplied: () => void }) {
         if (action === "accept") onApplied();
       } catch (e) {
         const text =
-          e instanceof OrigoError && e.status === 409
+          e instanceof OrigoFSError && e.status === 409
             ? `#${s.id} has a stale base — the file changed since it was proposed. Re-propose it.`
             : e instanceof Error
               ? e.message

@@ -1,10 +1,10 @@
-// TypeScript mirrors of the exact JSON shapes the origo Python bindings emit
-// (via origo.fastapi.build_router at /fs) and the app server (/api/*). Keys and
-// nullability match the bindings 1:1 — see crates/origo-py/src/lib.rs.
+// TypeScript mirrors of the exact JSON shapes the origofs Python bindings emit
+// (via origofs.fastapi.build_router at /fs) and the app server (/api/*). Keys and
+// nullability match the bindings 1:1 — see crates/origofs-py/src/lib.rs.
 
 export type ActorKind = "human" | "agent" | "system";
 
-/** The actor embedded in every blame range (crates/origo-py/src/lib.rs `actor_dict`). */
+/** The actor embedded in every blame range (crates/origofs-py/src/lib.rs `actor_dict`). */
 export interface Actor {
   id: number;
   kind: ActorKind;
@@ -17,11 +17,17 @@ export interface Actor {
 }
 
 /**
- * One attributed run of lines. Line numbers are **1-based and inclusive** on
- * both ends; a single line has `line_start === line_end`. `blame()` returns an
- * empty array for an unattributed file (a plain `write`, or empty content).
+ * One attributed span. `byte_start`/`byte_end` are the exact `[start, end)` byte
+ * range — the ground truth — so sub-line, character-level authorship from live
+ * co-editing renders precisely (two authors on one line are two spans that share
+ * a line number). `line_start`/`line_end` are the **1-based, inclusive** lines the
+ * span touches, for line-oriented views; a single line has
+ * `line_start === line_end`. `blame()` returns an empty array for an unattributed
+ * file (a plain `write`, or empty content).
  */
 export interface BlameRange {
+  byte_start: number;
+  byte_end: number;
   line_start: number;
   line_end: number;
   session: number | null;
@@ -156,4 +162,15 @@ export interface DemoToken {
 export interface AppConfig {
   demo: boolean;
   tokens: DemoToken[];
+}
+
+/**
+ * The result of a write. A `direct` actor's write lands (`written` bytes); a
+ * `propose`-only actor's write is routed into the suggestion queue for review
+ * (`proposed` is the new suggestion id) and the file is left unchanged.
+ */
+export interface WriteResult {
+  path: string;
+  written?: number;
+  proposed?: number;
 }

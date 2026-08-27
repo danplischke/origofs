@@ -1,0 +1,49 @@
+version: 2
+
+# `cargo deny` gates CI on RUSTSEC advisories. Without something keeping the tree
+# current, that gate eventually fails on an advisory with no PR queued to fix it —
+# so the check that is meant to protect the project becomes the thing blocking it.
+# `deny.toml` currently waives two advisories (quick-xml via object_store); those
+# waivers stop being needed the moment the upstream bump lands, which is what this
+# is here to surface.
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the routine patch/minor churn — 400+ crates in the lock file
+      # would otherwise produce a wall of individual PRs nobody reviews. Major
+      # bumps stay separate because they need reading.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # The fuzz crate is detached from the workspace on purpose (so it never enters a
+  # stable build), which also means `directory: /` does not see its lock file.
+  - package-ecosystem: cargo
+    directory: "/crates/origofs-core/fuzz"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    groups:
+      all:
+        patterns: ["*"]
+
+  # Pinned action versions go stale silently; a deprecated runner image or a
+  # yanked action shows up as a red build with no obvious cause.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The Dockerfile pins a Rust image. It already drifted below the workspace MSRV
+  # once and stopped building, which is why CI now builds it.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: monthly

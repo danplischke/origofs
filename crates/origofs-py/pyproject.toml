@@ -1,0 +1,103 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "origofs"
+description = "Python bindings for origofs (agent filesystem): async workspace ops, attribution, suggestions, and mount/NFS orchestration"
+# Rendered as the project page on PyPI. Without it the listing is a bare
+# description, which is most of what a reader sees before deciding to install.
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: System :: Filesystems",
+    "Topic :: Software Development :: Version Control",
+    "Framework :: AsyncIO",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/danplischke/origofs"
+Repository = "https://github.com/danplischke/origofs"
+Issues = "https://github.com/danplischke/origofs/issues"
+Changelog = "https://github.com/danplischke/origofs/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# The `origofs.fastapi` router integration (and the examples under examples/).
+fastapi = ["fastapi", "uvicorn"]
+# The `origofs.fsspec` filesystem (pandas/Dask/PyArrow/Zarr can read origofs paths).
+fsspec = ["fsspec>=2023.9.0"]
+# universal-pathlib: a pathlib-style `UPath("origofs://…")` over the filesystem.
+upath = ["universal_pathlib>=0.2.0", "fsspec>=2023.9.0"]
+# `origofs.llamaindex.SimpleWorkspaceReader` — RAG documents with provenance.
+# (`origofs.rag` itself needs no extra deps; it's built on the compiled core.)
+llamaindex = ["llama-index-core>=0.11"]
+# `origofs.converters.MarkItDownConverter` — project PDFs/Office docs to Markdown.
+markitdown = ["markitdown"]
+# `origofs.db`: SQLAlchemy models of the metadata schema + Alembic migrations
+# for it (`origofs.db.upgrade`). Add a driver for your backend too, e.g.
+# `psycopg[binary]` for Postgres — sqlite3 is stdlib, no extra needed for it.
+db = ["sqlalchemy>=2.0", "alembic>=1.13"]
+
+# Register the "origofs://" protocol so `fsspec.filesystem("origofs", ...)` and
+# `pandas.read_*("origofs://…", storage_options=…)` resolve to our filesystem
+# without an explicit `import origofs.fsspec` first.
+[project.entry-points."fsspec.specs"]
+origofs = "origofs.fsspec:OrigoFileSystem"
+
+# Register an explicit `UPath` subclass for the "origofs://" protocol, so
+# `UPath("origofs://…")` resolves to it (universal-pathlib otherwise falls back to
+# its generic implementation and warns that the filesystem isn't explicitly
+# supported — the fallback works, this just makes it first-class).
+[project.entry-points."universal_pathlib.implementations"]
+origofs = "origofs._upath:OrigofsPath"
+
+[tool.mypy]
+python_version = "3.11"
+# `tests` alone only validates call sites against these modules' declared
+# signatures (mypy follows the import to resolve types, but doesn't deep-check
+# a followed module's own body unless it's also an explicit target here) --
+# list the pure-Python implementation modules explicitly so their internals get
+# checked too, not just how tests happen to call them. `origofs/__init__.py`
+# itself is deliberately not listed: it only re-exports the compiled
+# `_origofs` extension, which has no type stub of its own (the package-level
+# `__init__.pyi` already describes that surface for anyone importing
+# `origofs`) — checking `__init__.py`'s own body would just fail to resolve
+# that import.
+files = [
+    "tests",
+    "python/origofs/fastapi.py",
+    "python/origofs/db",
+    "python/origofs/rag.py",
+    "python/origofs/converters.py",
+    "python/origofs/llamaindex.py",
+]
+
+# fsspec's own test-support submodule ships no py.typed marker; that's a gap in
+# fsspec, not origofs, so don't let it show up as noise in our check.
+[[tool.mypy.overrides]]
+module = "fsspec.tests.*"
+ignore_missing_imports = true
+
+# MarkItDown ships no type stubs; the `origofs.converters` wrapper is defensive
+# about its API anyway (it's an optional, swappable converter).
+[[tool.mypy.overrides]]
+module = "markitdown"
+ignore_missing_imports = true
+
+[tool.maturin]
+# Build the importable extension module (pyo3 resolves libpython at import).
+features = ["extension-module"]
+# Mixed layout: the pure-Python `origofs` package lives under python/, and the
+# compiled core is imported as its `origofs._origofs` submodule. Type stubs and
+# py.typed ship inside python/origofs/ automatically.
+python-source = "python"
+module-name = "origofs._origofs"

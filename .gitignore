@@ -4,4 +4,10 @@ Cargo.lock.orig
 *.db
 *.db-wal
 *.db-shm
-.origo-cas/
+.origofs-cas/
+# cargo-mutants writes its per-run reports here (see .github/workflows/mutants.yml)
+mutants.out/
+mutants.out.old/
+
+# maturin/pytest virtualenv for the Python bindings
+crates/origofs-py/.venv/

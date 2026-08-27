@@ -1,0 +1,70 @@
+name: Mutants
+
+# B10 (#70): mutation testing. cargo-mutants rewrites small pieces of
+# origofs-core (a return value, a comparison, a `+` for a `-`) and checks the
+# suite still fails — surfacing behavior the tests don't actually pin down.
+# A full sweep is ~1700 mutants, each rebuilding and re-running the suite, so
+# this runs weekly on a schedule (and on demand) rather than per-PR. It is a
+# code-quality signal, not a merge gate: surviving mutants are expected and
+# reviewed from the uploaded reports, not treated as a build failure.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays, 06:00 UTC
+  workflow_dispatch:
+
+# A new run (a later cron tick, or a manual dispatch) supersedes an in-flight one.
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    name: cargo-mutants (origofs-core, shard ${{ matrix.shard }}/10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    strategy:
+      # One slow or survivor-heavy shard must not cancel the others.
+      fail-fast: false
+      matrix:
+        # cargo-mutants shards are 0-based (k/N for k in 0..N-1); 0..9 over /10
+        # is the complete, disjoint partition of the ~1700 mutants.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants and nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants, nextest
+
+      # Mutate origofs-core; catch survivors with nextest on the SQLite path.
+      # `-p origofs-core` scopes the build so the access-surface features
+      # (api/mcp/sandbox/git/fuse/nfs — feature-gated modules of origofs-sdk)
+      # never enter it. No Postgres service on purpose: cargo-mutants runs several test
+      # processes at once (`--jobs`), which would race on one shared database
+      # (the PG suites reset it wholesale between tests), so the PG-backed
+      # modules aren't exercised here — their mutants show as missed and are
+      # ignored in review. `--shard k/10` gives this leg its slice of the sweep.
+      # continue-on-error keeps surviving mutants (the expected, reviewable
+      # signal) from marking the workflow failed.
+      - name: Run cargo-mutants
+        continue-on-error: true
+        run: cargo mutants -p origofs-core --test-tool nextest --jobs 2 --shard ${{ matrix.shard }}/10
+
+      # mutants.out/ holds the per-shard outcomes (caught/missed/timeout/unviable
+      # lists + outcomes.json); keep them for review even when the step above
+      # exits non-zero.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out/

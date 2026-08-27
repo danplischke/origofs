@@ -1,0 +1,124 @@
+[package]
+name = "origofs-core"
+# Inherited from the workspace so the four crates cannot drift apart again.
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# `description` is not optional for publishing: crates.io rejects a crate without
+# one, so `cargo publish` failed before it got as far as uploading.
+description = "The origofs engine: content-addressed storage, a pluggable metadata store, opt-in Git-style versioning, and per-actor edit attribution"
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+# docs.rs renders with default features, and this crate's optional ones (coedit,
+# metrics) are off by default — so the co-editing and metrics surfaces would be
+# missing from the published docs entirely.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+argon2 = { version = "0.5.3", optional = true }
+async-recursion = "1.1.1"
+async-trait = "0.1.91"
+blake3 = "1.8.5"
+bytes = "1.12.1"
+chacha20poly1305 = { version = "0.10.1", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
+diffy = "0.5.1"
+fastcdc = "3"
+futures = "0.3.33"
+hex = "0.4.3"
+object_store = { version = "0.12", features = ["aws", "gcp"], optional = true }
+# `arc_lock` gives an owned (`'static`) connection guard a transaction can hold
+# across `.await`s; `send_guard` makes that guard `Send` so the transaction
+# future stays `Send`. Both are needed for the SQLite `MetaTxn` (C1).
+parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
+# `backup` is SQLite's online-backup API: a consistent snapshot of a *live*
+# database, which a plain file copy is not. The metadata DB is the one thing the
+# content store cannot rebuild (blame, the audit log, actors, uncommitted edits),
+# so backing it up correctly matters more than anything else here.
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+# TLS for Postgres. `tokio-postgres` ships only `NoTls`, so a connector has to be
+# supplied to reach any managed Postgres (RDS, Cloud SQL, Neon, Supabase all
+# require it) — and without one, metadata crosses the network in cleartext.
+# rustls and the native root store are already in the tree via `object_store`, so
+# this adds a connector and no new TLS stack. `ring` is named explicitly so the
+# client config picks its provider rather than depending on a process-wide
+# default a *library* has no business installing. PEM parsing for the CA bundle
+# comes from `rustls::pki_types::pem` rather than `rustls-pemfile`: the latter is
+# unmaintained (RUSTSEC-2025-0134) and 2.x is only a thin wrapper over this same
+# code, so using it directly drops a dependency instead of adding one.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+similar = "3.1.1"
+tokio-postgres-rustls = { version = "0.13", optional = true }
+thiserror = "2.0.19"
+# Metrics facade — the numeric counterpart to `tracing`. Same emit-only deal: the
+# library only *records*; it installs no exporter and starts no server, so with no
+# recorder installed every measurement hits the crate's global no-op recorder.
+# Optional so a default build pulls nothing; the CLI installs
+# `metrics-exporter-prometheus`. See `src/metrics.rs`.
+metrics = { version = "0.24", optional = true }
+# Structured, leveled instrumentation. A library only *emits*; it is a no-op
+# until a binary installs a subscriber, so an embedder pays nothing until they
+# opt in. The CLI installs one (see origofs-cli); Rust embedders install their own.
+tracing = "0.1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time"] }
+tokio-postgres = { version = "0.7", optional = true }
+# Opt-in CRDT co-editing (roadmap M8): a Yjs-in-Rust document whose per-span
+# authorship checkpoints through `write_as_blamed`. Gated so non-collab builds
+# don't pull it in.
+yrs = { version = "0.23", optional = true }
+
+[features]
+# Everything on by default, so nothing changes for an existing consumer — but each
+# backend can now be turned off. `--no-default-features` was previously a no-op
+# here: a pure-SQLite embedder still compiled deadpool-postgres, tokio-postgres,
+# the rustls stack, and `object_store` with both the aws and gcp features. That is
+# compile time, binary size, and — via `cargo deny` — audit surface they had no way
+# to opt out of.
+default = ["postgres", "object-store", "encryption"]
+
+# The Postgres metadata backend (multi-writer / production) and its TLS connector.
+# Turning it off leaves the SQLite backend, which is the solo/offline pairing.
+postgres = [
+    "dep:deadpool-postgres",
+    "dep:tokio-postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+]
+# The S3/R2/GCS/MinIO content backend (and the in-memory object adapter that shares
+# its code path). Off leaves `LocalCasStore`, `MemStore`, `PackStore`, and the
+# decorators.
+object-store = ["dep:object_store"]
+# Encryption at rest: XChaCha20-Poly1305 with an Argon2id-derived key.
+encryption = ["dep:argon2", "dep:chacha20poly1305"]
+
+coedit = ["dep:yrs"]
+# Opt-in metrics recording (roadmap M9). Off by default: with the feature off the
+# `record_*` helpers in `metrics.rs` compile to nothing, so call sites stay
+# unconditional and an embedder who wants no metrics pays nothing.
+metrics = ["dep:metrics"]
+
+[dev-dependencies]
+# pack.rs wraps a backend to inject a mid-repack failure, which needs the same
+# `#[async_trait]` the ContentStore trait is declared with.
+async-trait = "0.1.91"
+criterion = "0.5.1"
+proptest = "1"
+tempfile = "3.27.0"
+tokio-postgres = "0.7"
+# The coedit tests drive a *vanilla* Yjs client (a raw `yrs::Doc` + the stock
+# y-sync `DefaultProtocol`, no origofs authorship) against our server handler, to
+# prove an unmodified editor connects and is attributed server-side. Dev-only;
+# the library still pulls `yrs` in solely through the `coedit` feature.
+yrs = "0.23"
+
+[[bench]]
+name = "engine"
+harness = false

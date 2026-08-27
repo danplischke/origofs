@@ -1,13 +1,12 @@
-# The origo Python bindings with the FastAPI extra, plus an ASGI server.
+# The origofs Python bindings with the FastAPI extra, plus an ASGI server.
 #
-# The distribution is named `origofs` on PyPI (`origo` was taken); the import
-# name is still `origo`.
-origofs[fastapi]
-uvicorn[standard]
-
-# To run against a checkout instead of the published wheel, build the bindings
-# locally — the extension is a compiled pyo3 module:
+# From a checkout you build the bindings locally instead of installing from an
+# index — the extension is a compiled pyo3 module:
 #
-#     (cd ../../../crates/origo-py && python -m venv .venv && . .venv/bin/activate \
+#     (cd ../../../crates/origofs-py && python -m venv .venv && . .venv/bin/activate \
 #        && pip install maturin && maturin develop)
 #     pip install fastapi "uvicorn[standard]"
+#
+# When origofs is published, this file is all you need:
+origofs[fastapi]
+uvicorn[standard]

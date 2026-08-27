@@ -1,8 +1,8 @@
-// The authoring surface: a PlateJS Markdown editor bound to a document in origo.
+// The authoring surface: a PlateJS Markdown editor bound to a document in origofs.
 //
 // - Loads by deserializing the stored Markdown into Plate nodes.
 // - Saves by serializing back to Markdown and doing an **attributed** write
-//   (write_as) — so origo records blame + an audit op crediting the signed-in
+//   (write_as) — so origofs records blame + an audit op crediting the signed-in
 //   principal. A client can't forge that: the token is resolved server-side.
 // - "Suggest" queues the same content as a proposal instead.
 // - Inline attribution is native: the AttributionPlugin *decorates* authored
@@ -17,7 +17,7 @@ import { AttributionPlugin } from "./attributionPlugin";
 import { blockAuthorship, blockLineSpans, type BlockAuthorship } from "../lib/blame";
 import { actorColor, kindGlyph } from "../lib/colors";
 import { useSession } from "../session";
-import { OrigoError } from "../lib/origoClient";
+import { OrigoFSError } from "../lib/origofsClient";
 import type { BlameRange } from "../lib/types";
 
 // Native current-line attribution: reads the caret's block from the editor
@@ -85,8 +85,16 @@ export function EditorTab({
     setStatus(null);
     try {
       const md = serializeMd(editor);
-      const { written } = await client.writeDoc(path, md);
-      setStatus({ kind: "ok", text: `saved ${written} bytes — attributed to you` });
+      const res = await client.writeDoc(path, md);
+      if (res.proposed !== undefined) {
+        // This actor is propose-only: the write was routed into the review queue.
+        setStatus({
+          kind: "ok",
+          text: `you're propose-only — queued as suggestion #${res.proposed} for review, not applied`,
+        });
+      } else {
+        setStatus({ kind: "ok", text: `saved ${res.written} bytes — attributed to you` });
+      }
       onSaved();
     } catch (e) {
       setStatus({ kind: "err", text: e instanceof Error ? e.message : String(e) });
@@ -105,7 +113,7 @@ export function EditorTab({
       const id = await client.suggest(path, md, summary || undefined);
       setStatus({ kind: "ok", text: `suggestion #${id} queued — not applied until a reviewer accepts it` });
     } catch (e) {
-      const text = e instanceof OrigoError ? e.message : e instanceof Error ? e.message : String(e);
+      const text = e instanceof OrigoFSError ? e.message : e instanceof Error ? e.message : String(e);
       setStatus({ kind: "err", text });
     } finally {
       setBusy(false);

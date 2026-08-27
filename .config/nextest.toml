@@ -1,0 +1,80 @@
+# cargo-nextest configuration (B8, #70). Adds a hang guard (a wedged test is
+# terminated instead of running out the whole CI job) and targeted retries for
+# the randomized concurrency / durability-crash stress suites. The Rust CI job
+# runs `cargo nextest run --profile ci`.
+
+# The Postgres-backed suites share ONE database and several reset it wholesale
+# (DROP SCHEMA public CASCADE) between tests. Under `cargo test` they serialize
+# two ways — a process-global mutex within a binary, and cargo running one test
+# binary at a time — so the race never shows up locally. nextest is
+# process-per-test and runs binaries concurrently, so neither protection holds
+# ("No support for in-process mutexes — emulate them with test groups", per the
+# nextest docs) and one binary's wholesale reset lands mid-test in another,
+# failing it with `relation "..." does not exist`. Serialize every PG-touching
+# binary into one logical mutex (max-threads = 1). They self-skip when
+# ORIGOFS_PG_TEST_URL is unset, so this is a no-op on a stock runner. Assigned
+# via a default-profile override below, which the `ci` profile inherits.
+[test-groups]
+postgres = { max-threads = 1 }
+
+[profile.default]
+# Report a test as slow once it passes 60s and terminate it after a second such
+# period (~120s), so a genuine hang surfaces as a failure. The slowest real test
+# today is ~11s locally, so this is comfortable headroom.
+slow-timeout = { period = "60s", terminate-after = 2 }
+retries = 0
+
+# Serialize the PG-touching binaries into the `postgres` group (see [test-groups]
+# above). Declared on the default profile so it applies to every profile via
+# inheritance — including `ci`, which is what CI runs.
+#
+# MAINTENANCE: this list must name EVERY test binary that connects to Postgres.
+# A binary left out runs outside the mutex and will be broken by another
+# binary's schema reset — which is exactly how this regressed. To find them all:
+#
+#     grep -rln ORIGOFS_PG_TEST_URL crates/*/tests/
+#
+# That grep is the authority, and it has already caught three omissions:
+# `atomicity` and `pg_object_store` (both of which call DROP SCHEMA themselves)
+# and `sandbox`. They ran outside the mutex and reset the schema under whatever
+# else was running, which surfaced as `migration_paths` failing with a bare
+# "db error" while building its v1 fixture. Note that none of the three has a
+# test name containing "postgres", so the `test(/postgres/)` net below did not
+# catch them either — `atomicity` runs every test against both backends via
+# `both_backends`, and `pg_object_store` names its tests after what they assert.
+#
+# The `test(/postgres/)` clause is a safety net, not a substitute: it catches a
+# newly-added test that follows the `*_postgres` / `postgres_*` naming
+# convention even if its binary is missing below. A PG test named otherwise in a
+# binary that isn't listed is still unprotected, so keep the list current.
+[[profile.default.overrides]]
+filter = '''
+    test(/postgres/)
+  | (package(origofs-core) & (
+        binary(postgres) | binary(collab) | binary(coedit_relay)
+      | binary(coedit_live) | binary(coedit_suggest)
+      | binary(migration_paths) | binary(resync) | binary(suggest_superseded)
+      | binary(atomicity) | binary(pg_object_store)
+    ))
+  | (package(origofs-sdk) & (
+        binary(api_coedit_cluster) | binary(multi_workspace) | binary(subscribe)
+      | binary(fuse_mount) | binary(sandbox)
+    ))
+'''
+test-group = 'postgres'
+
+# CI: run every test (don't stop at the first failure), tolerate a single
+# transient retry, and loosen the hang guard since coverage/instrumentation and
+# the Postgres backend make CI slower than a local run.
+[profile.ci]
+fail-fast = false
+retries = 1
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+# The randomized concurrency and durability/crash simulations are the
+# flakiness-prone, long-running suites — give them extra retries and a longer
+# leash before the hang guard fires.
+[[profile.ci.overrides]]
+filter = 'package(origofs-core) & (binary(simulation) | binary(concurrency) | binary(gc))'
+retries = 3
+slow-timeout = { period = "180s", terminate-after = 3 }
