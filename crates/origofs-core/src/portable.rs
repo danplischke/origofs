@@ -192,6 +192,30 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// durable, and `fsck --rebuild` can reconstruct committed structure from it —
     /// the metadata is the half that cannot be rebuilt, which is the whole reason
     /// this exists.
+    /// [`dump`](Self::dump), authorized as `ctx`.
+    ///
+    /// **A surface exposing `dump` to callers it did not itself authenticate wants
+    /// this one.** A dump is whole-*store*: every workspace, every actor —
+    /// including each one's `auth_subject`, the value identity is resolved by
+    /// server-side — every ACL grant, all blame and the audit log. None of that is
+    /// path-scoped, so no [`Scope`](crate::Scope) narrows it and no subtree grant
+    /// bounds it. In a deployment where workspaces are tenants
+    /// (`docs/MULTI_TENANCY.md`), one tenant calling `dump` reads every other
+    /// tenant's metadata.
+    ///
+    /// The check is `WRITE` at `/` — the same one
+    /// [`ensure_may_write_workspace`](Self::ensure_may_write_workspace) applies to
+    /// `commit` and an unbounded `revert_session`. Using a *write* permission to
+    /// gate a *read* is deliberate rather than sloppy: the engine has no read-side
+    /// ACL, and "may write anywhere in this workspace" is the only permission that
+    /// already means administrative reach over the whole of it. Anything narrower
+    /// would not be a meaningful bound on an operation with no path.
+    pub async fn dump_as<W: std::io::Write>(&self, ctx: crate::WriteCtx, out: W) -> Result<usize> {
+        self.ensure_may_write_workspace(ctx, "dump the metadata store")
+            .await?;
+        self.dump(out).await
+    }
+
     pub async fn dump<W: std::io::Write>(&self, mut out: W) -> Result<usize> {
         use serde_json::json;
 
@@ -327,6 +351,27 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// A freshly `init`ed store has a root inode and the default config, and that
     /// is the only state a load tolerates. See [`load`](Self::load) on why this is
     /// not a merge.
+    ///
+    /// # Why the identity tables count as "anything"
+    ///
+    /// This used to check inodes and branches only, which reads as a completeness
+    /// check and is really a **security** one. [`reset_for_load`] clears every
+    /// table in [`DUMP_TABLES`] — `actor`, `acl` and `config` among them — and the
+    /// dump then reinstalls its own. So a store that had been given actors and
+    /// grants but no content yet was "pristine" by the old test, and loading a
+    /// dump into it replaced the entire identity registry and every ACL grant with
+    /// the dump author's.
+    ///
+    /// That is not a hypothetical ordering. `set_acl_default_deny`'s own doc says
+    /// deny-by-default is the deliberate switch precisely so *the grants get
+    /// written first* — which is exactly the window where a store holds actors and
+    /// grants and nothing else. A `load` there is a silent, total takeover of the
+    /// workspace's authorization state.
+    ///
+    /// `load` itself cannot be ACL-gated — the identities a check would consult
+    /// are the ones the load installs — so refusing a store that has any is the
+    /// check. Everything a load would overwrite must therefore be absent, not just
+    /// the content-shaped part of it.
     async fn ensure_loadable(&self) -> Result<()> {
         let usage = self.usage().await?;
         // The root directory is the one inode `init` creates.
@@ -344,6 +389,26 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                  restores into an empty store, it does not merge"
                     .into(),
             ));
+        }
+        // The identity half. Checked after the content half so the more familiar
+        // message wins when a store has both.
+        let actors = self.list_actors().await?.len();
+        if actors > 0 {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "refusing to load into a store that already has {actors} registered \
+                 actor(s); a load replaces the whole identity registry and every ACL \
+                 grant with the dump's, so restoring over a configured store would \
+                 silently hand it the dump author's permissions. Load into a store \
+                 that has not been set up yet, or use `resync` to combine two live \
+                 workspaces"
+            )));
+        }
+        let grants = self.list_grants(None).await?.len();
+        if grants > 0 {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "refusing to load into a store that already has {grants} ACL grant(s); \
+                 a load replaces them with the dump's"
+            )));
         }
         Ok(())
     }

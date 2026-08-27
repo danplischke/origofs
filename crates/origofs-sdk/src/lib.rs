@@ -1080,6 +1080,16 @@ impl Workspace {
         self.fs.dump(out).await
     }
 
+    /// [`dump`](Self::dump), authorized as `ctx` — checked as `WRITE` at `/`,
+    /// because a dump is whole-store and carries every actor's `auth_subject` and
+    /// every ACL grant. See [`Fs::dump_as`](origofs_core::Fs::dump_as) for why a
+    /// write permission gates a read here.
+    ///
+    /// **A surface serving callers it did not authenticate wants this one.**
+    pub async fn dump_as<W: std::io::Write>(&self, ctx: WriteCtx, out: W) -> Result<usize> {
+        self.fs.dump_as(ctx, out).await
+    }
+
     /// Restore a dump into a pristine store. Refuses to merge — see
     /// [`Fs::load`](origofs_core::Fs::load).
     pub async fn load<R: std::io::BufRead>(&self, input: R) -> Result<LoadReport> {

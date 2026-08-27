@@ -618,6 +618,45 @@ async fn workspace_wide_ops_need_permission_at_the_root() {
     );
 }
 
+/// A dump reads *everything*, so a subtree grant must not buy one.
+///
+/// This is the sharpest case for gating a read on a write permission. A dump is
+/// whole-store: every workspace, every actor's `auth_subject` — the value identity
+/// is resolved by server-side — every ACL grant, and all blame. An actor confined
+/// to `/tenant-a` reading that has escaped its confinement completely, and no
+/// `Scope` or grant narrows a dump, because a dump has no path to narrow.
+#[tokio::test]
+async fn a_dump_is_checked_at_the_workspace_root() {
+    let (fs, _agent, ctx) = subtree_only().await;
+
+    let m = denied(
+        fs.dump_as(ctx, Vec::new()).await.unwrap_err(),
+        "dump from a subtree-scoped actor",
+    );
+    assert!(m.contains("whole workspace"), "dump: {m}");
+
+    // The unattributed `dump` is still there for the CLI and for an embedder that
+    // owns the store — the same exemption every unattributed engine op has.
+    let mut out = Vec::new();
+    fs.dump(&mut out).await.unwrap();
+    assert!(!out.is_empty(), "the unattributed dump must still work");
+}
+
+/// …and with no grant at `/`, a dump falls back to the write policy — so binding
+/// the check did not break the workspaces that have no ACLs at all.
+#[tokio::test]
+async fn a_dump_falls_back_to_the_write_policy() {
+    let (fs, agent) = fixture().await;
+    let ctx = WriteCtx::actor(agent);
+    fs.write_as(ctx, "/f.txt", b"x\n").await.unwrap();
+
+    let n = fs
+        .dump_as(ctx, Vec::new())
+        .await
+        .expect("no grant covers `/`, so the write policy decides — as it did before");
+    assert!(n > 0, "the dump should have carried rows");
+}
+
 /// A revert *bounded to a subtree the actor holds* is allowed — the check follows
 /// the prefix, so scoping the blast radius is also what earns the permission.
 #[tokio::test]
