@@ -139,6 +139,11 @@ implicit, clean boundary. The facts, from the code and not the sketch:
   (`origofs-api/src/lib.rs`) is documented to never trust a client-named actor. This
   is the exact invariant we extend to tenancy: **the tenant is resolved
   server-side from a verified credential, never read from a path segment or body.**
+  Note that this governs *writes*: reads are open unless `ApiOptions::gate_reads`
+  is set (`origofs serve --gate-reads`), so any deployment relying on the
+  "cannot read a neighbour's data" half of §1 must turn it on or gate reads at its
+  proxy. Until #129 the CLI had no way to set it at all, because `origofs serve`
+  called the defaults-only `api::serve`.
 - **The metadata DB is the per-tenant crown jewel.** Per `DESIGN.md` §7 and
   `CLAUDE.md`: the content store can rebuild *committed files* via `fsck --rebuild`,
   but **blame, the audit log, actors, and uncommitted edits live only in the DB**.

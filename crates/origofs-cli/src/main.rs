@@ -462,8 +462,44 @@ enum Cmd {
         /// Bearer-token → actor mapping `TOKEN=ACTOR_ID[:SESSION_ID]` (repeatable).
         /// Required to bind a non-loopback address; on loopback with none given,
         /// all writes are attributed to an auto-created local actor (dev only).
+        ///
+        /// Prefer `ORIGOFS_AUTH_TOKENS` (same syntax, newline- or
+        /// comma-separated) for anything real: an argument is visible to every
+        /// process on the host via `ps` and lands in shell history, which is the
+        /// reason `ORIGOFS_ENCRYPTION_KEY` is env-only. Both may be given; they
+        /// are merged.
         #[arg(long = "auth-token", value_name = "TOKEN=ACTOR[:SESSION]")]
         auth_tokens: Vec<String>,
+        /// Require a credential for **reads** as well as writes.
+        ///
+        /// Off by default, which means file bytes, blame, the change feed, the
+        /// audit log and the review queue are served to anyone who can reach the
+        /// port. Writes are gated either way. Turn this on for any bind that is
+        /// not loopback, or gate reads at your proxy.
+        #[arg(long)]
+        gate_reads: bool,
+        /// Serve only this subtree of the workspace, e.g. `/tenant-a`.
+        ///
+        /// Every path a caller supplies is resolved *inside* it, so nothing
+        /// outside is addressable at all, and workspace-wide listings are
+        /// filtered to it. Scoping, not authorization — see `docs/MULTI_TENANCY.md`.
+        #[arg(long, value_name = "PATH")]
+        root: Option<String>,
+        /// Allow cross-origin browser requests from this origin (repeatable).
+        /// With none given, same-origin only.
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origins: Vec<String>,
+        /// Maximum upload body size in bytes (default 64 MiB). `PUT` buffers the
+        /// whole body, so this bounds per-request allocation.
+        #[arg(long, value_name = "BYTES")]
+        max_body_bytes: Option<usize>,
+        /// Per-request timeout in seconds (default 60). `0` disables it.
+        #[arg(long, value_name = "SECS")]
+        request_timeout: Option<u64>,
+        /// Maximum concurrent in-flight requests (default 512). `0` disables the
+        /// cap.
+        #[arg(long, value_name = "N")]
+        max_concurrent_requests: Option<usize>,
         /// Install the Prometheus recorder and expose `GET /metrics` (also
         /// `ORIGOFS_METRICS=1`). Off by default: without it nothing is exported and
         /// that route answers `503 metrics not enabled`. Like `/readyz`, the
@@ -1780,9 +1816,48 @@ async fn main() -> Result<()> {
         Cmd::Serve {
             addr,
             auth_tokens,
+            gate_reads,
+            root,
+            cors_origins,
+            max_body_bytes,
+            request_timeout,
+            max_concurrent_requests,
             metrics,
         } => {
-            let auth = build_api_auth(&ws, &addr, &auth_tokens).await?;
+            // Validated here rather than left to `router_with`, which *panics* on a
+            // malformed root — correct for a library whose caller is code, wrong
+            // for a value a user typed.
+            if let Some(r) = &root {
+                origofs_sdk::Scope::at(r).with_context(|| format!("--root {r:?}"))?;
+            }
+            let auth = build_api_auth(&ws, &addr, &auth_tokens_with_env(auth_tokens)).await?;
+            let defaults = origofs_sdk::api::ApiOptions::default();
+            let options = origofs_sdk::api::ApiOptions {
+                gate_reads,
+                root,
+                cors_origins,
+                max_body_bytes: max_body_bytes.unwrap_or(defaults.max_body_bytes),
+                request_timeout: match request_timeout {
+                    Some(0) => None,
+                    Some(s) => Some(std::time::Duration::from_secs(s)),
+                    None => defaults.request_timeout,
+                },
+                max_concurrent_requests: match max_concurrent_requests {
+                    Some(0) => None,
+                    Some(n) => Some(n),
+                    None => defaults.max_concurrent_requests,
+                },
+                ..defaults
+            };
+            // `build_api_auth` refuses to serve unauthenticated *writes* off
+            // loopback. Reads are a separate decision and default to open, so say
+            // so rather than letting a public bind quietly publish every file's
+            // bytes, its blame map, and the change feed.
+            if !gate_reads && !addr.ip().is_loopback() {
+                eprintln!(
+                    "warning: reads are unauthenticated on {addr} (non-loopback bind); anyone who can reach it can read every file, its blame, the audit log and the review queue. Pass --gate-reads, or gate reads at your proxy."
+                );
+            }
             if metrics || env_flag("ORIGOFS_METRICS") {
                 init_metrics()?;
                 // `/metrics` gets the same auth treatment as `/readyz`: open. Its
@@ -1807,7 +1882,7 @@ async fn main() -> Result<()> {
             // bases that had already moved. A server is exactly the process that
             // should be running them; nothing else is long-lived enough to.
             let janitor = tokio::spawn(spawn_janitor(ws.clone()));
-            let result = origofs_sdk::api::serve(ws, addr, auth).await;
+            let result = origofs_sdk::api::serve_with(ws, addr, auth, options).await;
             janitor.abort();
             result?;
         }
@@ -1925,6 +2000,28 @@ async fn build_api_auth(
         )));
     }
     Ok(std::sync::Arc::new(parse_auth_specs(specs)?))
+}
+
+/// Merge `--auth-token` arguments with `ORIGOFS_AUTH_TOKENS`.
+///
+/// Bearer tokens on the command line are readable by every process on the host
+/// through `ps` and are written to shell history — the same objection that keeps
+/// `ORIGOFS_ENCRYPTION_KEY` out of argv. The flag stays, because it is what makes
+/// the README's one-liner work, but a real deployment should use the environment.
+///
+/// Entries are separated by newlines or commas, so both a here-doc and a one-line
+/// value work. A token itself may contain `=` (base64 padding) but not a comma or
+/// a newline; blank entries are skipped so trailing separators are harmless.
+fn auth_tokens_with_env(mut specs: Vec<String>) -> Vec<String> {
+    if let Ok(raw) = std::env::var("ORIGOFS_AUTH_TOKENS") {
+        specs.extend(
+            raw.split(['\n', ','])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    specs
 }
 
 /// Parse `--auth-token TOKEN=ACTOR_ID[:SESSION_ID]` specs into a token map.

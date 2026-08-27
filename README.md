@@ -635,9 +635,19 @@ heartbeat.
 the *credential* resolves to — the request never names an actor, so a client can't
 forge blame, and a propose-only actor's `PUT` is routed into the review queue
 instead of landing. `--auth-token TOKEN=ACTOR[:SESSION]` is the built-in bearer
-mapping; `serve` refuses to bind a non-loopback address without one. Errors come
+mapping; `serve` refuses to bind a non-loopback address without one. Set the same
+specs in **`ORIGOFS_AUTH_TOKENS`** (newline- or comma-separated) to keep tokens out
+of `ps` and shell history, as `ORIGOFS_ENCRYPTION_KEY` already is. Errors come
 back as a machine-readable envelope (`{"error":{"code","message","retryable"}}`)
 and every response carries an `x-request-id`.
+
+**Reads are open unless you close them.** Writes always need a credential; reads
+do not, which is why the `curl` calls above fetch files, events and presence with
+no `AUTH`. That is the right default for a loopback dev server and the wrong one
+for anything else — an open read serves file bytes, blame, the audit log and the
+review queue. Pass **`--gate-reads`** to require the same credential on reads, and
+**`--root /tenant-a`** to restrict what the surface can address at all. `serve`
+warns when it binds a non-loopback address without read gating.
 
 ### Metrics
 
