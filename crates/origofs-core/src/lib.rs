@@ -90,4 +90,6 @@ pub use sqlite::SqliteMetadataStore;
 pub use suggest::{
     Suggestion, SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, WriteOutcome,
 };
-pub use types::{DirEntry, DirEntryAttr, DirPage, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit};
+pub use types::{
+    DirEntry, DirEntryAttr, DirPage, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit, Owner,
+};

@@ -669,6 +669,8 @@ fn row_to_inode(r: &Row) -> Result<Inode> {
         content,
         mtime: r.get(6),
         ctime: r.get(7),
+        uid: r.get::<_, i64>(8) as u32,
+        gid: r.get::<_, i64>(9) as u32,
     })
 }
 
@@ -818,7 +820,7 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let row = c
             .query_opt(
-                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid
                  FROM inode WHERE ino = $1",
                 &[&ino],
             )
@@ -839,7 +841,7 @@ impl MetadataStore for PostgresMetadataStore {
         // plan stays a single index probe per key.
         let rows = c
             .query(
-                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid
                  FROM inode WHERE ino = ANY($1)",
                 &[&inos],
             )
@@ -857,9 +859,16 @@ impl MetadataStore for PostgresMetadataStore {
         let mode = init.mode as i64;
         let row = c
             .query_one(
-                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4) RETURNING ino",
-                &[&self.workspace_id, &init.kind.as_str(), &mode, &now],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid)
+                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4, $5, $6) RETURNING ino",
+                &[
+                    &self.workspace_id,
+                    &init.kind.as_str(),
+                    &mode,
+                    &now,
+                    &(init.owner.uid as i64),
+                    &(init.owner.gid as i64),
+                ],
             )
             .await?;
         Ok(row.get(0))
@@ -892,6 +901,36 @@ impl MetadataStore for PostgresMetadataStore {
         c.execute(
             "UPDATE inode SET nlink = $1 WHERE ino = $2",
             &[&nlink, &ino],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()> {
+        let c = self.client().await?;
+        // Mask in only the permission bits: the format bits are the inode's kind,
+        // not a caller's to rewrite. `& 0o7777` keeps setuid/setgid/sticky.
+        c.execute(
+            "UPDATE inode SET mode = (mode & ~4095) | $1, ctime = $2 WHERE ino = $3",
+            &[&((mode & 0o7777) as i64), &now_secs(), &ino],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        let c = self.client().await?;
+        // COALESCE so a `None` half leaves the stored value alone, which is what
+        // chown(2)'s -1 sentinel means.
+        c.execute(
+            "UPDATE inode SET uid = COALESCE($1, uid), gid = COALESCE($2, gid), \
+             ctime = $3 WHERE ino = $4",
+            &[
+                &uid.map(|v| v as i64),
+                &gid.map(|v| v as i64),
+                &now_secs(),
+                &ino,
+            ],
         )
         .await?;
         Ok(())
@@ -1815,9 +1854,16 @@ impl MetaTxn for PostgresTxn {
         let row = self
             .conn()
             .query_one(
-                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4) RETURNING ino",
-                &[&ws, &init.kind.as_str(), &mode, &now],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid)
+                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4, $5, $6) RETURNING ino",
+                &[
+                    &ws,
+                    &init.kind.as_str(),
+                    &mode,
+                    &now,
+                    &(init.owner.uid as i64),
+                    &(init.owner.gid as i64),
+                ],
             )
             .await?;
         Ok(row.get(0))

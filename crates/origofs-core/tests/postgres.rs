@@ -58,10 +58,7 @@ async fn postgres_backend() {
     assert_eq!(root.kind, FileKind::Dir);
 
     let ino = meta
-        .create_inode(InodeInit {
-            kind: FileKind::File,
-            mode: 0o100644,
-        })
+        .create_inode(InodeInit::new(FileKind::File, 0o100644))
         .await
         .unwrap();
     assert!(ino > 1, "identity sequence must not collide with root");
@@ -695,10 +692,7 @@ async fn postgres_readdir_paging() {
     let mut inos = Vec::new();
     for n in &names {
         let ino = meta
-            .create_inode(InodeInit {
-                kind: FileKind::File,
-                mode: 0o100644,
-            })
+            .create_inode(InodeInit::new(FileKind::File, 0o100644))
             .await
             .unwrap();
         meta.add_dentry(1, n, ino).await.unwrap();

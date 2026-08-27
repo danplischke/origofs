@@ -439,10 +439,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // inode (C1/M6).
         let mut tx = self.meta.begin().await?;
         let ino = tx
-            .create_inode(InodeInit {
-                kind: FileKind::Dir,
-                mode: DIR_MODE,
-            })
+            .create_inode(InodeInit::new(FileKind::Dir, DIR_MODE))
             .await?;
         tx.add_dentry(parent, name, ino).await?;
         tx.commit().await?;
@@ -474,10 +471,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                     // `mkdir -p` idempotent under concurrency (C1/M6).
                     let mut tx = self.meta.begin().await?;
                     let child = tx
-                        .create_inode(InodeInit {
-                            kind: FileKind::Dir,
-                            mode: DIR_MODE,
-                        })
+                        .create_inode(InodeInit::new(FileKind::Dir, DIR_MODE))
                         .await?;
                     match tx.add_dentry(ino, seg, child).await {
                         Ok(()) => {
@@ -590,10 +584,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         name: &str,
     ) -> Result<Ino> {
         let ino = tx
-            .create_inode(InodeInit {
-                kind: FileKind::File,
-                mode: FILE_MODE,
-            })
+            .create_inode(InodeInit::new(FileKind::File, FILE_MODE))
             .await?;
         tx.add_dentry(parent, name, ino).await?;
         Ok(ino)
@@ -1261,10 +1252,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // Inode, its target, and its dentry commit together (C1/M6).
         let mut tx = self.meta.begin().await?;
         let ino = tx
-            .create_inode(InodeInit {
-                kind: FileKind::Symlink,
-                mode: SYMLINK_MODE,
-            })
+            .create_inode(InodeInit::new(FileKind::Symlink, SYMLINK_MODE))
             .await?;
         tx.set_symlink(ino, target).await?;
         tx.add_dentry(parent, name, ino).await?;

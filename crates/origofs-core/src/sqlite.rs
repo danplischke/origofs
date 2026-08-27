@@ -92,10 +92,28 @@ impl SqliteMetadataStore {
     }
 }
 
+/// The inode columns every `SELECT` in this backend reads, in the order
+/// [`build_inode`] expects them. One constant so a column added to the row (uid
+/// and gid, in V17) cannot be picked up by some queries and missed by others.
+const INODE_COLS: &str = "ino, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid";
+
 /// Build an [`Inode`] from a raw row tuple.
 #[allow(clippy::type_complexity)]
-fn build_inode(row: (i64, String, i64, i64, i64, Option<String>, i64, i64)) -> Result<Inode> {
-    let (ino, kind, mode, nlink, size, content_hash, mtime, ctime) = row;
+fn build_inode(
+    row: (
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        i64,
+    ),
+) -> Result<Inode> {
+    let (ino, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid) = row;
     let kind = FileKind::parse(&kind)
         .ok_or_else(|| OrigoFSError::Metadata(format!("unknown inode kind {kind:?}")))?;
     let content = match content_hash {
@@ -114,6 +132,8 @@ fn build_inode(row: (i64, String, i64, i64, i64, Option<String>, i64, i64)) -> R
         content,
         mtime,
         ctime,
+        uid: uid as u32,
+        gid: gid as u32,
     })
 }
 
@@ -330,8 +350,7 @@ impl MetadataStore for SqliteMetadataStore {
             let conn = self.lock();
             let row = conn
                 .query_row(
-                    "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
-                     FROM inode WHERE ino = ?1",
+                    &format!("SELECT {INODE_COLS} FROM inode WHERE ino = ?1"),
                     params![ino],
                     |r| {
                         Ok((
@@ -343,6 +362,8 @@ impl MetadataStore for SqliteMetadataStore {
                             r.get::<_, Option<String>>(5)?,
                             r.get::<_, i64>(6)?,
                             r.get::<_, i64>(7)?,
+                            r.get::<_, i64>(8)?,
+                            r.get::<_, i64>(9)?,
                         ))
                     },
                 )
@@ -369,8 +390,7 @@ impl MetadataStore for SqliteMetadataStore {
                     .collect::<Vec<_>>()
                     .join(",");
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
-                     FROM inode WHERE ino IN ({placeholders})"
+                    "SELECT {INODE_COLS} FROM inode WHERE ino IN ({placeholders})"
                 ))?;
                 let binds: Vec<&dyn rusqlite::ToSql> =
                     chunk.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
@@ -384,6 +404,8 @@ impl MetadataStore for SqliteMetadataStore {
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, i64>(6)?,
                         r.get::<_, i64>(7)?,
+                        r.get::<_, i64>(8)?,
+                        r.get::<_, i64>(9)?,
                     ))
                 })?;
                 for row in rows {
@@ -399,9 +421,16 @@ impl MetadataStore for SqliteMetadataStore {
             let conn = self.lock();
             let now = now_secs();
             conn.execute(
-                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES (?1, ?2, ?3, 1, 0, NULL, ?4, ?4)",
-                params![self.workspace_id, init.kind.as_str(), init.mode as i64, now],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid)
+                 VALUES (?1, ?2, ?3, 1, 0, NULL, ?4, ?4, ?5, ?6)",
+                params![
+                    self.workspace_id,
+                    init.kind.as_str(),
+                    init.mode as i64,
+                    now,
+                    init.owner.uid as i64,
+                    init.owner.gid as i64
+                ],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -435,6 +464,38 @@ impl MetadataStore for SqliteMetadataStore {
             conn.execute(
                 "UPDATE inode SET nlink = ?1 WHERE ino = ?2",
                 params![nlink, ino],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // Mask in only the permission bits: the format bits are the inode's
+            // kind, not a caller's to rewrite. `& 0o7777` keeps setuid/setgid/sticky.
+            conn.execute(
+                "UPDATE inode SET mode = (mode & ~4095) | ?1, ctime = ?2 WHERE ino = ?3",
+                params![(mode & 0o7777) as i64, now_secs(), ino],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // COALESCE so a `None` half leaves the stored value alone, which is what
+            // chown(2)'s -1 sentinel means.
+            conn.execute(
+                "UPDATE inode SET uid = COALESCE(?1, uid), gid = COALESCE(?2, gid), \
+                 ctime = ?3 WHERE ino = ?4",
+                params![
+                    uid.map(|v| v as i64),
+                    gid.map(|v| v as i64),
+                    now_secs(),
+                    ino
+                ],
             )?;
             Ok(())
         })
@@ -1493,9 +1554,16 @@ impl MetaTxn for SqliteTxn {
             let ws = self.workspace_id;
             let conn = self.conn();
             conn.execute(
-                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES (?1, ?2, ?3, 1, 0, NULL, ?4, ?4)",
-                params![ws, init.kind.as_str(), init.mode as i64, now_secs()],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid)
+                 VALUES (?1, ?2, ?3, 1, 0, NULL, ?4, ?4, ?5, ?6)",
+                params![
+                    ws,
+                    init.kind.as_str(),
+                    init.mode as i64,
+                    now_secs(),
+                    init.owner.uid as i64,
+                    init.owner.gid as i64
+                ],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -1920,10 +1988,7 @@ mod tests {
         assert_eq!(has_branch, 1);
         // and normal operations still work
         store
-            .create_inode(InodeInit {
-                kind: FileKind::File,
-                mode: 0o100644,
-            })
+            .create_inode(InodeInit::new(FileKind::File, 0o100644))
             .await
             .unwrap();
     }

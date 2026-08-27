@@ -15,11 +15,11 @@
 //! `mount -t nfs -o vers=3,tcp,port=11111,mountport=11111,nolock host:/ /mnt`
 //! (needs the OS NFS client / `nfs-utils`).
 
-use crate::{FileKind, Inode, OrigoFSError, Workspace};
+use crate::{FileKind, Inode, OrigoFSError, Owner, Workspace};
 use async_trait::async_trait;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_mode3,
-    set_size3, specdata3,
+    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_gid3,
+    set_mode3, set_size3, set_uid3, specdata3,
 };
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
@@ -100,6 +100,22 @@ fn ftype(kind: FileKind) -> ftype3 {
     }
 }
 
+/// The ownership an NFSv3 CREATE asks for, or [`Owner::ROOT`] when it names none.
+///
+/// NFSv3 has no per-request credential reaching this layer the way FUSE's
+/// `Request` does, so a create takes what the client put in the `sattr3`.
+fn owner_of(a: &sattr3) -> Owner {
+    let uid = match a.uid {
+        set_uid3::uid(u) => u,
+        _ => 0,
+    };
+    let gid = match a.gid {
+        set_gid3::gid(g) => g,
+        _ => 0,
+    };
+    Owner::new(uid, gid)
+}
+
 /// Build NFS attributes from an origofs inode.
 fn attr(inode: &Inode) -> fattr3 {
     let t = nfstime3 {
@@ -110,8 +126,9 @@ fn attr(inode: &Inode) -> fattr3 {
         ftype: ftype(inode.kind),
         mode: inode.mode & 0o7777,
         nlink: inode.nlink.max(1) as u32,
-        uid: 0,
-        gid: 0,
+        // Real ownership since #122; these were hardcoded to 0.
+        uid: inode.uid,
+        gid: inode.gid,
         size: inode.size,
         used: inode.size,
         rdev: specdata3 {
@@ -166,9 +183,28 @@ impl NFSFileSystem for OrigoFSNfs {
                 .await
                 .map_err(stat)?;
         }
-        // origofs's minimal inode set doesn't persist uid/gid/atime/mtime; mode
-        // changes aren't yet surfaced by vfs_*, so those set-attrs are accepted
-        // but no-op. Size (truncate) is the one that matters for NFS clients.
+        // Mode and ownership are applied since #121/#122. They used to be accepted
+        // and silently dropped — a client's `chmod` returned success and moved
+        // nothing. atime/mtime are still not persisted (the inode carries a single
+        // mtime the engine maintains), so those remain accepted-and-ignored.
+        if let set_mode3::mode(m) = setattr.mode {
+            self.ws.fs().vfs_chmod(id as i64, m).await.map_err(stat)?;
+        }
+        let uid = match setattr.uid {
+            set_uid3::uid(u) => Some(u),
+            _ => None,
+        };
+        let gid = match setattr.gid {
+            set_gid3::gid(g) => Some(g),
+            _ => None,
+        };
+        if uid.is_some() || gid.is_some() {
+            self.ws
+                .fs()
+                .vfs_chown(id as i64, uid, gid)
+                .await
+                .map_err(stat)?;
+        }
         Ok(attr(
             &self.ws.fs().vfs_getattr(id as i64).await.map_err(stat)?,
         ))
@@ -218,10 +254,13 @@ impl NFSFileSystem for OrigoFSNfs {
             set_mode3::mode(m) => m,
             _ => 0o644,
         };
+        // NFSv3 carries the intended ownership in the CREATE attributes rather
+        // than in a per-request credential the way FUSE does, so take it from
+        // there; unset means root, matching the pre-#122 behaviour.
         let inode = self
             .ws
             .fs()
-            .vfs_create(dirid as i64, name(filename)?, mode)
+            .vfs_create(dirid as i64, name(filename)?, mode, owner_of(&attr_in))
             .await
             .map_err(stat)?;
         if let set_size3::size(sz) = attr_in.size {
@@ -243,7 +282,7 @@ impl NFSFileSystem for OrigoFSNfs {
         let inode = self
             .ws
             .fs()
-            .vfs_create(dirid as i64, name(filename)?, 0o644)
+            .vfs_create(dirid as i64, name(filename)?, 0o644, Owner::ROOT)
             .await
             .map_err(stat)?;
         Ok(inode.ino as fileid3)
@@ -257,7 +296,7 @@ impl NFSFileSystem for OrigoFSNfs {
         let inode = self
             .ws
             .fs()
-            .vfs_mkdir(dirid as i64, name(dirname)?, 0o755)
+            .vfs_mkdir(dirid as i64, name(dirname)?, 0o755, Owner::ROOT)
             .await
             .map_err(stat)?;
         Ok((inode.ino as fileid3, attr(&inode)))
@@ -383,7 +422,7 @@ impl NFSFileSystem for OrigoFSNfs {
         let inode = self
             .ws
             .fs()
-            .vfs_symlink(dirid as i64, name(linkname)?, target)
+            .vfs_symlink(dirid as i64, name(linkname)?, target, Owner::ROOT)
             .await
             .map_err(stat)?;
         Ok((inode.ino as fileid3, attr(&inode)))

@@ -170,6 +170,25 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V16_SQLITE,
         postgres: V16_POSTGRES,
     },
+    // V17 — POSIX ownership on `inode` (issue #122). There was no `uid` and no
+    // `gid` anywhere in the schema, so both mounts hardcoded `uid: 0, gid: 0` and
+    // every inode reported as root-owned. That was self-consistent — the FUSE
+    // mount asks the kernel to run real permission checks
+    // (`MountOption::DefaultPermissions`) and `fuse_mountable()` requires root, so
+    // every check passed — but it is precisely why `allow_other` and non-root
+    // mounts could not work: a non-root caller is evaluated against uid 0 in the
+    // *other* class and loses write access to the whole tree. Not fixable with
+    // mount options; it needs real ownership.
+    //
+    // Defaults to 0 so existing workspaces are unchanged: every current inode is
+    // already reported as root-owned, and the backfill states that rather than
+    // altering it. Buys no authorization on its own (see `docs/PERMISSIONS.md` §2
+    // for why a uid must not become the principal) — it stops the mount lying.
+    Migration {
+        version: 17,
+        sqlite: V17_SQLITE,
+        postgres: V17_POSTGRES,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -371,6 +390,18 @@ CREATE TABLE IF NOT EXISTS live_doc(
 // claiming a time it doesn't have.
 const V16_SQLITE: &str = "ALTER TABLE live_doc ADD COLUMN checkpointed_at BIGINT;";
 const V16_POSTGRES: &str = "ALTER TABLE live_doc ADD COLUMN IF NOT EXISTS checkpointed_at BIGINT;";
+
+// V17 — POSIX ownership (see the migration entry above). NOT NULL with a 0 default
+// so it applies to existing rows unchanged; the runner tolerates a re-applied
+// SQLite ADD COLUMN, Postgres expresses idempotency directly.
+const V17_SQLITE: &str = "
+ALTER TABLE inode ADD COLUMN uid INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE inode ADD COLUMN gid INTEGER NOT NULL DEFAULT 0;
+";
+const V17_POSTGRES: &str = "
+ALTER TABLE inode ADD COLUMN IF NOT EXISTS uid BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE inode ADD COLUMN IF NOT EXISTS gid BIGINT NOT NULL DEFAULT 0;
+";
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS`; the migration runner tolerates a
 // re-applied ADD COLUMN (duplicate-column) so a re-run is idempotent. Postgres

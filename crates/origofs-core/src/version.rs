@@ -549,10 +549,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             match &e.node {
                 PlanNode::Dir(children) => {
                     let ino = txn
-                        .create_inode(InodeInit {
-                            kind: FileKind::Dir,
-                            mode: e.mode,
-                        })
+                        .create_inode(InodeInit::new(FileKind::Dir, e.mode))
                         .await?;
                     txn.add_dentry(parent_ino, &e.name, ino).await?;
                     self.apply_plan_into_txn(&mut *txn, &children.entries, ino)
@@ -560,20 +557,14 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 }
                 PlanNode::File { hash, size } => {
                     let ino = txn
-                        .create_inode(InodeInit {
-                            kind: FileKind::File,
-                            mode: e.mode,
-                        })
+                        .create_inode(InodeInit::new(FileKind::File, e.mode))
                         .await?;
                     txn.set_content(ino, Some(*hash), *size).await?;
                     txn.add_dentry(parent_ino, &e.name, ino).await?;
                 }
                 PlanNode::Symlink(target) => {
                     let ino = txn
-                        .create_inode(InodeInit {
-                            kind: FileKind::Symlink,
-                            mode: e.mode,
-                        })
+                        .create_inode(InodeInit::new(FileKind::Symlink, e.mode))
                         .await?;
                     txn.set_symlink(ino, target).await?;
                     txn.add_dentry(parent_ino, &e.name, ino).await?;

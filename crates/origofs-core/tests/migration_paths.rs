@@ -105,10 +105,7 @@ async fn assert_upgraded(store: &dyn MetadataStore, from: i64) {
     }
     // A store that migrated but can't be written to is not actually upgraded.
     let fresh = store
-        .create_inode(InodeInit {
-            kind: FileKind::File,
-            mode: 0o100644,
-        })
+        .create_inode(InodeInit::new(FileKind::File, 0o100644))
         .await
         .unwrap();
     assert!(

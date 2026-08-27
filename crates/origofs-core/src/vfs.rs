@@ -10,7 +10,7 @@ use crate::content::ContentStore;
 use crate::engine::{Fs, validate_component};
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
-use crate::types::{DirEntry, DirEntryAttr, DirPage, FileKind, Ino, Inode, InodeInit};
+use crate::types::{DirEntry, DirEntryAttr, DirPage, FileKind, Ino, Inode, InodeInit, Owner};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -253,8 +253,18 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(true)
     }
 
-    /// Create a regular file under `parent`.
-    pub async fn vfs_create(&self, parent: Ino, name: &str, mode: u32) -> Result<Inode> {
+    /// Create a regular file under `parent`, owned by `owner` (issue #122).
+    ///
+    /// The mounts pass the uid/gid of the process that issued the `create`, so a
+    /// file made through a mount belongs to whoever made it rather than to root.
+    /// Pass [`Owner::ROOT`] from anything without a requesting process.
+    pub async fn vfs_create(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        owner: Owner,
+    ) -> Result<Inode> {
         validate_component(name)?;
         if self.meta.lookup(parent, name).await?.is_some() {
             return Err(OrigoFSError::AlreadyExists(name.to_string()));
@@ -263,28 +273,37 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // inode (C1/M6).
         let mut tx = self.meta.begin().await?;
         let ino = tx
-            .create_inode(InodeInit {
-                kind: FileKind::File,
-                mode: S_IFREG | (mode & 0o7777),
-            })
+            .create_inode(InodeInit::owned_by(
+                FileKind::File,
+                S_IFREG | (mode & 0o7777),
+                owner,
+            ))
             .await?;
         tx.add_dentry(parent, name, ino).await?;
         tx.commit().await?;
         self.vfs_getattr(ino).await
     }
 
-    /// Create a directory under `parent`.
-    pub async fn vfs_mkdir(&self, parent: Ino, name: &str, mode: u32) -> Result<Inode> {
+    /// Create a directory under `parent`, owned by `owner`. See
+    /// [`vfs_create`](Self::vfs_create).
+    pub async fn vfs_mkdir(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        owner: Owner,
+    ) -> Result<Inode> {
         validate_component(name)?;
         if self.meta.lookup(parent, name).await?.is_some() {
             return Err(OrigoFSError::AlreadyExists(name.to_string()));
         }
         let mut tx = self.meta.begin().await?;
         let ino = tx
-            .create_inode(InodeInit {
-                kind: FileKind::Dir,
-                mode: S_IFDIR | (mode & 0o7777),
-            })
+            .create_inode(InodeInit::owned_by(
+                FileKind::Dir,
+                S_IFDIR | (mode & 0o7777),
+                owner,
+            ))
             .await?;
         tx.add_dentry(parent, name, ino).await?;
         tx.commit().await?;
@@ -397,22 +416,62 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(())
     }
 
-    /// Create a symlink under `parent`.
-    pub async fn vfs_symlink(&self, parent: Ino, name: &str, target: &str) -> Result<Inode> {
+    /// Create a symlink under `parent`, owned by `owner`. See
+    /// [`vfs_create`](Self::vfs_create).
+    pub async fn vfs_symlink(
+        &self,
+        parent: Ino,
+        name: &str,
+        target: &str,
+        owner: Owner,
+    ) -> Result<Inode> {
         validate_component(name)?;
         if self.meta.lookup(parent, name).await?.is_some() {
             return Err(OrigoFSError::AlreadyExists(name.to_string()));
         }
         let mut tx = self.meta.begin().await?;
         let ino = tx
-            .create_inode(InodeInit {
-                kind: FileKind::Symlink,
-                mode: SYMLINK_MODE,
-            })
+            .create_inode(InodeInit::owned_by(FileKind::Symlink, SYMLINK_MODE, owner))
             .await?;
         tx.set_symlink(ino, target).await?;
         tx.add_dentry(parent, name, ino).await?;
         tx.commit().await?;
+        self.vfs_getattr(ino).await
+    }
+
+    /// Change an inode's permission bits (issue #121).
+    ///
+    /// Only the low 12 bits are the caller's — the format bits (`S_IFREG`/
+    /// `S_IFDIR`/`S_IFLNK`) are the inode's kind, and the store masks them in.
+    ///
+    /// Until this existed, both mounts accepted a mode change and discarded it,
+    /// then reported success: FUSE's `setattr` bound `mode` with a leading
+    /// underscore and replied with freshly-read (unchanged) attributes, and NFS
+    /// documented the no-op in a comment. A script running `chmod +x build.sh` and
+    /// checking the return code proceeded on a false premise. Worse, the mode a
+    /// file happened to be *created* with was the mode it carried into committed
+    /// tree objects (`TreeEntry.mode`) and out through `git clone origofs://…`,
+    /// with no way to correct it.
+    pub async fn vfs_chmod(&self, ino: Ino, mode: u32) -> Result<Inode> {
+        // Confirm it exists first, so a chmod of a missing inode is NotFound
+        // rather than a silently-zero-row UPDATE — the same silence this fixes.
+        self.vfs_getattr(ino).await?;
+        self.meta.set_mode(ino, mode).await?;
+        self.vfs_getattr(ino).await
+    }
+
+    /// Change an inode's owning uid/gid (issue #122).
+    ///
+    /// Either half may be `None` to leave it alone — `chown(2)`'s `-1` sentinel,
+    /// which is how `chgrp` reaches this and how both mounts forward a request
+    /// carrying only one of the two.
+    ///
+    /// This is ownership, not authorization: it changes what the *kernel* evaluates
+    /// its permission checks against on a mount, and nothing about what an actor may
+    /// do. See `docs/PERMISSIONS.md` §2.
+    pub async fn vfs_chown(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<Inode> {
+        self.vfs_getattr(ino).await?;
+        self.meta.set_owner(ino, uid, gid).await?;
         self.vfs_getattr(ino).await
     }
 

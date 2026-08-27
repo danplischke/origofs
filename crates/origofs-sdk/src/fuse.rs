@@ -16,7 +16,7 @@
 //! enough). Constructing an [`OrigoFSFuse`] and handing it to `fuser` yourself
 //! skips that; use [`spawn`] unless you have a reason not to.
 
-use crate::{Event, FileKind, Inode, OrigoFSError, Workspace};
+use crate::{Event, FileKind, Inode, OrigoFSError, Owner, Workspace};
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, Notifier, OpenFlags, ReplyAttr,
@@ -573,6 +573,15 @@ fn ftype(k: FileKind) -> FileType {
     }
 }
 
+/// The ownership to stamp on something this request creates: the uid/gid of the
+/// process that issued the call (issue #122).
+///
+/// A file made through a mount belongs to whoever made it. Before ownership
+/// existed every inode was created root-owned, which is the state this replaces.
+fn caller_owner(req: &Request) -> Owner {
+    Owner::new(req.uid(), req.gid())
+}
+
 fn to_attr(i: &Inode) -> FileAttr {
     let t = UNIX_EPOCH + Duration::from_secs(i.mtime.max(0) as u64);
     FileAttr {
@@ -586,8 +595,13 @@ fn to_attr(i: &Inode) -> FileAttr {
         kind: ftype(i.kind),
         perm: (i.mode & 0o7777) as u16,
         nlink: i.nlink.max(1) as u32,
-        uid: 0,
-        gid: 0,
+        // Real ownership since #122. These were hardcoded to 0, which made every
+        // inode report as root-owned — self-consistent while `fuse_mountable()`
+        // requires root, but exactly why `allow_other` and non-root mounts could
+        // not work: a non-root caller is evaluated against uid 0 in the *other*
+        // class and loses write access to the whole tree.
+        uid: i.uid,
+        gid: i.gid,
         rdev: 0,
         blksize: 4096,
         flags: 0,
@@ -624,9 +638,9 @@ impl Filesystem for OrigoFSFuse {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
@@ -641,6 +655,23 @@ impl Filesystem for OrigoFSFuse {
         let ino = ino.0 as i64;
         if let Some(sz) = size
             && let Err(e) = self.blk(self.ws.fs().vfs_truncate(ino, sz))
+        {
+            reply.error(errno(&e));
+            return;
+        }
+        // Mode and ownership used to be bound as `_mode`/`_uid`/`_gid` and dropped,
+        // after which this replied with freshly-read (unchanged) attributes — so a
+        // `chmod` reported success and moved nothing (#121, #122). Apply them.
+        if let Some(m) = mode
+            && let Err(e) = self.blk(self.ws.fs().vfs_chmod(ino, m))
+        {
+            reply.error(errno(&e));
+            return;
+        }
+        // One call for both halves: `chown` and `chgrp` each send only their own,
+        // and `vfs_chown` treats `None` as chown(2)'s -1 ("leave alone").
+        if (uid.is_some() || gid.is_some())
+            && let Err(e) = self.blk(self.ws.fs().vfs_chown(ino, uid, gid))
         {
             reply.error(errno(&e));
             return;
@@ -782,7 +813,7 @@ impl Filesystem for OrigoFSFuse {
 
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -791,7 +822,11 @@ impl Filesystem for OrigoFSFuse {
         reply: ReplyCreate,
     ) {
         let name = name.to_string_lossy().to_string();
-        match self.blk(self.ws.fs().vfs_create(parent.0 as i64, &name, mode)) {
+        match self.blk(
+            self.ws
+                .fs()
+                .vfs_create(parent.0 as i64, &name, mode, caller_owner(req)),
+        ) {
             Ok(i) => reply.created(
                 &TTL,
                 &to_attr(&i),
@@ -805,7 +840,7 @@ impl Filesystem for OrigoFSFuse {
 
     fn mkdir(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -813,7 +848,11 @@ impl Filesystem for OrigoFSFuse {
         reply: ReplyEntry,
     ) {
         let name = name.to_string_lossy().to_string();
-        match self.blk(self.ws.fs().vfs_mkdir(parent.0 as i64, &name, mode)) {
+        match self.blk(
+            self.ws
+                .fs()
+                .vfs_mkdir(parent.0 as i64, &name, mode, caller_owner(req)),
+        ) {
             Ok(i) => reply.entry(&TTL, &to_attr(&i), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }
@@ -860,7 +899,7 @@ impl Filesystem for OrigoFSFuse {
 
     fn symlink(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         link_name: &OsStr,
         target: &Path,
@@ -868,7 +907,11 @@ impl Filesystem for OrigoFSFuse {
     ) {
         let name = link_name.to_string_lossy().to_string();
         let target = target.to_string_lossy().to_string();
-        match self.blk(self.ws.fs().vfs_symlink(parent.0 as i64, &name, &target)) {
+        match self.blk(
+            self.ws
+                .fs()
+                .vfs_symlink(parent.0 as i64, &name, &target, caller_owner(req)),
+        ) {
             Ok(i) => reply.entry(&TTL, &to_attr(&i), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }

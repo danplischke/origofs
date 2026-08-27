@@ -106,6 +106,20 @@ pub trait MetadataStore: Send + Sync {
     /// Set an inode's link count.
     async fn set_nlink(&self, ino: Ino, nlink: i64) -> Result<()>;
 
+    /// Set an inode's permission bits, preserving its file-type bits (issue #121).
+    ///
+    /// `mode` is the low 12 bits (`rwx` plus setuid/setgid/sticky); the format bits
+    /// (`S_IFREG`/`S_IFDIR`/`S_IFLNK`) are the inode's kind and are not a caller's
+    /// to change, so backends mask them in rather than taking the whole word. Bumps
+    /// `ctime`, which is what POSIX says a mode change does.
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()>;
+
+    /// Set an inode's owning uid/gid (issue #122). Bumps `ctime`.
+    ///
+    /// Either half may be left alone by passing `None`, which is what `chown(2)`'s
+    /// `-1` sentinel means and what both mount surfaces forward.
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()>;
+
     /// Delete an inode and any symlink row. The caller ensures `nlink` hit 0.
     /// Reclaiming now-unreferenced content is deferred to GC (M9).
     async fn delete_inode(&self, ino: Ino) -> Result<()>;
@@ -550,6 +564,12 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn set_nlink(&self, ino: Ino, nlink: i64) -> Result<()> {
         (**self).set_nlink(ino, nlink).await
+    }
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()> {
+        (**self).set_mode(ino, mode).await
+    }
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        (**self).set_owner(ino, uid, gid).await
     }
     async fn delete_inode(&self, ino: Ino) -> Result<()> {
         (**self).delete_inode(ino).await

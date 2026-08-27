@@ -11,10 +11,7 @@
 use origofs_core::{FileKind, InodeInit, MetadataStore, OrigoFSError, SqliteMetadataStore};
 
 fn file() -> InodeInit {
-    InodeInit {
-        kind: FileKind::File,
-        mode: 0o100644,
-    }
+    InodeInit::new(FileKind::File, 0o100644)
 }
 
 /// Committing a multi-step transaction persists every mutation together.

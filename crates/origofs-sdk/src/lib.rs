@@ -22,7 +22,7 @@ pub use origofs_core::metrics;
 pub use origofs_core::{
     Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DEFAULT_GC_GRACE_SECS,
     DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event, EventInit, FileKind,
-    GcStats, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError, PackStore, Passage,
+    GcStats, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError, Owner, PackStore, Passage,
     PassageOptions, Presence, RebuildReport, ResyncOutcome, ResyncReport, Segmentation, Suggestion,
     SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit,
     TransferStats, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
