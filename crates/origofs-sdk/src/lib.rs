@@ -20,13 +20,13 @@ pub use origofs_core::metrics;
 // `Workspace::open_encrypted` takes. Previously private, so an embedder could not
 // compose one.
 pub use origofs_core::{
-    Actor, ActorInit, ActorKind, BlameRange, CacheLimits, CommitInfo, Conflict,
+    AclGrant, Actor, ActorInit, ActorKind, BlameRange, CacheLimits, CommitInfo, Conflict,
     DEFAULT_GC_GRACE_SECS, DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event,
-    EventInit, FileKind, GcStats, Hash, Inode, LiveDoc, LoadReport, MemStore, MergeOutcome,
-    OrigoFSError, Owner, PackStore, Passage, PassageOptions, Presence, RebuildReport,
+    EventInit, FileKind, FsStat, GcStats, Hash, Inode, LiveDoc, LoadReport, MemStore, MergeOutcome,
+    OrigoFSError, Owner, PackStore, Passage, PassageOptions, Perms, Presence, Quota, RebuildReport,
     ResyncOutcome, ResyncReport, Scope, ScopeError, Segmentation, Suggestion, SuggestionContent,
     SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats,
-    TrashEntry, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    TrashEntry, Usage, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
 // Backend-specific re-exports, gated to match `origofs-core`'s own features.
 #[cfg(feature = "encryption")]
@@ -205,6 +205,22 @@ impl CacheConfig {
     pub fn min_free_bytes(mut self, n: u64) -> Self {
         self.min_free_bytes = n;
         self
+    }
+}
+
+/// Split an absolute path into `(parent, name)`.
+///
+/// The façade's path-addressed wrappers over the inode-oriented engine ops need
+/// this; the engine's own `resolve_parent` is `pub(crate)`, and an inode number is
+/// a mount implementation detail no `Workspace` caller should have to hold.
+fn split_parent(path: &str) -> Result<(String, String)> {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some(("", name)) if !name.is_empty() => Ok(("/".to_string(), name.to_string())),
+        Some((parent, name)) if !name.is_empty() => Ok((parent.to_string(), name.to_string())),
+        _ => Err(OrigoFSError::InvalidPath(format!(
+            "{path:?} names no parent directory"
+        ))),
     }
 }
 
@@ -901,6 +917,133 @@ impl Workspace {
     #[tracing::instrument(skip_all)]
     pub async fn gc(&self) -> Result<GcStats> {
         self.fs.gc().await
+    }
+
+    // --- usage, quotas, statfs (issues #116, #119) --------------------------
+
+    /// Usage of the whole workspace — one aggregate query.
+    pub async fn usage(&self) -> Result<Usage> {
+        self.fs.usage().await
+    }
+
+    /// Recursive usage of a subtree: the `du` primitive.
+    pub async fn du(&self, path: &str) -> Result<Usage> {
+        self.fs.du(path).await
+    }
+
+    /// The workspace's capacity limits, all-`None` when unset.
+    pub async fn quota(&self) -> Result<Quota> {
+        self.fs.quota().await
+    }
+
+    /// Set (or clear) the workspace's capacity limits.
+    pub async fn set_quota(&self, quota: Quota) -> Result<()> {
+        self.fs.set_quota(quota).await
+    }
+
+    /// Answer a `statfs(2)`.
+    pub async fn statfs(&self) -> Result<FsStat> {
+        self.fs.statfs().await
+    }
+
+    // --- ownership, mode, links, xattrs (issues #119, #121, #122) -----------
+
+    /// Change a path's permission bits.
+    pub async fn chmod(&self, path: &str, mode: u32) -> Result<Inode> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_chmod(ino, mode).await
+    }
+
+    /// Change a path's owning uid/gid. `None` leaves that half alone, as
+    /// `chown(2)`'s `-1` does.
+    pub async fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<Inode> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_chown(ino, uid, gid).await
+    }
+
+    /// Hard-link `existing` as `link_path`.
+    pub async fn link(&self, existing: &str, link_path: &str) -> Result<Inode> {
+        let ino = self.fs.stat(existing).await?.ino;
+        let (parent, name) = split_parent(link_path)?;
+        let parent_ino = self.fs.stat(&parent).await?.ino;
+        self.fs.vfs_link(ino, parent_ino, &name).await
+    }
+
+    /// Read one extended attribute.
+    pub async fn getxattr(&self, path: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_getxattr(ino, name).await
+    }
+
+    /// Set one extended attribute. Values are capped at
+    /// [`MAX_XATTR_LEN`](origofs_core::MAX_XATTR_LEN) — an xattr lives in the
+    /// metadata store, which never holds large bytes.
+    pub async fn setxattr(&self, path: &str, name: &str, value: &[u8]) -> Result<()> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_setxattr(ino, name, value).await
+    }
+
+    /// Remove one extended attribute, reporting whether it was set.
+    pub async fn removexattr(&self, path: &str, name: &str) -> Result<bool> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_removexattr(ino, name).await
+    }
+
+    /// Every extended-attribute name on a path, in name order.
+    pub async fn listxattr(&self, path: &str) -> Result<Vec<String>> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_listxattr(ino).await
+    }
+
+    // --- path-scoped ACLs (issue #123) --------------------------------------
+
+    /// Grant `perms` to an actor under `path_prefix`.
+    pub async fn grant(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: Perms,
+        granted_by: Option<i64>,
+    ) -> Result<()> {
+        self.fs
+            .grant(actor_id, path_prefix, perms, granted_by)
+            .await
+    }
+
+    /// Remove a grant, reporting whether one was there.
+    pub async fn revoke(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        revoked_by: Option<i64>,
+    ) -> Result<bool> {
+        self.fs.revoke(actor_id, path_prefix, revoked_by).await
+    }
+
+    /// Every grant in this workspace, or just one actor's.
+    pub async fn list_grants(&self, actor_id: Option<i64>) -> Result<Vec<AclGrant>> {
+        self.fs.list_grants(actor_id).await
+    }
+
+    /// The permissions an actor has at a path — longest matching prefix wins,
+    /// falling back to its `write_policy` when it has no grant.
+    pub async fn effective_perms(&self, actor_id: i64, path: &str) -> Result<Perms> {
+        self.fs.effective_perms(actor_id, path).await
+    }
+
+    /// Whether an ungranted actor is denied rather than falling back.
+    pub async fn acl_default_deny(&self) -> Result<bool> {
+        self.fs.acl_default_deny().await
+    }
+
+    /// Switch between fallback (the default) and deny-by-default.
+    pub async fn set_acl_default_deny(&self, deny: bool) -> Result<()> {
+        self.fs.set_acl_default_deny(deny).await
+    }
+
+    /// Refuse an op at a path for an actor without `WRITE` there.
+    pub async fn ensure_may_write_at(&self, ctx: WriteCtx, op: &str, path: &str) -> Result<()> {
+        self.fs.ensure_may_write_at(ctx, op, path).await
     }
 
     // --- portable dump/load (issue #117) ------------------------------------

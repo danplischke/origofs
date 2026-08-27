@@ -78,6 +78,16 @@ fn fetch_concurrency() -> usize {
     })
 }
 
+/// How many chunks either side of a written range [`Fs::splice_body`] re-chunks
+/// along with it (issue #111).
+///
+/// Re-chunking only the written range would force chunk boundaries at its two
+/// edges, costing deduplication there. Including a neighbour on each side gives
+/// FastCDC enough context to re-discover the natural boundary, so the seam usually
+/// heals rather than persisting. One is enough: the content-defined boundary is a
+/// function of a rolling window far smaller than a chunk.
+const SPLICE_MARGIN: usize = 1;
+
 /// The chunks covering `[off, end)` of `manifest`, each as `(hash, from, len)`
 /// **relative to that chunk**.
 ///
@@ -592,6 +602,263 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Chunk `data` (content-defined), store each chunk, and write a manifest.
     /// Returns `(manifest_hash, size)`; an empty body yields `(None, 0)`.
+    /// Apply `data` at `offset` to `manifest` **without re-chunking the whole
+    /// file** (issue #111), returning the new `(manifest_hash, size)`.
+    ///
+    /// # The problem
+    ///
+    /// `vfs_write` used to read the entire body, patch the range, re-run FastCDC
+    /// over the whole buffer, and re-upload every changed chunk. `docs/LIMITS.md`
+    /// documented the consequence: *"Rewriting a 1 GiB file through a mount is
+    /// quadratic in allocation and hashing."* The kernel issues a bulk write as
+    /// many modest requests, so a sequential rewrite of an N-byte file cost
+    /// `O(N^2 / request_size)`.
+    ///
+    /// # Why splicing rather than slices
+    ///
+    /// The issue sketches a slice list: the inode keeps its manifest as a
+    /// materialized base, pending slices live beside it, reads resolve
+    /// base-then-slices newest-wins, and compaction collapses them back. It also
+    /// names the property that would keep that contained — "commit forces
+    /// compaction first, so trees, merge, blame and gc never see a slice".
+    ///
+    /// Splicing reaches the same `O(bytes written)` goal without introducing the
+    /// second representation at all, and that difference is the whole argument:
+    ///
+    /// * **Nothing else has to learn anything.** A manifest is an ordered list of
+    ///   `(hash, len)`. Writing at an offset needs only the *affected* region
+    ///   re-chunked and spliced into that list — so `inode.content` remains an
+    ///   ordinary, complete manifest at every instant. Trees, merge, blame, gc,
+    ///   git export, and every read path keep working unchanged because there is
+    ///   nothing new for them to see.
+    /// * **The containment property is free rather than enforced.** With slices,
+    ///   "no other reader ever observes one" is an invariant maintained by
+    ///   remembering to compact at every boundary; missing one is a silent stale
+    ///   read. Here it holds by construction.
+    /// * It answers both of the issue's open questions by dissolving them: there
+    ///   is no slice list, so it neither becomes the attribution record nor needs
+    ///   somewhere to live.
+    ///
+    /// **What this does not fix**, and the issue's second motivation: two writers
+    /// at *different* offsets still contend, because both still compare-and-set
+    /// the inode's single `manifest_hash`. Disjoint slices would not have
+    /// conflicted. The bounded retry in `vfs_write` (`VFS_CAS_ATTEMPTS`) still
+    /// resolves it correctly, and the per-handle buffering added in #112 collapses
+    /// many kernel requests into one flush, so the contention is far rarer than it
+    /// was — but it is not gone, and a workload of many concurrent writers to one
+    /// large file is the case that would justify revisiting slices.
+    ///
+    /// # Seams
+    ///
+    /// Re-chunking only a window means the boundaries at its two edges are forced
+    /// rather than content-defined, which costs a little deduplication there. The
+    /// window is widened by [`SPLICE_MARGIN`] chunks on each side so FastCDC has
+    /// room to re-discover natural boundaries and the seam usually heals; the
+    /// residual cost is two chunks per write, against re-hashing the entire file.
+    pub(crate) async fn splice_body(
+        &self,
+        manifest: &Manifest,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(Option<Hash>, u64)> {
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| OrigoFSError::TooLarge("write end overflows u64".into()))?;
+        let new_size = manifest.size.max(end);
+        let n = manifest.chunks.len();
+
+        // Chunks intersecting the written range. A write starting at or past EOF
+        // intersects nothing, and anchors on the tail instead so the last chunk
+        // can merge with the new bytes rather than leaving a runt behind.
+        let (mut lo, mut hi) = (n, 0usize);
+        let mut found = false;
+        let mut pos = 0u64;
+        for (i, c) in manifest.chunks.iter().enumerate() {
+            let (cs, ce) = (pos, pos + c.len as u64);
+            pos = ce;
+            if ce > offset && cs < end {
+                if !found {
+                    lo = i;
+                    found = true;
+                }
+                hi = i;
+            }
+        }
+        if !found {
+            if n == 0 {
+                lo = 0;
+                hi = 0;
+            } else {
+                lo = n - 1;
+                hi = n - 1;
+            }
+        }
+        // Widen, so FastCDC can re-find boundaries at the seams.
+        let (lo, hi) = if n == 0 {
+            (0usize, 0usize)
+        } else {
+            (
+                lo.saturating_sub(SPLICE_MARGIN),
+                (hi + SPLICE_MARGIN).min(n - 1),
+            )
+        };
+        let replaced: &[ChunkRef] = if n == 0 {
+            &[]
+        } else {
+            &manifest.chunks[lo..=hi]
+        };
+
+        // Byte span the replaced chunks cover.
+        let region_start: u64 = manifest.chunks[..lo].iter().map(|c| c.len as u64).sum();
+        let covered_end: u64 = region_start + replaced.iter().map(|c| c.len as u64).sum::<u64>();
+        let region_end = covered_end.max(end);
+
+        let region_len = usize::try_from(region_end - region_start).map_err(|_| {
+            OrigoFSError::TooLarge(format!(
+                "splice region of {} bytes",
+                region_end - region_start
+            ))
+        })?;
+        let mut region = Vec::new();
+        region.try_reserve(region_len).map_err(|_| {
+            OrigoFSError::TooLarge(format!("cannot allocate {region_len} bytes to splice"))
+        })?;
+
+        // The existing bytes of the replaced chunks, fetched with the same bounded
+        // concurrency as any other read.
+        if !replaced.is_empty() {
+            let sub = Manifest {
+                size: covered_end - region_start,
+                chunks: replaced.to_vec(),
+            };
+            let mut parts = self.content_stream(sub);
+            while let Some(part) = parts.next().await {
+                region.extend_from_slice(&part?);
+            }
+        }
+        // A write past EOF leaves a hole, which reads back as zeroes.
+        region.resize(region_len, 0);
+
+        let at = usize::try_from(offset - region_start)
+            .map_err(|_| OrigoFSError::TooLarge("splice offset".into()))?;
+        region[at..at + data.len()].copy_from_slice(data);
+
+        // Re-chunk only the region, then splice its chunks into the existing list.
+        let bounds = crate::util::blocking_section(|| chunk_bounds(&region));
+        let region = &region;
+        let fresh: Vec<ChunkRef> = futures::stream::iter(bounds)
+            .map(move |(off, len)| async move {
+                self.content
+                    .put(&region[off..off + len])
+                    .await
+                    .map(|hash| ChunkRef {
+                        hash,
+                        len: len as u32,
+                    })
+            })
+            .buffered(upload_concurrency())
+            .try_collect()
+            .await?;
+
+        let mut chunks = Vec::with_capacity(manifest.chunks.len() + fresh.len());
+        chunks.extend_from_slice(&manifest.chunks[..lo]);
+        chunks.extend(fresh);
+        if n > 0 && hi + 1 < n {
+            chunks.extend_from_slice(&manifest.chunks[hi + 1..]);
+        }
+
+        let spliced = Manifest {
+            size: new_size,
+            chunks,
+        };
+        debug_assert_eq!(
+            spliced.chunks.iter().map(|c| c.len as u64).sum::<u64>(),
+            new_size,
+            "spliced chunk lengths must sum to the declared size"
+        );
+        let mhash = self.content.put(&spliced.encode()?).await?;
+        // Same durability barrier as `store_body`: content durable before the
+        // metadata that references it.
+        self.content.flush().await?;
+        Ok((Some(mhash), new_size))
+    }
+
+    /// Resize `manifest` to `size` without re-chunking the whole body (issue #111).
+    ///
+    /// Shrinking drops whole chunks past the new end and re-chunks only the one
+    /// straddling it. Growing appends zeroes, which is `splice_body` of an empty
+    /// write at the new end — a hole reads back as zeroes either way.
+    ///
+    /// The old path read the entire body, resized the buffer, and re-ran FastCDC
+    /// over all of it, so truncating a 1 GiB file to zero cost a full read and a
+    /// full re-chunk of bytes that were being discarded.
+    pub(crate) async fn resize_body(
+        &self,
+        manifest: &Manifest,
+        size: u64,
+    ) -> Result<(Option<Hash>, u64)> {
+        if size == manifest.size {
+            // Nothing to do, but the caller still needs an address for the body.
+            if manifest.chunks.is_empty() {
+                return Ok((None, 0));
+            }
+            let h = self.content.put(&manifest.encode()?).await?;
+            self.content.flush().await?;
+            return Ok((Some(h), size));
+        }
+        if size == 0 {
+            return Ok((None, 0));
+        }
+        if size > manifest.size {
+            // Growing: the hole is zeroes. A zero-length splice at the new end
+            // extends the manifest without materializing the whole file.
+            return self.splice_body(manifest, size - 1, &[0u8]).await;
+        }
+
+        // Shrinking. Keep whole chunks that end at or before the new size; the one
+        // straddling it is re-chunked from its own start.
+        let mut kept: Vec<ChunkRef> = Vec::new();
+        let mut pos = 0u64;
+        let mut straddler: Option<(ChunkRef, u64)> = None;
+        for c in &manifest.chunks {
+            let (cs, ce) = (pos, pos + c.len as u64);
+            pos = ce;
+            if ce <= size {
+                kept.push(*c);
+            } else if cs < size {
+                straddler = Some((*c, cs));
+                break;
+            } else {
+                break;
+            }
+        }
+
+        let mut chunks = kept;
+        if let Some((c, cs)) = straddler {
+            // Only the surviving prefix of that one chunk is re-chunked.
+            let keep_len = (size - cs) as usize;
+            let bytes = self.content.get_range(&c.hash, 0, keep_len as u64).await?;
+            let bounds = crate::util::blocking_section(|| chunk_bounds(&bytes));
+            for (off, len) in bounds {
+                let hash = self.content.put(&bytes[off..off + len]).await?;
+                chunks.push(ChunkRef {
+                    hash,
+                    len: len as u32,
+                });
+            }
+        }
+
+        let resized = Manifest { size, chunks };
+        debug_assert_eq!(
+            resized.chunks.iter().map(|c| c.len as u64).sum::<u64>(),
+            size,
+            "resized chunk lengths must sum to the declared size"
+        );
+        let h = self.content.put(&resized.encode()?).await?;
+        self.content.flush().await?;
+        Ok((Some(h), size))
+    }
+
     pub(crate) async fn store_body(&self, data: &[u8]) -> Result<(Option<Hash>, u64)> {
         if data.is_empty() {
             return Ok((None, 0));

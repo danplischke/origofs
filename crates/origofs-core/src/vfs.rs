@@ -206,36 +206,30 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         )))
     }
 
-    /// One read-modify-write attempt. `Ok(None)` means the file changed underneath
-    /// us and the caller should retry.
+    /// One attempt. `Ok(None)` means the file changed underneath us and the caller
+    /// should retry.
+    ///
+    /// Since #111 this **splices** the written range into the existing manifest
+    /// rather than reading, patching and re-chunking the whole body, so the cost is
+    /// `O(bytes written)` rather than `O(file size)` — see
+    /// [`Fs::splice_body`](crate::Fs::splice_body) for why splicing rather than the
+    /// slice list the issue sketches.
     async fn vfs_write_attempt(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<Option<u32>> {
         let inode = self.vfs_getattr(ino).await?;
         let pre = inode.content;
-        let mut bytes = match inode.content {
-            Some(h) => self.read_body(&h).await?,
-            None => Vec::new(),
+        // A hostile offset/size (near u64::MAX) must fail cleanly rather than
+        // overflow; `splice_body` rejects an overflowing end and a region it
+        // cannot allocate. There is still no fixed file-size limit.
+        let base = match inode.content {
+            Some(h) => self.load_manifest(&h).await?,
+            None => crate::chunk::Manifest::default(),
         };
-        // This path rewrites the whole file in memory (read-modify-write), so the
-        // only real ceiling is what can actually be allocated — there is no fixed
-        // file-size limit. A hostile offset/size (e.g. near u64::MAX) must still
-        // fail cleanly rather than overflow or abort the process: reject an
-        // overflowing end, one that can't be addressed, or one we can't reserve.
         let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
             OrigoFSError::TooLarge(format!("write end overflows u64 (ino {ino})"))
         })?;
-        let end = usize::try_from(end)
-            .map_err(|_| OrigoFSError::TooLarge(format!("write past {end} bytes (ino {ino})")))?;
-        if bytes.len() < end {
-            let extra = end - bytes.len();
-            bytes.try_reserve(extra).map_err(|_| {
-                OrigoFSError::TooLarge(format!("cannot allocate {end} bytes (ino {ino})"))
-            })?;
-            bytes.resize(end, 0);
-        }
-        bytes[offset as usize..end].copy_from_slice(data);
         // Refuse before storing — see `write_attempt` (issue #116).
-        self.check_quota_for_ino(ino, bytes.len() as u64).await?;
-        let (mhash, size) = self.store_body(&bytes).await?;
+        self.check_quota_for_ino(ino, base.size.max(end)).await?;
+        let (mhash, size) = self.splice_body(&base, offset, data).await?;
         // Conditional on the version this body was read from, so a concurrent
         // write to another offset is not silently erased. The orphaned chunks a
         // lost race leaves behind are ordinary unreferenced content; gc reclaims
@@ -267,27 +261,19 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     async fn vfs_truncate_attempt(&self, ino: Ino, size: u64) -> Result<bool> {
         let inode = self.vfs_getattr(ino).await?;
         let pre = inode.content;
-        // No fixed ceiling: growing a file materializes it in memory, so bound
-        // only by what can actually be addressed and allocated — a hostile size
-        // (e.g. u64::MAX) fails as TooLarge instead of aborting the process.
-        let target = usize::try_from(size)
-            .map_err(|_| OrigoFSError::TooLarge(format!("truncate to {size} bytes (ino {ino})")))?;
-        let mut bytes = match inode.content {
-            Some(h) => self.read_body(&h).await?,
-            None => Vec::new(),
+        // Since #111 this resizes the manifest rather than materializing the body:
+        // shrinking drops whole chunks past the new end and re-chunks only the one
+        // straddling it, and growing appends a hole. Truncating a 1 GiB file to
+        // zero used to read and re-chunk all of it first.
+        let base = match inode.content {
+            Some(h) => self.load_manifest(&h).await?,
+            None => crate::chunk::Manifest::default(),
         };
-        if target > bytes.len() {
-            let extra = target - bytes.len();
-            bytes.try_reserve(extra).map_err(|_| {
-                OrigoFSError::TooLarge(format!("cannot allocate {size} bytes (ino {ino})"))
-            })?;
-        }
-        bytes.resize(target, 0);
         // Only a *growing* truncate can breach a quota, but the check is uniform:
         // `check_quota_for_ino` compares against the current size, so shrinking
         // yields a zero delta and always passes (issue #116).
-        self.check_quota_for_ino(ino, bytes.len() as u64).await?;
-        let (mhash, sz) = self.store_body(&bytes).await?;
+        self.check_quota_for_ino(ino, size).await?;
+        let (mhash, sz) = self.resize_body(&base, size).await?;
         // See `vfs_write_attempt`: conditional, so a concurrent write is not lost.
         let mut tx = self.meta.begin().await?;
         let won = tx.set_content_if(ino, pre.as_ref(), mhash, sz).await?;
