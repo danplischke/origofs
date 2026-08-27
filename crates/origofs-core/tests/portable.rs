@@ -390,3 +390,107 @@ async fn transient_tables_are_not_dumped() {
         );
     }
 }
+
+// --- what a load overwrites, and what that means for "pristine" --------------
+
+/// **A load into a configured-but-empty store is a total takeover, and is
+/// refused.**
+///
+/// `reset_for_load` clears every table in `DUMP_TABLES` — `actor`, `acl` and
+/// `config` among them — and the dump reinstalls its own. `ensure_loadable` used
+/// to check inodes and branches only, which is a *content* check standing in for a
+/// security one: a store given actors and grants but no files yet passed it, and
+/// the load replaced the whole identity registry and every grant with the dump
+/// author's.
+///
+/// That ordering is the recommended one, not a corner case. `set_acl_default_deny`
+/// is a deliberate switch precisely so the grants get written first — which is
+/// exactly the window this describes.
+#[tokio::test]
+async fn a_load_refuses_a_store_that_has_actors_but_no_content() {
+    let (src, store) = fixture().await;
+    let mallory = src
+        .create_human("mallory", Some("sub:mallory"))
+        .await
+        .unwrap();
+    src.write_as(WriteCtx::actor(mallory), "/f.txt", b"x")
+        .await
+        .unwrap();
+    src.grant(mallory, "/", Perms::WRITE | Perms::READ, None)
+        .await
+        .unwrap();
+    let mut dump = Vec::new();
+    src.dump(&mut dump).await.unwrap();
+
+    // The victim: set up exactly as an operator is told to set one up — actors and
+    // grants written *before* deny-by-default is switched on, and no content yet.
+    let dst = fs_sharing(store).await;
+    let admin = dst.create_human("admin", Some("sub:admin")).await.unwrap();
+    dst.grant(admin, "/", Perms::WRITE | Perms::READ, None)
+        .await
+        .unwrap();
+    dst.set_acl_default_deny(true).await.unwrap();
+
+    let err = dst
+        .load(std::io::Cursor::new(dump))
+        .await
+        .expect_err("a load must not overwrite a configured store's identity tables");
+    match err {
+        OrigoFSError::InvalidArgument(m) => {
+            assert!(m.contains("actor"), "{m}");
+            assert!(m.contains("identity registry"), "{m}");
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+
+    // And the refusal left the destination's authorization state exactly as it was
+    // — which is the whole point, so it is asserted rather than assumed.
+    assert!(dst.acl_default_deny().await.unwrap());
+    let grants = dst.list_grants(None).await.unwrap();
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(grants[0].actor_id, admin);
+    let actors = dst.list_actors().await.unwrap();
+    assert_eq!(actors.len(), 1, "{actors:?}");
+    assert_eq!(actors[0].display_name, "admin");
+}
+
+/// The grant check is separate from the actor check, so a store carrying a grant
+/// whose actor is gone is still refused.
+#[tokio::test]
+async fn a_load_refuses_a_store_that_has_grants() {
+    let (src, store) = fixture().await;
+    let a = src.create_human("a", None).await.unwrap();
+    src.write_as(WriteCtx::actor(a), "/f.txt", b"x")
+        .await
+        .unwrap();
+    let mut dump = Vec::new();
+    src.dump(&mut dump).await.unwrap();
+
+    let dst = fs_sharing(store).await;
+    // A grant referencing an actor id that no longer resolves: the `acl` table is
+    // non-empty, which is what a load would silently replace.
+    dst.grant(4242, "/", Perms::WRITE, None).await.unwrap();
+
+    match dst.load(std::io::Cursor::new(dump)).await.unwrap_err() {
+        OrigoFSError::InvalidArgument(m) => assert!(m.contains("ACL grant"), "{m}"),
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+/// The tightening must not have closed the door on the case the feature is *for*:
+/// a genuinely fresh store still loads.
+#[tokio::test]
+async fn a_load_into_a_fresh_store_still_works() {
+    let (src, store) = fixture().await;
+    let alice = src.create_human("alice", Some("sub:alice")).await.unwrap();
+    src.write_as(WriteCtx::actor(alice), "/notes.md", b"hi\n")
+        .await
+        .unwrap();
+    let mut dump = Vec::new();
+    src.dump(&mut dump).await.unwrap();
+
+    let dst = fs_sharing(store).await;
+    dst.load(std::io::Cursor::new(dump)).await.unwrap();
+    assert_eq!(&dst.read("/notes.md").await.unwrap()[..], b"hi\n");
+    assert_eq!(dst.list_actors().await.unwrap().len(), 1);
+}

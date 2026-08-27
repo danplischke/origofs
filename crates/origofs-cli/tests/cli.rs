@@ -2215,6 +2215,12 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         ),
         (
             "dump",
+            // Exempt from *this* framework, which classifies mutations. It is not
+            // ungated in general: a dump reads the whole store out (every actor's
+            // `auth_subject`, every ACL grant), so a surface serving callers it did
+            // not authenticate must use `dump_as`, which checks WRITE at `/`. The
+            // CLI is not a boundary — a local process holding the workspace
+            // directory has `meta.db` on disk anyway.
             Exempt("reads the metadata store out; mutates nothing"),
         ),
         // --- read-only ------------------------------------------------------
