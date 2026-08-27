@@ -486,6 +486,55 @@ class BenchReport(TypedDict):
     reread: BenchStageRecord
     kept: bool
 
+class TransferStats(TypedDict):
+    """Objects moved by one half of a replication (``push_objects``/``fetch_objects``).
+
+    ``skipped`` is where the walk stopped because the destination already had the
+    object, so a repeat transfer is nearly all ``skipped`` and no ``bytes``.
+    """
+
+    objects: int
+    bytes: int
+    skipped: int
+
+
+class ResyncReport(TypedDict):
+    """The outcome of a ``resync``.
+
+    ``outcome`` is one of ``"up-to-date" | "pushed" | "fast-forward" | "merged" |
+    "conflicts"``. ``head`` is the commit the outcome carries, flattened out of the
+    tag so a caller reads one key — ``None`` for ``"up-to-date"`` and
+    ``"conflicts"``. ``stale_live_paths`` is advisory: those paths had an open CRDT
+    document that may have been ahead of its durable bytes, and the merge still ran.
+    """
+
+    branch: str
+    outcome: str
+    head: Optional[str]
+    fetched: TransferStats
+    pushed: TransferStats
+    blame_fetched: int
+    blame_pushed: int
+    conflicts: list[ConflictRecord]
+    stale_live_paths: list[str]
+    cas_retries: int
+    remote_tree_updated: bool
+
+
+class LoadReport(TypedDict):
+    """What a ``load`` restored.
+
+    ``tables`` maps table name to rows applied. ``skipped_tables`` names tables the
+    dump carried that this build does not know — reported rather than fatal, so a
+    dump from a newer origofs still restores what an older one understands.
+    """
+
+    tables: Dict[str, int]
+    skipped_tables: list[str]
+    source_schema_version: int
+    total_rows: int
+
+
 class OrigoFSError(Exception):
     """Base origofs error (raised for errors without a more specific mapping)."""
 
@@ -558,6 +607,26 @@ if sys.platform == "linux":
         def unmount(self) -> None: ...
         def __enter__(self) -> "Mount": ...
         def __exit__(self, *args: Any) -> None: ...
+
+class CacheConfig:
+    """Bounds for the local read cache in front of an object store (issue #114).
+
+    The tier keeps recently-read chunks under ``dir`` and evicts to stay inside
+    **both** bounds: at most ``max_bytes`` cached, and never taking the filesystem
+    below ``min_free_bytes`` free. The second is the one that matters in practice —
+    a cache that fills the disk takes the workspace down with it.
+
+    Defaults are the Rust ones: 8 GiB cached, yielding under 2 GiB free. Pick them
+    explicitly for a container, whose writable layer is usually far smaller than
+    the disk those numbers assume.
+    """
+
+    def __init__(
+        self,
+        dir: str,
+        max_bytes: Optional[int] = None,
+        min_free_bytes: Optional[int] = None,
+    ) -> None: ...
 
 class Scope:
     """A surface's view of a workspace: everything, or one subtree (issue #125).
@@ -794,6 +863,25 @@ class Workspace:
     async def open_pg_gcs(dsn: str, cfg: GcsConfig) -> "Workspace": ...
     @staticmethod
     async def open_pg_gcs_packed(dsn: str, cfg: GcsConfig, index_dir: str) -> "Workspace": ...
+    # ...and with a bounded local read cache (issue #114). Every read of an
+    # uncached chunk otherwise costs a network round trip, which is what makes a
+    # mount or a repeated ranged read over an object store slow.
+    @staticmethod
+    async def open_s3_cached(
+        db_path: str, cfg: S3Config, cache: CacheConfig
+    ) -> "Workspace": ...
+    @staticmethod
+    async def open_pg_s3_cached(
+        dsn: str, cfg: S3Config, cache: CacheConfig
+    ) -> "Workspace": ...
+    @staticmethod
+    async def open_gcs_cached(
+        db_path: str, cfg: GcsConfig, cache: CacheConfig
+    ) -> "Workspace": ...
+    @staticmethod
+    async def open_pg_gcs_cached(
+        dsn: str, cfg: GcsConfig, cache: CacheConfig
+    ) -> "Workspace": ...
     @staticmethod
     async def open_object_memory(db_path: str) -> "Workspace": ...
 
@@ -938,6 +1026,20 @@ class Workspace:
 
     # --- live collaboration ---
     async def watch(self, after_seq: int = 0) -> list[EventRecord]: ...
+    # Append an arbitrary event to the feed, returning its sequence number. Every
+    # mutating method emits its own, so this is for what origofs cannot see: an
+    # agent finished a task, a review was requested, a deploy went out. Consumers
+    # receive it like any other, so a host's milestones interleave with file
+    # changes in one ordered stream rather than needing a second channel.
+    async def record_event(
+        self,
+        kind: str,
+        path: str,
+        actor_id: Optional[int] = None,
+        session_id: Optional[int] = None,
+        detail: Optional[str] = None,
+        branch: Optional[str] = None,
+    ) -> int: ...
     async def subscribe(self, after_seq: int = 0, branch: Optional[str] = None) -> Subscription: ...
     async def presence(self, window_secs: int = 60) -> list[PresenceRecord]: ...
     async def touch(self, actor_id: int, session_id: int, path: Optional[str] = None) -> None: ...
@@ -988,6 +1090,20 @@ class Workspace:
     # operations that have no attributed variant of their own.
     async def ensure_may_write(self, ctx: WriteCtx, op: str) -> None: ...
 
+    # Explicit byte-range authorship: `spans` is a list of
+    # (actor_id, session_id, byte_len) runs summing to len(data), so co-edited
+    # content lands with each collaborator's spans attributed exactly (sub-line,
+    # interleaved) instead of going through the line-diff heuristic. `ctx` is the
+    # actor performing the checkpoint. `checkpoint_coedit` does this for a
+    # CoeditDoc; reach for this when the document lives in *your* editor.
+    async def write_as_blamed(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        data: bytes,
+        spans: Sequence[Tuple[int, int, int]],
+    ) -> None: ...
+
     # ── symlinks ─────────────────────────────────────────────────────────────
     async def symlink(self, target: str, linkpath: str) -> None: ...
     async def readlink(self, path: str) -> str: ...
@@ -1008,12 +1124,69 @@ class Workspace:
     # {ready, metadata, content} — each store None when healthy. Mirrors /readyz.
     async def ready(self) -> ReadyReport: ...
 
+    # ── portable dump / load (issue #117) ────────────────────────────────────
+    async def dump_as(self, ctx: WriteCtx, path: str) -> int:
+        """Write an engine-independent metadata dump to ``path`` (JSON Lines),
+        returning the record count. The supported SQLite -> Postgres migration path.
+
+        Takes a ``ctx`` where the Rust ``dump`` does not, and is checked as
+        ``write`` at ``/``: a dump is whole-**store**, carrying every workspace,
+        every actor's ``auth_subject``, every ACL grant and all blame. Nothing about
+        it is path-scoped, so no ``Scope`` narrows it and no subtree grant bounds
+        it. Where no grant covers ``/`` this falls back to the actor's write policy,
+        so a workspace with no ACLs behaves as it always did.
+
+        **Metadata only** — a dump references content by hash and does not carry the
+        bytes. Restored against a store without those chunks you get every name,
+        actor and blame span, and no readable file."""
+        ...
+    async def load(self, path: str) -> LoadReport:
+        """Restore a dump into a **pristine** store — one with no content, branches,
+        registered actors or ACL grants.
+
+        Refuses to merge: two dumps have independent id spaces (inode, actor and
+        session ids are all local sequences) and reconciling them wrongly produces
+        blame attributed to the wrong actor. Use ``resync`` to combine two live
+        workspaces.
+
+        The actor and grant halves of that check are what stop a load being a
+        privilege escalation — a load replaces the identity registry and every grant
+        with the dump's. There is deliberately no ``load_as``: a load cannot be
+        ACL-gated, because the identities a check would consult are the ones it
+        installs."""
+        ...
+
+    # ── replication between workspaces ───────────────────────────────────────
+    async def resync(
+        self, remote: "Workspace", branch: str, author: str, message: str
+    ) -> ResyncReport:
+        """Reconcile ``branch`` with ``remote`` both ways: fetch, push, merge if
+        diverged, advance both refs.
+
+        Per-byte-range blame travels with the content in both directions, actors
+        matched on ``auth_subject``. The op-log, audit log, change feed and pending
+        suggestions do not. Both working trees must be clean, both workspaces must
+        have versioning on, and ``branch`` must be the local current branch."""
+        ...
+    async def push_objects(self, remote: "Workspace", head: str) -> TransferStats:
+        """Copy the commit closure of ``head`` into ``remote``'s content store,
+        stopping at what it already has. Moves objects only and never touches a ref,
+        so it is safe to run ahead of a resync to make it cheap."""
+        ...
+    async def fetch_objects(self, remote: "Workspace", head: str) -> TransferStats:
+        """The fetch half: copy the closure of ``head`` from ``remote`` into this
+        workspace. Refs are untouched."""
+        ...
+
     # ── versioning: merge and mode ───────────────────────────────────────────
     # merge_branch returns {outcome, commit, conflicts}; `outcome` is one of
     # "already_up_to_date" | "fast_forward" | "merged" | "conflicts".
     async def merge_branch(
         self, branch: str, author: str, message: Optional[str] = None
     ) -> MergeResult: ...
+    # The by-hash counterpart, for merging something with no branch name: a
+    # detached head, a commit out of `log`, a ref another workspace advanced.
+    async def merge(self, theirs: str, author: str, message: str) -> MergeResult: ...
     async def conflicts(self) -> list[ConflictRecord]: ...
     async def versioning_mode(self) -> str: ...
     async def set_versioning_mode(self, mode: str) -> None: ...
@@ -1124,6 +1297,31 @@ class Workspace:
     # Raises PermissionError when the actor may not write at `path`. The denial
     # never says whether the path exists.
     async def ensure_may_write_at(self, ctx: WriteCtx, op: str, path: str) -> None: ...
+    async def ensure_may_write_workspace(self, ctx: WriteCtx, op: str) -> None:
+        """Raises ``PermissionError`` when the actor may not write at ``/``.
+
+        The path-less counterpart: having no path is not the same as touching none.
+        ``commit``, ``checkout``, ``create_branch``, an unbounded ``revert_session``
+        and ``dump_as`` all reach the whole workspace, so they are checked at the
+        root rather than skipping the grant layer. The bound methods call this
+        themselves; a surface adding its own workspace-wide route wants it."""
+        ...
+
+    # ── attribution completeness (issue #128) ────────────────────────────────
+    # An attribution-*completeness* switch, not access control: it makes an
+    # unattributed mutation an error so a blame trail has no holes, and says
+    # nothing about who may do what. Off by default.
+    async def require_attribution(self) -> bool: ...
+    async def set_require_attribution(self, required: bool) -> None: ...
+    async def ensure_attributed(self, op: str) -> None:
+        """Raises ``PermissionError`` when this workspace requires attribution and
+        no actor was named. Returns ``None`` when it does not.
+
+        **A surface calls this on the path where no actor was named** — it is what
+        makes ``require_attribution`` mean anything. Enforcement is surface-side by
+        design, so a workspace with the switch on is only enforced on the surfaces
+        that call it."""
+        ...
 
     # ── performance introspection (issue #118) ───────────────────────────────
     async def file_layout(self, path: str, probe: bool = False) -> FileLayoutRecord:

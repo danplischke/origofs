@@ -123,6 +123,26 @@ async def _collect() -> dict:
     # measurement, which is not what this test is for.
     bench = await ws.bench(dir="/.bench", files=1, file_size=4096)
 
+    # Replication and the portable dump both need a *second* workspace, which is
+    # the only reason they are set up here rather than inline in the dict below.
+    other = await _workspace()
+    head = (await ws.log())[0]["hash"]
+    pushed = await ws.push_objects(other, head)
+
+    # `resync` refuses a dirty working tree, and `ws` has an uncommitted change on
+    # purpose (so `status` has something to report) -- so the resync record comes
+    # from a clean pair of its own rather than from bending the main fixture.
+    clean = await _workspace()
+    clean_actor = await clean.create_human("dan", "sub:dan")
+    clean_ctx = origofs.WriteCtx.actor(clean_actor)
+    await clean.write_as(clean_ctx, "/f.txt", b"one\n")
+    await clean.commit_as(clean_ctx, "dan", "one")
+    resynced = await clean.resync(await _workspace(), "main", "dan", "sync")
+
+    dump = os.path.join(tempfile.mkdtemp(), "d.jsonl")
+    await ws.dump_as(ctx, dump)
+    loaded = await (await _workspace()).load(dump)
+
     records = {
         "ActorRecord": await ws.actor(human),
         "BlameSpan": (await ws.blame("/docs/notes.txt"))[0],
@@ -157,6 +177,9 @@ async def _collect() -> dict:
         "BenchOptsRecord": bench["opts"],
         "BenchStageRecord": bench["write"],
         "TunableRecord": bench["upload_concurrency"],
+        "TransferStats": pushed,
+        "ResyncReport": resynced,
+        "LoadReport": loaded,
     }
     assert commit  # the commit above is what `log`/`branches` report on
     return records

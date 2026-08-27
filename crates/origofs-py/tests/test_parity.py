@@ -1077,3 +1077,295 @@ async def test_bench_measures_this_workspaces_backends():
     with pytest.raises(Exception):
         await ws.bench(dir="/occupied", files=1, file_size=4096)
     assert bytes(await ws.read("/occupied/mine.txt")) == b"do not touch"
+
+
+# --- portable dump / load (#117) -------------------------------------------
+#
+# The gap that mattered most here is not that `dump`/`load` were unbound but what
+# binding them naively would have cost. A dump is whole-**store**: every
+# workspace, every actor including its `auth_subject`, every ACL grant, all blame.
+# So the binding is the *authorized* form only.
+
+
+@asyncio_test
+async def test_a_dump_round_trips_into_a_fresh_workspace():
+    ws = await workspace()
+    alice = await ws.create_human("alice", "sub:alice")
+    await ws.write_as(origofs.WriteCtx.actor(alice), "/notes.md", b"hello\n")
+    await ws.mkdir_as(origofs.WriteCtx.actor(alice), "/sub")
+
+    d = tempfile.mkdtemp()
+    dump = os.path.join(d, "dump.jsonl")
+    n = await ws.dump_as(origofs.WriteCtx.actor(alice), dump)
+    assert n > 0
+    # JSON Lines, readable with ordinary tools -- a stated goal of #117.
+    with open(dump) as f:
+        lines = [line for line in f if line.strip()]
+    assert len(lines) == n + 1, "one header record plus one per row"
+
+    dst = await workspace()
+    report = await dst.load(dump)
+    assert report["total_rows"] == n
+    assert report["skipped_tables"] == []
+    assert report["tables"]["actor"] == 1
+    # Names, structure and the identity registry survived.
+    assert [e["name"] for e in await dst.ls("/")] == ["notes.md", "sub"]
+    assert [a["display_name"] for a in await dst.list_actors()] == ["alice"]
+
+
+@asyncio_test
+async def test_a_dump_is_checked_at_the_workspace_root():
+    """A subtree grant must not buy a dump of the whole store.
+
+    This is the sharpest case for gating a read on a write permission: an actor
+    confined to `/tenant-a` that can dump has read every other tenant's metadata,
+    every actor's `auth_subject`, and every grant. Nothing narrows a dump, because
+    a dump has no path to narrow.
+    """
+    ws = await workspace()
+    admin = await ws.create_human("admin", None)
+    agent = await ws.create_agent("claude", "opus", admin)
+    await ws.mkdir_as(origofs.WriteCtx.actor(admin), "/tenant-a")
+    await ws.write_as(origofs.WriteCtx.actor(admin), "/tenant-a/f.txt", b"x")
+    await ws.set_acl_default_deny(True)
+    await ws.grant(agent, "/tenant-a", ["read", "write"], admin)
+    await ws.grant(admin, "/", ["read", "write"], admin)
+
+    d = tempfile.mkdtemp()
+    with pytest.raises(PermissionError) as denied:
+        await ws.dump_as(origofs.WriteCtx.actor(agent), os.path.join(d, "no.jsonl"))
+    assert "whole workspace" in str(denied.value)
+
+    # The actor holding `/` can, so this is about reach and not about dump being
+    # broken.
+    ok = os.path.join(d, "yes.jsonl")
+    assert await ws.dump_as(origofs.WriteCtx.actor(admin), ok) > 0
+
+
+@asyncio_test
+async def test_a_dump_falls_back_to_the_write_policy_with_no_grants():
+    """Binding the check did not break the workspaces that have no ACLs at all."""
+    ws = await workspace()
+    a = await ws.create_human("a", None)
+    await ws.write_as(origofs.WriteCtx.actor(a), "/f.txt", b"x")
+    assert not await ws.list_grants()
+    d = tempfile.mkdtemp()
+    assert await ws.dump_as(origofs.WriteCtx.actor(a), os.path.join(d, "d.jsonl")) > 0
+
+
+@asyncio_test
+async def test_a_load_refuses_a_store_that_is_already_configured():
+    """A load replaces the identity registry and every grant with the dump's.
+
+    `ensure_loadable` used to check content and branches only, so a store given
+    actors and grants but no files yet counted as pristine -- and that is the
+    recommended setup order, since deny-by-default is a deliberate switch thrown
+    *after* the grants are written. A load in that window is a silent, total
+    takeover of the workspace's authorization state.
+
+    There is deliberately no `load_as`: a load cannot be ACL-gated, because the
+    identities a check would consult are the ones it installs. Refusing a store
+    that has any is the check.
+    """
+    src = await workspace()
+    mallory = await src.create_human("mallory", "sub:mallory")
+    await src.write_as(origofs.WriteCtx.actor(mallory), "/f.txt", b"x")
+    await src.grant(mallory, "/", ["read", "write"], mallory)
+    d = tempfile.mkdtemp()
+    dump = os.path.join(d, "d.jsonl")
+    await src.dump_as(origofs.WriteCtx.actor(mallory), dump)
+
+    # The victim, set up exactly as an operator is told to set one up.
+    dst = await workspace()
+    admin = await dst.create_human("admin", "sub:admin")
+    await dst.grant(admin, "/", ["read", "write"], admin)
+    await dst.set_acl_default_deny(True)
+
+    with pytest.raises(ValueError) as refused:
+        await dst.load(dump)
+    assert "identity registry" in str(refused.value)
+
+    # And the refusal left the destination's authorization state as it was.
+    assert await dst.acl_default_deny() is True
+    grants = await dst.list_grants()
+    assert len(grants) == 1 and grants[0]["actor_id"] == admin
+    assert [a["display_name"] for a in await dst.list_actors()] == ["admin"]
+
+
+# --- attribution completeness (#128) ---------------------------------------
+
+
+@asyncio_test
+async def test_require_attribution_is_readable_settable_and_enforceable():
+    """All three halves, because two of them are useless alone.
+
+    Enforcement is surface-side by design -- the unattributed engine ops exist for
+    internal machinery and are exempt by construction -- so a workspace with the
+    switch on is only actually enforced on surfaces that call `ensure_attributed`.
+    The CLI does. A Python service could not, because none of this was bound: an
+    operator could set the switch with the CLI and a Python server would go on
+    accepting unattributed writes without a word.
+    """
+    ws = await workspace()
+    assert await ws.require_attribution() is False
+    await ws.ensure_attributed("write")  # off: no raise
+
+    await ws.set_require_attribution(True)
+    assert await ws.require_attribution() is True
+    with pytest.raises(PermissionError) as denied:
+        await ws.ensure_attributed("write")
+    assert "requires an actor" in str(denied.value)
+
+    # It is completeness, not access control: an *attributed* write is unaffected.
+    a = await ws.create_human("a", None)
+    await ws.write_as(origofs.WriteCtx.actor(a), "/f.txt", b"x")
+
+    await ws.set_require_attribution(False)
+    await ws.ensure_attributed("write")
+
+
+@asyncio_test
+async def test_ensure_may_write_workspace_is_the_path_less_check():
+    ws = await workspace()
+    admin = await ws.create_human("admin", None)
+    agent = await ws.create_agent("claude", "opus", admin)
+    await ws.set_acl_default_deny(True)
+    await ws.grant(agent, "/docs", ["read", "write"], admin)
+    await ws.grant(admin, "/", ["read", "write"], admin)
+
+    # Having no path is not the same as touching none.
+    await ws.ensure_may_write_workspace(origofs.WriteCtx.actor(admin), "commit")
+    with pytest.raises(PermissionError) as denied:
+        await ws.ensure_may_write_workspace(origofs.WriteCtx.actor(agent), "commit")
+    assert "whole workspace" in str(denied.value)
+
+
+# --- replication between workspaces ----------------------------------------
+
+
+@asyncio_test
+async def test_push_and_fetch_move_objects_without_touching_refs():
+    src = await workspace()
+    a = await src.create_human("a", "sub:a")
+    ctx = origofs.WriteCtx.actor(a)
+    await src.write_as(ctx, "/f.txt", b"hello\n")
+    head = await src.commit_as(ctx, "seed", "a <a@example.com>")
+
+    dst = await workspace()
+    stats = await src.push_objects(dst, head)
+    assert stats["objects"] > 0
+    # Refs are untouched, which is what makes this safe to run ahead of a resync.
+    assert await dst.branches() == []
+
+    # Idempotent: the second pass finds everything already there.
+    again = await src.push_objects(dst, head)
+    assert again["objects"] == 0 and again["skipped"] > 0
+
+    # And the fetch half is the same walk in the other direction.
+    third = await workspace()
+    assert (await third.fetch_objects(src, head))["objects"] > 0
+
+
+@asyncio_test
+async def test_resync_reconciles_a_branch_both_ways():
+    src = await workspace()
+    dst = await workspace()
+    a = await src.create_human("a", "sub:a")
+    ctx = origofs.WriteCtx.actor(a)
+    await src.write_as(ctx, "/f.txt", b"one\n")
+    await src.commit_as(ctx, "one", "a <a@example.com>")
+
+    report = await src.resync(dst, "main", "a <a@example.com>", "sync")
+    assert report["branch"] == "main"
+    assert report["outcome"] == "pushed"
+    assert report["head"] is not None
+    assert report["pushed"]["objects"] > 0
+    assert report["conflicts"] == []
+    # Blame travels with the content, which is the point of resync over a plain
+    # object copy.
+    assert report["blame_pushed"] > 0
+
+    # Nothing new to do the second time.
+    assert (await src.resync(dst, "main", "a <a@example.com>", "sync"))[
+        "outcome"
+    ] == "up-to-date"
+
+
+@asyncio_test
+async def test_a_bad_hash_is_a_value_error_not_a_missing_object():
+    src = await workspace()
+    dst = await workspace()
+    with pytest.raises(ValueError):
+        await src.push_objects(dst, "not-a-hash")
+
+
+# --- the change feed, written to ------------------------------------------
+
+
+@asyncio_test
+async def test_record_event_interleaves_with_file_changes():
+    ws = await workspace()
+    a = await ws.create_human("a", None)
+    await ws.write_as(origofs.WriteCtx.actor(a), "/f.txt", b"x")
+    seq = await ws.record_event(
+        "task_finished", "/f.txt", actor_id=a, detail="refactored the parser"
+    )
+    assert seq > 0
+
+    feed = await ws.watch(0)
+    kinds = [e["kind"] for e in feed]
+    assert "write" in kinds and "task_finished" in kinds
+    mine = next(e for e in feed if e["kind"] == "task_finished")
+    assert mine["path"] == "/f.txt"
+    assert mine["actor_id"] == a
+    assert mine["detail"] == "refactored the parser"
+    # One ordered stream: the host's own milestone came after the write it follows.
+    assert kinds.index("task_finished") > kinds.index("write")
+
+
+# --- explicit span attribution (M8) ----------------------------------------
+
+
+@asyncio_test
+async def test_write_as_blamed_attributes_sub_line_spans():
+    """`write_as` diffs line-by-line; this one is told who wrote which bytes.
+
+    That is the difference between "one collaborator touched this line" and the
+    character-level truth a co-editing session actually has, and only
+    `checkpoint_coedit` could reach it before -- so an editor integration that was
+    not origofs's own CRDT had no way to record what it knew.
+    """
+    ws = await workspace()
+    alice = await ws.create_human("alice", None)
+    bob = await ws.create_human("bob", None)
+    sa = await ws.create_session(alice, None)
+    sb = await ws.create_session(bob, None)
+
+    data = b"aaaabbbb"
+    await ws.write_as_blamed(
+        origofs.WriteCtx.session(alice, sa),
+        "/co.txt",
+        data,
+        [(alice, sa, 4), (bob, sb, 4)],
+    )
+
+    spans = await ws.blame("/co.txt")
+    by_actor = {s["actor"]["id"]: (s["byte_start"], s["byte_end"]) for s in spans}
+    # `byte_end` is exclusive.
+    assert by_actor[alice] == (0, 4)
+    assert by_actor[bob] == (4, 8)
+    assert bytes(await ws.read("/co.txt")) == data
+
+
+# --- the bounded read cache (#114) -----------------------------------------
+
+
+@asyncio_test
+async def test_a_cache_config_carries_both_bounds():
+    """The tier itself needs an object store to exercise; what is worth pinning
+    here is that the config reaches Rust with both bounds, since a cache that
+    honours only `max_bytes` is the one that fills someone's disk."""
+    c = origofs.CacheConfig("/tmp/origofs-cache")
+    assert "8589934592" in repr(c) and "2147483648" in repr(c)
+    c = origofs.CacheConfig("/tmp/origofs-cache", max_bytes=1 << 20, min_free_bytes=1 << 21)
+    assert "1048576" in repr(c) and "2097152" in repr(c)
