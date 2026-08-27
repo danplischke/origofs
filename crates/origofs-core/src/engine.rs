@@ -51,6 +51,63 @@ fn upload_concurrency() -> usize {
     })
 }
 
+/// How many chunk **fetches** a read keeps in flight (issue #113).
+///
+/// The mirror of [`upload_concurrency`], and it exists for the same reason: a read
+/// walks its manifest and pulls each covering chunk, and doing that one `await` at
+/// a time costs a full round trip per chunk. At the ~64 KiB average chunk size a
+/// 1 MiB read is ~16 chunks, so on an S3-backed workspace at 30 ms RTT it spent
+/// about half a second of pure latency per megabyte with the link idle throughout.
+/// The write path has had bounded concurrency since M1; the read path had not.
+///
+/// Bounded for the same three reasons — memory is `window x MAX_CHUNK`, object
+/// stores rate-limit, and an unbounded window would let one read queue the whole
+/// file. On the streaming paths it doubles as the look-ahead window, which is why
+/// those must not simply submit the entire plan.
+///
+/// Override with `ORIGOFS_FETCH_CONCURRENCY`; set it to 1 to recover the old
+/// strictly-sequential behaviour.
+fn fetch_concurrency() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORIGOFS_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(16)
+    })
+}
+
+/// The chunks covering `[off, end)` of `manifest`, each as `(hash, from, len)`
+/// **relative to that chunk**.
+///
+/// Every ranged read — buffered or streaming, borrowed or owned — needs exactly
+/// this walk, and it was open-coded at each of them. One helper, so the four call
+/// sites cannot drift on the boundary arithmetic (the trimming of the first and
+/// last chunk is the fiddly part) and so a fix lands everywhere at once.
+///
+/// `end` is expected to be clamped to `manifest.size` by the caller; entries are
+/// returned in byte order, which is the order the results must be concatenated in.
+fn covering_chunks(manifest: &Manifest, off: u64, end: u64) -> Vec<(Hash, u64, u64)> {
+    let mut plan: Vec<(Hash, u64, u64)> = Vec::new();
+    let mut pos: u64 = 0;
+    for c in &manifest.chunks {
+        let cstart = pos;
+        let cend = pos + c.len as u64;
+        pos = cend;
+        if cend <= off {
+            continue;
+        }
+        if cstart >= end {
+            break;
+        }
+        let from = off.max(cstart) - cstart;
+        let to = end.min(cend) - cstart;
+        plan.push((c.hash, from, to - from));
+    }
+    plan
+}
+
 /// Reject a single path component that could escape the workspace tree or
 /// corrupt the dentry graph: the traversal names `.`/`..`, an empty name, or a
 /// name embedding a path separator or NUL. Enforced at every metadata boundary
@@ -127,26 +184,27 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// An owned [`Stream`] over a manifest's chunks, one `store.get` at a time. The
-/// store handle is moved into the stream state, so the stream is self-contained
-/// (`'static` when `S` is) and can outlive the [`Fs`] it came from — unlike
-/// [`Fs::content_stream`], which borrows. Powers [`Fs::read_stream_owned`].
+/// An owned [`Stream`] over a manifest's chunks, with up to
+/// [`fetch_concurrency`] fetches in flight. The store handle is moved into the
+/// stream, so it is self-contained (`'static` when `S` is) and can outlive the
+/// [`Fs`] it came from — unlike [`Fs::content_stream`], which borrows. Powers
+/// [`Fs::read_stream_owned`].
+///
+/// `buffered` (not `buffer_unordered`) so chunks are yielded in manifest order,
+/// which *is* the file's byte order — the same reason `store_body` uses it on the
+/// write side. The bound doubles as the read-ahead window: a consumer that stops
+/// early leaves at most that many fetches wasted, rather than the whole file.
 fn owned_chunk_stream<S: ContentStore + 'static>(
     store: S,
     manifest: Manifest,
 ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
-    futures::stream::unfold(
-        Some((store, manifest.chunks.into_iter())),
-        |state| async move {
-            let (store, mut chunks) = state?;
-            let c = chunks.next()?;
-            match store.get(&c.hash).await {
-                Ok(bytes) => Some((Ok(bytes), Some((store, chunks)))),
-                // Surface the error once, then end the stream (state -> None).
-                Err(e) => Some((Err(e), None)),
-            }
-        },
-    )
+    let store = std::sync::Arc::new(store);
+    futures::stream::iter(manifest.chunks)
+        .map(move |c| {
+            let store = store.clone();
+            async move { store.get(&c.hash).await }
+        })
+        .buffered(fetch_concurrency())
 }
 
 /// A filesystem over a metadata store and a content store.
@@ -828,8 +886,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // use [`Self::read_stream`] instead. The reservation is a capped hint
         // rather than the manifest's declared size — see `Manifest::capacity_hint`.
         let mut buf = BytesMut::with_capacity(manifest.capacity_hint());
-        for c in &manifest.chunks {
-            buf.extend_from_slice(&self.content.get(&c.hash).await?);
+        // Bounded-concurrency, ordered fetch (issue #113). This is what `read`
+        // itself uses, so it is the single most-travelled read path in the engine.
+        let mut parts = self.content_stream(manifest);
+        while let Some(part) = parts.next().await {
+            buf.extend_from_slice(&part?);
         }
         Ok(buf.freeze())
     }
@@ -851,32 +912,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         C: Clone + 'static,
     {
         let end = off.saturating_add(len).min(manifest.size);
-        let mut plan: Vec<(Hash, u64, u64)> = Vec::new();
-        let mut pos: u64 = 0;
-        for c in &manifest.chunks {
-            let cstart = pos;
-            let cend = pos + c.len as u64;
-            pos = cend;
-            if cend <= off {
-                continue;
-            }
-            if cstart >= end {
-                break;
-            }
-            let from = off.max(cstart) - cstart;
-            let to = end.min(cend) - cstart;
-            plan.push((c.hash, from, to - from));
-        }
-        let store = self.content.clone();
-        futures::stream::unfold(Some((store, plan.into_iter())), |state| async move {
-            let (store, mut plan) = state?;
-            let (hash, from, len) = plan.next()?;
-            match store.get_range(&hash, from, len).await {
-                Ok(bytes) => Some((Ok(bytes), Some((store, plan)))),
-                Err(e) => Some((Err(e), None)),
-            }
-        })
-        .boxed()
+        let plan = covering_chunks(&manifest, off, end);
+        let store = std::sync::Arc::new(self.content.clone());
+        // Bounded look-ahead, in order — see `owned_chunk_stream`.
+        futures::stream::iter(plan)
+            .map(move |(hash, from, len)| {
+                let store = store.clone();
+                async move { store.get_range(&hash, from, len).await }
+            })
+            .buffered(fetch_concurrency())
+            .boxed()
     }
 
     /// Open a file for streaming and report its size, so a caller can answer a
@@ -911,33 +956,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let end = off.saturating_add(len).min(manifest.size);
         // Precompute each covering chunk's (hash, from, to) so the stream itself
         // stays a simple fetch loop.
-        let mut plan: Vec<(Hash, u64, u64)> = Vec::new();
-        let mut pos: u64 = 0;
-        for c in &manifest.chunks {
-            let cstart = pos;
-            let cend = pos + c.len as u64;
-            pos = cend;
-            if cend <= off {
-                continue;
-            }
-            if cstart >= end {
-                break;
-            }
-            let from = off.max(cstart) - cstart;
-            let to = end.min(cend) - cstart;
-            plan.push((c.hash, from, to - from));
-        }
-        futures::stream::unfold(
-            Some((&self.content, plan.into_iter())),
-            |state| async move {
-                let (content, mut plan) = state?;
-                let (hash, from, len) = plan.next()?;
-                match content.get_range(&hash, from, len).await {
-                    Ok(bytes) => Some((Ok(bytes), Some((content, plan)))),
-                    Err(e) => Some((Err(e), None)),
-                }
-            },
-        )
+        let plan = covering_chunks(&manifest, off, end);
+        let content = &self.content;
+        // Bounded look-ahead, in order — see `owned_chunk_stream`.
+        futures::stream::iter(plan)
+            .map(move |(hash, from, len)| async move { content.get_range(&hash, from, len).await })
+            .buffered(fetch_concurrency())
     }
 
     async fn open_for_stream(&self, path: &str) -> Result<Option<Manifest>> {
@@ -979,21 +1003,17 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
     }
 
-    /// A borrowed [`Stream`] over a manifest's chunks, one `content.get` at a
-    /// time. Borrows `self`, so the stream cannot outlive this handle.
-    fn content_stream(&self, manifest: Manifest) -> impl Stream<Item = Result<Bytes>> + Send + '_ {
-        futures::stream::unfold(
-            Some((&self.content, manifest.chunks.into_iter())),
-            |state| async move {
-                let (content, mut chunks) = state?;
-                let c = chunks.next()?;
-                match content.get(&c.hash).await {
-                    Ok(bytes) => Some((Ok(bytes), Some((content, chunks)))),
-                    // Surface the error once, then end the stream (state -> None).
-                    Err(e) => Some((Err(e), None)),
-                }
-            },
-        )
+    /// A borrowed [`Stream`] over a manifest's chunks, with up to
+    /// [`fetch_concurrency`] fetches in flight. Borrows `self`, so the stream
+    /// cannot outlive this handle. See [`owned_chunk_stream`] for why `buffered`.
+    pub(crate) fn content_stream(
+        &self,
+        manifest: Manifest,
+    ) -> impl Stream<Item = Result<Bytes>> + Send + '_ {
+        let content = &self.content;
+        futures::stream::iter(manifest.chunks)
+            .map(move |c| async move { content.get(&c.hash).await })
+            .buffered(fetch_concurrency())
     }
 
     /// Like [`Self::read_stream`] but the returned stream owns its content handle,
@@ -1056,21 +1076,14 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // store (see `Manifest::capacity_hint`).
         let mut buf =
             BytesMut::with_capacity(((end - off) as usize).min(manifest.capacity_hint().max(1)));
-        let mut pos: u64 = 0;
-        for c in &manifest.chunks {
-            let cstart = pos;
-            let cend = pos + c.len as u64;
-            pos = cend;
-            if cend <= off {
-                continue;
-            }
-            if cstart >= end {
-                break;
-            }
-            let from = off.max(cstart) - cstart;
-            let to = end.min(cend) - cstart;
-            let part = self.content.get_range(&c.hash, from, to - from).await?;
-            buf.extend_from_slice(&part);
+        // Bounded-concurrency fetch, ordered: `buffered` keeps up to N `get_range`s
+        // in flight but yields them in submission order, so appending as they
+        // arrive still reconstructs the range in byte order (issue #113).
+        let mut parts = futures::stream::iter(covering_chunks(&manifest, off, end))
+            .map(|(hash, from, len)| async move { self.content.get_range(&hash, from, len).await })
+            .buffered(fetch_concurrency());
+        while let Some(part) = parts.next().await {
+            buf.extend_from_slice(&part?);
         }
         Ok(buf.freeze())
     }

@@ -12,6 +12,7 @@ use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
 use crate::types::{DirEntry, DirEntryAttr, DirPage, FileKind, Ino, Inode, InodeInit};
 use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use std::collections::HashMap;
 
 const S_IFDIR: u32 = 0o040000;
@@ -121,20 +122,14 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             return Ok(Bytes::new());
         }
         let mut buf = BytesMut::with_capacity((end - offset) as usize);
-        let mut pos = 0u64;
-        for c in &manifest.chunks {
-            let cstart = pos;
-            let cend = pos + c.len as u64;
-            pos = cend;
-            if cend <= offset {
-                continue;
-            }
-            if cstart >= end {
-                break;
-            }
-            let from = offset.max(cstart) - cstart;
-            let to = end.min(cend) - cstart;
-            buf.extend_from_slice(&self.content.get_range(&c.hash, from, to - from).await?);
+        // Bounded-concurrency, ordered fetch (issue #113). The kernel issues a
+        // mount read as many modest requests, each covering a handful of chunks;
+        // fetching those serially made every one of them cost a round trip per
+        // chunk. `read_range_stream` yields in byte order, so appending as parts
+        // arrive still reconstructs the range correctly.
+        let mut parts = self.read_range_stream(manifest, offset, end - offset);
+        while let Some(part) = parts.next().await {
+            buf.extend_from_slice(&part?);
         }
         Ok(buf.freeze())
     }
