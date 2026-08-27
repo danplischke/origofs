@@ -88,6 +88,18 @@ fn fetch_concurrency() -> usize {
 /// function of a rolling window far smaller than a chunk.
 const SPLICE_MARGIN: usize = 1;
 
+/// Chunk length used to represent a run of zeroes — a **hole** left by a growing
+/// truncate or by a write that starts past EOF.
+///
+/// The chunker's maximum, so a hole never produces a chunk larger than one the
+/// content-defined path could produce: `perf`'s chunk-size audit, the reassembly
+/// buffers, and every reader already reason in terms of that bound, and a hole is
+/// not the place to start violating it. Larger would mean fewer manifest entries
+/// per hole; it would also make the first write *into* a hole re-chunk a
+/// proportionally larger neighbourhood, since [`SPLICE_MARGIN`] is counted in
+/// chunks.
+const HOLE_CHUNK: u32 = crate::chunk::MAX_CHUNK;
+
 /// The chunks covering `[off, end)` of `manifest`, each as `(hash, from, len)`
 /// **relative to that chunk**.
 ///
@@ -655,6 +667,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// window is widened by [`SPLICE_MARGIN`] chunks on each side so FastCDC has
     /// room to re-discover natural boundaries and the seam usually heals; the
     /// residual cost is two chunks per write, against re-hashing the entire file.
+    ///
+    /// # Holes
+    ///
+    /// A write that starts *past* EOF leaves a gap of zeroes behind it. That gap
+    /// is emitted as [zero chunks](Self::append_hole) rather than being folded
+    /// into the materialized region: writing ten bytes at offset 1 GiB of a small
+    /// file must not allocate and hash a gigabyte of zeroes to get there. The
+    /// existing chunks are left alone in that case — there is no seam to heal
+    /// across a hole, so there is nothing for the [`SPLICE_MARGIN`] widening to
+    /// buy.
     pub(crate) async fn splice_body(
         &self,
         manifest: &Manifest,
@@ -664,12 +686,45 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| OrigoFSError::TooLarge("write end overflows u64".into()))?;
+
+        // A zero-length write has no effect — `write(2)` says so explicitly for a
+        // regular file, so it must not extend the body and must not disturb it.
+        //
+        // Returning here is also what keeps the arithmetic below sound. That code
+        // assumes the write either intersects an existing chunk or extends the
+        // body, and an empty write can do neither: no chunk satisfies
+        // `cend > offset && cstart < end` when `end == offset`, so an empty write
+        // *inside* the file took the past-EOF branch and anchored on the tail.
+        // `region_start` then sat past `offset`, and `offset - region_start`
+        // underflowed — a panic in debug, and an out-of-bounds slice index in
+        // release. A zero-length write at offset 0, or at any chunk boundary, was
+        // enough; `nfs.rs` hands one straight through from a legal NFSv3 WRITE of
+        // count 0.
+        if data.is_empty() {
+            return self.address_of(manifest).await;
+        }
+
         let new_size = manifest.size.max(end);
         let n = manifest.chunks.len();
 
-        // Chunks intersecting the written range. A write starting at or past EOF
+        // A write starting past EOF: keep the body as it is, fill the gap with
+        // zero chunks, and append the new bytes. Folding the gap into the
+        // materialized region (which is what the tail-anchored path below would
+        // do) is `O(hole)` in both allocation and hashing for bytes that are all
+        // zero and mostly not being written.
+        if offset > manifest.size {
+            let mut chunks = manifest.chunks.clone();
+            self.append_hole(&mut chunks, offset - manifest.size)
+                .await?;
+            self.append_chunked(&mut chunks, data).await?;
+            return self.seal(Manifest { size: end, chunks }).await;
+        }
+
+        // Chunks intersecting the written range. A write starting exactly at EOF
         // intersects nothing, and anchors on the tail instead so the last chunk
-        // can merge with the new bytes rather than leaving a runt behind.
+        // can merge with the new bytes rather than leaving a runt behind. (A write
+        // starting *past* EOF returned above, and an empty one before that, so
+        // `region_start <= offset` holds for every case that reaches here.)
         let (mut lo, mut hi) = (n, 0usize);
         let mut found = false;
         let mut pos = 0u64;
@@ -736,7 +791,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 region.extend_from_slice(&part?);
             }
         }
-        // A write past EOF leaves a hole, which reads back as zeroes.
+        // An append extends past what the replaced chunks cover; those trailing
+        // bytes are filled by `data` itself immediately below.
         region.resize(region_len, 0);
 
         let at = usize::try_from(offset - region_start)
@@ -744,12 +800,31 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         region[at..at + data.len()].copy_from_slice(data);
 
         // Re-chunk only the region, then splice its chunks into the existing list.
-        let bounds = crate::util::blocking_section(|| chunk_bounds(&region));
-        let region = &region;
+        let mut chunks = Vec::with_capacity(manifest.chunks.len() + 1);
+        chunks.extend_from_slice(&manifest.chunks[..lo]);
+        self.append_chunked(&mut chunks, &region).await?;
+        if n > 0 && hi + 1 < n {
+            chunks.extend_from_slice(&manifest.chunks[hi + 1..]);
+        }
+
+        self.seal(Manifest {
+            size: new_size,
+            chunks,
+        })
+        .await
+    }
+
+    /// Content-defined-chunk `data` and append the resulting chunks to `chunks`.
+    ///
+    /// The upload is bounded-concurrency and `buffered`, so results arrive in
+    /// submission order — which *is* byte order, and therefore the order a
+    /// manifest's chunk list has to be in.
+    async fn append_chunked(&self, chunks: &mut Vec<ChunkRef>, data: &[u8]) -> Result<()> {
+        let bounds = crate::util::blocking_section(|| chunk_bounds(data));
         let fresh: Vec<ChunkRef> = futures::stream::iter(bounds)
-            .map(move |(off, len)| async move {
+            .map(|(off, len)| async move {
                 self.content
-                    .put(&region[off..off + len])
+                    .put(&data[off..off + len])
                     .await
                     .map(|hash| ChunkRef {
                         hash,
@@ -759,39 +834,100 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .buffered(upload_concurrency())
             .try_collect()
             .await?;
-
-        let mut chunks = Vec::with_capacity(manifest.chunks.len() + fresh.len());
-        chunks.extend_from_slice(&manifest.chunks[..lo]);
         chunks.extend(fresh);
-        if n > 0 && hi + 1 < n {
-            chunks.extend_from_slice(&manifest.chunks[hi + 1..]);
-        }
+        Ok(())
+    }
 
-        let spliced = Manifest {
-            size: new_size,
-            chunks,
-        };
+    /// Append chunks covering `len` bytes of **zeroes** to `chunks`.
+    ///
+    /// A hole is content like any other as far as the manifest is concerned — it
+    /// is a run of chunks whose bytes happen to be zero — but it must not *cost*
+    /// like content. Because the store is content-addressed and deduplicating, a
+    /// hole of any size stores at most two distinct objects: one full
+    /// [`HOLE_CHUNK`] of zeroes that every whole chunk in the run shares, and a
+    /// short remainder. Memory stays `O(HOLE_CHUNK)` however large the hole is.
+    ///
+    /// What this does *not* buy is a sparse manifest: the run still costs one
+    /// 36-byte entry per [`HOLE_CHUNK`], so a hole's manifest is about the size a
+    /// real body of the same length would have (a little smaller, since
+    /// `HOLE_CHUNK` is the chunker's maximum rather than its average). Making a
+    /// hole free in the manifest too means a sentinel chunk kind, which is a
+    /// change to a frozen on-disk format — see `docs/LIMITS.md`.
+    async fn append_hole(&self, chunks: &mut Vec<ChunkRef>, len: u64) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let full = len / HOLE_CHUNK as u64;
+        let rest = (len % HOLE_CHUNK as u64) as u32;
+        // Reserve up front so an absurd hole fails cleanly here rather than after
+        // pushing its way into an allocator abort. `Manifest::encode` guards the
+        // format's `u32` chunk count; this guards the `Vec` that gets there first.
+        let extra = usize::try_from(full)
+            .ok()
+            .and_then(|f| f.checked_add(usize::from(rest > 0)))
+            .ok_or_else(|| OrigoFSError::TooLarge(format!("hole of {len} bytes")))?;
+        chunks.try_reserve(extra).map_err(|_| {
+            OrigoFSError::TooLarge(format!("hole of {len} bytes needs {extra} chunks"))
+        })?;
+        if full > 0 {
+            let hash = self.content.put(&vec![0u8; HOLE_CHUNK as usize]).await?;
+            chunks.extend(std::iter::repeat_n(
+                ChunkRef {
+                    hash,
+                    len: HOLE_CHUNK,
+                },
+                extra - usize::from(rest > 0),
+            ));
+        }
+        if rest > 0 {
+            let hash = self.content.put(&vec![0u8; rest as usize]).await?;
+            chunks.push(ChunkRef { hash, len: rest });
+        }
+        Ok(())
+    }
+
+    /// Store `manifest` and return its address, with the same durability barrier
+    /// `store_body` uses: content durable before the metadata referencing it.
+    async fn seal(&self, manifest: Manifest) -> Result<(Option<Hash>, u64)> {
         debug_assert_eq!(
-            spliced.chunks.iter().map(|c| c.len as u64).sum::<u64>(),
-            new_size,
-            "spliced chunk lengths must sum to the declared size"
+            manifest.chunks.iter().map(|c| c.len as u64).sum::<u64>(),
+            manifest.size,
+            "chunk lengths must sum to the declared size"
         );
-        let mhash = self.content.put(&spliced.encode()?).await?;
-        // Same durability barrier as `store_body`: content durable before the
-        // metadata that references it.
+        let size = manifest.size;
+        let hash = self.content.put(&manifest.encode()?).await?;
         self.content.flush().await?;
-        Ok((Some(mhash), new_size))
+        Ok((Some(hash), size))
+    }
+
+    /// The address of a body that is not being changed.
+    ///
+    /// An empty body has no manifest object at all — `store_body` returns `None`
+    /// for one — so this reports the same thing rather than minting an object for
+    /// nothing.
+    async fn address_of(&self, manifest: &Manifest) -> Result<(Option<Hash>, u64)> {
+        if manifest.chunks.is_empty() {
+            return Ok((None, manifest.size));
+        }
+        self.seal(manifest.clone()).await
     }
 
     /// Resize `manifest` to `size` without re-chunking the whole body (issue #111).
     ///
     /// Shrinking drops whole chunks past the new end and re-chunks only the one
-    /// straddling it. Growing appends zeroes, which is `splice_body` of an empty
-    /// write at the new end — a hole reads back as zeroes either way.
+    /// straddling it. Growing appends a hole — [zero chunks](Self::append_hole),
+    /// which is what a hole reads back as.
     ///
     /// The old path read the entire body, resized the buffer, and re-ran FastCDC
     /// over all of it, so truncating a 1 GiB file to zero cost a full read and a
     /// full re-chunk of bytes that were being discarded.
+    ///
+    /// Growth used to route through `splice_body` as a one-byte write at the new
+    /// end, which reached the same *result* by materializing the entire hole first:
+    /// growing an empty file to 256 MiB allocated and hashed 256 MiB of zeroes and
+    /// took over a second, and growing it to a few tens of gigabytes — an ordinary
+    /// `truncate -s` for a sparse file — failed outright on the allocation. Only
+    /// the manifest ever needed to change.
     pub(crate) async fn resize_body(
         &self,
         manifest: &Manifest,
@@ -799,20 +935,15 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     ) -> Result<(Option<Hash>, u64)> {
         if size == manifest.size {
             // Nothing to do, but the caller still needs an address for the body.
-            if manifest.chunks.is_empty() {
-                return Ok((None, 0));
-            }
-            let h = self.content.put(&manifest.encode()?).await?;
-            self.content.flush().await?;
-            return Ok((Some(h), size));
+            return self.address_of(manifest).await;
         }
         if size == 0 {
             return Ok((None, 0));
         }
         if size > manifest.size {
-            // Growing: the hole is zeroes. A zero-length splice at the new end
-            // extends the manifest without materializing the whole file.
-            return self.splice_body(manifest, size - 1, &[0u8]).await;
+            let mut chunks = manifest.chunks.clone();
+            self.append_hole(&mut chunks, size - manifest.size).await?;
+            return self.seal(Manifest { size, chunks }).await;
         }
 
         // Shrinking. Keep whole chunks that end at or before the new size; the one
@@ -848,15 +979,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
         }
 
-        let resized = Manifest { size, chunks };
-        debug_assert_eq!(
-            resized.chunks.iter().map(|c| c.len as u64).sum::<u64>(),
-            size,
-            "resized chunk lengths must sum to the declared size"
-        );
-        let h = self.content.put(&resized.encode()?).await?;
-        self.content.flush().await?;
-        Ok((Some(h), size))
+        self.seal(Manifest { size, chunks }).await
     }
 
     pub(crate) async fn store_body(&self, data: &[u8]) -> Result<(Option<Hash>, u64)> {

@@ -22,7 +22,8 @@ hit: **stream, or buffer.**
 | `read`, Python `read` | whole body resident |
 | HTTP `PUT /v1/files/*` | whole body resident, capped |
 | MCP `origofs_write` / `origofs_read` | whole body, as a JSON string |
-| FUSE / NFS `write`, `truncate` | **whole file** resident, per `write(2)` |
+| FUSE / NFS `write` | **the written range**, plus a chunk either side |
+| FUSE / NFS `truncate` | one chunk (shrink) or nothing (grow) |
 
 A buffered write of an N-byte file holds roughly 2N (`write_as` also loads the
 previous body to diff against it). From Python it was ~3N, because pyo3 copies the
@@ -121,6 +122,20 @@ since #112 the FUSE mount buffers per file handle so the kernel's small requests
 are coalesced before they reach the engine. Measured: quadrupling a file multiplies
 the work by ~4.5x rather than ~16x, and a 4 KiB write into a 4 MiB file touches
 ~270 KiB rather than the whole 8 MiB of read-plus-rewrite.
+
+**Holes cost a manifest entry, not their bytes.** A growing `truncate`, or a write
+that starts past EOF, leaves a run of zeroes behind it. That run is emitted as zero
+chunks rather than being materialized: because the store is content-addressed and
+deduplicating, a hole of any size stores at most two distinct objects and holds one
+chunk in memory. Growth used to route through the splice path as a one-byte write at
+the new end, which allocated and hashed the entire gap first — growing an empty file
+to 256 MiB took over a second, and an ordinary `truncate -s` for a sparse file failed
+on the allocation.
+
+The manifest is **not** sparse, though: a hole still costs one 36-byte entry per
+256 KiB, so a 1 TiB hole is a ~150 MB manifest — about what a real 1 TiB body costs,
+and held whole in memory per the manifest note above. Making a hole free there needs a
+sentinel chunk kind, which is a change to a frozen on-disk format.
 
 What remains: two writers at *different* offsets of one file still contend, because
 both compare-and-set the same inode `manifest_hash` (retried up to 16 times); and
