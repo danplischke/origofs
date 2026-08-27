@@ -24,9 +24,9 @@ pub use origofs_core::{
     DEFAULT_GC_GRACE_SECS, DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event,
     EventInit, FileKind, GcStats, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError,
     Owner, PackStore, Passage, PassageOptions, Presence, RebuildReport, ResyncOutcome,
-    ResyncReport, Segmentation, Suggestion, SuggestionContent, SuggestionInit, SuggestionKind,
-    SuggestionStatus, TieredStore, ToolCallInit, TransferStats, VerifyingStore, VersioningMode,
-    WriteCtx, WriteOutcome, WritePolicy,
+    ResyncReport, Scope, ScopeError, Segmentation, Suggestion, SuggestionContent, SuggestionInit,
+    SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats, VerifyingStore,
+    VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
 // Backend-specific re-exports, gated to match `origofs-core`'s own features.
 #[cfg(feature = "encryption")]

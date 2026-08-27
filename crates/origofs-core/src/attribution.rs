@@ -19,6 +19,7 @@ use crate::content::ContentStore;
 use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
+use crate::scope::Scope;
 use crate::types::{Hash, Ino};
 use similar::{ChangeTag, TextDiff};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1186,7 +1187,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         session_id: i64,
         path_prefix: Option<&str>,
     ) -> Result<Vec<String>> {
-        let scope = path_prefix.map(PathScope::new).transpose()?;
+        // One scope implementation for the whole tree (issue #125). This used to be
+        // a local `PathScope` with the same directory-boundary rule, which made three
+        // copies of that rule counting the Python router's; `Scope` is now the single
+        // one, and it additionally refuses a `..` in the prefix.
+        let scope = path_prefix.map(Scope::at).transpose()?;
 
         // Distinct files this actor touched in this session (from the op-log),
         // filtered to the scope *before* any of them is written.
@@ -1194,7 +1199,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let mut paths: Vec<(Ino, String)> = Vec::new();
         for op in ops {
             if let Some(s) = &scope
-                && !s.covers(&op.path)
+                && !s.contains(Some(op.path.as_str()))
             {
                 continue;
             }
@@ -1280,77 +1285,6 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             changed.push(path);
         }
         Ok(changed)
-    }
-}
-
-/// A `/`-boundary path prefix, for scoping an operation to a subtree.
-///
-/// The naive `path.starts_with(prefix)` is wrong in a way that matters for the
-/// multi-tenant case it exists to serve: `/tenant-a` would also match
-/// `/tenant-abc`, so the scope would leak into exactly the neighbouring tenant it
-/// was meant to exclude.
-struct PathScope {
-    /// Normalized: absolute, no trailing slash (so the root is `""`).
-    prefix: String,
-}
-
-impl PathScope {
-    fn new(prefix: &str) -> Result<Self> {
-        if !prefix.starts_with('/') {
-            return Err(OrigoFSError::InvalidArgument(format!(
-                "path prefix must be absolute, got {prefix:?}"
-            )));
-        }
-        Ok(Self {
-            prefix: prefix.trim_end_matches('/').to_string(),
-        })
-    }
-
-    /// Whether `path` is the prefix itself or sits under it.
-    fn covers(&self, path: &str) -> bool {
-        // The root prefix (`/`, normalized to `""`) covers everything.
-        if self.prefix.is_empty() {
-            return true;
-        }
-        path == self.prefix
-            || (path.starts_with(&self.prefix)
-                && path.as_bytes().get(self.prefix.len()) == Some(&b'/'))
-    }
-}
-
-#[cfg(test)]
-mod path_scope_tests {
-    use super::PathScope;
-
-    #[test]
-    fn a_prefix_matches_only_on_directory_boundaries() {
-        let s = PathScope::new("/tenant-a").unwrap();
-        assert!(s.covers("/tenant-a"));
-        assert!(s.covers("/tenant-a/notes.txt"));
-        assert!(s.covers("/tenant-a/deep/nested/f"));
-        // The whole point: a sibling sharing a textual prefix is not covered.
-        assert!(!s.covers("/tenant-abc/notes.txt"));
-        assert!(!s.covers("/tenant-a2"));
-        assert!(!s.covers("/other/tenant-a"));
-    }
-
-    #[test]
-    fn a_trailing_slash_is_accepted_and_means_the_same_thing() {
-        let with = PathScope::new("/tenant-a/").unwrap();
-        assert!(with.covers("/tenant-a/notes.txt"));
-        assert!(!with.covers("/tenant-abc/notes.txt"));
-    }
-
-    #[test]
-    fn the_root_covers_everything() {
-        let s = PathScope::new("/").unwrap();
-        assert!(s.covers("/"));
-        assert!(s.covers("/anything/at/all"));
-    }
-
-    #[test]
-    fn a_relative_prefix_is_refused() {
-        assert!(PathScope::new("tenant-a").is_err());
     }
 }
 
