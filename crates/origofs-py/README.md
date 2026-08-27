@@ -345,20 +345,59 @@ alembic -x db_url=sqlite:///./dev.db upgrade head
 
 ## API surface
 
-`Workspace`: `open_local` · `open_local_packed` · `open_pg` · `open_s3` ·
-`open_s3_packed` · `open_pg_s3` · `open_pg_s3_packed` · `open_object_memory` ·
-`read` · `read_range` · `write` ·
-`write_as` · `mkdir_p` · `ls` · `stat` · `remove` · `rename` · `commit` · `log` ·
-`status` · `diff` · `diff_file` · `create_branch` · `checkout` · `branches` ·
-`current_branch` · `rebuild` · `scan` ·
-`create_human` · `create_agent` · `actor_by_subject` · `actor` · `list_actors` ·
-`find_or_create_human` · `find_or_create_agent` · `create_session` · `blame` ·
-`passages` (RAG) · `watch` · `subscribe` · `presence` · `touch` · `suggest` · `suggest_delete` ·
-`list_suggestions` ·
-`get_suggestion` · `suggestion_diff` · `suggestion_content` · `accept_suggestion` ·
-`reject_suggestion` ·
-`mount` · `serve_nfs`. Plus `WriteCtx`, `S3Config`, `Mount`, `content_hash()`,
-`fuse_mountable()`.
+**`python/origofs/__init__.pyi` is the complete, authoritative list** — every
+method with its signature, its return shape as a `TypedDict`, and a note on what
+it is for. Your editor already reads it. This section is a map, not an index:
+enumerating the methods here means maintaining a second copy that silently falls
+behind, which is how the bindings drifted from the engine in the first place.
+
+Three tests keep the stub honest rather than aspirational.
+`test_parity.py::test_every_sdk_method_is_bound_or_has_a_reason` diffs the Rust
+`Workspace` against the pyo3 one, so an engine method with no binding fails
+rather than going unnoticed; `test_the_type_stub_declares_every_binding` diffs
+the stub against the bindings; and `test_stub_records.py` builds one live
+instance of every declared record and compares its keys.
+
+`Workspace` covers, roughly in the order you meet them:
+
+- **opening** — `open_local` and `open_pg` for a local store; `open_s3` /
+  `open_gcs` and their `open_pg_*` forms for object storage, each with
+  `_packed` (few big PUTs), `_encrypted` (at rest), and `_cached` (a bounded
+  local read tier) variants; `open_object_memory` for tests.
+- **files** — `read` · `read_range` · `read_to_path` · `write` · `write_path` ·
+  `ls` · `stat` · `mkdir_p` · `remove` · `rename` · `symlink` · `link` ·
+  `chmod` · `chown` · the `*xattr` family · `statfs`.
+- **attribution** — the `_as` form of every mutation (`write_as`,
+  `mkdir_as`, `remove_or_propose`, …), `write_as_blamed` for explicit byte-range
+  authorship, `blame`, `edit_ops`, and `revert_session_as`.
+- **identity and permission** — `create_human` / `create_agent` /
+  `find_or_create_*` · `create_session` · `set_write_policy` ·
+  `grant` / `revoke` / `list_grants` / `effective_perms` ·
+  `ensure_may_write_at` / `ensure_may_write_workspace` ·
+  `require_attribution` and `ensure_attributed`.
+- **versioning** — `commit_as` · `log` · `status` · `diff` · branches ·
+  `checkout_as` · `merge` / `merge_branch` · `conflicts` · locks.
+- **review** — `suggest` · `list_suggestions` · `suggestion_diff` ·
+  `accept_suggestion` / `reject_suggestion`.
+- **collaboration** — `watch` · `subscribe` · `record_event` · `presence` ·
+  the `coedit` family (CRDT documents, tree documents, the cross-worker relay).
+- **operations** — `gc` · `flush` · `repack` · `trash` · `usage` / `quota` ·
+  `backup_metadata` · `dump_as` / `load` · `resync` / `push_objects` /
+  `fetch_objects` · `rebuild` / `scan` · `migrate` · `ready` · `bench` ·
+  `file_layout`.
+- **mounting** — `mount` (FUSE, Linux) · `serve_nfs` (Unix).
+
+Plus `WriteCtx`, `Scope`, `S3Config`, `GcsConfig`, `CacheConfig`, `Mount`,
+`content_hash()` and `fuse_mountable()`.
+
+One asymmetry worth knowing: **`dump_as` takes a `WriteCtx` where the Rust
+`dump` does not**, and the unauthorized form is not bound. A dump is
+whole-*store* — every workspace, every actor including its `auth_subject`, every
+ACL grant, all blame — and none of it is path-scoped, so no `Scope` narrows it
+and no subtree grant bounds it. It is checked as `write` at `/`. `load` has no
+`_as` counterpart for the opposite reason: it cannot be ACL-gated, because the
+identities a check would consult are the ones it installs, so it refuses any
+store that already has actors or grants.
 
 Integrations (own extras): `origofs.fastapi` (HTTP router) · `origofs.fsspec`
 (`OrigoFileSystem`, the fsspec filesystem — also a `UPath("origofs://…")` via

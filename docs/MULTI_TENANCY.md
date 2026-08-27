@@ -168,8 +168,28 @@ which is the invariant above, applied to the path prefix.
 This is **not** the isolation model of §5: it is one metadata store and one
 content store, so it inherits every hazard of sharing them, and a bug in the
 router is a cross-tenant bug. It is the density end of the menu with a usable
-front door, not a boundary. The Rust HTTP API has the same workspace-global
-routes and no equivalent yet.
+front door, not a boundary. The Rust HTTP API has the same shape via
+`ApiOptions::root`, reachable from the binary as `origofs serve --root` since #129.
+
+**The operations no scope can narrow are the ones to keep away from tenants.**
+A `Scope` resolves *paths*, so an operation without one is outside it entirely:
+
+- **`dump` is whole-store, not whole-workspace.** It carries every workspace,
+  every actor — including each `auth_subject`, the value identity resolves by —
+  every ACL grant, all blame and the audit log. One tenant calling it reads every
+  other tenant's metadata. `dump_as` gates it on `write` at `/`, and the Python
+  binding exposes *only* that form; the CLI keeps the unauthorized one because a
+  local process holding the workspace directory has `meta.db` on disk anyway.
+- **`load` replaces the identity registry and every grant with the dump's.** It
+  cannot be ACL-gated — the identities a check would consult are the ones it
+  installs — so it refuses any store that already holds content, branches, actors
+  or grants. The actor and grant halves of that check are load-bearing: without
+  them, a store configured in the recommended order (actors and grants written
+  first, `acl_default_deny` switched on after) was "pristine" and a load into it
+  was a silent, total takeover.
+- The same reasoning is why `commit`, `checkout`, `create_branch` and an
+  unbounded `revert_session` take `ensure_may_write_workspace` rather than the
+  path-less policy check: having no path is not the same as touching none.
 
 ---
 
