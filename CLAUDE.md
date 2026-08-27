@@ -164,12 +164,24 @@ write path enforces this and you must not weaken it:
   only on `accept`, and `accept` lands the edit **attributed to the original
   author** while recording the approver (and refuses a stale base). Reviewer must
   differ from author.
-- **The `Propose` write policy is enforced in the engine, not per surface.**
+- **The write policy and the ACLs are enforced in the engine, not per surface.**
   Every *attributed* mutation on `Fs` — `write_or_propose`, `remove_or_propose`,
-  `rename_as`, `mkdir_as`, `symlink_as`, `commit_as`, `accept_suggestion`,
-  `reject_suggestion` — runs `ensure_may_write` (`suggest.rs`), which refuses a
-  propose-only actor with `OrigoFSError::Denied` (`403` on the HTTP API). Ops with
-  a propose-shaped equivalent queue instead of refusing. **A new mutating endpoint
+  `rename_as`, `mkdir_as`, `symlink_as`, `commit_as`, `checkout_as`,
+  `create_branch_as`, `revert_session_as`, `accept_suggestion`,
+  `reject_suggestion` — runs one of three checks, all refusing with
+  `OrigoFSError::Denied` (`403` on the HTTP API). Ops with a propose-shaped
+  equivalent queue instead of refusing.
+  - `ensure_may_write_at` (`acl.rs`) — the default. Takes the path and consults
+    the grant covering it, falling back to the actor's write policy where there
+    is none.
+  - `ensure_may_write_workspace` (`acl.rs`) — for an op with no single path that
+    reaches every one of them (`commit`, `checkout`, `create_branch`, an
+    unbounded `revert_session`); checks the grant at `/`. **Having no path is not
+    the same as touching none** — these used to take the path-less check below,
+    so no ACL could contain them.
+  - `ensure_may_write` (`suggest.rs`) — policy only, no grant. Now *only* for
+    path-free administration (registering an actor, setting a policy). Reach for
+    it last, and never for something that touches the working tree. **A new mutating endpoint
   on any surface must call an attributed variant**, never the raw `remove`/
   `rename`/`mkdir_p`/`symlink`/`commit` — those take no actor, exist for internal
   machinery (checkout, merge materialization, applying an accepted suggestion),

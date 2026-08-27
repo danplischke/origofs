@@ -545,3 +545,185 @@ async fn require_attribution_does_not_second_guess_the_write_policy() {
         "require_attribution must not turn a queued write into a refusal"
     );
 }
+
+// --- the operations that have no path ----------------------------------------
+//
+// `commit`, `checkout`, `create_branch` and an unbounded `revert_session` have no
+// single path, so they were left on the path-less `ensure_may_write` — which
+// consults the actor's `write_policy` and never looks at a grant. An ACL therefore
+// could not contain them at all: under deny-by-default an actor with no grant
+// anywhere still reached `checkout`, which truncates and rematerializes the whole
+// working tree, and `revert_session`, which deletes another actor's lines
+// everywhere they wrote.
+//
+// Having no path is not the same as touching none. They reach every path, so they
+// are checked at the root.
+
+/// Set up a workspace with commits enabled, deny-by-default on, and an actor whose
+/// only grant is over one subtree.
+async fn subtree_only() -> (Fs<Arc<dyn MetadataStore>, Arc<MemStore>>, i64, WriteCtx) {
+    let (fs, agent) = fixture().await;
+    let ctx = WriteCtx::actor(agent);
+    // Something to commit, written while the actor still has blanket permission.
+    fs.mkdir_as(ctx, "/tenant-a").await.unwrap();
+    fs.write_as(ctx, "/tenant-a/f.txt", b"hello\n")
+        .await
+        .unwrap();
+    fs.commit_as(ctx, "seed", "t <t@example.com>")
+        .await
+        .unwrap();
+
+    fs.set_acl_default_deny(true).await.unwrap();
+    fs.grant(agent, "/tenant-a", Perms::WRITE | Perms::READ, None)
+        .await
+        .unwrap();
+    (fs, agent, ctx)
+}
+
+fn denied(e: OrigoFSError, what: &str) -> String {
+    match e {
+        OrigoFSError::Denied(m) => m,
+        other => panic!("{what} should have been denied, got {other:?}"),
+    }
+}
+
+/// A subtree grant does not carry the workspace-wide operations with it.
+#[tokio::test]
+async fn workspace_wide_ops_need_permission_at_the_root() {
+    let (fs, _agent, ctx) = subtree_only().await;
+
+    // The write the grant *does* cover still works, so this is about scope and not
+    // about the actor being broken.
+    fs.write_or_propose(ctx, "/tenant-a/f.txt", b"edit\n", None)
+        .await
+        .unwrap();
+
+    let m = denied(
+        fs.commit_as(ctx, "m", "t <t@example.com>")
+            .await
+            .unwrap_err(),
+        "commit",
+    );
+    assert!(m.contains("whole workspace"), "commit: {m}");
+
+    fs.create_branch("side").await.unwrap();
+    denied(fs.checkout_as(ctx, "side").await.unwrap_err(), "checkout");
+    denied(
+        fs.create_branch_as(ctx, "other").await.unwrap_err(),
+        "create_branch",
+    );
+    denied(
+        fs.revert_session_as(ctx, 1, 1, None).await.unwrap_err(),
+        "unbounded revert_session",
+    );
+}
+
+/// A revert *bounded to a subtree the actor holds* is allowed — the check follows
+/// the prefix, so scoping the blast radius is also what earns the permission.
+#[tokio::test]
+async fn a_bounded_revert_is_checked_against_its_prefix() {
+    let (fs, agent, ctx) = subtree_only().await;
+
+    // In scope: permitted (it finds nothing to revert, which is fine — the point
+    // is that it was not refused).
+    fs.revert_session_as(ctx, agent, 1, Some("/tenant-a"))
+        .await
+        .expect("a revert bounded to a granted subtree");
+
+    // Out of scope: refused, and the message names the subtree rather than
+    // revealing anything about what is in it.
+    let m = denied(
+        fs.revert_session_as(ctx, agent, 1, Some("/tenant-b"))
+            .await
+            .unwrap_err(),
+        "a revert bounded to an ungranted subtree",
+    );
+    assert!(m.contains("/tenant-b"), "{m}");
+}
+
+/// **The behaviour-preservation half.** With no grants written, the workspace-wide
+/// operations behave exactly as they did before: the actor's `write_policy`
+/// decides, because `effective_perms` falls back to it at the root just as it does
+/// anywhere else.
+#[tokio::test]
+async fn workspace_wide_ops_fall_back_to_the_write_policy() {
+    let (fs, agent) = fixture().await;
+    let ctx = WriteCtx::actor(agent);
+    fs.write_as(ctx, "/f.txt", b"x").await.unwrap();
+    assert!(fs.list_grants(None).await.unwrap().is_empty());
+
+    // Direct: permitted, as before.
+    fs.commit_as(ctx, "one", "t <t@example.com>").await.unwrap();
+    fs.create_branch_as(ctx, "side").await.unwrap();
+    fs.checkout_as(ctx, "side").await.unwrap();
+
+    // Propose-only: refused, as before — and still says so in those words, which
+    // the CLI and the HTTP surface both surface to users.
+    fs.set_write_policy(agent, WritePolicy::Propose)
+        .await
+        .unwrap();
+    let m = denied(
+        fs.commit_as(ctx, "two", "t <t@example.com>")
+            .await
+            .unwrap_err(),
+        "commit by a propose-only actor",
+    );
+    assert!(m.contains("propose-only"), "{m}");
+}
+
+/// Reviewing is checked at the **suggestion's own path**, not workspace-wide.
+///
+/// Accepting lands a write at that path, so the grant covering it is the one that
+/// decides. The path-less check let an actor with write permission over one
+/// subtree approve edits into any other.
+#[tokio::test]
+async fn reviewing_is_checked_at_the_suggestions_path() {
+    let (fs, author) = fixture().await;
+    let author_ctx = WriteCtx::actor(author);
+    fs.mkdir_as(author_ctx, "/tenant-a").await.unwrap();
+    fs.mkdir_as(author_ctx, "/tenant-b").await.unwrap();
+
+    let reviewer = fs.create_human("rev", Some("rev")).await.unwrap();
+    let rev_ctx = WriteCtx::actor(reviewer);
+    fs.set_acl_default_deny(true).await.unwrap();
+    fs.grant(reviewer, "/tenant-a", Perms::WRITE | Perms::READ, None)
+        .await
+        .unwrap();
+    fs.grant(author, "", Perms::PROPOSE | Perms::READ, None)
+        .await
+        .unwrap();
+
+    let in_scope = match fs
+        .write_or_propose(author_ctx, "/tenant-a/x.txt", b"a", None)
+        .await
+        .unwrap()
+    {
+        WriteOutcome::Proposed(id) => id,
+        other => panic!("expected a proposal, got {other:?}"),
+    };
+    let out_of_scope = match fs
+        .write_or_propose(author_ctx, "/tenant-b/y.txt", b"b", None)
+        .await
+        .unwrap()
+    {
+        WriteOutcome::Proposed(id) => id,
+        other => panic!("expected a proposal, got {other:?}"),
+    };
+
+    fs.accept_suggestion(in_scope, rev_ctx)
+        .await
+        .expect("accepting inside the granted subtree");
+    let m = denied(
+        fs.accept_suggestion(out_of_scope, rev_ctx)
+            .await
+            .unwrap_err(),
+        "accepting outside the granted subtree",
+    );
+    assert!(m.contains("/tenant-b/y.txt"), "{m}");
+    denied(
+        fs.reject_suggestion(out_of_scope, rev_ctx)
+            .await
+            .unwrap_err(),
+        "rejecting outside the granted subtree",
+    );
+}

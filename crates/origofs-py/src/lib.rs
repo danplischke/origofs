@@ -3641,6 +3641,36 @@ impl Workspace {
         })
     }
 
+    /// [`revert_session`](Self::revert_session), authorized against `ctx`.
+    ///
+    /// The target actor/session stay parameters — a revert is a review action
+    /// performed on someone else's work — while `ctx` is the reviewer performing
+    /// it, who must hold write permission over what is being reverted: the named
+    /// subtree, or the whole workspace when `path_prefix` is `None`.
+    ///
+    /// **A surface serving possibly-untrusted callers wants this one.**
+    ///
+    /// ```python
+    /// changed = await ws.revert_session_as(reviewer, agent, session, path_prefix="/tenant-a")
+    /// ```
+    #[pyo3(signature = (ctx, actor_id, session_id, path_prefix = None))]
+    fn revert_session_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        actor_id: i64,
+        session_id: i64,
+        path_prefix: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.revert_session_as(c, actor_id, session_id, path_prefix.as_deref())
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
     /// The append-only edit-op log for an actor (optionally one session) — the
     /// ground truth behind blame, as a list of dicts.
     #[pyo3(signature = (actor_id, session_id = None))]

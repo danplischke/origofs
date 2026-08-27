@@ -195,17 +195,35 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     /// **The trust gate (§6).** Refuse `op` outright when `ctx`'s actor is
     /// [`Propose`](WritePolicy::Propose)-only.
     ///
-    /// This is the one place a direct mutation is authorized, and every
-    /// actor-attributed mutating entry point on [`Fs`](crate::Fs) calls it — so a
-    /// new surface cannot forget the check by simply not knowing about it, which
-    /// is exactly how `origofs_rm` shipped ungated (issue #78).
+    /// # This one does not consult ACLs, and that is its whole remaining scope
     ///
-    /// Operations that have a propose-shaped equivalent (`write` →
+    /// It answers "is this actor trusted to write at all", never "may it write
+    /// *here*" — it reads the actor's policy column and no grant. Since #123 every
+    /// operation that touches the working tree uses a path-aware check instead:
+    /// [`ensure_may_write_at`](Self::ensure_may_write_at) where there is a path,
+    /// and [`ensure_may_write_workspace`](Self::ensure_may_write_workspace) where
+    /// the operation has no single path but reaches every one of them — `commit`,
+    /// `checkout`, `create_branch`, an unbounded `revert_session`.
+    ///
+    /// Those four used to call *this*, which meant an ACL could not contain them
+    /// at all: under `acl_default_deny` an actor with no grant anywhere still
+    /// reached `checkout`, which truncates and rematerializes the whole working
+    /// tree. Having no path is not the same as touching none.
+    ///
+    /// What is left here is the genuinely path-free administration — registering
+    /// an actor, setting a write policy — which mutates the identity registry
+    /// rather than the tree, so there is no path for a grant to be about.
+    ///
+    /// # Prefer a propose-shaped variant
+    ///
+    /// Operations that have one (`write` →
     /// [`write_or_propose`](Self::write_or_propose), `remove` →
-    /// [`remove_or_propose`](Self::remove_or_propose)) should prefer that, so a
-    /// propose-only actor's request is *queued* rather than refused. This is the
-    /// backstop for the ones that have no such equivalent — rename, mkdir,
-    /// symlink, commit, accepting someone else's suggestion.
+    /// [`remove_or_propose`](Self::remove_or_propose)) should use it, so a
+    /// propose-only actor's request is *queued* rather than refused. The checks
+    /// here and above are the backstop for the ones that have no such equivalent —
+    /// rename, mkdir, symlink, commit, accepting someone else's suggestion — where
+    /// a new surface cannot forget the gate by simply not knowing about it, which
+    /// is exactly how `origofs_rm` shipped ungated (issue #78).
     ///
     /// Internal machinery is exempt **by construction**, not by flag: it calls the
     /// raw unattributed engine ops ([`remove`](crate::Fs::remove),
@@ -540,7 +558,12 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         // propose-only actor approve would be a direct write wearing a review as a
         // costume — and two propose-only agents could rubber-stamp each other into
         // full write access (issue #78).
-        self.ensure_may_write(approver, "accept suggestions")
+        //
+        // Checked **at the suggestion's own path**, not workspace-wide: accepting
+        // is a write to that path, so the grant covering it is the one that
+        // decides. The path-less form let an actor with write permission over one
+        // subtree approve edits into any other.
+        self.ensure_may_write_at(approver, "accept suggestions for", &s.path)
             .await?;
 
         // Part two: a suggestion's own author cannot approve it. This is
@@ -746,7 +769,9 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         // of the review queue. An actor that cannot write cannot review (#78).
         // Withdrawing your own proposal is a different operation and stays open.
         if approver.actor != s.actor_id {
-            self.ensure_may_write(approver, "reject others' suggestions")
+            // Path-scoped for the same reason accepting is: disposing of a
+            // proposal is a review action *over that path*.
+            self.ensure_may_write_at(approver, "reject others' suggestions for", &s.path)
                 .await?;
         }
         // Same CAS, same reason it must be checked — a reject that lost to a

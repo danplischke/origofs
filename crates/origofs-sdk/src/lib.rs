@@ -1463,6 +1463,15 @@ impl Workspace {
         self.fs.ensure_may_write(ctx, op).await
     }
 
+    /// Refuse a **workspace-wide** `op` for an actor without `WRITE` at the root.
+    ///
+    /// For an operation that has no single path but reaches every one of them.
+    /// Unlike [`ensure_may_write`](Self::ensure_may_write) this consults the ACL
+    /// grants, so deny-by-default and subtree grants actually contain it.
+    pub async fn ensure_may_write_workspace(&self, ctx: WriteCtx, op: &str) -> Result<()> {
+        self.fs.ensure_may_write_workspace(ctx, op).await
+    }
+
     /// Submit an edit to `path` governed by the actor's write policy: a `Direct`
     /// actor writes straight to the working tree ([`WriteOutcome::Wrote`]); a
     /// `Propose` actor's edit is queued as a suggestion for review
@@ -1638,6 +1647,27 @@ impl Workspace {
     ) -> Result<Vec<String>> {
         self.fs
             .revert_session(actor_id, session_id, path_prefix)
+            .await
+    }
+
+    /// [`revert_session`](Self::revert_session), authorized against `ctx`.
+    ///
+    /// The target actor/session stay parameters — a revert is a review action
+    /// performed on someone else's work — while `ctx` decides whether the caller
+    /// may do it, and over which subtree. **A surface accepting requests from
+    /// possibly-untrusted actors must call this**, never the unauthorized form: a
+    /// revert writes to every file the named session touched, and the path-less
+    /// policy check the surfaces used before never consulted an ACL grant at all.
+    #[tracing::instrument(skip_all, fields(actor = actor_id, session = session_id))]
+    pub async fn revert_session_as(
+        &self,
+        ctx: WriteCtx,
+        actor_id: i64,
+        session_id: i64,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<String>> {
+        self.fs
+            .revert_session_as(ctx, actor_id, session_id, path_prefix)
             .await
     }
 
