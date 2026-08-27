@@ -7,7 +7,7 @@ provide. origo has no built-in auth on purpose: a blame trail is only trustworth
 if the identity behind each write is, and that's yours to own.
 
 Run:
-    pip install "origo[fastapi]"        # or: maturin develop && pip install fastapi uvicorn
+    pip install "origofs[fastapi]"        # or: maturin develop && pip install fastapi uvicorn
     uvicorn fastapi_router:app --reload
 
 Then, having created an actor (e.g. `id = await ws.create_human("dan", ...)`):

@@ -7,6 +7,8 @@ directly JSON-serializable.
 from __future__ import annotations
 from typing import Any, Optional
 
+__version__: str
+
 class OrigoError(Exception):
     """Base origo error (raised for errors without a more specific mapping)."""
 

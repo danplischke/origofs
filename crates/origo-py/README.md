@@ -7,7 +7,32 @@ and orchestrate FUSE/NFS mounts.
 Every I/O method returns an **awaitable**, so it drops straight into `async def`
 handlers. Structured results come back as plain `dict`/`list` (JSON-serializable).
 
-## Build
+## Install
+
+```bash
+pip install origofs
+```
+
+The distribution is **`origofs`** — `origo` on PyPI belongs to an unrelated
+project — but the import name is `origo`:
+
+```python
+import origo
+```
+
+Wheels ship for CPython ≥ 3.9 on Linux (x86_64, aarch64 — manylinux_2_28),
+macOS (Intel and Apple Silicon), and Windows x64. They are `abi3`, so one wheel
+per platform serves every supported Python. Anywhere else, pip falls back to the
+sdist and builds from source, which needs a Rust toolchain (≥ 1.85) and a C
+compiler (SQLite is compiled in).
+
+The FastAPI router integration is an extra: `pip install "origofs[fastapi]"`.
+
+> FUSE mounting (`Workspace.mount`) is Linux-only. On macOS, use the NFS surface
+> (`Workspace.serve_nfs`) instead — the macOS wheels are deliberately built
+> without a FUSE mount implementation, so they need no macFUSE install.
+
+## Build from a checkout
 
 ```bash
 cd crates/origo-py
@@ -18,6 +43,21 @@ pytest tests/              # end-to-end test
 ```
 
 Wheels: `maturin build --release` (abi3, one wheel works on CPython ≥ 3.9).
+
+## Releasing
+
+`crates/origo-py/Cargo.toml`’s `version` is the single source of truth. Bump it,
+commit, then tag:
+
+```bash
+git tag py-v0.1.0 && git push origin py-v0.1.0
+```
+
+`.github/workflows/release-py.yml` builds every wheel plus the sdist, smoke-tests
+each one by importing it, and publishes to PyPI via Trusted Publishing (OIDC —
+no API token is stored in the repo). It refuses to publish if the tag and the
+manifest version disagree. A `workflow_dispatch` run can target TestPyPI for a
+dry run.
 
 ## Use
 
@@ -72,7 +112,7 @@ Every mutating route depends on `authn` and passes its `WriteCtx` straight to th
 workspace — the request body never names an actor, so a client can't forge
 attribution. Reads are open by default; pass `reader=<dependency>` to gate them,
 or `dependencies=[...]` (forwarded to `APIRouter`) to gate everything. Needs the
-`fastapi` extra (`pip install "origo[fastapi]"`). See `examples/fastapi_router.py`.
+`fastapi` extra (`pip install "origofs[fastapi]"`). See `examples/fastapi_router.py`.
 
 ## Live change feed (push)
 

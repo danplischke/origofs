@@ -56,6 +56,25 @@ maturin develop        # builds the pyo3 extension + installs the `origo` module
 pytest tests/          # some tests also gate on ORIGO_PG_TEST_URL
 ```
 
+### Publishing the Python package
+
+The PyPI **distribution is `origofs`**, not `origo` — that name belongs to an
+unrelated project. The **import name is still `origo`**; only `[project].name` in
+`crates/origo-py/pyproject.toml` differs. Don't "fix" the mismatch.
+
+`crates/origo-py/Cargo.toml`'s `version` is the single source of truth for the
+released version, and is deliberately **not** `version.workspace = true` — the
+wheel releases on its own cadence, independent of the workspace's `0.0.0`.
+
+Releasing is `git tag py-v<version> && git push origin <tag>`.
+`.github/workflows/release-py.yml` builds wheels (Linux x86_64/aarch64 on
+manylinux_2_28, macOS Intel/Apple Silicon, Windows x64) plus an sdist, imports
+each artifact as a smoke test, and publishes via PyPI **Trusted Publishing
+(OIDC)** — there is no API token in the repo, so don't add one. The workflow
+refuses to publish when the tag and the manifest version disagree. It also runs
+(without publishing) on PRs that touch the bindings or the manifests, which is
+the only cross-platform build coverage the repo has — `ci.yml` is Linux-only.
+
 ### Toolchain note
 
 There is no `rust-toolchain` file and no CI config in the repo. **`origo-core`
@@ -208,6 +227,13 @@ export/import + `git-remote-origo` bridge to genuine git objects). `native` and
   (`migrations.rs`, `latest_schema_version`) are forward-only and authored once
   with per-engine SQL variants where they diverge. `Workspace::migrate` is the
   explicit runner (a normal `open` already migrates).
+- **On macOS, `fuser` is built with its `macos-no-mount` feature** (see the
+  `[target.'cfg(target_os = "macos")']` blocks in `origo-fuse`/`origo-py`).
+  Building it normally there requires macFUSE headers via pkg-config, which no
+  CI runner has — without this the *entire workspace* fails to compile on macOS,
+  and no macOS wheel can be built. The cost is that `origo_fuse::mount`/`spawn`
+  return a plain `io::Error` on macOS; that is the documented posture anyway
+  (FUSE on Linux, NFSv3 elsewhere). Don't drop the feature to "clean up".
 - **`ORIGO_ENCRYPTION_KEY`** opts a workspace into encryption at rest (kept out of
   argv/history); the *same* value must be used on every open or reads fail loudly.
 - Integration tests live in each crate's `tests/` and are the clearest executable

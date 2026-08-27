@@ -26,7 +26,7 @@ authenticated principal, and a client cannot forge attribution by naming an
 actor id in the request. Read routes are open by default; pass ``reader`` (any
 dependency) to gate them too.
 
-Requires FastAPI: ``pip install "origo[fastapi]"``.
+Requires FastAPI: ``pip install "origofs[fastapi]"``.
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ try:
     from pydantic import BaseModel, Field
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
-        "origo.fastapi requires FastAPI. Install it with: pip install \"origo[fastapi]\""
+        "origo.fastapi requires FastAPI. Install it with: pip install \"origofs[fastapi]\""
     ) from exc
 
 # A dependency that resolves a request to the WriteCtx a change is attributed to.

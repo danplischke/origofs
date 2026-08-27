@@ -19,7 +19,7 @@ Two ways to run it
 ------------------
 1. As a real server::
 
-       pip install "origo[fastapi]" uvicorn      # or: maturin develop && pip install fastapi uvicorn httpx
+       pip install "origofs[fastapi]" uvicorn      # or: maturin develop && pip install fastapi uvicorn httpx
        uvicorn collab_app:app --reload
        # then drive it over HTTP (see the curl hints printed at "/")
 

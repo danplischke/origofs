@@ -25,7 +25,7 @@ origo stays a storage-and-attribution engine, not a user directory.
 
 Run it
 ------
-    pip install -r requirements.txt          # origo[fastapi] + uvicorn
+    pip install -r requirements.txt          # origofs[fastapi] + uvicorn
     uvicorn app:app --reload                 # http://127.0.0.1:8000
 
 Point it at a real store with env vars: ``ORIGO_DSN=postgres://…`` (multi-writer),

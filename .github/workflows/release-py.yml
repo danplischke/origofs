@@ -1,0 +1,199 @@
+# Builds and publishes the `origofs` wheel (the `origo` Python module) to PyPI.
+#
+# Releasing = pushing a tag: `git tag py-v0.1.0 && git push origin py-v0.1.0`.
+# The version in crates/origo-py/Cargo.toml is the single source of truth; the
+# `version` job refuses to go further if the tag disagrees, so a tag can never
+# ship a differently-numbered wheel.
+#
+# Pull requests touching the bindings or the manifests run the same build matrix
+# without publishing, so a platform that stops compiling is caught before a tag
+# exists (the main CI only ever builds x86_64 Linux).
+name: Release (PyPI)
+
+on:
+  push:
+    tags: ["py-v*"]
+  pull_request:
+    paths:
+      - "crates/origo-py/**"
+      - "crates/origo-fuse/**"
+      - "crates/origo-nfs/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release-py.yml"
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Index to publish to"
+        type: choice
+        options: ["testpypi", "pypi"]
+        default: testpypi
+
+concurrency:
+  group: release-py-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Fail fast and cheaply: a mismatched tag should not burn the whole matrix.
+  version:
+    name: Check tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - shell: bash
+        run: |
+          set -euo pipefail
+          # Ask cargo rather than parsing TOML by hand — this is the exact
+          # version maturin will stamp on the wheel.
+          cargo_version="$(
+            cargo metadata --no-deps --format-version 1 \
+              --manifest-path crates/origo-py/Cargo.toml \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "origo-py"))'
+          )"
+          echo "crates/origo-py/Cargo.toml version: $cargo_version"
+
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#py-v}"
+            if [ "$tag_version" != "$cargo_version" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} implies version ${tag_version}, but crates/origo-py/Cargo.toml says ${cargo_version}. Bump the manifest and re-tag."
+              exit 1
+            fi
+            echo "tag ${GITHUB_REF_NAME} matches."
+          fi
+
+  # abi3-py39: one wheel per platform covers CPython 3.9+, so the matrix has no
+  # Python-version axis. Every target builds on a runner of its own architecture,
+  # which keeps the bundled-SQLite C build and `ring` off any cross-compilation
+  # toolchain.
+  wheels:
+    name: Wheel ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            manylinux: "auto"
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            manylinux: "auto"
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: "auto"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          working-directory: crates/origo-py
+          # Linux builds run inside quay.io/pypa/manylinux_2_28_<arch> (glibc
+          # 2.28 — AlmaLinux 8 and newer, Debian 10+, Ubuntu 18.10+). Ignored
+          # on macOS and Windows, which build directly on the runner.
+          manylinux: ${{ matrix.manylinux }}
+          sccache: "true"
+
+      # Install and import the wheel on the runner that produced it. Catches a
+      # wheel that links but cannot load (missing symbol, wrong abi3 tag, a
+      # platform tag no interpreter accepts) before it reaches the index.
+      - name: Smoke-test the wheel
+        shell: bash
+        working-directory: crates/origo-py
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --no-index --find-links dist origofs
+          python -c "import origo; print('origo', origo.__version__, origo.Workspace)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: crates/origo-py/dist
+
+  sdist:
+    name: Source distribution
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # origo-core is edition 2024, so the source build below needs Rust >= 1.85
+      # rather than whatever the runner image happens to ship.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # maturin vendors the in-workspace path dependencies (origo-core, -sdk,
+      # -fuse, -nfs) into the sdist, so it builds standalone from the index.
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: crates/origo-py
+
+      # An sdist that cannot be compiled is worse than no sdist: pip falls back
+      # to it on any platform without a wheel. Compile it here from the tarball
+      # alone, exactly as a user on such a platform would. `--no-index` keeps pip
+      # off PyPI, so this can only ever test the tarball just built.
+      - name: Compile the sdist from source
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --no-index --no-binary origofs \
+            --find-links crates/origo-py/dist origofs
+          python -c "import origo; print('origo', origo.__version__, origo.Workspace)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: crates/origo-py/dist
+
+  publish:
+    name: Publish to ${{ github.event_name == 'workflow_dispatch' && inputs.repository || 'pypi' }}
+    # Tags publish to PyPI; a manual run can target TestPyPI for a dry run.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && inputs.repository || 'pypi' }}
+    permissions:
+      # Trusted Publishing: the job mints a short-lived OIDC token instead of
+      # reading a stored API token. No PyPI credential lives in this repo.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - run: ls -l dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: >-
+            ${{ (github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi')
+                && 'https://test.pypi.org/legacy/'
+                || 'https://upload.pypi.org/legacy/' }}

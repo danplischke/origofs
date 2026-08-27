@@ -1,6 +1,10 @@
 [package]
 name = "origo-py"
-version.workspace = true
+# The published PyPI version (distribution `origofs`), deliberately decoupled
+# from the workspace version: the wheel has its own release cadence. This line
+# is the single source of truth — `.github/workflows/release-py.yml` refuses to
+# publish unless the `py-v*` tag matches it.
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -28,7 +32,14 @@ pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
 [target.'cfg(unix)'.dependencies]
 origo-fuse = { version = "0.0.0", path = "../origo-fuse" }
 origo-nfs = { version = "0.0.0", path = "../origo-nfs" }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 fuser = "0.17"
+
+# See origo-fuse/Cargo.toml: macOS lacks macFUSE headers on CI runners, so the
+# crate is built without its mount implementation there (NFS is the macOS path).
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.17", features = ["macos-no-mount"] }
 
 [features]
 # Enabled only when building the wheel (see pyproject.toml). Off during

@@ -6,7 +6,7 @@ write to that user/agent via `WriteCtx`. origo records blame + an edit-op audit
 trail for every attributed write.
 
 Run:
-    pip install "origo[fastapi]"        # or: maturin develop && pip install fastapi uvicorn
+    pip install "origofs[fastapi]"        # or: maturin develop && pip install fastapi uvicorn
     uvicorn fastapi_app:app --reload
 """
 from contextlib import asynccontextmanager

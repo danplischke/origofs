@@ -309,7 +309,7 @@ origo --workspace "$WS" gc     # run when idle — not safe alongside active wri
 |---|---|
 | **`origo` CLI** | Scripting and day-to-day workspace operations |
 | **Rust SDK** (`origo-sdk`) | Embedding origo in a Rust service |
-| **Python** (`origo-py`) | Async-native PyO3 bindings — FastAPI-ready, resolve identity yourself |
+| **Python** (`origo-py`) | Async-native PyO3 bindings — FastAPI-ready, resolve identity yourself (`pip install origofs`) |
 | **HTTP API** (`origo-api`) | Any language / any client over JSON |
 | **MCP** (`origo-mcp`) | Agents calling filesystem tools directly, attributed |
 | **Overlay mount** | Running an agent live in a fast native mount |
@@ -317,6 +317,10 @@ origo --workspace "$WS" gc     # run when idle — not safe alongside active wri
 
 Python, for example, keeps every I/O method awaitable so it composes with
 FastAPI, and lets you inject the user/agent behind each write:
+
+```bash
+pip install origofs        # distribution `origofs`, import name `origo`
+```
 
 ```python
 import origo
