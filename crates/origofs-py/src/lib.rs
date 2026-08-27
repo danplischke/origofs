@@ -869,6 +869,47 @@ impl S3Config {
     }
 }
 
+// --- read-cache config ------------------------------------------------------
+
+/// Bounds for the local read cache in front of an object store (issue #114).
+/// Pass to `Workspace.open_s3_cached` / `open_gcs_cached` and their `open_pg_*`
+/// forms.
+///
+/// The tier keeps recently-read chunks on local disk under `dir` and evicts to
+/// stay inside **both** bounds: at most `max_bytes` of cache, and never taking the
+/// filesystem below `min_free_bytes` free. The second is the one that matters in
+/// practice — a cache that fills the disk takes the workspace down with it.
+///
+/// The defaults are the Rust ones: 8 GiB of cache, yielding under 2 GiB free.
+#[pyclass(frozen, from_py_object)]
+#[derive(Clone)]
+struct CacheConfig {
+    inner: origofs_sdk::CacheConfig,
+}
+
+#[pymethods]
+impl CacheConfig {
+    #[new]
+    #[pyo3(signature = (dir, max_bytes = None, min_free_bytes = None))]
+    fn new(dir: String, max_bytes: Option<u64>, min_free_bytes: Option<u64>) -> Self {
+        let mut inner = origofs_sdk::CacheConfig::new(dir);
+        if let Some(n) = max_bytes {
+            inner = inner.max_bytes(n);
+        }
+        if let Some(n) = min_free_bytes {
+            inner = inner.min_free_bytes(n);
+        }
+        Self { inner }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CacheConfig(dir={:?}, max_bytes={}, min_free_bytes={})",
+            self.inner.dir, self.inner.max_bytes, self.inner.min_free_bytes
+        )
+    }
+}
+
 // --- GCS config -------------------------------------------------------------
 
 /// Connection settings for a **native** Google Cloud Storage object store (GCS
@@ -1737,6 +1778,80 @@ impl Workspace {
         })
     }
 
+    /// `open_s3` with a **bounded local read cache** (issue #114).
+    ///
+    /// Every read of an uncached chunk otherwise costs a network round trip, which
+    /// is what makes a mount or a repeated ranged read over an object store slow.
+    /// The tier keeps recently-read chunks on local disk inside `cache`'s bounds.
+    ///
+    /// The packed and encrypted variants were bound and this one was not, so a
+    /// Python caller could compose every remote stack except the one that makes a
+    /// remote stack fast.
+    #[staticmethod]
+    fn open_s3_cached<'py>(
+        py: Python<'py>,
+        db_path: String,
+        cfg: S3Config,
+        cache: CacheConfig,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            let ws = CoreWorkspace::open_s3_cached(&db_path, cfg.inner, cache.inner)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Py::new(py, Workspace { inner: ws }))
+        })
+    }
+
+    /// `open_gcs` with a bounded local read cache. See `open_s3_cached`.
+    #[staticmethod]
+    fn open_gcs_cached<'py>(
+        py: Python<'py>,
+        db_path: String,
+        cfg: GcsConfig,
+        cache: CacheConfig,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            let ws = CoreWorkspace::open_gcs_cached(&db_path, cfg.inner, cache.inner)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Py::new(py, Workspace { inner: ws }))
+        })
+    }
+
+    /// `open_pg_s3` with a bounded local read cache — the shape a multi-writer
+    /// deployment actually wants: one shared database, one shared bucket, and each
+    /// host keeping its own hot chunks locally. See `open_s3_cached`.
+    #[staticmethod]
+    fn open_pg_s3_cached<'py>(
+        py: Python<'py>,
+        dsn: String,
+        cfg: S3Config,
+        cache: CacheConfig,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            let ws = CoreWorkspace::open_pg_s3_cached(&dsn, cfg.inner, cache.inner)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Py::new(py, Workspace { inner: ws }))
+        })
+    }
+
+    /// `open_pg_gcs` with a bounded local read cache. See `open_pg_s3_cached`.
+    #[staticmethod]
+    fn open_pg_gcs_cached<'py>(
+        py: Python<'py>,
+        dsn: String,
+        cfg: GcsConfig,
+        cache: CacheConfig,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            let ws = CoreWorkspace::open_pg_gcs_cached(&dsn, cfg.inner, cache.inner)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Py::new(py, Workspace { inner: ws }))
+        })
+    }
+
     /// Postgres metadata (multi-writer) + an S3-compatible object store — the
     /// production pairing for a shared human+agent workspace: many writers on one
     /// database, one shared content store.
@@ -1992,6 +2107,35 @@ impl Workspace {
         let c = ctx.inner;
         future_into_py(py, async move {
             ws.write_as(c, &path, &data).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Attributed write with **explicit** byte-range authorship — the path an
+    /// editor integration takes when it already knows who typed what.
+    ///
+    /// `spans` is a list of `(actor_id, session_id, byte_len)` runs summing to
+    /// `len(data)`, so co-edited content lands with each collaborator's spans
+    /// attributed exactly — sub-line and interleaved — instead of going through the
+    /// line-diff heuristic `write_as` uses. `ctx` is the actor performing the
+    /// checkpoint, recorded on the op-log and the feed.
+    ///
+    /// `checkpoint_coedit` does this for you for a `CoeditDoc`. Reach for this one
+    /// when the document lives in *your* editor rather than in origofs's CRDT.
+    fn write_as_blamed<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        data: Vec<u8>,
+        spans: Vec<(i64, i64, u64)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.write_as_blamed(c, &path, &data, &spans)
+                .await
+                .map_err(to_pyerr)?;
             Ok(())
         })
     }
@@ -2803,6 +2947,41 @@ impl Workspace {
 
     // --- live collaboration -------------------------------------------------
 
+    /// Append an arbitrary event to the change feed, returning its sequence
+    /// number.
+    ///
+    /// Every mutating method emits its own event, so this is for the things origofs
+    /// cannot see: an agent finished a task, a review was requested, a deploy went
+    /// out. Feed consumers (`watch`, `subscribe`) receive it like any other, so a
+    /// host's own milestones interleave with file changes in one ordered stream
+    /// rather than needing a second channel.
+    #[pyo3(signature = (kind, path, actor_id = None, session_id = None, detail = None, branch = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn record_event<'py>(
+        &self,
+        py: Python<'py>,
+        kind: String,
+        path: String,
+        actor_id: Option<i64>,
+        session_id: Option<i64>,
+        detail: Option<String>,
+        branch: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.record_event(origofs_sdk::EventInit {
+                actor_id,
+                session_id,
+                kind,
+                path,
+                detail,
+                branch,
+            })
+            .await
+            .map_err(to_pyerr)
+        })
+    }
+
     /// Change-feed events strictly after `after_seq` (oldest first).
     #[pyo3(signature = (after_seq=0))]
     fn watch<'py>(&self, py: Python<'py>, after_seq: i64) -> PyResult<Bound<'py, PyAny>> {
@@ -3439,6 +3618,91 @@ impl Workspace {
         })
     }
 
+    // ── portable dump / load (issue #117) ────────────────────────────────────
+
+    /// Write an engine-independent metadata dump to `path`, authorized as `ctx`.
+    /// Returns the number of records written.
+    ///
+    /// JSON Lines, one record per row. This is the half of a workspace the content
+    /// store cannot rebuild — `rebuild()` recovers committed files, dirs, symlinks
+    /// and branches from the bucket alone and none of the attribution — and it is
+    /// the supported SQLite -> Postgres migration path.
+    ///
+    /// # Why this takes a `ctx` when the Rust `dump` does not
+    ///
+    /// A dump is whole-**store**: every workspace, every actor including its
+    /// `auth_subject` (the value identity is resolved by, server-side), every ACL
+    /// grant, all blame and the audit log. None of it is path-scoped, so no `Scope`
+    /// narrows a dump and no subtree grant bounds it — in a workspace-per-tenant
+    /// deployment, one tenant's dump reads every other tenant's metadata.
+    ///
+    /// So the binding is the authorized form only, and the check is `write` at `/`
+    /// — the same one `commit` and an unbounded `revert_session` take. Gating a
+    /// read on a write permission is deliberate: the engine has no read-side ACL,
+    /// and "may write anywhere in this workspace" is the only permission that
+    /// already means administrative reach over the whole of it. Where no grant
+    /// covers `/`, this falls back to the actor's write policy, so a workspace with
+    /// no ACLs behaves as it always did.
+    ///
+    /// **The content store is not dumped** — a dump references content by hash.
+    /// Restoring against a store that does not hold those chunks gives you every
+    /// name, actor and blame span and no readable bytes.
+    fn dump_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let f = std::fs::File::create(&path).map_err(PyOSError::new_err)?;
+            ws.dump_as(c, std::io::BufWriter::new(f))
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Restore a dump written by `dump_as` into a **pristine** store, returning
+    /// `{tables, skipped_tables, source_schema_version, total_rows}`.
+    ///
+    /// # This is a restore, not a merge
+    ///
+    /// It refuses a store holding anything beyond what an open created — content,
+    /// branches, registered actors, or ACL grants. Merging would have to reconcile
+    /// two independent id spaces (inode, actor and session ids are all local
+    /// sequences), and getting that wrong produces blame attributed to the wrong
+    /// actor. Use `resync` to combine two live workspaces.
+    ///
+    /// The actor and grant halves of that check are what stops a load being a
+    /// privilege escalation: a load replaces the identity registry and every grant
+    /// with the dump's, so restoring over a configured-but-empty store would hand
+    /// it the dump author's permissions. A load cannot itself be ACL-gated — the
+    /// identities a check would consult are the ones it installs — so refusing a
+    /// store that has any is the check, and there is deliberately no `load_as`.
+    fn load<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let f = std::fs::File::open(&path).map_err(PyOSError::new_err)?;
+            let report = ws
+                .load(std::io::BufReader::new(f))
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| {
+                let d = PyDict::new(py);
+                let tables = PyDict::new(py);
+                for (t, n) in &report.tables {
+                    tables.set_item(t, n)?;
+                }
+                d.set_item("tables", tables)?;
+                d.set_item("skipped_tables", report.skipped_tables.clone())?;
+                d.set_item("source_schema_version", report.source_schema_version)?;
+                d.set_item("total_rows", report.total_rows())?;
+                Ok(d.unbind())
+            })
+        })
+    }
+
     /// Drop presence rows for sessions that stopped heartbeating more than
     /// `grace_secs` ago, returning how many were removed. A long-running server
     /// should call this periodically; nothing else does it.
@@ -3506,6 +3770,98 @@ impl Workspace {
                 .await
                 .map_err(to_pyerr)?;
             Python::attach(|py| merge_outcome_dict(py, &outcome))
+        })
+    }
+
+    /// Merge the commit `theirs` (a hex hash) into the current branch — the
+    /// by-hash counterpart of `merge_branch`, for merging something with no branch
+    /// name: a detached head, a commit read out of `log`, or a ref another
+    /// workspace advanced.
+    fn merge<'py>(
+        &self,
+        py: Python<'py>,
+        theirs: String,
+        author: String,
+        message: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let h = parse_hash(&theirs)?;
+            let outcome = ws.merge(h, &author, &message).await.map_err(to_pyerr)?;
+            Python::attach(|py| merge_outcome_dict(py, &outcome))
+        })
+    }
+
+    // ── replication between workspaces ───────────────────────────────────────
+
+    /// Reconcile `branch` with `remote` in both directions: fetch what the remote
+    /// has, push what it lacks, merge if the two diverged, and advance both refs.
+    /// Returns a report dict.
+    ///
+    /// Per-byte-range blame **travels with the content** both ways, with actors
+    /// matched on `auth_subject` so the same person resolves to one actor across
+    /// resyncs. The op-log, audit log, change feed and pending suggestions do not.
+    /// Both working trees must be clean, both workspaces must have versioning
+    /// enabled, and `branch` must be the local current branch.
+    ///
+    /// A conflicted merge leaves the conflicts in *this* workspace's working tree
+    /// with `MERGE_HEAD` set, exactly as `merge` does, and does not advance the
+    /// remote: resolve, commit, and resync again.
+    fn resync<'py>(
+        &self,
+        py: Python<'py>,
+        remote: PyRef<'py, Workspace>,
+        branch: String,
+        author: String,
+        message: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let other = remote.inner.clone();
+        future_into_py(py, async move {
+            let report = ws
+                .resync(&other, &branch, &author, &message)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| resync_report_dict(py, &report))
+        })
+    }
+
+    /// Copy the commit closure reachable from `head` into `remote`'s content
+    /// store, stopping at objects it already has. Returns
+    /// `{objects, bytes, skipped}`.
+    ///
+    /// The push half of `resync` on its own: it moves objects only and never
+    /// touches a ref, so it is safe to run ahead of time to make a later resync
+    /// cheap — which is the point, since the object copy is the slow part.
+    fn push_objects<'py>(
+        &self,
+        py: Python<'py>,
+        remote: PyRef<'py, Workspace>,
+        head: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let other = remote.inner.clone();
+        future_into_py(py, async move {
+            let h = parse_hash(&head)?;
+            let stats = ws.push_objects(&other, h).await.map_err(to_pyerr)?;
+            Python::attach(|py| transfer_stats_dict(py, &stats))
+        })
+    }
+
+    /// The fetch half: copy the closure of `head` **from** `remote` into this
+    /// workspace's content store. Refs are untouched.
+    fn fetch_objects<'py>(
+        &self,
+        py: Python<'py>,
+        remote: PyRef<'py, Workspace>,
+        head: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let other = remote.inner.clone();
+        future_into_py(py, async move {
+            let h = parse_hash(&head)?;
+            let stats = ws.fetch_objects(&other, h).await.map_err(to_pyerr)?;
+            Python::attach(|py| transfer_stats_dict(py, &stats))
         })
     }
 
@@ -4180,6 +4536,82 @@ impl Workspace {
         })
     }
 
+    /// Refuse an op that reaches **every** path for an actor without `write` at
+    /// `/` — the path-less counterpart of `ensure_may_write_at` (issue #123).
+    ///
+    /// Having no path is not the same as touching none: `commit`, `checkout`,
+    /// `create_branch`, an unbounded `revert_session` and a `dump` all reach the
+    /// whole workspace, so they are checked at the root rather than skipping the
+    /// grant layer. A surface that adds its own workspace-wide route wants this
+    /// one; the bound methods already call it themselves.
+    ///
+    /// Raises `PermissionError`, or returns `None` if allowed.
+    fn ensure_may_write_workspace<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        op: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.fs()
+                .ensure_may_write_workspace(ctx.inner, &op)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    // ── attribution completeness (issue #128) ────────────────────────────────
+
+    /// Whether this workspace requires every surface-initiated mutation to name an
+    /// actor. Off by default.
+    ///
+    /// This is an attribution-**completeness** switch, not a security boundary: it
+    /// makes an unattributed mutation an error so a blame trail has no holes in it,
+    /// and it says nothing about who may do what. `grant`/`revoke` and the write
+    /// policy are the access-control layer.
+    fn require_attribution<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.require_attribution().await.map_err(to_pyerr)
+        })
+    }
+
+    /// Turn the attribution requirement on or off.
+    fn set_require_attribution<'py>(
+        &self,
+        py: Python<'py>,
+        required: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.set_require_attribution(required)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Refuse an unattributed mutation when this workspace requires attribution.
+    ///
+    /// **A surface calls this on the path where no actor was named** — it is what
+    /// makes `require_attribution` mean anything. Enforcement is surface-side by
+    /// design (the unattributed engine ops exist for internal machinery and are
+    /// exempt by construction), so a workspace with the switch on is only actually
+    /// enforced on the surfaces that call it. The CLI does; a Python service has to,
+    /// and could not before this was bound.
+    ///
+    /// `op` names the operation in the error. Raises `PermissionError`, or returns
+    /// `None` when attribution is not required.
+    fn ensure_attributed<'py>(&self, py: Python<'py>, op: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.ensure_attributed(&op).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
     // ── performance introspection (issue #118) ───────────────────────────────
 
     /// What one file costs to read: chunk count, size distribution, self-dedup,
@@ -4276,6 +4708,56 @@ fn gc_stats_dict(py: Python<'_>, s: &origofs_sdk::GcStats) -> PyResult<Py<PyDict
 /// A tagged dict rather than four separate result types: the caller almost always
 /// wants to branch on the tag and read one field, and this stays JSON-serializable
 /// straight into an API response.
+/// Parse a hex commit hash, rejecting a malformed one with `ValueError` rather
+/// than letting it read as "no such object" further down.
+fn parse_hash(s: &str) -> PyResult<origofs_sdk::Hash> {
+    origofs_sdk::Hash::from_hex(s)
+        .ok_or_else(|| PyValueError::new_err(format!("not a hash: {s:?}")))
+}
+
+fn transfer_stats_dict(py: Python<'_>, s: &origofs_sdk::TransferStats) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("objects", s.objects)?;
+    d.set_item("bytes", s.bytes)?;
+    d.set_item("skipped", s.skipped)?;
+    Ok(d.unbind())
+}
+
+fn resync_report_dict(py: Python<'_>, r: &origofs_sdk::ResyncReport) -> PyResult<Py<PyDict>> {
+    use origofs_sdk::ResyncOutcome::*;
+    let d = PyDict::new(py);
+    d.set_item("branch", &r.branch)?;
+    d.set_item("outcome", r.outcome.as_str())?;
+    // The head the outcome carries, flattened out so a caller reads one key rather
+    // than matching on the tag first.
+    d.set_item(
+        "head",
+        match &r.outcome {
+            Pushed(h) | FastForwarded(h) | Merged(h) => Some(h.to_hex()),
+            UpToDate | Conflicted => None,
+        },
+    )?;
+    d.set_item("fetched", transfer_stats_dict(py, &r.fetched)?)?;
+    d.set_item("pushed", transfer_stats_dict(py, &r.pushed)?)?;
+    d.set_item("blame_fetched", r.blame_fetched)?;
+    d.set_item("blame_pushed", r.blame_pushed)?;
+    let conflicts: Vec<Py<PyDict>> = r
+        .conflicts
+        .iter()
+        .map(|c| {
+            let e = PyDict::new(py);
+            e.set_item("path", &c.path)?;
+            e.set_item("kind", c.kind.as_str())?;
+            Ok(e.unbind())
+        })
+        .collect::<PyResult<_>>()?;
+    d.set_item("conflicts", conflicts)?;
+    d.set_item("stale_live_paths", r.stale_live_paths.clone())?;
+    d.set_item("cas_retries", r.cas_retries)?;
+    d.set_item("remote_tree_updated", r.remote_tree_updated)?;
+    Ok(d.unbind())
+}
+
 fn merge_outcome_dict(py: Python<'_>, outcome: &origofs_sdk::MergeOutcome) -> PyResult<Py<PyDict>> {
     use origofs_sdk::MergeOutcome::*;
     let d = PyDict::new(py);
@@ -4347,6 +4829,7 @@ fn _origofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Scope>()?;
     m.add_class::<S3Config>()?;
     m.add_class::<GcsConfig>()?;
+    m.add_class::<CacheConfig>()?;
     m.add_class::<Subscription>()?;
     m.add_class::<CoeditDoc>()?;
     m.add_class::<CoeditTreeDoc>()?;
