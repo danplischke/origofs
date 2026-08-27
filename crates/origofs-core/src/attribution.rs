@@ -618,6 +618,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
 
+        // Refuse before storing — see `Fs::write_attempt` (issue #116).
+        self.check_quota_for_path(path, data.len() as u64).await?;
         // Content durable first (store_body is idempotent, so it's computed once
         // and reused across create-race retries), then commit blame + content +
         // op-log together with the file's creation, so a crash can never leave a

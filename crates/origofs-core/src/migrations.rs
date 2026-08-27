@@ -189,6 +189,21 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V17_SQLITE,
         postgres: V17_POSTGRES,
     },
+    // V18 — extended attributes (issue #119). The only xattr code in the tree was
+    // `sandbox.rs` reading overlayfs whiteout markers off the *host* filesystem;
+    // origofs itself had nowhere to put one, so macOS metadata, SELinux labels, and
+    // git's own use all failed confusingly rather than cleanly.
+    //
+    // Keyed by inode rather than by content hash: an xattr describes *this file at
+    // this path* (a label, a resource fork), not the bytes, and two files that
+    // happen to dedup to one manifest must not share them. Values are bytes, and
+    // deliberately size-capped in the engine rather than here — see `MAX_XATTR_LEN`
+    // for why the metadata/content split makes that a rule and not a preference.
+    Migration {
+        version: 18,
+        sqlite: V18,
+        postgres: V18,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -401,6 +416,21 @@ ALTER TABLE inode ADD COLUMN gid INTEGER NOT NULL DEFAULT 0;
 const V17_POSTGRES: &str = "
 ALTER TABLE inode ADD COLUMN IF NOT EXISTS uid BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE inode ADD COLUMN IF NOT EXISTS gid BIGINT NOT NULL DEFAULT 0;
+";
+
+// V18 — extended attributes (see the migration entry above). Identical SQL in both
+// dialects: `BLOB` and `BYTEA` are spelled differently, so the value is stored as
+// the one binary type both accept under the same name — SQLite types are advisory
+// (`BYTEA` is simply an unrecognized name with BLOB affinity) and Postgres has
+// `BYTEA` natively.
+const V18: &str = "
+CREATE TABLE IF NOT EXISTS xattr(
+    ino   BIGINT NOT NULL,
+    name  TEXT   NOT NULL,
+    value BYTEA  NOT NULL,
+    PRIMARY KEY (ino, name)
+);
+CREATE INDEX IF NOT EXISTS idx_xattr_ino ON xattr(ino);
 ";
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS`; the migration runner tolerates a

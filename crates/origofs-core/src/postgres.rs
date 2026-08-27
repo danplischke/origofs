@@ -688,6 +688,12 @@ async fn truncate_workspace_tree_pg(c: &tokio_postgres::Client, ws: i64) -> Resu
         &[&ws],
     )
     .await?;
+    // xattrs are keyed by inode, so a truncated tree takes them with it (#119).
+    c.execute(
+        "DELETE FROM xattr WHERE ino IN (SELECT ino FROM inode WHERE workspace_id = $1)",
+        &[&ws],
+    )
+    .await?;
     c.execute(
         "DELETE FROM inode WHERE workspace_id = $1
            AND ino <> (SELECT root_ino FROM workspace WHERE id = $1)",
@@ -940,6 +946,9 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         c.execute("DELETE FROM symlink WHERE ino = $1", &[&ino])
             .await?;
+        // xattrs are keyed by inode, so they die with it (issue #119).
+        c.execute("DELETE FROM xattr WHERE ino = $1", &[&ino])
+            .await?;
         c.execute("DELETE FROM inode WHERE ino = $1", &[&ino])
             .await?;
         Ok(())
@@ -1087,6 +1096,87 @@ impl MetadataStore for PostgresMetadataStore {
             )
             .await?;
         Ok(row.get::<_, i64>(0) as usize)
+    }
+
+    async fn workspace_usage(&self) -> Result<(u64, u64)> {
+        let c = self.client().await?;
+        let r = c
+            .query_one(
+                "SELECT COUNT(*)::BIGINT, COALESCE(SUM(size), 0)::BIGINT
+                 FROM inode WHERE workspace_id = $1",
+                &[&self.workspace_id],
+            )
+            .await?;
+        Ok((
+            r.get::<_, i64>(0).max(0) as u64,
+            r.get::<_, i64>(1).max(0) as u64,
+        ))
+    }
+
+    async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
+        let c = self.client().await?;
+        // `UNION` (not `UNION ALL`) dedups inode ids, so an inode reachable by
+        // several names -- a hard link -- is counted once, as `du` does.
+        let r = c
+            .query_one(
+                "WITH RECURSIVE sub(ino) AS (
+                     SELECT $1::BIGINT
+                     UNION
+                     SELECT d.ino FROM dentry d JOIN sub ON d.parent_ino = sub.ino
+                 )
+                 SELECT COUNT(*)::BIGINT, COALESCE(SUM(i.size), 0)::BIGINT
+                 FROM inode i JOIN sub ON i.ino = sub.ino",
+                &[&ino],
+            )
+            .await?;
+        Ok((
+            r.get::<_, i64>(0).max(0) as u64,
+            r.get::<_, i64>(1).max(0) as u64,
+        ))
+    }
+
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT value FROM xattr WHERE ino = $1 AND name = $2",
+                &[&ino, &name],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, Vec<u8>>(0)))
+    }
+
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO xattr(ino, name, value) VALUES ($1, $2, $3)
+             ON CONFLICT (ino, name) DO UPDATE SET value = EXCLUDED.value",
+            &[&ino, &name, &value],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM xattr WHERE ino = $1 AND name = $2",
+                &[&ino, &name],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT name FROM xattr WHERE ino = $1 ORDER BY name",
+                &[&ino],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
     async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()> {
@@ -1938,6 +2028,9 @@ impl MetaTxn for PostgresTxn {
         let c = self.conn();
         c.execute("DELETE FROM symlink WHERE ino = $1", &[&ino])
             .await?;
+        // xattrs are keyed by inode, so they die with it (issue #119).
+        c.execute("DELETE FROM xattr WHERE ino = $1", &[&ino])
+            .await?;
         c.execute("DELETE FROM inode WHERE ino = $1", &[&ino])
             .await?;
         Ok(())
@@ -1974,6 +2067,9 @@ impl MetaTxn for PostgresTxn {
             .await?;
         if n == 1 {
             c.execute("DELETE FROM symlink WHERE ino = $1", &[&ino])
+                .await?;
+            // xattrs are keyed by inode, so they die with it (issue #119).
+            c.execute("DELETE FROM xattr WHERE ino = $1", &[&ino])
                 .await?;
         }
         Ok(n == 1)

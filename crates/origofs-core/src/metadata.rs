@@ -190,6 +190,45 @@ pub trait MetadataStore: Send + Sync {
     /// Number of entries directly under `parent`.
     async fn child_count(&self, parent: Ino) -> Result<usize>;
 
+    /// `(inodes, bytes)` for the whole current workspace (issue #116).
+    ///
+    /// One aggregate over the workspace's inode rows — not a tree walk — so it is
+    /// cheap enough to answer `statfs` on every call, which is what a mount needs.
+    /// `bytes` sums `inode.size`, i.e. **logical** size: it is what `df` should
+    /// report and deliberately not the deduplicated on-disk footprint, which is a
+    /// property of the content store and not knowable from here.
+    async fn workspace_usage(&self) -> Result<(u64, u64)>;
+
+    /// `(inodes, bytes)` for the subtree rooted at `ino`, inclusive (issue #116).
+    ///
+    /// The `du` primitive, and what a per-directory quota is checked against. Each
+    /// backend runs it as a single recursive CTE rather than a walk from the
+    /// engine, so it costs one round trip instead of one per directory level.
+    ///
+    /// An inode reachable by several names (a hard link, since #119) is counted
+    /// **once** — the recursion unions inode ids rather than accumulating per
+    /// dentry, which is the same choice `du` makes.
+    async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)>;
+
+    // --- extended attributes (issue #119) --------------------------------
+
+    /// Read one extended attribute, or `None` if the inode has no such name.
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Set (upsert) one extended attribute.
+    ///
+    /// The engine caps `value` at [`MAX_XATTR_LEN`](crate::MAX_XATTR_LEN) before
+    /// this is reached; backends store what they are given.
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()>;
+
+    /// Remove one extended attribute. Returns whether it existed — the FUSE
+    /// surface must answer `ENODATA` for a name that was not set, which it cannot
+    /// do if a removal of a missing name is indistinguishable from a real one.
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool>;
+
+    /// Every extended-attribute name on `ino`, in name order.
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>>;
+
     /// Set (or replace) the target of a symlink inode.
     async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()>;
 
@@ -570,6 +609,24 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
         (**self).set_owner(ino, uid, gid).await
+    }
+    async fn workspace_usage(&self) -> Result<(u64, u64)> {
+        (**self).workspace_usage().await
+    }
+    async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
+        (**self).subtree_usage(ino).await
+    }
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        (**self).get_xattr(ino, name).await
+    }
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        (**self).set_xattr(ino, name, value).await
+    }
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
+        (**self).remove_xattr(ino, name).await
+    }
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        (**self).list_xattrs(ino).await
     }
     async fn delete_inode(&self, ino: Ino) -> Result<()> {
         (**self).delete_inode(ino).await

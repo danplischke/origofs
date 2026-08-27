@@ -671,6 +671,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     async fn write_attempt(&self, path: &str, data: &[u8]) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
+        // Refuse before storing, not after: a quota that only rejected the metadata
+        // commit would still have uploaded the body, leaving chunks for gc to sweep
+        // and charging the user's bandwidth for a write that was never going to
+        // land (issue #116).
+        self.check_quota_for_path(path, data.len() as u64).await?;
         // Content is made durable first (store_body flushes), then the metadata
         // that references it commits atomically: for a new file the inode, its
         // dentry, and its content all land together or not at all (C1).

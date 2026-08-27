@@ -194,6 +194,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             bytes.resize(end, 0);
         }
         bytes[offset as usize..end].copy_from_slice(data);
+        // Refuse before storing — see `write_attempt` (issue #116).
+        self.check_quota_for_ino(ino, bytes.len() as u64).await?;
         let (mhash, size) = self.store_body(&bytes).await?;
         // Conditional on the version this body was read from, so a concurrent
         // write to another offset is not silently erased. The orphaned chunks a
@@ -242,6 +244,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             })?;
         }
         bytes.resize(target, 0);
+        // Only a *growing* truncate can breach a quota, but the check is uniform:
+        // `check_quota_for_ino` compares against the current size, so shrinking
+        // yields a zero delta and always passes (issue #116).
+        self.check_quota_for_ino(ino, bytes.len() as u64).await?;
         let (mhash, sz) = self.store_body(&bytes).await?;
         // See `vfs_write_attempt`: conditional, so a concurrent write is not lost.
         let mut tx = self.meta.begin().await?;
@@ -330,6 +336,45 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Hard-link the existing inode `ino` as `(newparent, newname)` (issue #119).
+    ///
+    /// The increment side of `nlink`, which the schema anticipated and nothing ever
+    /// built: the column, the type, and the whole decrement path (`vfs_unlink`,
+    /// `vfs_rename`, and the two path-API removes) already existed, and
+    /// `adjust_nlink` had only ever been called with `-1`. That made this the
+    /// cheapest of #119's POSIX holes to close, and it is not an exotic one —
+    /// `git` uses hard links, and several editors save via `rename`+`link`.
+    ///
+    /// Directories are refused (`EPERM`), as POSIX requires: a directory hard link
+    /// would let the dentry graph form a cycle no longer reachable from the root,
+    /// which nothing here — `gc`, commit, the recursive walks — is written to
+    /// survive.
+    ///
+    /// The dentry and the `nlink` bump commit together, so a failed link cannot
+    /// leave a count that no name backs (a leak that would keep the inode alive
+    /// forever) or a name whose count was never raised (a premature delete on the
+    /// next unlink).
+    pub async fn vfs_link(&self, ino: Ino, newparent: Ino, newname: &str) -> Result<Inode> {
+        validate_component(newname)?;
+        let inode = self.vfs_getattr(ino).await?;
+        if inode.kind == FileKind::Dir {
+            // POSIX: EPERM, not EISDIR — the operation is forbidden for this type,
+            // rather than the caller having named a directory where a file was
+            // wanted.
+            return Err(OrigoFSError::Denied(format!(
+                "hard links to directories are not allowed (ino {ino})"
+            )));
+        }
+        if self.meta.lookup(newparent, newname).await?.is_some() {
+            return Err(OrigoFSError::AlreadyExists(newname.to_string()));
+        }
+        let mut tx = self.meta.begin().await?;
+        tx.add_dentry(newparent, newname, ino).await?;
+        tx.adjust_nlink(ino, 1).await?;
+        tx.commit().await?;
+        self.vfs_getattr(ino).await
     }
 
     /// Remove an empty directory under `parent`.
@@ -473,6 +518,55 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         self.vfs_getattr(ino).await?;
         self.meta.set_owner(ino, uid, gid).await?;
         self.vfs_getattr(ino).await
+    }
+
+    /// Read one extended attribute (issue #119).
+    pub async fn vfs_getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        self.vfs_getattr(ino).await?;
+        self.meta.get_xattr(ino, name).await
+    }
+
+    /// Set one extended attribute (issue #119).
+    ///
+    /// Refuses a value larger than [`MAX_XATTR_LEN`](crate::MAX_XATTR_LEN). That
+    /// bound is not a preference: an xattr lives in the **metadata** store, and the
+    /// rule this whole design rests on is that the metadata DB never holds large
+    /// bytes. Without a cap here, `setfattr` is an unbounded, un-deduplicated,
+    /// un-chunked write straight into the DB — a supported way to do exactly the
+    /// thing the metadata/content split exists to prevent. The limit matches
+    /// Linux's own per-value ceiling, so nothing that works on ext4 or XFS is
+    /// refused here.
+    pub async fn vfs_setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        if name.is_empty() {
+            return Err(OrigoFSError::InvalidArgument(
+                "xattr name must not be empty".into(),
+            ));
+        }
+        if value.len() > crate::MAX_XATTR_LEN {
+            return Err(OrigoFSError::TooLarge(format!(
+                "xattr {name:?} is {} bytes; the limit is {} — extended attributes \
+                 live in the metadata store, which never holds large bytes",
+                value.len(),
+                crate::MAX_XATTR_LEN
+            )));
+        }
+        self.vfs_getattr(ino).await?;
+        self.meta.set_xattr(ino, name, value).await
+    }
+
+    /// Remove one extended attribute, reporting whether it was there (issue #119).
+    ///
+    /// The boolean is what lets a mount answer `ENODATA` for a name that was never
+    /// set, rather than reporting success for a removal that removed nothing.
+    pub async fn vfs_removexattr(&self, ino: Ino, name: &str) -> Result<bool> {
+        self.vfs_getattr(ino).await?;
+        self.meta.remove_xattr(ino, name).await
+    }
+
+    /// Every extended-attribute name on an inode, in name order (issue #119).
+    pub async fn vfs_listxattr(&self, ino: Ino) -> Result<Vec<String>> {
+        self.vfs_getattr(ino).await?;
+        self.meta.list_xattrs(ino).await
     }
 
     /// Read a symlink target by inode.

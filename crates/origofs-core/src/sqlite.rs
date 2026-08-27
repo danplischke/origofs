@@ -196,6 +196,11 @@ fn truncate_workspace_tree(conn: &Connection, ws: i64) -> rusqlite::Result<()> {
         "DELETE FROM symlink WHERE ino IN (SELECT ino FROM inode WHERE workspace_id = ?1)",
         params![ws],
     )?;
+    // xattrs are keyed by inode, so a truncated tree takes them with it (#119).
+    conn.execute(
+        "DELETE FROM xattr WHERE ino IN (SELECT ino FROM inode WHERE workspace_id = ?1)",
+        params![ws],
+    )?;
     conn.execute(
         "DELETE FROM inode WHERE workspace_id = ?1
            AND ino <> (SELECT root_ino FROM workspace WHERE id = ?1)",
@@ -505,6 +510,8 @@ impl MetadataStore for SqliteMetadataStore {
         blocking_section(move || {
             let conn = self.lock();
             conn.execute("DELETE FROM symlink WHERE ino = ?1", params![ino])?;
+            // xattrs are keyed by inode, so they die with it (issue #119).
+            conn.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             conn.execute("DELETE FROM inode WHERE ino = ?1", params![ino])?;
             Ok(())
         })
@@ -669,6 +676,87 @@ impl MetadataStore for SqliteMetadataStore {
                 |r| r.get(0),
             )?;
             Ok(n as usize)
+        })
+    }
+
+    async fn workspace_usage(&self) -> Result<(u64, u64)> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let (n, b): (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM inode WHERE workspace_id = ?1",
+                params![self.workspace_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok((n.max(0) as u64, b.max(0) as u64))
+        })
+    }
+
+    async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // `UNION` (not `UNION ALL`) dedups inode ids, so an inode reachable by
+            // several names -- a hard link -- is counted once, as `du` does.
+            let (n, b): (i64, i64) = conn.query_row(
+                "WITH RECURSIVE sub(ino) AS (
+                     SELECT ?1
+                     UNION
+                     SELECT d.ino FROM dentry d JOIN sub ON d.parent_ino = sub.ino
+                 )
+                 SELECT COUNT(*), COALESCE(SUM(i.size), 0)
+                 FROM inode i JOIN sub ON i.ino = sub.ino",
+                params![ino],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok((n.max(0) as u64, b.max(0) as u64))
+        })
+    }
+
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM xattr WHERE ino = ?1 AND name = ?2",
+                    params![ino, name],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?)
+        })
+    }
+
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO xattr(ino, name, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(ino, name) DO UPDATE SET value = excluded.value",
+                params![ino, name, value],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM xattr WHERE ino = ?1 AND name = ?2",
+                params![ino, name],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let mut stmt = conn.prepare("SELECT name FROM xattr WHERE ino = ?1 ORDER BY name")?;
+            let rows = stmt.query_map(params![ino], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
         })
     }
 
@@ -1638,6 +1726,8 @@ impl MetaTxn for SqliteTxn {
         blocking_section(move || {
             let conn = self.conn();
             conn.execute("DELETE FROM symlink WHERE ino = ?1", params![ino])?;
+            // xattrs are keyed by inode, so they die with it (issue #119).
+            conn.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             conn.execute("DELETE FROM inode WHERE ino = ?1", params![ino])?;
             Ok(())
         })
@@ -1663,6 +1753,8 @@ impl MetaTxn for SqliteTxn {
             )?;
             if n == 1 {
                 conn.execute("DELETE FROM symlink WHERE ino = ?1", params![ino])?;
+                // xattrs are keyed by inode, so they die with it (issue #119).
+                conn.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             }
             Ok(n == 1)
         })

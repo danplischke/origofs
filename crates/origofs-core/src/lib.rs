@@ -39,6 +39,7 @@ pub mod recover;
 pub mod resync;
 mod retry;
 pub mod sqlite;
+pub mod stats;
 pub mod suggest;
 pub mod types;
 mod util;
@@ -65,6 +66,21 @@ pub use corpus::{Passage, PassageOptions, Segmentation};
 pub use encrypt::EncryptedStore;
 pub use engine::{Fs, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
+pub use stats::{FsStat, Quota, STATFS_BLOCK_SIZE, Usage};
+
+/// The largest value a single extended attribute may hold (issue #119).
+///
+/// 64 KiB, matching Linux's own per-value ceiling, so nothing that works on ext4
+/// or XFS is refused here.
+///
+/// This is a hard rule rather than a tuning knob. An xattr is stored in the
+/// **metadata** store, and the invariant the whole design rests on is that the
+/// metadata DB references content by hash and never holds large bytes. Without a
+/// cap, `setfattr` would be a supported way to write unbounded,
+/// un-deduplicated, un-chunked data straight into the DB — precisely what the
+/// metadata/content split exists to prevent. Raise it only alongside a decision
+/// about where oversized attribute values would actually live.
+pub const MAX_XATTR_LEN: usize = 64 * 1024;
 pub use gc::{DEFAULT_GC_GRACE_SECS, GcStats};
 pub use merge::{Conflict, MergeOutcome};
 pub use metadata::{MetaTxn, MetadataStore};

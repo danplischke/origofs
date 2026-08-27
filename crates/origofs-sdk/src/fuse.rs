@@ -20,8 +20,8 @@ use crate::{Event, FileKind, Inode, OrigoFSError, Owner, Workspace};
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, Notifier, OpenFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow,
-    WriteFlags,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs, ReplyWrite,
+    ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -578,6 +578,12 @@ fn ftype(k: FileKind) -> FileType {
 ///
 /// A file made through a mount belongs to whoever made it. Before ownership
 /// existed every inode was created root-owned, which is the state this replaces.
+/// The longest single path component a mount reports supporting, for `statfs`.
+///
+/// 255 bytes is what every common Linux filesystem reports and what tools expect;
+/// origofs itself imposes no component-length limit beyond `validate_component`.
+const MAX_NAME_LEN: u32 = 255;
+
 fn caller_owner(req: &Request) -> Owner {
     Owner::new(req.uid(), req.gid())
 }
@@ -913,6 +919,131 @@ impl Filesystem for OrigoFSFuse {
                 .vfs_symlink(parent.0 as i64, &name, &target, caller_owner(req)),
         ) {
             Ok(i) => reply.entry(&TTL, &to_attr(&i), Generation(0)),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// Hard link (issue #119). `git` uses these, and several editors save via
+    /// `rename`+`link`; without it both got a confusing failure rather than a
+    /// clean one.
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let newname = newname.to_string_lossy().to_string();
+        match self.blk(
+            self.ws
+                .fs()
+                .vfs_link(ino.0 as i64, newparent.0 as i64, &newname),
+        ) {
+            Ok(i) => reply.entry(&TTL, &to_attr(&i), Generation(0)),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// `statfs` (issues #116, #119) — what `df` reads, and what some installers
+    /// refuse to run without. See `Fs::statfs` for what the totals mean when no
+    /// quota is set.
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        match self.blk(self.ws.fs().statfs()) {
+            Ok(s) => reply.statfs(
+                s.total_blocks,
+                s.free_blocks,
+                // bavail (space available to an unprivileged user) is the same as
+                // bfree here: origofs reserves nothing for root.
+                s.free_blocks,
+                s.total_inodes,
+                s.free_inodes,
+                s.block_size,
+                MAX_NAME_LEN,
+                s.block_size,
+            ),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// Set an extended attribute (issue #119).
+    ///
+    /// `position` is a macOS resource-fork offset; a non-zero one asks for a
+    /// partial write into a value, which is not supported rather than silently
+    /// treated as a whole-value write.
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        _flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if position != 0 {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let name = name.to_string_lossy().to_string();
+        match self.blk(self.ws.fs().vfs_setxattr(ino.0 as i64, &name, value)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// Get an extended attribute (issue #119).
+    ///
+    /// The two-call protocol: `size == 0` asks only for the length, and a `size`
+    /// too small for the value is `ERANGE` — a caller sizes its buffer from the
+    /// first form and would otherwise silently get a truncated value.
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let name = name.to_string_lossy().to_string();
+        match self.blk(self.ws.fs().vfs_getxattr(ino.0 as i64, &name)) {
+            Ok(Some(v)) => {
+                if size == 0 {
+                    reply.size(v.len() as u32);
+                } else if (v.len() as u32) > size {
+                    reply.error(Errno::ERANGE);
+                } else {
+                    reply.data(&v);
+                }
+            }
+            // "no such attribute" is ENODATA, distinct from "no such file".
+            Ok(None) => reply.error(Errno::ENODATA),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// List extended attribute names (issue #119). The reply is the
+    /// NUL-separated, NUL-terminated form `listxattr(2)` specifies.
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        match self.blk(self.ws.fs().vfs_listxattr(ino.0 as i64)) {
+            Ok(names) => {
+                let mut buf = Vec::new();
+                for n in names {
+                    buf.extend_from_slice(n.as_bytes());
+                    buf.push(0);
+                }
+                if size == 0 {
+                    reply.size(buf.len() as u32);
+                } else if (buf.len() as u32) > size {
+                    reply.error(Errno::ERANGE);
+                } else {
+                    reply.data(&buf);
+                }
+            }
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// Remove an extended attribute (issue #119). Removing a name that was never
+    /// set is `ENODATA`, not success.
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let name = name.to_string_lossy().to_string();
+        match self.blk(self.ws.fs().vfs_removexattr(ino.0 as i64, &name)) {
+            Ok(true) => reply.ok(),
+            Ok(false) => reply.error(Errno::ENODATA),
             Err(e) => reply.error(errno(&e)),
         }
     }
