@@ -110,6 +110,45 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         self.meta.dentry_name(parent, ino).await
     }
 
+    /// The absolute path of `ino`, or `None` if it is not reachable from the root.
+    ///
+    /// The mount surfaces address everything by inode number, so nothing on those
+    /// call paths already knows a path — but a trash entry is only useful if it
+    /// knows where to put the file back (issue #115), and an error message naming
+    /// an inode number helps nobody.
+    ///
+    /// Walks up via `parent_of`/`dentry_name`, both single indexed lookups, so the
+    /// cost is the depth rather than the size of the tree. Bounded, so a cycle
+    /// already present in the store surfaces as `None` instead of hanging — the
+    /// same guard `ensure_not_own_descendant` uses.
+    pub async fn vfs_path_of(&self, ino: Ino) -> Result<Option<String>> {
+        /// Deeper than any real tree; only a pre-existing cycle reaches it.
+        const MAX_DEPTH: usize = 4096;
+
+        if ino == crate::types::INO_ROOT {
+            return Ok(Some("/".to_string()));
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = ino;
+        for _ in 0..MAX_DEPTH {
+            let Some(parent) = self.meta.parent_of(cur).await? else {
+                // No dentry: unreachable from the root (an orphan, or the root of
+                // another workspace).
+                return Ok(None);
+            };
+            let Some(name) = self.meta.dentry_name(parent, cur).await? else {
+                return Ok(None);
+            };
+            parts.push(name);
+            if parent == crate::types::INO_ROOT {
+                parts.reverse();
+                return Ok(Some(format!("/{}", parts.join("/"))));
+            }
+            cur = parent;
+        }
+        Ok(None)
+    }
+
     /// Read up to `size` bytes at `offset`, fetching only the covering chunks.
     pub async fn vfs_read(&self, ino: Ino, offset: u64, size: u32) -> Result<Bytes> {
         let inode = self.vfs_getattr(ino).await?;
@@ -317,6 +356,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// Remove a file under `parent`.
+    ///
+    /// Captures into the trash first when the workspace has retention enabled
+    /// (issue #115). A mount has no actor context — a deliberate bypass per
+    /// `CLAUDE.md` — so the entry records no actor; that is strictly better than
+    /// not capturing it, since `rm` through a mount is exactly the failure mode
+    /// trash exists for.
     pub async fn vfs_unlink(&self, parent: Ino, name: &str) -> Result<()> {
         let ino = self
             .meta
@@ -327,6 +372,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if inode.kind == FileKind::Dir {
             return Err(OrigoFSError::IsADirectory(name.to_string()));
         }
+        self.trash_capture_inode(&inode, parent, name, None).await?;
         let mut tx = self.meta.begin().await?;
         tx.remove_dentry(parent, name).await?;
         // The database decrements; see `MetaTxn::adjust_nlink` for why the

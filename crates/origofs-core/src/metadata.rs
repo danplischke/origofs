@@ -229,6 +229,31 @@ pub trait MetadataStore: Send + Sync {
     /// Every extended-attribute name on `ino`, in name order.
     async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>>;
 
+    // --- trash (issue #115) ----------------------------------------------
+
+    /// Record a deleted entry, returning its trash id.
+    async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64>;
+
+    /// One trash entry by id, or `None`.
+    async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>>;
+
+    /// Every trash entry in this workspace, newest deletion first.
+    async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>>;
+
+    /// Drop one trash entry, reporting whether it existed.
+    async fn delete_trash(&self, id: i64) -> Result<bool>;
+
+    /// Drop every trash entry deleted before `cutoff`, returning how many went.
+    async fn purge_trash_before(&self, cutoff: i64) -> Result<usize>;
+
+    /// Every manifest hash a retained trash entry still needs.
+    ///
+    /// A GC root (`gc.rs`, root 5): without it the sweep reclaims a trashed body's
+    /// chunks and a restore finds an entry pointing at content that is gone.
+    /// Store-wide rather than workspace-scoped at the call site — `gc` marks from
+    /// every workspace, since content is shared across all of them.
+    async fn trash_content_hashes(&self) -> Result<Vec<Hash>>;
+
     /// Set (or replace) the target of a symlink inode.
     async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()>;
 
@@ -615,6 +640,24 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
         (**self).subtree_usage(ino).await
+    }
+    async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
+        (**self).push_trash(init).await
+    }
+    async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>> {
+        (**self).get_trash(id).await
+    }
+    async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>> {
+        (**self).list_trash().await
+    }
+    async fn delete_trash(&self, id: i64) -> Result<bool> {
+        (**self).delete_trash(id).await
+    }
+    async fn purge_trash_before(&self, cutoff: i64) -> Result<usize> {
+        (**self).purge_trash_before(cutoff).await
+    }
+    async fn trash_content_hashes(&self) -> Result<Vec<Hash>> {
+        (**self).trash_content_hashes().await
     }
     async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         (**self).get_xattr(ino, name).await

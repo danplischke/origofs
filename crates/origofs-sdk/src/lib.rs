@@ -25,8 +25,8 @@ pub use origofs_core::{
     EventInit, FileKind, GcStats, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError,
     Owner, PackStore, Passage, PassageOptions, Presence, RebuildReport, ResyncOutcome,
     ResyncReport, Scope, ScopeError, Segmentation, Suggestion, SuggestionContent, SuggestionInit,
-    SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats, VerifyingStore,
-    VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats, TrashEntry,
+    VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
 // Backend-specific re-exports, gated to match `origofs-core`'s own features.
 #[cfg(feature = "encryption")]
@@ -903,6 +903,54 @@ impl Workspace {
         self.fs.gc().await
     }
 
+    // --- trash (issue #115) ------------------------------------------------
+
+    /// The workspace's trash retention in seconds, or `None` when trash is off.
+    ///
+    /// Off is the default: enabling it by default would silently change *when
+    /// space is reclaimed* for every existing deployment, and the first anyone
+    /// would learn of it is a storage bill.
+    pub async fn trash_retention(&self) -> Result<Option<i64>> {
+        self.fs.trash_retention().await
+    }
+
+    /// Enable trash with `secs` of retention, or disable it with `None`.
+    ///
+    /// Disabling does not purge what is already there — see
+    /// [`Fs::set_trash_retention`](origofs_core::Fs::set_trash_retention).
+    pub async fn set_trash_retention(&self, secs: Option<i64>) -> Result<()> {
+        self.fs.set_trash_retention(secs).await
+    }
+
+    /// Everything currently recoverable, newest deletion first.
+    pub async fn list_trash(&self) -> Result<Vec<TrashEntry>> {
+        self.fs.list_trash().await
+    }
+
+    /// Put a trashed entry back at its original path, attributed to `ctx`.
+    #[tracing::instrument(skip(self, ctx))]
+    pub async fn restore_trash(&self, id: i64, ctx: WriteCtx) -> Result<String> {
+        self.fs.restore_trash(id, ctx).await
+    }
+
+    /// Permanently drop one trash entry.
+    pub async fn purge_trash(&self, id: i64) -> Result<bool> {
+        self.fs.purge_trash(id).await
+    }
+
+    /// Permanently drop every trash entry, whatever its age.
+    pub async fn empty_trash(&self) -> Result<usize> {
+        self.fs.empty_trash().await
+    }
+
+    /// Remove a path, capturing it into the trash first when retention is on.
+    ///
+    /// The unattributed counterpart of `remove_as` for a surface with no actor
+    /// context. Prefer `remove_as`/`remove_or_propose` wherever an actor is known.
+    pub async fn remove_trashing(&self, path: &str) -> Result<()> {
+        self.fs.remove_trashing(path).await
+    }
+
     /// [`gc`](Self::gc) with an explicit grace period, in seconds. Only content
     /// unreferenced *and* untouched for at least that long is reclaimed.
     ///
@@ -1681,6 +1729,29 @@ impl Workspace {
     pub async fn reap_presence(&self, grace_secs: i64) -> Result<u64> {
         self.fs.reap_presence(grace_secs).await
     }
+
+    /// Report what one file costs to read — chunk count, size distribution,
+    /// self-dedup, and whether the store still holds the chunks (issue #118).
+    ///
+    /// `probe_residency` is the only part that touches the content backend, at one
+    /// `has` per distinct chunk; everything else comes from the manifest. See
+    /// [`origofs_core::perf`] for what the numbers do and do not claim — in
+    /// particular that "dedup" here is repetition *within this file*, and that
+    /// presence is not cache residency.
+    pub async fn file_layout(&self, path: &str, probe_residency: bool) -> Result<FileLayout> {
+        self.fs.file_layout(path, probe_residency).await
+    }
+
+    /// Run an end-to-end write/read benchmark against **this** workspace's
+    /// backends (issue #118).
+    ///
+    /// It writes and then deletes files under [`BenchOpts::dir`], so it is a
+    /// mutating call; it refuses to start in a directory that already holds
+    /// anything unless [`BenchOpts::force`] is set. [`Fs::bench`] documents the
+    /// destructive surface and what the phases do and do not measure.
+    pub async fn bench(&self, opts: &BenchOpts) -> Result<BenchReport> {
+        self.fs.bench(opts).await
+    }
 }
 
 /// The per-store encryption salt, created with 16 fresh random bytes on first use.
@@ -1723,3 +1794,8 @@ async fn read_or_create_salt(content: &Content) -> Result<Vec<u8>> {
     }
     Ok(stored)
 }
+
+// The performance-introspection types behind `origofs info` and `origofs bench`
+// (issue #118). Re-exported here because the CLI — like every other consumer —
+// depends on the sdk alone and never on `origofs-core` directly.
+pub use origofs_core::perf::{BenchOpts, BenchReport, BenchStage, FileLayout, Residency, Tunable};

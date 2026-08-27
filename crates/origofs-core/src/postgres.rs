@@ -649,6 +649,28 @@ fn row_to_event(r: &Row) -> Event {
     }
 }
 
+/// Build a [`TrashEntry`](crate::trash::TrashEntry) from a row (issue #115).
+fn row_to_trash(r: &Row) -> Result<crate::trash::TrashEntry> {
+    let kind_s: String = r.get(2);
+    Ok(crate::trash::TrashEntry {
+        id: r.get(0),
+        path: r.get(1),
+        kind: FileKind::parse(&kind_s)
+            .ok_or_else(|| OrigoFSError::Metadata(format!("unknown trash kind {kind_s:?}")))?,
+        mode: r.get::<_, i64>(3) as u32,
+        size: r.get::<_, i64>(4) as u64,
+        content: r
+            .get::<_, Option<String>>(5)
+            .as_deref()
+            .and_then(Hash::from_hex),
+        symlink_target: r.get(6),
+        owner: crate::types::Owner::new(r.get::<_, i64>(7) as u32, r.get::<_, i64>(8) as u32),
+        actor_id: r.get(9),
+        session_id: r.get(10),
+        deleted_at: r.get(11),
+    })
+}
+
 fn row_to_inode(r: &Row) -> Result<Inode> {
     let kind_s: String = r.get(1);
     let kind = FileKind::parse(&kind_s)
@@ -1133,6 +1155,97 @@ impl MetadataStore for PostgresMetadataStore {
             r.get::<_, i64>(0).max(0) as u64,
             r.get::<_, i64>(1).max(0) as u64,
         ))
+    }
+
+    async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
+        let c = self.client().await?;
+        let row = c
+            .query_one(
+                "INSERT INTO trash(workspace_id, path, kind, mode, size, content_hash,
+                                   symlink_target, uid, gid, actor_id, session_id, deleted_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
+                &[
+                    &self.workspace_id,
+                    &init.path,
+                    &init.kind.as_str(),
+                    &(init.mode as i64),
+                    &(init.size as i64),
+                    &init.content.map(|h| h.to_hex()),
+                    &init.symlink_target,
+                    &(init.owner.uid as i64),
+                    &(init.owner.gid as i64),
+                    &init.actor_id,
+                    &init.session_id,
+                    &init.deleted_at,
+                ],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT id, path, kind, mode, size, content_hash, symlink_target,
+                        uid, gid, actor_id, session_id, deleted_at
+                 FROM trash WHERE id = $1 AND workspace_id = $2",
+                &[&id, &self.workspace_id],
+            )
+            .await?;
+        row.as_ref().map(row_to_trash).transpose()
+    }
+
+    async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT id, path, kind, mode, size, content_hash, symlink_target,
+                        uid, gid, actor_id, session_id, deleted_at
+                 FROM trash WHERE workspace_id = $1 ORDER BY deleted_at DESC, id DESC",
+                &[&self.workspace_id],
+            )
+            .await?;
+        rows.iter().map(row_to_trash).collect()
+    }
+
+    async fn delete_trash(&self, id: i64) -> Result<bool> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM trash WHERE id = $1 AND workspace_id = $2",
+                &[&id, &self.workspace_id],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn purge_trash_before(&self, cutoff: i64) -> Result<usize> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM trash WHERE workspace_id = $1 AND deleted_at < $2",
+                &[&self.workspace_id, &cutoff],
+            )
+            .await?;
+        Ok(n as usize)
+    }
+
+    async fn trash_content_hashes(&self) -> Result<Vec<Hash>> {
+        let c = self.client().await?;
+        // Store-wide, not workspace-scoped: `gc` sweeps one shared content store,
+        // so a workspace-scoped root would let it reclaim another workspace's
+        // trashed content.
+        let rows = c
+            .query(
+                "SELECT content_hash FROM trash WHERE content_hash IS NOT NULL",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| Hash::from_hex(&r.get::<_, String>(0)))
+            .collect())
     }
 
     async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {

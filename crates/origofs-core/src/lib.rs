@@ -33,6 +33,7 @@ pub mod objectgraph;
 #[cfg(feature = "object-store")]
 pub mod objectstore;
 pub mod pack;
+pub mod perf;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod recover;
@@ -42,6 +43,7 @@ pub mod scope;
 pub mod sqlite;
 pub mod stats;
 pub mod suggest;
+pub mod trash;
 pub mod types;
 mod util;
 pub mod version;
@@ -70,6 +72,7 @@ pub use engine::{Fs, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
 pub use scope::{Scope, ScopeError};
 pub use stats::{FsStat, Quota, STATFS_BLOCK_SIZE, Usage};
+pub use trash::{DEFAULT_TRASH_RETENTION_SECS, TrashEntry, TrashInit};
 
 /// The largest value a single extended attribute may hold (issue #119).
 ///

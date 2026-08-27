@@ -196,6 +196,30 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     async fn gc_locked(&self, grace_secs: u64) -> Result<GcStats> {
+        // Expire the trash *before* marking, so an entry past its retention does
+        // not keep its content alive for one more pass (issue #115). Folded into
+        // gc rather than run from a background thread: one maintenance schedule
+        // rather than two, and a deployment that never runs gc also never silently
+        // loses trash it is relying on.
+        //
+        // Per workspace, since retention is per-workspace config. Driven off the
+        // store handle rather than an `Fs` per workspace: `gc` already walks every
+        // workspace this way, and the purge needs nothing from the engine.
+        let now = self.now_secs();
+        for (id, _name, _root) in self.meta.list_workspaces().await? {
+            let ws = self.meta.with_workspace(id);
+            let retention = ws
+                .get_config(crate::trash::TRASH_RETENTION)
+                .await?
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|n| *n > 0);
+            // Trash disabled: deliberately *not* a purge. Turning retention off
+            // must not destroy entries captured while it was on.
+            if let Some(secs) = retention {
+                ws.purge_trash_before(now - secs).await?;
+            }
+        }
+
         let mut marked: HashSet<Hash> = HashSet::new();
 
         // Content is shared across every workspace in the store, so GC marks from
@@ -242,6 +266,15 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             // unreferenced and get reclaimed, so mirrors never accumulate.
             if let Some(h) = Self::mirror_hash_of(ws.as_ref()).await? {
                 marked.insert(h);
+            }
+            // Root 5: retained trash entries (issue #115). A trashed body is
+            // referenced by no ref and no working file — that is what being deleted
+            // means — so without this root the sweep reclaims its chunks and a
+            // restore finds an entry pointing at content that is gone. Expired
+            // entries were already purged above, so this marks only what is still
+            // restorable.
+            for h in ws.trash_content_hashes().await? {
+                self.mark_manifest(h, &mut marked).await?;
             }
         }
 

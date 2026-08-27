@@ -137,6 +137,73 @@ fn build_inode(
     })
 }
 
+/// Columns every trash `SELECT` reads, in the order [`build_trash`] expects.
+const TRASH_COLS: &str = "id, path, kind, mode, size, content_hash, symlink_target, \
+                          uid, gid, actor_id, session_id, deleted_at";
+
+type TrashRow = (
+    i64,
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    i64,
+);
+
+fn trash_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrashRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+        r.get(11)?,
+    ))
+}
+
+fn build_trash(row: TrashRow) -> Result<crate::trash::TrashEntry> {
+    let (
+        id,
+        path,
+        kind,
+        mode,
+        size,
+        content_hash,
+        symlink_target,
+        uid,
+        gid,
+        actor_id,
+        session_id,
+        deleted_at,
+    ) = row;
+    Ok(crate::trash::TrashEntry {
+        id,
+        path,
+        kind: FileKind::parse(&kind)
+            .ok_or_else(|| OrigoFSError::Metadata(format!("unknown trash kind {kind:?}")))?,
+        mode: mode as u32,
+        size: size as u64,
+        content: content_hash.as_deref().and_then(Hash::from_hex),
+        symlink_target,
+        owner: crate::types::Owner::new(uid as u32, gid as u32),
+        actor_id,
+        session_id,
+        deleted_at,
+    })
+}
+
 /// True if a DDL error is SQLite's "duplicate column name" — i.e. an
 /// `ADD COLUMN` migration re-applied to a table that already has the column.
 fn is_duplicate_column(e: &rusqlite::Error) -> bool {
@@ -708,6 +775,103 @@ impl MetadataStore for SqliteMetadataStore {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             Ok((n.max(0) as u64, b.max(0) as u64))
+        })
+    }
+
+    async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
+        blocking_section(move || {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO trash(workspace_id, path, kind, mode, size, content_hash,
+                                   symlink_target, uid, gid, actor_id, session_id, deleted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    self.workspace_id,
+                    init.path,
+                    init.kind.as_str(),
+                    init.mode as i64,
+                    init.size as i64,
+                    init.content.map(|h| h.to_hex()),
+                    init.symlink_target,
+                    init.owner.uid as i64,
+                    init.owner.gid as i64,
+                    init.actor_id,
+                    init.session_id,
+                    init.deleted_at,
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let row = conn
+                .query_row(
+                    &format!("SELECT {TRASH_COLS} FROM trash WHERE id = ?1 AND workspace_id = ?2"),
+                    params![id, self.workspace_id],
+                    trash_row,
+                )
+                .optional()?;
+            row.map(build_trash).transpose()
+        })
+    }
+
+    async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {TRASH_COLS} FROM trash WHERE workspace_id = ?1
+                 ORDER BY deleted_at DESC, id DESC"
+            ))?;
+            let rows = stmt.query_map(params![self.workspace_id], trash_row)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(build_trash(r?)?);
+            }
+            Ok(out)
+        })
+    }
+
+    async fn delete_trash(&self, id: i64) -> Result<bool> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM trash WHERE id = ?1 AND workspace_id = ?2",
+                params![id, self.workspace_id],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    async fn purge_trash_before(&self, cutoff: i64) -> Result<usize> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM trash WHERE workspace_id = ?1 AND deleted_at < ?2",
+                params![self.workspace_id, cutoff],
+            )?;
+            Ok(n)
+        })
+    }
+
+    async fn trash_content_hashes(&self) -> Result<Vec<Hash>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // Store-wide, not workspace-scoped: `gc` sweeps one shared content
+            // store, so a workspace-scoped root would let it reclaim another
+            // workspace's trashed content.
+            let mut stmt =
+                conn.prepare("SELECT content_hash FROM trash WHERE content_hash IS NOT NULL")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                if let Some(h) = Hash::from_hex(&r?) {
+                    out.push(h);
+                }
+            }
+            Ok(out)
         })
     }
 

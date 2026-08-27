@@ -980,6 +980,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // Capture identity and content *before* the removal: afterwards the inode
         // is gone and the op-log could not name what was destroyed.
         let inode = self.stat(path).await?;
+        // Same reason, one layer up: trash records the whole entry (mode,
+        // ownership, manifest, symlink target) plus who deleted it, and none of
+        // that is readable once the row is gone (issue #115). A no-op when trash
+        // is disabled, which is the default.
+        self.trash_capture(path, Some(ctx)).await?;
         self.remove(path).await?;
         self.meta
             .append_edit_op(EditOpInit {

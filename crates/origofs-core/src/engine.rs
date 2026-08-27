@@ -1140,6 +1140,22 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
     }
 
+    /// [`remove`](Self::remove), first capturing the entry into the trash when the
+    /// workspace has retention enabled (issue #115).
+    ///
+    /// Separate from `remove` rather than folded into it, because `remove` is also
+    /// the internal machinery's demolition primitive — checkout truncating a tree,
+    /// merge materialization replacing a file. Trashing those would fill the trash
+    /// with entries no user ever deleted and pin their content as a GC root, which
+    /// is the opposite of useful. Only a *user-facing* delete goes through here.
+    ///
+    /// The attributed path (`remove_as_unchecked`) captures separately, since it
+    /// has an actor to record.
+    pub async fn remove_trashing(&self, path: &str) -> Result<()> {
+        self.trash_capture(path, None).await?;
+        self.remove(path).await
+    }
+
     /// Refuse to move `sino` inside itself.
     ///
     /// `rename("/a", "/a/b/a2")` would make `a` a child of its own child. The
