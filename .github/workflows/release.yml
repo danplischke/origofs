@@ -14,6 +14,14 @@ name: Release
 #     `cfg(target_os = "linux")` in crates/origofs-py/Cargo.toml, because macFUSE
 #     is a kernel extension a wheel cannot provide. macOS mounts over NFSv3
 #     (`serve_nfs`), which is pure Rust.
+#
+# **A release is only ever cut from a `v*` tag on `main`.** GitHub cannot express
+# that here — `on.push.tags` matches a tag anywhere in the repo, with no branch
+# filter — so the `main` half of the rule is enforced by the `guard` job below,
+# which every other job depends on. The other half — *who* may cut a `v*` tag, and
+# that a cut tag never moves — is a repository ruleset, kept alongside as
+# `.github/rulesets/v-tags.json`; a ruleset cannot check what a tag points at,
+# which is exactly why the `guard` job exists.
 on:
   push:
     tags: ["v*"]
@@ -31,8 +39,46 @@ permissions:
   contents: read
 
 jobs:
+  # The `main`-only half of the release rule (see the header). A `v*` tag pushed
+  # at a commit that is not contained in `origin/main` — a side branch, a fork's
+  # branch pushed here, a tag on a reverted commit — fails this job, and because
+  # every other job `needs` it, nothing is built, attached to a Release, or
+  # uploaded to PyPI.
+  guard:
+    name: Tag is on main
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Full history: `merge-base --is-ancestor` needs both the tagged commit and
+      # main's, and a tag push checks out at depth 1 by default.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require the tagged commit to be on main
+        shell: bash
+        # Via env, not `${{ }}` interpolation — a tag name is attacker-shaped
+        # input and must never be pasted into the script body.
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "push" ]; then
+            echo "Dry run ($EVENT, $GITHUB_REF) — wheels only, nothing is published."
+            exit 0
+          fi
+          git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag '$TAG' points at $GITHUB_SHA, which is not on main." \
+                 "Releases are only cut from v* tags on main — merge to main first, then tag."
+            exit 1
+          fi
+          echo "Tag '$TAG' ($GITHUB_SHA) is on main."
+
   wheels:
     name: ${{ matrix.name }}
+    needs: [guard]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -103,6 +149,7 @@ jobs:
 
   sdist:
     name: sdist
+    needs: [guard]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -123,7 +170,7 @@ jobs:
   # build stage — and it needs no account setup, unlike the PyPI job below.
   github-release:
     name: Attach to GitHub Release
-    needs: [wheels, sdist]
+    needs: [guard, wheels, sdist]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -154,7 +201,7 @@ jobs:
   #   3. Set the repository variable PUBLISH_TO_PYPI to `true`.
   pypi:
     name: Publish to PyPI
-    needs: [wheels, sdist]
+    needs: [guard, wheels, sdist]
     if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_TO_PYPI == 'true'
     runs-on: ubuntu-latest
     environment: pypi
