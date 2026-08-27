@@ -1038,6 +1038,19 @@ class Workspace:
         ``/tenant-abc/notes.txt``. Omit it to revert everywhere the session
         wrote."""
         ...
+    async def revert_session_as(
+        self,
+        ctx: WriteCtx,
+        actor_id: int,
+        session_id: int,
+        path_prefix: Optional[str] = None,
+    ) -> list[str]:
+        """:meth:`revert_session`, authorized as ``ctx``.
+
+        A surface serving possibly-untrusted callers wants this one: a bounded
+        revert is checked against ``path_prefix``, and an unbounded one — which
+        reaches every path — against the workspace root."""
+        ...
     async def edit_ops(
         self, actor_id: int, session_id: Optional[int] = None
     ) -> list[EditOp]: ...
