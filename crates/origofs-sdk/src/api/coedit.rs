@@ -28,7 +28,7 @@
 //! out to its sockets, so all replicas converge. A joining room replays recent ops
 //! to catch up. On SQLite (single-writer) the relay is simply off.
 
-use super::{AppState, abspath};
+use super::{AppState, scope_path};
 use crate::{CoeditDoc, CoeditTreeDoc, OrigoFSError, TreeSpan, Workspace, WriteCtx};
 use axum::{
     body::Bytes,
@@ -673,7 +673,13 @@ pub(crate) async fn coedit_ws(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let path = abspath(&path);
+    // Scoped like every other path route (issue #125): a co-editing socket is a
+    // read *and* a write channel onto a path, so leaving it unscoped would be the
+    // widest hole of the set.
+    let path = match scope_path(&state.scope, &path) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
     upgrade_room(
         state,
         RoomKey::Flat(path),
@@ -703,7 +709,10 @@ pub(crate) async fn coedit_tree_ws(
         root: q
             .root
             .unwrap_or_else(|| crate::DEFAULT_TREE_ROOT.to_string()),
-        path: abspath(&path),
+        path: match scope_path(&state.scope, &path) {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
+        },
     };
     upgrade_room(state, key, q.token.as_deref(), headers, upgrade).await
 }
@@ -811,7 +820,10 @@ pub(crate) async fn coedit_tree_checkpoint(
         .into_iter()
         .map(|s| TreeSpan::new(s.start, s.end, s.node))
         .collect();
-    let path = abspath(&path);
+    let path = match scope_path(&state.scope, &path) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
     match state
         .coedit
         .checkpoint_tree(&path, &root, ctx, req.body.as_bytes(), &spans)

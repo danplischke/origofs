@@ -111,6 +111,18 @@ async def _collect() -> dict:
     tree = await ws.open_coedit_tree(ctx, "/docs/tree.md", "content")
     await tree.append_text(ctx, "p", "structured")
 
+    # Trash is off by default, so a recoverable delete has to be turned on first.
+    await ws.set_trash_retention(3600)
+    await ws.write("/docs/doomed.txt", b"delete me\n")
+    await ws.remove_trashing("/docs/doomed.txt")
+
+    # One prefix grant, so the ACL record has something to describe.
+    await ws.grant(agent, "/docs", ["read", "propose"], human)
+
+    # A tiny benchmark: the defaults (8 x 8 MiB) are sized for a real
+    # measurement, which is not what this test is for.
+    bench = await ws.bench(dir="/.bench", files=1, file_size=4096)
+
     records = {
         "ActorRecord": await ws.actor(human),
         "BlameSpan": (await ws.blame("/docs/notes.txt"))[0],
@@ -133,6 +145,18 @@ async def _collect() -> dict:
         "MigrateReport": await ws.migrate(),
         "ReadyReport": await ws.ready(),
         "TreeRun": (await tree.runs())[0],
+        "TrashRecord": (await ws.list_trash())[0],
+        "UsageRecord": await ws.usage(),
+        "QuotaRecord": await ws.quota(),
+        "FsStatRecord": await ws.statfs(),
+        "AclGrantRecord": (await ws.list_grants())[0],
+        # `probe=True` so the nested residency record is built rather than None.
+        "FileLayoutRecord": await ws.file_layout("/docs/notes.txt", True),
+        "ResidencyRecord": (await ws.file_layout("/docs/notes.txt", True))["residency"],
+        "BenchReport": bench,
+        "BenchOptsRecord": bench["opts"],
+        "BenchStageRecord": bench["write"],
+        "TunableRecord": bench["upload_concurrency"],
     }
     assert commit  # the commit above is what `log`/`branches` report on
     return records

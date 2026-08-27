@@ -6,7 +6,7 @@
 //! milestones add commits and attribution behind the same façade.
 
 use origofs_core::{Fs, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use bytes::Bytes;
@@ -20,12 +20,13 @@ pub use origofs_core::metrics;
 // `Workspace::open_encrypted` takes. Previously private, so an embedder could not
 // compose one.
 pub use origofs_core::{
-    Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DEFAULT_GC_GRACE_SECS,
-    DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event, EventInit, FileKind,
-    GcStats, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError, PackStore, Passage,
-    PassageOptions, Presence, RebuildReport, ResyncOutcome, ResyncReport, Segmentation, Suggestion,
-    SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit,
-    TransferStats, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    AclGrant, Actor, ActorInit, ActorKind, BlameRange, CacheLimits, CommitInfo, Conflict,
+    DEFAULT_GC_GRACE_SECS, DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event,
+    EventInit, FileKind, FsStat, GcStats, Hash, Inode, LiveDoc, LoadReport, MemStore, MergeOutcome,
+    OrigoFSError, Owner, PackStore, Passage, PassageOptions, Perms, Presence, Quota, RebuildReport,
+    ResyncOutcome, ResyncReport, Scope, ScopeError, Segmentation, Suggestion, SuggestionContent,
+    SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats,
+    TrashEntry, Usage, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
 // Backend-specific re-exports, gated to match `origofs-core`'s own features.
 #[cfg(feature = "encryption")]
@@ -160,6 +161,69 @@ pub struct Workspace {
     pg: Option<Arc<PostgresMetadataStore>>,
 }
 
+/// Where and how large a local read cache may be (issue #114).
+///
+/// Caching is **opt-in** rather than a default, and deliberately so: turning it on
+/// means writing to the user's disk, and a library that starts doing that without
+/// being asked is a library that fills someone's laptop. The cost of opt-in is that
+/// it gets used less, which is a fair trade against surprising a caller who chose a
+/// remote backend precisely so that nothing landed locally.
+///
+/// The defaults from [`new`](Self::new) are sized for a developer machine. Pick
+/// them explicitly for a container, where the writable layer is usually far smaller
+/// than the disk the numbers below assume.
+#[derive(Clone, Debug)]
+pub struct CacheConfig {
+    /// Directory for the cache tier. Created if absent.
+    pub dir: PathBuf,
+    /// Evict least-recently-used chunks to stay at or below this.
+    pub max_bytes: u64,
+    /// Also evict whenever the filesystem holding `dir` has less than this free,
+    /// so the cache yields to the rest of the machine rather than competing with
+    /// it. Enforced on Unix; on Windows there is no `statvfs` and only `max_bytes`
+    /// applies.
+    pub min_free_bytes: u64,
+}
+
+impl CacheConfig {
+    /// 8 GiB of cache, yielding whenever the disk drops under 2 GiB free.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            max_bytes: 8 << 30,
+            min_free_bytes: 2 << 30,
+        }
+    }
+
+    /// Set the size bound.
+    pub fn max_bytes(mut self, n: u64) -> Self {
+        self.max_bytes = n;
+        self
+    }
+
+    /// Set the free-space floor.
+    pub fn min_free_bytes(mut self, n: u64) -> Self {
+        self.min_free_bytes = n;
+        self
+    }
+}
+
+/// Split an absolute path into `(parent, name)`.
+///
+/// The façade's path-addressed wrappers over the inode-oriented engine ops need
+/// this; the engine's own `resolve_parent` is `pub(crate)`, and an inode number is
+/// a mount implementation detail no `Workspace` caller should have to hold.
+fn split_parent(path: &str) -> Result<(String, String)> {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some(("", name)) if !name.is_empty() => Ok(("/".to_string(), name.to_string())),
+        Some((parent, name)) if !name.is_empty() => Ok((parent.to_string(), name.to_string())),
+        _ => Err(OrigoFSError::InvalidPath(format!(
+            "{path:?} names no parent directory"
+        ))),
+    }
+}
+
 impl Workspace {
     /// Open (creating if needed) a workspace from explicit metadata + content
     /// backends.
@@ -219,6 +283,81 @@ impl Workspace {
         let salt = read_or_create_salt(&backend).await?;
         let content: Content =
             Arc::new(EncryptedStore::from_passphrase(backend, passphrase, &salt)?);
+        Self::open(meta, content).await
+    }
+
+    /// Wrap a remote content backend in a **bounded local read cache** (issue
+    /// #114), returning the full stack a workspace should use.
+    ///
+    /// The layering is the point, and it is not the obvious one:
+    ///
+    /// ```text
+    /// VerifyingStore( TieredStore( cache: LocalCasStore, backend: <remote> ) )
+    /// ```
+    ///
+    /// `VerifyingStore` stays **outside**, as every other `open_*` recipe arranges,
+    /// so integrity is still checked at the chunk-addressed boundary the caller
+    /// reads by. The cache goes *inside* it, which is why a cache cannot simply be
+    /// bolted onto an already-verified stack — and why the cached constructors are
+    /// separate rather than a decorator a caller applies afterwards.
+    /// `TieredStore` additionally re-verifies its own cache hits, so a corrupt
+    /// cached copy becomes a refetch instead of the hard `Corrupt` the outer layer
+    /// would raise.
+    #[cfg(feature = "object-store")]
+    async fn cached_remote(backend: Content, cache: &CacheConfig) -> Result<Content> {
+        let local: Content = Arc::new(LocalCasStore::open(&cache.dir).await?);
+        let tier = TieredStore::with_limits(
+            local,
+            backend,
+            CacheLimits::bounded(&cache.dir, cache.max_bytes, cache.min_free_bytes),
+        );
+        // Account for whatever the directory already holds, so the bound covers a
+        // cache that survived a restart rather than only this process's own reads.
+        tier.warm_index().await?;
+        Ok(Arc::new(VerifyingStore::new(Arc::new(tier))))
+    }
+
+    /// [`open_s3`](Self::open_s3) with a bounded local read cache (issue #114).
+    #[cfg(feature = "object-store")]
+    pub async fn open_s3_cached(
+        db_path: impl AsRef<Path>,
+        cfg: S3Config,
+        cache: CacheConfig,
+    ) -> Result<Self> {
+        let meta: Meta = Arc::new(SqliteMetadataStore::open(db_path)?);
+        let backend: Content = Arc::new(ObjectContentStore::s3(cfg)?);
+        let content = Self::cached_remote(backend, &cache).await?;
+        Self::open(meta, content).await
+    }
+
+    /// [`open_pg_s3`](Self::open_pg_s3) with a bounded local read cache (#114).
+    #[cfg(all(feature = "object-store", feature = "postgres"))]
+    pub async fn open_pg_s3_cached(dsn: &str, cfg: S3Config, cache: CacheConfig) -> Result<Self> {
+        let meta: Meta = Arc::new(PostgresMetadataStore::connect(dsn).await?);
+        let backend: Content = Arc::new(ObjectContentStore::s3(cfg)?);
+        let content = Self::cached_remote(backend, &cache).await?;
+        Self::open(meta, content).await
+    }
+
+    /// [`open_gcs`](Self::open_gcs) with a bounded local read cache (#114).
+    #[cfg(feature = "object-store")]
+    pub async fn open_gcs_cached(
+        db_path: impl AsRef<Path>,
+        cfg: GcsConfig,
+        cache: CacheConfig,
+    ) -> Result<Self> {
+        let meta: Meta = Arc::new(SqliteMetadataStore::open(db_path)?);
+        let backend: Content = Arc::new(ObjectContentStore::gcs(cfg)?);
+        let content = Self::cached_remote(backend, &cache).await?;
+        Self::open(meta, content).await
+    }
+
+    /// [`open_pg_gcs`](Self::open_pg_gcs) with a bounded local read cache (#114).
+    #[cfg(all(feature = "object-store", feature = "postgres"))]
+    pub async fn open_pg_gcs_cached(dsn: &str, cfg: GcsConfig, cache: CacheConfig) -> Result<Self> {
+        let meta: Meta = Arc::new(PostgresMetadataStore::connect(dsn).await?);
+        let backend: Content = Arc::new(ObjectContentStore::gcs(cfg)?);
+        let content = Self::cached_remote(backend, &cache).await?;
         Self::open(meta, content).await
     }
 
@@ -778,6 +917,221 @@ impl Workspace {
     #[tracing::instrument(skip_all)]
     pub async fn gc(&self) -> Result<GcStats> {
         self.fs.gc().await
+    }
+
+    // --- usage, quotas, statfs (issues #116, #119) --------------------------
+
+    /// Usage of the whole workspace — one aggregate query.
+    pub async fn usage(&self) -> Result<Usage> {
+        self.fs.usage().await
+    }
+
+    /// Recursive usage of a subtree: the `du` primitive.
+    pub async fn du(&self, path: &str) -> Result<Usage> {
+        self.fs.du(path).await
+    }
+
+    /// The workspace's capacity limits, all-`None` when unset.
+    pub async fn quota(&self) -> Result<Quota> {
+        self.fs.quota().await
+    }
+
+    /// Set (or clear) the workspace's capacity limits.
+    pub async fn set_quota(&self, quota: Quota) -> Result<()> {
+        self.fs.set_quota(quota).await
+    }
+
+    /// Answer a `statfs(2)`.
+    pub async fn statfs(&self) -> Result<FsStat> {
+        self.fs.statfs().await
+    }
+
+    // --- ownership, mode, links, xattrs (issues #119, #121, #122) -----------
+
+    /// Change a path's permission bits.
+    pub async fn chmod(&self, path: &str, mode: u32) -> Result<Inode> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_chmod(ino, mode).await
+    }
+
+    /// Change a path's owning uid/gid. `None` leaves that half alone, as
+    /// `chown(2)`'s `-1` does.
+    pub async fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<Inode> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_chown(ino, uid, gid).await
+    }
+
+    /// Hard-link `existing` as `link_path`.
+    pub async fn link(&self, existing: &str, link_path: &str) -> Result<Inode> {
+        let ino = self.fs.stat(existing).await?.ino;
+        let (parent, name) = split_parent(link_path)?;
+        let parent_ino = self.fs.stat(&parent).await?.ino;
+        self.fs.vfs_link(ino, parent_ino, &name).await
+    }
+
+    /// Read one extended attribute.
+    pub async fn getxattr(&self, path: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_getxattr(ino, name).await
+    }
+
+    /// Set one extended attribute. Values are capped at
+    /// [`MAX_XATTR_LEN`](origofs_core::MAX_XATTR_LEN) — an xattr lives in the
+    /// metadata store, which never holds large bytes.
+    pub async fn setxattr(&self, path: &str, name: &str, value: &[u8]) -> Result<()> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_setxattr(ino, name, value).await
+    }
+
+    /// Remove one extended attribute, reporting whether it was set.
+    pub async fn removexattr(&self, path: &str, name: &str) -> Result<bool> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_removexattr(ino, name).await
+    }
+
+    /// Every extended-attribute name on a path, in name order.
+    pub async fn listxattr(&self, path: &str) -> Result<Vec<String>> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.vfs_listxattr(ino).await
+    }
+
+    // --- attribution completeness (issue #128) ------------------------------
+
+    /// Whether this workspace requires every surface-initiated mutation to name
+    /// an actor. Off by default; see
+    /// [`Fs::require_attribution`](origofs_core::Fs::require_attribution) for why
+    /// this is an attribution-completeness switch and **not** a security boundary.
+    pub async fn require_attribution(&self) -> Result<bool> {
+        self.fs.require_attribution().await
+    }
+
+    /// Turn the attribution requirement on or off.
+    pub async fn set_require_attribution(&self, required: bool) -> Result<()> {
+        self.fs.set_require_attribution(required).await
+    }
+
+    /// Refuse an unattributed mutation when this workspace requires attribution.
+    /// Surfaces call this on the path where no actor was named.
+    pub async fn ensure_attributed(&self, op: &str) -> Result<()> {
+        self.fs.ensure_attributed(op).await
+    }
+
+    // --- path-scoped ACLs (issue #123) --------------------------------------
+
+    /// Grant `perms` to an actor under `path_prefix`.
+    pub async fn grant(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: Perms,
+        granted_by: Option<i64>,
+    ) -> Result<()> {
+        self.fs
+            .grant(actor_id, path_prefix, perms, granted_by)
+            .await
+    }
+
+    /// Remove a grant, reporting whether one was there.
+    pub async fn revoke(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        revoked_by: Option<i64>,
+    ) -> Result<bool> {
+        self.fs.revoke(actor_id, path_prefix, revoked_by).await
+    }
+
+    /// Every grant in this workspace, or just one actor's.
+    pub async fn list_grants(&self, actor_id: Option<i64>) -> Result<Vec<AclGrant>> {
+        self.fs.list_grants(actor_id).await
+    }
+
+    /// The permissions an actor has at a path — longest matching prefix wins,
+    /// falling back to its `write_policy` when it has no grant.
+    pub async fn effective_perms(&self, actor_id: i64, path: &str) -> Result<Perms> {
+        self.fs.effective_perms(actor_id, path).await
+    }
+
+    /// Whether an ungranted actor is denied rather than falling back.
+    pub async fn acl_default_deny(&self) -> Result<bool> {
+        self.fs.acl_default_deny().await
+    }
+
+    /// Switch between fallback (the default) and deny-by-default.
+    pub async fn set_acl_default_deny(&self, deny: bool) -> Result<()> {
+        self.fs.set_acl_default_deny(deny).await
+    }
+
+    /// Refuse an op at a path for an actor without `WRITE` there.
+    pub async fn ensure_may_write_at(&self, ctx: WriteCtx, op: &str, path: &str) -> Result<()> {
+        self.fs.ensure_may_write_at(ctx, op, path).await
+    }
+
+    // --- portable dump/load (issue #117) ------------------------------------
+
+    /// Write an engine-independent dump of the whole metadata store.
+    ///
+    /// The metadata DB is the half the content store cannot rebuild: `fsck
+    /// --rebuild` recovers committed files, dirs, symlinks and branches from the
+    /// bucket alone, and none of the attribution. This is how that half moves —
+    /// as a backup, or as the SQLite → Postgres migration path that did not
+    /// previously exist.
+    pub async fn dump<W: std::io::Write>(&self, out: W) -> Result<usize> {
+        self.fs.dump(out).await
+    }
+
+    /// Restore a dump into a pristine store. Refuses to merge — see
+    /// [`Fs::load`](origofs_core::Fs::load).
+    pub async fn load<R: std::io::BufRead>(&self, input: R) -> Result<LoadReport> {
+        self.fs.load(input).await
+    }
+
+    // --- trash (issue #115) ------------------------------------------------
+
+    /// The workspace's trash retention in seconds, or `None` when trash is off.
+    ///
+    /// Off is the default: enabling it by default would silently change *when
+    /// space is reclaimed* for every existing deployment, and the first anyone
+    /// would learn of it is a storage bill.
+    pub async fn trash_retention(&self) -> Result<Option<i64>> {
+        self.fs.trash_retention().await
+    }
+
+    /// Enable trash with `secs` of retention, or disable it with `None`.
+    ///
+    /// Disabling does not purge what is already there — see
+    /// [`Fs::set_trash_retention`](origofs_core::Fs::set_trash_retention).
+    pub async fn set_trash_retention(&self, secs: Option<i64>) -> Result<()> {
+        self.fs.set_trash_retention(secs).await
+    }
+
+    /// Everything currently recoverable, newest deletion first.
+    pub async fn list_trash(&self) -> Result<Vec<TrashEntry>> {
+        self.fs.list_trash().await
+    }
+
+    /// Put a trashed entry back at its original path, attributed to `ctx`.
+    #[tracing::instrument(skip(self, ctx))]
+    pub async fn restore_trash(&self, id: i64, ctx: WriteCtx) -> Result<String> {
+        self.fs.restore_trash(id, ctx).await
+    }
+
+    /// Permanently drop one trash entry.
+    pub async fn purge_trash(&self, id: i64) -> Result<bool> {
+        self.fs.purge_trash(id).await
+    }
+
+    /// Permanently drop every trash entry, whatever its age.
+    pub async fn empty_trash(&self) -> Result<usize> {
+        self.fs.empty_trash().await
+    }
+
+    /// Remove a path, capturing it into the trash first when retention is on.
+    ///
+    /// The unattributed counterpart of `remove_as` for a surface with no actor
+    /// context. Prefer `remove_as`/`remove_or_propose` wherever an actor is known.
+    pub async fn remove_trashing(&self, path: &str) -> Result<()> {
+        self.fs.remove_trashing(path).await
     }
 
     /// [`gc`](Self::gc) with an explicit grace period, in seconds. Only content
@@ -1558,6 +1912,29 @@ impl Workspace {
     pub async fn reap_presence(&self, grace_secs: i64) -> Result<u64> {
         self.fs.reap_presence(grace_secs).await
     }
+
+    /// Report what one file costs to read — chunk count, size distribution,
+    /// self-dedup, and whether the store still holds the chunks (issue #118).
+    ///
+    /// `probe_residency` is the only part that touches the content backend, at one
+    /// `has` per distinct chunk; everything else comes from the manifest. See
+    /// [`origofs_core::perf`] for what the numbers do and do not claim — in
+    /// particular that "dedup" here is repetition *within this file*, and that
+    /// presence is not cache residency.
+    pub async fn file_layout(&self, path: &str, probe_residency: bool) -> Result<FileLayout> {
+        self.fs.file_layout(path, probe_residency).await
+    }
+
+    /// Run an end-to-end write/read benchmark against **this** workspace's
+    /// backends (issue #118).
+    ///
+    /// It writes and then deletes files under [`BenchOpts::dir`], so it is a
+    /// mutating call; it refuses to start in a directory that already holds
+    /// anything unless [`BenchOpts::force`] is set. [`Fs::bench`] documents the
+    /// destructive surface and what the phases do and do not measure.
+    pub async fn bench(&self, opts: &BenchOpts) -> Result<BenchReport> {
+        self.fs.bench(opts).await
+    }
 }
 
 /// The per-store encryption salt, created with 16 fresh random bytes on first use.
@@ -1600,3 +1977,8 @@ async fn read_or_create_salt(content: &Content) -> Result<Vec<u8>> {
     }
     Ok(stored)
 }
+
+// The performance-introspection types behind `origofs info` and `origofs bench`
+// (issue #118). Re-exported here because the CLI — like every other consumer —
+// depends on the sdk alone and never on `origofs-core` directly.
+pub use origofs_core::perf::{BenchOpts, BenchReport, BenchStage, FileLayout, Residency, Tunable};

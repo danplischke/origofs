@@ -30,10 +30,7 @@ async fn seed<M: MetadataStore>(meta: &M, parent: Ino, names: &[&str]) -> HashMa
     let mut out = HashMap::new();
     for n in names {
         let ino = meta
-            .create_inode(InodeInit {
-                kind: FileKind::File,
-                mode: 0o100644,
-            })
+            .create_inode(InodeInit::new(FileKind::File, 0o100644))
             .await
             .unwrap();
         meta.add_dentry(parent, n, ino).await.unwrap();
@@ -192,10 +189,7 @@ async fn limit_is_respected() {
     // A page in a directory that has none.
     let empty = fs
         .meta
-        .create_inode(InodeInit {
-            kind: FileKind::Dir,
-            mode: 0o040755,
-        })
+        .create_inode(InodeInit::new(FileKind::Dir, 0o040755))
         .await
         .unwrap();
     assert!(

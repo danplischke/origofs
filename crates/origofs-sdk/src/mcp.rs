@@ -6,7 +6,7 @@
 //! actor, so blame + the edit-op audit come "for free" from how the agent works
 //! — reading and writing files *is* the tool call.
 
-use crate::{OrigoFSError, SuggestionStatus, Workspace, WriteCtx, WriteOutcome};
+use crate::{OrigoFSError, Scope, ScopeError, SuggestionStatus, Workspace, WriteCtx, WriteOutcome};
 use serde_json::{Value, json};
 
 type Result<T> = std::result::Result<T, OrigoFSError>;
@@ -18,11 +18,43 @@ pub struct McpServer {
     ws: Workspace,
     agent: i64,
     session: i64,
+    /// This server's view of the workspace (issue #125). [`Scope::whole`] unless
+    /// [`with_scope`](Self::with_scope) narrowed it.
+    scope: Scope,
 }
 
 impl McpServer {
     pub fn new(ws: Workspace, agent: i64, session: i64) -> Self {
-        Self { ws, agent, session }
+        Self {
+            ws,
+            agent,
+            session,
+            scope: Scope::whole(),
+        }
+    }
+
+    /// Restrict this server to one subtree of the workspace (issue #125).
+    ///
+    /// Every path a tool call supplies is then resolved *inside* `scope`, so an
+    /// agent cannot address anything outside it — including by asking. Same
+    /// primitive the HTTP surface uses, so the two cannot drift.
+    ///
+    /// This is scoping, not authorization: it bounds what this server can
+    /// *address*, and is orthogonal to the `Propose` write policy that bounds what
+    /// the agent may *do*. An agent typically wants both.
+    pub fn with_scope(mut self, scope: Scope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    /// This server's scope.
+    pub fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// The workspace this server serves.
+    pub fn workspace(&self) -> &Workspace {
+        &self.ws
     }
 
     /// The agent actor every mutating tool call on this server is attributed to.
@@ -114,14 +146,27 @@ impl McpServer {
     }
 
     async fn dispatch(&self, name: &str, args: &Value) -> Result<String> {
-        let path = || args.get("path").and_then(Value::as_str).unwrap_or_default();
+        // The single chokepoint for every path a tool call supplies, so scoping
+        // cannot be forgotten by an individual tool — the same reason the HTTP
+        // surface scopes in its extractor rather than per handler (issue #125).
+        let path = || -> Result<String> {
+            let raw = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            self.scope.resolve(raw).map_err(|e| match e {
+                ScopeError::Traversal => {
+                    OrigoFSError::InvalidPath("path may not contain '..'".into())
+                }
+                // "not found", never "denied": a scoped agent must not be able to
+                // tell "exists but not yours" from "does not exist".
+                ScopeError::OutOfScope => OrigoFSError::NotFound(raw.to_string()),
+            })
+        };
         match name {
             "origofs_read" => {
-                let bytes = self.ws.read(path()).await?;
+                let bytes = self.ws.read(&path()?).await?;
                 Ok(String::from_utf8_lossy(&bytes).into_owned())
             }
             "origofs_write" => {
-                let p = path();
+                let p = &path()?;
                 let data = args.get("content").and_then(Value::as_str).unwrap_or("");
                 // `mkdir_as`, not the unattributed `mkdir_p`. Creating the
                 // parent is a working-tree mutation like any other, so it has to
@@ -158,7 +203,7 @@ impl McpServer {
                 // content-based, never line numbers, and `old` must be unique so an
                 // edit can't land in the wrong place. Governed by the write policy,
                 // like `origofs_write`.
-                let p = path();
+                let p = &path()?;
                 let old = args.get("old").and_then(Value::as_str).unwrap_or("");
                 let new = args.get("new").and_then(Value::as_str).unwrap_or("");
                 let replace_all = args
@@ -216,7 +261,7 @@ impl McpServer {
                 }
             }
             "origofs_suggest" => {
-                let p = path();
+                let p = &path()?;
                 let data = args.get("content").and_then(Value::as_str).unwrap_or("");
                 let summary = args.get("summary").and_then(Value::as_str);
                 // `mkdir_as`, not the unattributed `mkdir_p`. Creating the
@@ -245,7 +290,7 @@ impl McpServer {
             // proposal nor be clobbered by accepting it. Only with `coedit`.
             #[cfg(feature = "coedit")]
             "origofs_suggest_coedit" => {
-                let p = path();
+                let p = &path()?;
                 let old = args.get("old").and_then(Value::as_str).unwrap_or("");
                 let new = args.get("new").and_then(Value::as_str).unwrap_or("");
                 let summary = args.get("summary").and_then(Value::as_str);
@@ -305,7 +350,7 @@ impl McpServer {
                 ))
             }
             "origofs_live" => match args.get("path").and_then(Value::as_str) {
-                Some(p) if !p.is_empty() => match self.ws.live_doc(p).await? {
+                Some(p) if !p.is_empty() => match self.ws.live_doc(&path()?).await? {
                     Some(l) => Ok(format!(
                         "{p} is LIVE (open since {} by actor {}): its durable bytes are a \
                              checkpoint and may lag the open document — origofs_read still \
@@ -318,7 +363,12 @@ impl McpServer {
                     )),
                 },
                 _ => {
-                    let live = self.ws.live_paths().await?;
+                    // The live-document list is workspace-wide, so unscoped it
+                    // reports which of a neighbour's paths are being edited right
+                    // now — a side door around the path tools (issue #125).
+                    let live = self
+                        .scope
+                        .filter(self.ws.live_paths().await?, |l| Some(l.path.as_str()));
                     if live.is_empty() {
                         return Ok("no live documents".to_string());
                     }
@@ -332,11 +382,22 @@ impl McpServer {
                 }
             },
             "origofs_suggestions" => {
-                let path_filter = args.get("path").and_then(Value::as_str);
+                // Both halves, as on the HTTP surface: resolving the filter stops
+                // an agent *asking* about a neighbour, and filtering the results
+                // stops an absent filter from *returning* one.
+                let raw = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty());
+                let path_filter = match raw {
+                    Some(_) => Some(path()?),
+                    None => None,
+                };
                 let list = self
                     .ws
-                    .list_suggestions(Some(SuggestionStatus::Pending), path_filter)
+                    .list_suggestions(Some(SuggestionStatus::Pending), path_filter.as_deref())
                     .await?;
+                let list = self.scope.filter(list, |s| Some(s.path.as_str()));
                 if list.is_empty() {
                     return Ok("no pending suggestions".to_string());
                 }
@@ -369,7 +430,7 @@ impl McpServer {
                 Ok(format!("rejected suggestion #{id}"))
             }
             "origofs_ls" => {
-                let entries = self.ws.ls(path()).await?;
+                let entries = self.ws.ls(&path()?).await?;
                 Ok(entries
                     .iter()
                     .map(|e| format!("{}\t{}", e.kind.as_str(), e.name))
@@ -377,28 +438,28 @@ impl McpServer {
                     .join("\n"))
             }
             "origofs_mkdir" => {
-                self.ws.mkdir_as(self.ctx(), path()).await?;
-                Ok(format!("created {}", path()))
+                self.ws.mkdir_as(self.ctx(), &path()?).await?;
+                Ok(format!("created {}", path()?))
             }
             "origofs_rm" => {
                 // Policy-governed, like `origofs_write`: a propose-only agent's
                 // removal is queued for review rather than destroying the file
                 // it was already forbidden to overwrite (issue #78).
-                let summary = format!("delete {}", path());
+                let summary = format!("delete {}", path()?);
                 match self
                     .ws
-                    .remove_or_propose(self.ctx(), path(), Some(&summary))
+                    .remove_or_propose(self.ctx(), &path()?, Some(&summary))
                     .await?
                 {
-                    WriteOutcome::Wrote => Ok(format!("removed {}", path())),
+                    WriteOutcome::Wrote => Ok(format!("removed {}", path()?)),
                     WriteOutcome::Proposed(id) => Ok(format!(
                         "proposed deletion #{id} for {} (pending review)",
-                        path()
+                        path()?
                     )),
                 }
             }
             "origofs_blame" => {
-                let ranges = self.ws.blame(path()).await?;
+                let ranges = self.ws.blame(&path()?).await?;
                 Ok(ranges
                     .iter()
                     .map(|r| {

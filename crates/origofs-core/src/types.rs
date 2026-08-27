@@ -12,7 +12,12 @@ pub const INO_ROOT: Ino = 1;
 ///
 /// In M0 a file body is stored as a single content-addressed blob. M1 replaces
 /// the single blob with a FastCDC chunk manifest addressed the same way.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// `Ord` is the lexicographic order of the 32 address bytes. It carries no
+/// meaning about the content — it exists so a hash can key an ordered collection
+/// (the LRU index in [`TieredStore`](crate::TieredStore)) and so tie-breaks that
+/// need to be deterministic across runs, such as `merge_base`'s choice among
+/// equally-good candidates, can be.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash([u8; 32]);
 
 impl Hash {
@@ -92,6 +97,37 @@ impl FileKind {
     }
 }
 
+/// POSIX ownership of an inode: a numeric user and group id (issue #122).
+///
+/// Ownership is a **mount-surface** concept and is deliberately *not* origofs's
+/// notion of identity. A uid says which local account the kernel should evaluate
+/// its permission checks against; an [`Actor`](crate::Actor) says who a blame
+/// trail attributes bytes to. `docs/PERMISSIONS.md` §2 sets out why the two must
+/// not be collapsed — a uid is reused across machines, reassigned, and shared by
+/// every process a user runs, none of which is true of an actor.
+///
+/// This type exists so the mounts can stop reporting every inode as root-owned.
+/// That was coherent (the FUSE mount sets `DefaultPermissions`, and
+/// `fuse_mountable()` requires root, so every check passed) but it is exactly why
+/// `allow_other` and non-root mounts could not work: a non-root caller would be
+/// evaluated against uid 0 in the *other* class and lose write access to the
+/// whole tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Owner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl Owner {
+    /// uid 0 / gid 0 — what every inode reported before #122, and what existing
+    /// rows are backfilled to so the migration changes no observable behaviour.
+    pub const ROOT: Owner = Owner { uid: 0, gid: 0 };
+
+    pub fn new(uid: u32, gid: u32) -> Self {
+        Owner { uid, gid }
+    }
+}
+
 /// Inode metadata (an M0 subset of the POSIX inode in `docs/DESIGN.md` §5).
 #[derive(Clone, Debug)]
 pub struct Inode {
@@ -104,6 +140,21 @@ pub struct Inode {
     pub content: Option<Hash>,
     pub mtime: i64,
     pub ctime: i64,
+    /// Owning user id (issue #122). 0 for anything created before the ownership
+    /// migration, and for anything created off a mount.
+    pub uid: u32,
+    /// Owning group id (issue #122). See [`uid`](Self::uid).
+    pub gid: u32,
+}
+
+impl Inode {
+    /// This inode's ownership as an [`Owner`].
+    pub fn owner(&self) -> Owner {
+        Owner {
+            uid: self.uid,
+            gid: self.gid,
+        }
+    }
 }
 
 /// The fields required to allocate a new inode.
@@ -111,6 +162,32 @@ pub struct Inode {
 pub struct InodeInit {
     pub kind: FileKind,
     pub mode: u32,
+    /// Ownership for the new inode. [`Owner::ROOT`] for the internal machinery
+    /// (checkout, merge materialization, git import), which has no caller whose
+    /// uid would be meaningful; the mounts pass the requesting process's.
+    pub owner: Owner,
+}
+
+impl InodeInit {
+    /// A new inode owned by root — the default for every non-mount caller.
+    ///
+    /// Most `create_inode` call sites are internal machinery materializing a tree,
+    /// where there is no requesting process and therefore no uid worth recording.
+    /// They use this so adding ownership did not require each of them to invent an
+    /// answer.
+    pub fn new(kind: FileKind, mode: u32) -> Self {
+        InodeInit {
+            kind,
+            mode,
+            owner: Owner::ROOT,
+        }
+    }
+
+    /// A new inode owned by `owner` — what the mount surfaces use, passing the
+    /// uid/gid of the process that issued the `create`/`mkdir`/`symlink`.
+    pub fn owned_by(kind: FileKind, mode: u32, owner: Owner) -> Self {
+        InodeInit { kind, mode, owner }
+    }
 }
 
 /// One entry within a directory listing.

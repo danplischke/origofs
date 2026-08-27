@@ -2,7 +2,7 @@
 #![cfg(feature = "mcp")]
 
 use origofs_sdk::mcp::McpServer;
-use origofs_sdk::{SuggestionStatus, Workspace, WriteCtx, WritePolicy};
+use origofs_sdk::{Scope, SuggestionStatus, Workspace, WriteCtx, WritePolicy};
 use serde_json::{Value, json};
 
 async fn server() -> McpServer {
@@ -456,6 +456,91 @@ async fn every_mutating_mcp_tool_is_policy_classified() {
              READ_ONLY. See issue #78."
         );
     }
+}
+
+/// Every tool that takes a `path` resolves it through the server's [`Scope`], and
+/// no tool leaks a path outside it (issue #125).
+///
+/// The scoping counterpart of the classification test above, and it exists for the
+/// same reason: a new tool is invisible to the behavioural tests, so it would ship
+/// unscoped exactly the way `origofs_rm` shipped ungated. Rather than listing tools
+/// again, this drives every advertised tool that declares a `path` property with a
+/// path naming a neighbour, and asserts the neighbour is never touched or reported.
+#[tokio::test]
+async fn every_path_taking_mcp_tool_is_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    // A neighbour's tree, and the scoped agent's own.
+    ws.mkdir_p("/tenant-a").await.unwrap();
+    ws.mkdir_p("/other").await.unwrap();
+    ws.write("/other/secrets.txt", b"NEIGHBOUR-SECRET")
+        .await
+        .unwrap();
+
+    let s = McpServer::create(ws, "claude", "claude-opus-4-8")
+        .await
+        .unwrap()
+        .with_scope(Scope::at("/tenant-a").unwrap());
+
+    let list = s
+        .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .await
+        .unwrap();
+    let tools = list["result"]["tools"].as_array().unwrap().clone();
+
+    let mut checked = 0;
+    for t in &tools {
+        let name = t["name"].as_str().unwrap();
+        // Only the tools that actually take a path are in scope for this check.
+        if t["inputSchema"]["properties"]["path"].is_null() {
+            continue;
+        }
+        checked += 1;
+
+        // Every required argument gets a placeholder, so the call reaches the
+        // dispatch rather than failing on a missing field before scoping runs.
+        let mut args = serde_json::Map::new();
+        args.insert("path".into(), json!("/other/secrets.txt"));
+        if let Some(props) = t["inputSchema"]["properties"].as_object() {
+            for key in props.keys() {
+                if key != "path" {
+                    args.entry(key.clone()).or_insert(json!("x"));
+                }
+            }
+        }
+
+        let resp = s.handle(call(name, Value::Object(args))).await.unwrap();
+        let out = text(&resp);
+        assert!(
+            !out.contains("NEIGHBOUR-SECRET"),
+            "MCP tool {name} returned a neighbour's content from outside the \
+             scope: {out}"
+        );
+    }
+
+    assert!(
+        checked >= 5,
+        "expected several path-taking tools to check, found {checked} — has the \
+         schema shape changed?"
+    );
+
+    // Nothing reached the neighbour's tree, in either direction.
+    assert_eq!(
+        &s.workspace().read("/other/secrets.txt").await.unwrap()[..],
+        b"NEIGHBOUR-SECRET",
+        "a scoped MCP tool wrote into a tree it cannot address"
+    );
+    // The neighbour's *directory* is likewise untouched: a scoped write naming
+    // `/other/...` must have landed under `/tenant-a`, not created anything at the
+    // workspace top level.
+    let top = s.workspace().ls("/").await.unwrap();
+    let names: Vec<&str> = top.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"tenant-a") && names.contains(&"other"),
+        "the fixture's own directories should still be the only top-level ones: {names:?}"
+    );
 }
 
 /// A propose-only agent must not create directories on its way to the review

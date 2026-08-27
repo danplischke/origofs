@@ -58,7 +58,13 @@ enum Cmd {
     /// Initialize the workspace.
     Init,
     /// Create a directory and any missing parents.
-    Mkdir { path: String },
+    Mkdir {
+        path: String,
+        /// Attribute the mkdir to this actor id, and check its write policy.
+        /// Falls back to `ORIGOFS_ACTOR`; see `origofs require-attribution`.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Write a file's contents from `--from <file>` or stdin.
     Write {
         path: String,
@@ -78,16 +84,75 @@ enum Cmd {
     },
     /// Show inode metadata for a path.
     Stat { path: String },
+    /// Explain what a file costs to read: chunk count, chunk-size distribution,
+    /// self-dedup, and whether the content store still holds the chunks.
+    Info {
+        path: String,
+        /// Skip the store-presence probe, which costs one `has` (one HEAD against
+        /// object storage) per distinct chunk. Everything else comes from the
+        /// manifest, which a read would fetch anyway.
+        #[arg(long)]
+        no_probe: bool,
+    },
+    /// Measure this workspace's own backends end to end: write N files, read them
+    /// back twice, report throughput and latency. The number Criterion cannot give
+    /// you, because it depends on your bucket, your latency, and your settings.
+    ///
+    /// Writes and then deletes `bench-NNNN.bin` under `--dir`, and refuses to
+    /// start if that directory already holds anything (see `--force`).
+    Bench {
+        /// Workspace directory to run in. Created if absent, removed afterwards.
+        #[arg(long, default_value = "/.origofs-bench")]
+        dir: String,
+        /// How many files to write and read back.
+        #[arg(long, default_value_t = 8)]
+        files: usize,
+        /// Bytes per file; accepts `K`/`M`/`G` suffixes (`64M`, `1G`).
+        #[arg(long, default_value = "8M", value_parser = parse_size)]
+        size: u64,
+        /// Pin the body seed to reproduce a run. Defaults to a fresh value each
+        /// run, so that a second run writes genuinely new bytes instead of
+        /// deduplicating against the first and reporting that as write throughput.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Leave the sample files in place instead of deleting them.
+        #[arg(long)]
+        keep: bool,
+        /// Run in `--dir` even though it already holds entries. The benchmark
+        /// still only writes and deletes its own `bench-NNNN.bin` names.
+        #[arg(long)]
+        force: bool,
+    },
     /// Remove a file or empty directory.
-    Rm { path: String },
+    Rm {
+        path: String,
+        /// Attribute the delete to this actor id, and check its write policy — a
+        /// propose-only actor's delete is queued for review rather than executed.
+        /// Falls back to `ORIGOFS_ACTOR`; see `origofs require-attribution`.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Move/rename a path.
-    Mv { from: String, to: String },
+    Mv {
+        from: String,
+        to: String,
+        /// Attribute the rename to this actor id, and check its write policy.
+        /// Falls back to `ORIGOFS_ACTOR`; see `origofs require-attribution`.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Snapshot the working tree into a commit.
     Commit {
         #[arg(short, long)]
         message: String,
+        /// The name recorded *in* the commit object. Free-form, and not an
+        /// identity — use `--actor` for that.
         #[arg(long, default_value = "origofs")]
         author: String,
+        /// Attribute the commit to this actor id, and check its write policy.
+        /// Falls back to `ORIGOFS_ACTOR`; see `origofs require-attribution`.
+        #[arg(long)]
+        actor: Option<i64>,
     },
     /// Show commit history (HEAD, first-parent).
     Log,
@@ -211,6 +276,17 @@ enum Cmd {
         /// `direct` or `propose`.
         policy: String,
     },
+    /// Require every mutating CLI command to name an actor (`on`), or allow
+    /// unattributed ones (`off`); with no argument, print the current setting.
+    ///
+    /// This is an attribution-completeness switch, not access control: an actor id
+    /// on a command line is self-asserted, and a local process holding the
+    /// workspace directory can bypass the CLI entirely. It catches the script that
+    /// forgot, which is the failure that actually happens.
+    RequireAttribution {
+        /// `on` or `off`. Omit to print the current setting.
+        setting: Option<String>,
+    },
     /// Show per-line authorship (blame) for a file.
     Blame { path: String },
     /// Undo exactly the lines one actor authored in one session, across every file
@@ -290,6 +366,38 @@ enum Cmd {
     Git {
         #[command(subcommand)]
         cmd: GitCmd,
+    },
+    /// Write an engine-independent dump of the whole metadata store to a file
+    /// (or stdout with `-`), as JSON Lines.
+    ///
+    /// The metadata DB is the half the content store cannot rebuild: `fsck
+    /// --rebuild` recovers committed files, dirs, symlinks and branches from the
+    /// bucket alone, and none of the attribution. This is how that half moves —
+    /// as a backup, or as the SQLite → Postgres migration path.
+    ///
+    /// **Metadata only.** File bytes stay in the content store, which this does
+    /// not touch: a dump references content by hash. Restoring it against a
+    /// different, empty content store gives you the names and the blame with
+    /// nothing to read — point the restored workspace at the same store, or copy
+    /// the store across too.
+    Dump {
+        /// Where to write. `-` writes to stdout.
+        #[arg(default_value = "-")]
+        out: String,
+    },
+    /// Restore a dump written by `origofs dump` into a **pristine** workspace
+    /// (or stdin with `-`).
+    ///
+    /// Refuses to merge into a workspace that already holds data: inode numbers,
+    /// actor ids and session ids are all local sequences, and reconciling two id
+    /// spaces silently wrong would produce blame attributed to the wrong actor.
+    ///
+    /// **Metadata only** — see `dump`. The restored workspace needs the same
+    /// content store, or reads fail with `content missing for hash ...`.
+    Load {
+        /// Where to read from. `-` reads stdin.
+        #[arg(default_value = "-")]
+        input: String,
     },
     /// Reclaim content unreachable from any branch or the working tree.
     Gc,
@@ -401,6 +509,45 @@ enum GitCmd {
 /// never corrupt a data channel on stdout — notably the `origofs mcp` JSON-RPC
 /// transport. origofs-core/-sdk only *emit* spans and events; this is the one
 /// place they are shown (a Rust embedder installs its own subscriber instead).
+/// The actor a mutating command should act as: `--actor` if given, else
+/// `ORIGOFS_ACTOR` (issue #128).
+///
+/// # Why an environment fallback rather than a required flag
+///
+/// #128 framed the choice as required-and-breaking versus optional-and-useless,
+/// and steered at "a configured identity, as `serve` does for the API". This is
+/// that: a shell session, a CI job, or an agent harness exports `ORIGOFS_ACTOR`
+/// once and every subsequent command is attributed, without every existing script
+/// breaking on the next release.
+///
+/// **It is not an identity check.** Whoever writes the command line also writes
+/// the environment, so this asserts identity, it does not verify it. Verification
+/// needs a server that resolves the caller — which is what `build_api_auth` does
+/// for the HTTP surface, and why that one refuses to expose an unauthenticated
+/// API off-loopback. A shell has nobody to do the resolving. What this buys is
+/// that the attribution *gets recorded* — see `origofs require-attribution` for
+/// making that mandatory rather than merely available.
+fn resolve_actor(flag: Option<i64>) -> anyhow::Result<Option<i64>> {
+    if let Some(a) = flag {
+        return Ok(Some(a));
+    }
+    match std::env::var("ORIGOFS_ACTOR") {
+        Ok(v) if !v.trim().is_empty() => v.trim().parse::<i64>().map(Some).map_err(|_| {
+            anyhow::anyhow!("ORIGOFS_ACTOR is set to {v:?}, which is not an actor id")
+        }),
+        _ => Ok(None),
+    }
+}
+
+/// Open a CLI session for `actor` and return the write context to act under.
+///
+/// Every attributed CLI command opens its own session labelled `cli`, matching
+/// what `write` already did, so a `revert-session` can undo one command's work.
+async fn cli_ctx(ws: &origofs_sdk::Workspace, actor: i64) -> anyhow::Result<WriteCtx> {
+    let session = ws.create_session(actor, Some("cli")).await?;
+    Ok(WriteCtx::session(actor, session))
+}
+
 fn init_tracing(format: LogFormat) {
     use tracing_subscriber::fmt::format::FmtSpan;
     use tracing_subscriber::{EnvFilter, fmt};
@@ -455,6 +602,231 @@ fn init_metrics() -> Result<()> {
     Ok(())
 }
 
+/// Parse a byte count with an optional binary suffix: `4096`, `8K`, `64M`, `2G`.
+///
+/// `origofs bench --size` is the one place the CLI takes a number big enough that
+/// spelling it in bytes is a source of zero-counting mistakes — and a mistyped
+/// `--size 8000000000` is not a typo you notice until the run has been going for a
+/// while. Suffixes are binary (`K` = 1024), matching every size origofs reports.
+fn parse_size(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    // Strip the unit tail (`B`, `iB`) *before* looking for the scale letter, so
+    // `8MiB` — the spelling this program's own output uses — is read as `8M` and
+    // not as a number ending in `B`.
+    let body = s.strip_suffix(['B', 'b']).unwrap_or(s);
+    let body = body.strip_suffix(['I', 'i']).unwrap_or(body);
+    let (digits, shift) = match body.chars().last() {
+        Some('K') | Some('k') => (&body[..body.len() - 1], 10),
+        Some('M') | Some('m') => (&body[..body.len() - 1], 20),
+        Some('G') | Some('g') => (&body[..body.len() - 1], 30),
+        _ => (body, 0),
+    };
+    let n: u64 = digits
+        .trim_end()
+        .parse()
+        .map_err(|_| format!("{s:?} is not a byte count (try 4096, 8K, 64M, 2G)"))?;
+    n.checked_shl(shift)
+        .filter(|v| *v >> shift == n)
+        .ok_or_else(|| format!("{s:?} overflows a 64-bit byte count"))
+}
+
+/// Render `bytes` for a human, in the binary units the rest of origofs reports.
+///
+/// Reporting alongside the exact figure rather than instead of it: a benchmark is
+/// read to be compared with another one, and `8.0 MiB` cannot be subtracted.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit + 1 < UNITS.len() {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[unit])
+    }
+}
+
+/// Render a duration at a fixed three significant figures, picking the unit.
+fn human_dur(d: std::time::Duration) -> String {
+    let s = d.as_secs_f64();
+    if s >= 1.0 {
+        format!("{s:.2}s")
+    } else if s >= 0.001 {
+        format!("{:.1}ms", s * 1e3)
+    } else {
+        format!("{:.0}us", s * 1e6)
+    }
+}
+
+/// Print `origofs info` (issue #118).
+///
+/// The caveats are printed, not just documented, because this output is what gets
+/// pasted into an issue as evidence. A "dedup 1.4x" line that travels without the
+/// sentence saying it counts only repetition *inside this file* is how a
+/// measurement turns into a wrong claim about the store.
+fn print_info(path: &str, info: &origofs_sdk::FileLayout) {
+    let (min, avg, max) = info.chunker;
+    println!("path            {path}");
+    println!("size            {} ({})", info.size, human_bytes(info.size));
+    match info.manifest {
+        Some(h) => println!("manifest        {}", h.to_hex()),
+        None => println!("manifest        (none: empty file, so there is no body to read)"),
+    }
+    if info.chunks == 0 {
+        println!("chunks          0 — nothing to fetch");
+        return;
+    }
+    println!(
+        "chunks          {} refs, {} distinct — a whole-file read fetches {} objects",
+        info.chunks, info.distinct_chunks, info.chunks
+    );
+    let fmt = |v: Option<u32>| v.map(|v| human_bytes(u64::from(v))).unwrap_or_default();
+    println!(
+        "chunk sizes     min {}, median {}, mean {}, max {}",
+        fmt(info.smallest),
+        fmt(info.median),
+        info.mean().map(human_bytes).unwrap_or_default(),
+        fmt(info.largest),
+    );
+    let widest = info
+        .histogram
+        .iter()
+        .map(|(_, n)| *n)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    for (bound, count) in &info.histogram {
+        // Bar width is relative to the fullest bucket, so the shape is readable
+        // whether the file has 5 chunks or 5 million.
+        let bar = "#".repeat((*count as f64 / widest as f64 * 32.0).round() as usize);
+        println!(
+            "  <= {:>9}  {:>10}  {bar}",
+            human_bytes(u64::from(*bound)),
+            count
+        );
+    }
+    println!(
+        "distinct bytes  {} ({:.2}x self-dedup)",
+        human_bytes(info.distinct_bytes),
+        info.self_dedup()
+    );
+    println!("                repetition *within this file* only — what it also shares with");
+    println!("                other files is not measured (that means reading every manifest)");
+    match &info.residency {
+        None => println!("residency       not probed (--no-probe)"),
+        Some(r) => {
+            println!(
+                "residency       {}/{} distinct chunks present in the content store",
+                r.present, info.distinct_chunks
+            );
+            println!(
+                "                presence, not cache residency: a tiered store answers from \
+                 either tier"
+            );
+            if r.missing > 0 {
+                println!(
+                    "  WARNING: {} chunk(s) are GONE — this file cannot be read. First few:",
+                    r.missing
+                );
+                for h in &r.missing_sample {
+                    println!("    {}", h.to_hex());
+                }
+            }
+        }
+    }
+    println!(
+        "chunker         min {} / avg {} / max {}",
+        human_bytes(u64::from(min)),
+        human_bytes(u64::from(avg)),
+        human_bytes(u64::from(max))
+    );
+}
+
+/// Print `origofs bench` (issue #118). See [`print_info`] on why the caveats are
+/// part of the output rather than only of the docs.
+fn print_bench(report: &origofs_sdk::BenchReport) {
+    let (min, avg, max) = report.chunker;
+    println!(
+        "bench: {} files x {} = {}",
+        report.opts.files,
+        human_bytes(report.opts.file_size),
+        human_bytes(report.total_bytes)
+    );
+    println!(
+        "  chunker             min {} / avg {} / max {}",
+        human_bytes(u64::from(min)),
+        human_bytes(u64::from(avg)),
+        human_bytes(u64::from(max))
+    );
+    println!(
+        "  chunks produced     {} refs, {} distinct",
+        report.chunks, report.distinct_chunks
+    );
+    for t in [report.upload_concurrency, report.fetch_concurrency] {
+        match t.value {
+            Some(n) => println!("  {:<19} {n} ({})", concurrency_label(t.var), t.var),
+            None => println!(
+                "  {:<19} engine default ({} unset)",
+                concurrency_label(t.var),
+                t.var
+            ),
+        }
+    }
+    println!("  seed                {}", report.opts.seed);
+    println!();
+    println!(
+        "{:<8}{:>14}{:>10}{:>10}{:>10}   ({} ops each)",
+        "phase", "throughput", "p50", "p95", "max", report.write.ops
+    );
+    for (label, stage) in [
+        ("write", &report.write),
+        ("read", &report.read),
+        ("read#2", &report.reread),
+    ] {
+        println!(
+            "{label:<8}{:>14}{:>10}{:>10}{:>10}",
+            format!("{}/s", human_bytes(stage.bytes_per_sec() as u64)),
+            human_dur(stage.quantile(0.5)),
+            human_dur(stage.quantile(0.95)),
+            human_dur(stage.quantile(1.0)),
+        );
+    }
+    println!();
+    println!("note: `read` and `read#2` are the first and second pass, NOT cold and warm:");
+    println!("      nothing here evicts a page cache or a cache tier, so both ran over");
+    println!("      bytes this run had just written.");
+    println!("note: writes are unattributed, so no edit-op or blame-index update is on");
+    println!("      the clock; an attributed write costs a little more than this says.");
+    if report.distinct_chunks < report.chunks {
+        println!(
+            "note: only {} of {} chunks were distinct, so some writes deduplicated and",
+            report.distinct_chunks, report.chunks
+        );
+        println!("      the write figure is OVERSTATED. Re-run against an empty --dir.");
+    }
+    if report.kept {
+        println!(
+            "note: --keep, so the sample files are still in {}.",
+            report.opts.dir
+        );
+    } else {
+        println!("note: sample files removed; their chunks stay in the content store until");
+        println!("      a `gc` past the grace period reclaims them.");
+    }
+}
+
+/// The human name for a concurrency knob, from its environment variable.
+fn concurrency_label(var: &str) -> &'static str {
+    if var.contains("UPLOAD") {
+        "upload concurrency"
+    } else {
+        "fetch concurrency"
+    }
+}
+
 /// Whether an environment variable is set to a truthy value. Used for
 /// `ORIGOFS_METRICS`, the env-var twin of `serve --metrics`.
 fn env_flag(name: &str) -> bool {
@@ -492,9 +864,16 @@ async fn main() -> Result<()> {
                 cli.workspace.display()
             );
         }
-        Cmd::Mkdir { path } => {
-            ws.mkdir_p(&path).await?;
-        }
+        Cmd::Mkdir { path, actor } => match resolve_actor(actor)? {
+            Some(actor) => {
+                let ctx = cli_ctx(&ws, actor).await?;
+                ws.mkdir_as(ctx, &path).await?;
+            }
+            None => {
+                ws.ensure_attributed("mkdir").await?;
+                ws.mkdir_p(&path).await?;
+            }
+        },
         Cmd::Write { path, from, actor } => {
             // Convenience: ensure the parent directory exists before writing.
             if let Some(parent) = path
@@ -504,9 +883,13 @@ async fn main() -> Result<()> {
             {
                 ws.mkdir_p(parent).await?;
             }
+            // `write` resolves its actor the same way the other mutating commands
+            // do since #128, so `ORIGOFS_ACTOR` attributes it too.
+            let actor = resolve_actor(actor)?;
             match (from, actor) {
                 // Unattributed streaming from a file (large files stay off-heap).
                 (Some(p), None) => {
+                    ws.ensure_attributed("write").await?;
                     let file = std::fs::File::open(p)?;
                     ws.write_reader(&path, file).await?;
                 }
@@ -560,6 +943,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 (None, None) => {
+                    ws.ensure_attributed("write").await?;
                     let mut buf = Vec::new();
                     std::io::stdin().read_to_end(&mut buf)?;
                     ws.write(&path, &buf).await?;
@@ -586,14 +970,73 @@ async fn main() -> Result<()> {
                 i.size
             );
         }
-        Cmd::Rm { path } => {
-            ws.remove(&path).await?;
+        Cmd::Info { path, no_probe } => {
+            let info = ws.file_layout(&path, !no_probe).await?;
+            print_info(&path, &info);
         }
-        Cmd::Mv { from, to } => {
-            ws.rename(&from, &to).await?;
+        Cmd::Bench {
+            dir,
+            files,
+            size,
+            seed,
+            keep,
+            force,
+        } => {
+            let mut opts = origofs_sdk::BenchOpts::new();
+            opts.dir = dir;
+            opts.files = files;
+            opts.file_size = size;
+            opts.seed = seed.unwrap_or(opts.seed);
+            opts.keep = keep;
+            opts.force = force;
+            print_bench(&ws.bench(&opts).await?);
         }
-        Cmd::Commit { message, author } => {
-            let hash = ws.commit(&author, &message).await?;
+        Cmd::Rm { path, actor } => match resolve_actor(actor)? {
+            Some(actor) => {
+                let ctx = cli_ctx(&ws, actor).await?;
+                // `remove_or_propose`, not `remove`: a propose-only actor's delete
+                // is queued for review rather than refused, which is how `write`
+                // already behaves. Refusing would make the two inconsistent in the
+                // opposite direction.
+                match ws.remove_or_propose(ctx, &path, None).await? {
+                    origofs_sdk::WriteOutcome::Wrote => {}
+                    origofs_sdk::WriteOutcome::Proposed(id) => {
+                        println!(
+                            "actor {actor} is propose-only: queued suggestion #{id} to delete {path} (pending review)"
+                        );
+                    }
+                }
+            }
+            None => {
+                ws.ensure_attributed("rm").await?;
+                ws.remove(&path).await?;
+            }
+        },
+        Cmd::Mv { from, to, actor } => match resolve_actor(actor)? {
+            Some(actor) => {
+                let ctx = cli_ctx(&ws, actor).await?;
+                ws.rename_as(ctx, &from, &to).await?;
+            }
+            None => {
+                ws.ensure_attributed("mv").await?;
+                ws.rename(&from, &to).await?;
+            }
+        },
+        Cmd::Commit {
+            message,
+            author,
+            actor,
+        } => {
+            let hash = match resolve_actor(actor)? {
+                Some(actor) => {
+                    let ctx = cli_ctx(&ws, actor).await?;
+                    ws.commit_as(ctx, &author, &message).await?
+                }
+                None => {
+                    ws.ensure_attributed("commit").await?;
+                    ws.commit(&author, &message).await?
+                }
+            };
             let branch = ws.current_branch().await?.unwrap_or_else(|| "?".into());
             println!("[{branch} {}] {message}", &hash.to_hex()[..12]);
         }
@@ -918,6 +1361,76 @@ async fn main() -> Result<()> {
                 println!("  {p}");
             }
         }
+        Cmd::Dump { out } => {
+            let n = if out == "-" {
+                let stdout = std::io::stdout();
+                ws.dump(std::io::BufWriter::new(stdout.lock())).await?
+            } else {
+                let f = std::fs::File::create(&out)?;
+                let n = ws.dump(std::io::BufWriter::new(f)).await?;
+                println!("dumped {n} records to {out}");
+                n
+            };
+            let _ = n;
+        }
+        Cmd::Load { input } => {
+            let report = if input == "-" {
+                let stdin = std::io::stdin();
+                ws.load(std::io::BufReader::new(stdin.lock())).await?
+            } else {
+                let f = std::fs::File::open(&input)?;
+                ws.load(std::io::BufReader::new(f)).await?
+            };
+            println!(
+                "restored {} rows (dump taken at schema v{})",
+                report.total_rows(),
+                report.source_schema_version
+            );
+            for (table, n) in &report.tables {
+                println!("  {table}: {n}");
+            }
+            // The single most likely way to be confused by a successful load: the
+            // names and the blame are all here, and every read fails, because the
+            // bytes were never in the dump. Say so at the moment it matters rather
+            // than letting the user meet `content missing for hash ...` cold.
+            println!(
+                "note: this restored metadata only. File bytes live in the content \
+                 store, which a dump references by hash and does not carry — point \
+                 this workspace at the same content store, or reads will fail."
+            );
+            if !report.skipped_tables.is_empty() {
+                // A dump from a newer build may carry tables this one does not
+                // know. Skipping is deliberate (see `Fs::load`), but silence
+                // would let a partial restore look complete.
+                println!(
+                    "  skipped unknown tables: {}",
+                    report.skipped_tables.join(", ")
+                );
+            }
+        }
+        Cmd::RequireAttribution { setting } => match setting.as_deref() {
+            None => {
+                let on = ws.require_attribution().await?;
+                println!("require-attribution is {}", if on { "on" } else { "off" });
+            }
+            Some(v) => {
+                let on = match v {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(origofs_sdk::OrigoFSError::InvalidArgument(format!(
+                            "unknown setting {other:?} (expected `on` or `off`)"
+                        ))
+                        .into());
+                    }
+                };
+                ws.set_require_attribution(on).await?;
+                println!(
+                    "require-attribution set to {}",
+                    if on { "on" } else { "off" }
+                );
+            }
+        },
         Cmd::Blame { path } => {
             for r in ws.blame(&path).await? {
                 let who = format!("{}:{}", r.actor.kind.as_str(), r.actor.display_name);
@@ -1486,5 +1999,33 @@ mod tests {
         // The empty case is what routes `build_api_auth` into its loopback-only
         // dev path, so it must stay distinguishable from "tokens configured".
         assert!(parse_auth_specs(&[]).expect("no specs").is_empty());
+    }
+
+    /// `origofs bench --size` is the one flag here that scales, and a suffix that
+    /// parsed as the wrong power of two would silently move every throughput
+    /// number in the report by 1024x. Units are binary throughout, matching what
+    /// `human_bytes` prints back.
+    #[test]
+    fn size_suffixes_are_binary_and_round_trip_what_we_print() {
+        assert_eq!(parse_size("4096"), Ok(4096));
+        assert_eq!(parse_size("8K"), Ok(8 << 10));
+        assert_eq!(parse_size("64m"), Ok(64 << 20));
+        assert_eq!(parse_size("2G"), Ok(2 << 30));
+        // The spelling this program's own output uses has to be accepted, or a
+        // user cannot paste a figure back into the flag that produced it.
+        assert_eq!(parse_size("1MiB"), Ok(1 << 20));
+        assert_eq!(parse_size("1MB"), Ok(1 << 20));
+        assert_eq!(human_bytes(parse_size("64M").unwrap()), "64.0 MiB");
+    }
+
+    /// A size that does not fit is refused rather than wrapping to a small one —
+    /// a benchmark that silently ran on 1 MiB after being asked for 16 EiB would
+    /// report a number for the wrong experiment.
+    #[test]
+    fn a_size_that_overflows_is_refused_not_wrapped() {
+        assert!(parse_size("99999999999G").is_err());
+        assert!(parse_size("banana").is_err());
+        assert!(parse_size("").is_err());
+        assert!(parse_size("-1").is_err());
     }
 }

@@ -51,6 +51,73 @@ fn upload_concurrency() -> usize {
     })
 }
 
+/// How many chunk **fetches** a read keeps in flight (issue #113).
+///
+/// The mirror of [`upload_concurrency`], and it exists for the same reason: a read
+/// walks its manifest and pulls each covering chunk, and doing that one `await` at
+/// a time costs a full round trip per chunk. At the ~64 KiB average chunk size a
+/// 1 MiB read is ~16 chunks, so on an S3-backed workspace at 30 ms RTT it spent
+/// about half a second of pure latency per megabyte with the link idle throughout.
+/// The write path has had bounded concurrency since M1; the read path had not.
+///
+/// Bounded for the same three reasons — memory is `window x MAX_CHUNK`, object
+/// stores rate-limit, and an unbounded window would let one read queue the whole
+/// file. On the streaming paths it doubles as the look-ahead window, which is why
+/// those must not simply submit the entire plan.
+///
+/// Override with `ORIGOFS_FETCH_CONCURRENCY`; set it to 1 to recover the old
+/// strictly-sequential behaviour.
+fn fetch_concurrency() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORIGOFS_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(16)
+    })
+}
+
+/// How many chunks either side of a written range [`Fs::splice_body`] re-chunks
+/// along with it (issue #111).
+///
+/// Re-chunking only the written range would force chunk boundaries at its two
+/// edges, costing deduplication there. Including a neighbour on each side gives
+/// FastCDC enough context to re-discover the natural boundary, so the seam usually
+/// heals rather than persisting. One is enough: the content-defined boundary is a
+/// function of a rolling window far smaller than a chunk.
+const SPLICE_MARGIN: usize = 1;
+
+/// The chunks covering `[off, end)` of `manifest`, each as `(hash, from, len)`
+/// **relative to that chunk**.
+///
+/// Every ranged read — buffered or streaming, borrowed or owned — needs exactly
+/// this walk, and it was open-coded at each of them. One helper, so the four call
+/// sites cannot drift on the boundary arithmetic (the trimming of the first and
+/// last chunk is the fiddly part) and so a fix lands everywhere at once.
+///
+/// `end` is expected to be clamped to `manifest.size` by the caller; entries are
+/// returned in byte order, which is the order the results must be concatenated in.
+fn covering_chunks(manifest: &Manifest, off: u64, end: u64) -> Vec<(Hash, u64, u64)> {
+    let mut plan: Vec<(Hash, u64, u64)> = Vec::new();
+    let mut pos: u64 = 0;
+    for c in &manifest.chunks {
+        let cstart = pos;
+        let cend = pos + c.len as u64;
+        pos = cend;
+        if cend <= off {
+            continue;
+        }
+        if cstart >= end {
+            break;
+        }
+        let from = off.max(cstart) - cstart;
+        let to = end.min(cend) - cstart;
+        plan.push((c.hash, from, to - from));
+    }
+    plan
+}
+
 /// Reject a single path component that could escape the workspace tree or
 /// corrupt the dentry graph: the traversal names `.`/`..`, an empty name, or a
 /// name embedding a path separator or NUL. Enforced at every metadata boundary
@@ -127,26 +194,27 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// An owned [`Stream`] over a manifest's chunks, one `store.get` at a time. The
-/// store handle is moved into the stream state, so the stream is self-contained
-/// (`'static` when `S` is) and can outlive the [`Fs`] it came from — unlike
-/// [`Fs::content_stream`], which borrows. Powers [`Fs::read_stream_owned`].
+/// An owned [`Stream`] over a manifest's chunks, with up to
+/// [`fetch_concurrency`] fetches in flight. The store handle is moved into the
+/// stream, so it is self-contained (`'static` when `S` is) and can outlive the
+/// [`Fs`] it came from — unlike [`Fs::content_stream`], which borrows. Powers
+/// [`Fs::read_stream_owned`].
+///
+/// `buffered` (not `buffer_unordered`) so chunks are yielded in manifest order,
+/// which *is* the file's byte order — the same reason `store_body` uses it on the
+/// write side. The bound doubles as the read-ahead window: a consumer that stops
+/// early leaves at most that many fetches wasted, rather than the whole file.
 fn owned_chunk_stream<S: ContentStore + 'static>(
     store: S,
     manifest: Manifest,
 ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
-    futures::stream::unfold(
-        Some((store, manifest.chunks.into_iter())),
-        |state| async move {
-            let (store, mut chunks) = state?;
-            let c = chunks.next()?;
-            match store.get(&c.hash).await {
-                Ok(bytes) => Some((Ok(bytes), Some((store, chunks)))),
-                // Surface the error once, then end the stream (state -> None).
-                Err(e) => Some((Err(e), None)),
-            }
-        },
-    )
+    let store = std::sync::Arc::new(store);
+    futures::stream::iter(manifest.chunks)
+        .map(move |c| {
+            let store = store.clone();
+            async move { store.get(&c.hash).await }
+        })
+        .buffered(fetch_concurrency())
 }
 
 /// A filesystem over a metadata store and a content store.
@@ -381,10 +449,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // inode (C1/M6).
         let mut tx = self.meta.begin().await?;
         let ino = tx
-            .create_inode(InodeInit {
-                kind: FileKind::Dir,
-                mode: DIR_MODE,
-            })
+            .create_inode(InodeInit::new(FileKind::Dir, DIR_MODE))
             .await?;
         tx.add_dentry(parent, name, ino).await?;
         tx.commit().await?;
@@ -416,10 +481,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                     // `mkdir -p` idempotent under concurrency (C1/M6).
                     let mut tx = self.meta.begin().await?;
                     let child = tx
-                        .create_inode(InodeInit {
-                            kind: FileKind::Dir,
-                            mode: DIR_MODE,
-                        })
+                        .create_inode(InodeInit::new(FileKind::Dir, DIR_MODE))
                         .await?;
                     match tx.add_dentry(ino, seg, child).await {
                         Ok(()) => {
@@ -532,10 +594,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         name: &str,
     ) -> Result<Ino> {
         let ino = tx
-            .create_inode(InodeInit {
-                kind: FileKind::File,
-                mode: FILE_MODE,
-            })
+            .create_inode(InodeInit::new(FileKind::File, FILE_MODE))
             .await?;
         tx.add_dentry(parent, name, ino).await?;
         Ok(ino)
@@ -543,6 +602,263 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Chunk `data` (content-defined), store each chunk, and write a manifest.
     /// Returns `(manifest_hash, size)`; an empty body yields `(None, 0)`.
+    /// Apply `data` at `offset` to `manifest` **without re-chunking the whole
+    /// file** (issue #111), returning the new `(manifest_hash, size)`.
+    ///
+    /// # The problem
+    ///
+    /// `vfs_write` used to read the entire body, patch the range, re-run FastCDC
+    /// over the whole buffer, and re-upload every changed chunk. `docs/LIMITS.md`
+    /// documented the consequence: *"Rewriting a 1 GiB file through a mount is
+    /// quadratic in allocation and hashing."* The kernel issues a bulk write as
+    /// many modest requests, so a sequential rewrite of an N-byte file cost
+    /// `O(N^2 / request_size)`.
+    ///
+    /// # Why splicing rather than slices
+    ///
+    /// The issue sketches a slice list: the inode keeps its manifest as a
+    /// materialized base, pending slices live beside it, reads resolve
+    /// base-then-slices newest-wins, and compaction collapses them back. It also
+    /// names the property that would keep that contained — "commit forces
+    /// compaction first, so trees, merge, blame and gc never see a slice".
+    ///
+    /// Splicing reaches the same `O(bytes written)` goal without introducing the
+    /// second representation at all, and that difference is the whole argument:
+    ///
+    /// * **Nothing else has to learn anything.** A manifest is an ordered list of
+    ///   `(hash, len)`. Writing at an offset needs only the *affected* region
+    ///   re-chunked and spliced into that list — so `inode.content` remains an
+    ///   ordinary, complete manifest at every instant. Trees, merge, blame, gc,
+    ///   git export, and every read path keep working unchanged because there is
+    ///   nothing new for them to see.
+    /// * **The containment property is free rather than enforced.** With slices,
+    ///   "no other reader ever observes one" is an invariant maintained by
+    ///   remembering to compact at every boundary; missing one is a silent stale
+    ///   read. Here it holds by construction.
+    /// * It answers both of the issue's open questions by dissolving them: there
+    ///   is no slice list, so it neither becomes the attribution record nor needs
+    ///   somewhere to live.
+    ///
+    /// **What this does not fix**, and the issue's second motivation: two writers
+    /// at *different* offsets still contend, because both still compare-and-set
+    /// the inode's single `manifest_hash`. Disjoint slices would not have
+    /// conflicted. The bounded retry in `vfs_write` (`VFS_CAS_ATTEMPTS`) still
+    /// resolves it correctly, and the per-handle buffering added in #112 collapses
+    /// many kernel requests into one flush, so the contention is far rarer than it
+    /// was — but it is not gone, and a workload of many concurrent writers to one
+    /// large file is the case that would justify revisiting slices.
+    ///
+    /// # Seams
+    ///
+    /// Re-chunking only a window means the boundaries at its two edges are forced
+    /// rather than content-defined, which costs a little deduplication there. The
+    /// window is widened by [`SPLICE_MARGIN`] chunks on each side so FastCDC has
+    /// room to re-discover natural boundaries and the seam usually heals; the
+    /// residual cost is two chunks per write, against re-hashing the entire file.
+    pub(crate) async fn splice_body(
+        &self,
+        manifest: &Manifest,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(Option<Hash>, u64)> {
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| OrigoFSError::TooLarge("write end overflows u64".into()))?;
+        let new_size = manifest.size.max(end);
+        let n = manifest.chunks.len();
+
+        // Chunks intersecting the written range. A write starting at or past EOF
+        // intersects nothing, and anchors on the tail instead so the last chunk
+        // can merge with the new bytes rather than leaving a runt behind.
+        let (mut lo, mut hi) = (n, 0usize);
+        let mut found = false;
+        let mut pos = 0u64;
+        for (i, c) in manifest.chunks.iter().enumerate() {
+            let (cs, ce) = (pos, pos + c.len as u64);
+            pos = ce;
+            if ce > offset && cs < end {
+                if !found {
+                    lo = i;
+                    found = true;
+                }
+                hi = i;
+            }
+        }
+        if !found {
+            if n == 0 {
+                lo = 0;
+                hi = 0;
+            } else {
+                lo = n - 1;
+                hi = n - 1;
+            }
+        }
+        // Widen, so FastCDC can re-find boundaries at the seams.
+        let (lo, hi) = if n == 0 {
+            (0usize, 0usize)
+        } else {
+            (
+                lo.saturating_sub(SPLICE_MARGIN),
+                (hi + SPLICE_MARGIN).min(n - 1),
+            )
+        };
+        let replaced: &[ChunkRef] = if n == 0 {
+            &[]
+        } else {
+            &manifest.chunks[lo..=hi]
+        };
+
+        // Byte span the replaced chunks cover.
+        let region_start: u64 = manifest.chunks[..lo].iter().map(|c| c.len as u64).sum();
+        let covered_end: u64 = region_start + replaced.iter().map(|c| c.len as u64).sum::<u64>();
+        let region_end = covered_end.max(end);
+
+        let region_len = usize::try_from(region_end - region_start).map_err(|_| {
+            OrigoFSError::TooLarge(format!(
+                "splice region of {} bytes",
+                region_end - region_start
+            ))
+        })?;
+        let mut region = Vec::new();
+        region.try_reserve(region_len).map_err(|_| {
+            OrigoFSError::TooLarge(format!("cannot allocate {region_len} bytes to splice"))
+        })?;
+
+        // The existing bytes of the replaced chunks, fetched with the same bounded
+        // concurrency as any other read.
+        if !replaced.is_empty() {
+            let sub = Manifest {
+                size: covered_end - region_start,
+                chunks: replaced.to_vec(),
+            };
+            let mut parts = self.content_stream(sub);
+            while let Some(part) = parts.next().await {
+                region.extend_from_slice(&part?);
+            }
+        }
+        // A write past EOF leaves a hole, which reads back as zeroes.
+        region.resize(region_len, 0);
+
+        let at = usize::try_from(offset - region_start)
+            .map_err(|_| OrigoFSError::TooLarge("splice offset".into()))?;
+        region[at..at + data.len()].copy_from_slice(data);
+
+        // Re-chunk only the region, then splice its chunks into the existing list.
+        let bounds = crate::util::blocking_section(|| chunk_bounds(&region));
+        let region = &region;
+        let fresh: Vec<ChunkRef> = futures::stream::iter(bounds)
+            .map(move |(off, len)| async move {
+                self.content
+                    .put(&region[off..off + len])
+                    .await
+                    .map(|hash| ChunkRef {
+                        hash,
+                        len: len as u32,
+                    })
+            })
+            .buffered(upload_concurrency())
+            .try_collect()
+            .await?;
+
+        let mut chunks = Vec::with_capacity(manifest.chunks.len() + fresh.len());
+        chunks.extend_from_slice(&manifest.chunks[..lo]);
+        chunks.extend(fresh);
+        if n > 0 && hi + 1 < n {
+            chunks.extend_from_slice(&manifest.chunks[hi + 1..]);
+        }
+
+        let spliced = Manifest {
+            size: new_size,
+            chunks,
+        };
+        debug_assert_eq!(
+            spliced.chunks.iter().map(|c| c.len as u64).sum::<u64>(),
+            new_size,
+            "spliced chunk lengths must sum to the declared size"
+        );
+        let mhash = self.content.put(&spliced.encode()?).await?;
+        // Same durability barrier as `store_body`: content durable before the
+        // metadata that references it.
+        self.content.flush().await?;
+        Ok((Some(mhash), new_size))
+    }
+
+    /// Resize `manifest` to `size` without re-chunking the whole body (issue #111).
+    ///
+    /// Shrinking drops whole chunks past the new end and re-chunks only the one
+    /// straddling it. Growing appends zeroes, which is `splice_body` of an empty
+    /// write at the new end — a hole reads back as zeroes either way.
+    ///
+    /// The old path read the entire body, resized the buffer, and re-ran FastCDC
+    /// over all of it, so truncating a 1 GiB file to zero cost a full read and a
+    /// full re-chunk of bytes that were being discarded.
+    pub(crate) async fn resize_body(
+        &self,
+        manifest: &Manifest,
+        size: u64,
+    ) -> Result<(Option<Hash>, u64)> {
+        if size == manifest.size {
+            // Nothing to do, but the caller still needs an address for the body.
+            if manifest.chunks.is_empty() {
+                return Ok((None, 0));
+            }
+            let h = self.content.put(&manifest.encode()?).await?;
+            self.content.flush().await?;
+            return Ok((Some(h), size));
+        }
+        if size == 0 {
+            return Ok((None, 0));
+        }
+        if size > manifest.size {
+            // Growing: the hole is zeroes. A zero-length splice at the new end
+            // extends the manifest without materializing the whole file.
+            return self.splice_body(manifest, size - 1, &[0u8]).await;
+        }
+
+        // Shrinking. Keep whole chunks that end at or before the new size; the one
+        // straddling it is re-chunked from its own start.
+        let mut kept: Vec<ChunkRef> = Vec::new();
+        let mut pos = 0u64;
+        let mut straddler: Option<(ChunkRef, u64)> = None;
+        for c in &manifest.chunks {
+            let (cs, ce) = (pos, pos + c.len as u64);
+            pos = ce;
+            if ce <= size {
+                kept.push(*c);
+            } else if cs < size {
+                straddler = Some((*c, cs));
+                break;
+            } else {
+                break;
+            }
+        }
+
+        let mut chunks = kept;
+        if let Some((c, cs)) = straddler {
+            // Only the surviving prefix of that one chunk is re-chunked.
+            let keep_len = (size - cs) as usize;
+            let bytes = self.content.get_range(&c.hash, 0, keep_len as u64).await?;
+            let bounds = crate::util::blocking_section(|| chunk_bounds(&bytes));
+            for (off, len) in bounds {
+                let hash = self.content.put(&bytes[off..off + len]).await?;
+                chunks.push(ChunkRef {
+                    hash,
+                    len: len as u32,
+                });
+            }
+        }
+
+        let resized = Manifest { size, chunks };
+        debug_assert_eq!(
+            resized.chunks.iter().map(|c| c.len as u64).sum::<u64>(),
+            size,
+            "resized chunk lengths must sum to the declared size"
+        );
+        let h = self.content.put(&resized.encode()?).await?;
+        self.content.flush().await?;
+        Ok((Some(h), size))
+    }
+
     pub(crate) async fn store_body(&self, data: &[u8]) -> Result<(Option<Hash>, u64)> {
         if data.is_empty() {
             return Ok((None, 0));
@@ -622,6 +938,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     async fn write_attempt(&self, path: &str, data: &[u8]) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
+        // Refuse before storing, not after: a quota that only rejected the metadata
+        // commit would still have uploaded the body, leaving chunks for gc to sweep
+        // and charging the user's bandwidth for a write that was never going to
+        // land (issue #116).
+        self.check_quota_for_path(path, data.len() as u64).await?;
         // Content is made durable first (store_body flushes), then the metadata
         // that references it commits atomically: for a new file the inode, its
         // dentry, and its content all land together or not at all (C1).
@@ -828,8 +1149,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // use [`Self::read_stream`] instead. The reservation is a capped hint
         // rather than the manifest's declared size — see `Manifest::capacity_hint`.
         let mut buf = BytesMut::with_capacity(manifest.capacity_hint());
-        for c in &manifest.chunks {
-            buf.extend_from_slice(&self.content.get(&c.hash).await?);
+        // Bounded-concurrency, ordered fetch (issue #113). This is what `read`
+        // itself uses, so it is the single most-travelled read path in the engine.
+        let mut parts = self.content_stream(manifest);
+        while let Some(part) = parts.next().await {
+            buf.extend_from_slice(&part?);
         }
         Ok(buf.freeze())
     }
@@ -851,32 +1175,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         C: Clone + 'static,
     {
         let end = off.saturating_add(len).min(manifest.size);
-        let mut plan: Vec<(Hash, u64, u64)> = Vec::new();
-        let mut pos: u64 = 0;
-        for c in &manifest.chunks {
-            let cstart = pos;
-            let cend = pos + c.len as u64;
-            pos = cend;
-            if cend <= off {
-                continue;
-            }
-            if cstart >= end {
-                break;
-            }
-            let from = off.max(cstart) - cstart;
-            let to = end.min(cend) - cstart;
-            plan.push((c.hash, from, to - from));
-        }
-        let store = self.content.clone();
-        futures::stream::unfold(Some((store, plan.into_iter())), |state| async move {
-            let (store, mut plan) = state?;
-            let (hash, from, len) = plan.next()?;
-            match store.get_range(&hash, from, len).await {
-                Ok(bytes) => Some((Ok(bytes), Some((store, plan)))),
-                Err(e) => Some((Err(e), None)),
-            }
-        })
-        .boxed()
+        let plan = covering_chunks(&manifest, off, end);
+        let store = std::sync::Arc::new(self.content.clone());
+        // Bounded look-ahead, in order — see `owned_chunk_stream`.
+        futures::stream::iter(plan)
+            .map(move |(hash, from, len)| {
+                let store = store.clone();
+                async move { store.get_range(&hash, from, len).await }
+            })
+            .buffered(fetch_concurrency())
+            .boxed()
     }
 
     /// Open a file for streaming and report its size, so a caller can answer a
@@ -911,33 +1219,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let end = off.saturating_add(len).min(manifest.size);
         // Precompute each covering chunk's (hash, from, to) so the stream itself
         // stays a simple fetch loop.
-        let mut plan: Vec<(Hash, u64, u64)> = Vec::new();
-        let mut pos: u64 = 0;
-        for c in &manifest.chunks {
-            let cstart = pos;
-            let cend = pos + c.len as u64;
-            pos = cend;
-            if cend <= off {
-                continue;
-            }
-            if cstart >= end {
-                break;
-            }
-            let from = off.max(cstart) - cstart;
-            let to = end.min(cend) - cstart;
-            plan.push((c.hash, from, to - from));
-        }
-        futures::stream::unfold(
-            Some((&self.content, plan.into_iter())),
-            |state| async move {
-                let (content, mut plan) = state?;
-                let (hash, from, len) = plan.next()?;
-                match content.get_range(&hash, from, len).await {
-                    Ok(bytes) => Some((Ok(bytes), Some((content, plan)))),
-                    Err(e) => Some((Err(e), None)),
-                }
-            },
-        )
+        let plan = covering_chunks(&manifest, off, end);
+        let content = &self.content;
+        // Bounded look-ahead, in order — see `owned_chunk_stream`.
+        futures::stream::iter(plan)
+            .map(move |(hash, from, len)| async move { content.get_range(&hash, from, len).await })
+            .buffered(fetch_concurrency())
     }
 
     async fn open_for_stream(&self, path: &str) -> Result<Option<Manifest>> {
@@ -979,21 +1266,17 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
     }
 
-    /// A borrowed [`Stream`] over a manifest's chunks, one `content.get` at a
-    /// time. Borrows `self`, so the stream cannot outlive this handle.
-    fn content_stream(&self, manifest: Manifest) -> impl Stream<Item = Result<Bytes>> + Send + '_ {
-        futures::stream::unfold(
-            Some((&self.content, manifest.chunks.into_iter())),
-            |state| async move {
-                let (content, mut chunks) = state?;
-                let c = chunks.next()?;
-                match content.get(&c.hash).await {
-                    Ok(bytes) => Some((Ok(bytes), Some((content, chunks)))),
-                    // Surface the error once, then end the stream (state -> None).
-                    Err(e) => Some((Err(e), None)),
-                }
-            },
-        )
+    /// A borrowed [`Stream`] over a manifest's chunks, with up to
+    /// [`fetch_concurrency`] fetches in flight. Borrows `self`, so the stream
+    /// cannot outlive this handle. See [`owned_chunk_stream`] for why `buffered`.
+    pub(crate) fn content_stream(
+        &self,
+        manifest: Manifest,
+    ) -> impl Stream<Item = Result<Bytes>> + Send + '_ {
+        let content = &self.content;
+        futures::stream::iter(manifest.chunks)
+            .map(move |c| async move { content.get(&c.hash).await })
+            .buffered(fetch_concurrency())
     }
 
     /// Like [`Self::read_stream`] but the returned stream owns its content handle,
@@ -1056,21 +1339,14 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // store (see `Manifest::capacity_hint`).
         let mut buf =
             BytesMut::with_capacity(((end - off) as usize).min(manifest.capacity_hint().max(1)));
-        let mut pos: u64 = 0;
-        for c in &manifest.chunks {
-            let cstart = pos;
-            let cend = pos + c.len as u64;
-            pos = cend;
-            if cend <= off {
-                continue;
-            }
-            if cstart >= end {
-                break;
-            }
-            let from = off.max(cstart) - cstart;
-            let to = end.min(cend) - cstart;
-            let part = self.content.get_range(&c.hash, from, to - from).await?;
-            buf.extend_from_slice(&part);
+        // Bounded-concurrency fetch, ordered: `buffered` keeps up to N `get_range`s
+        // in flight but yields them in submission order, so appending as they
+        // arrive still reconstructs the range in byte order (issue #113).
+        let mut parts = futures::stream::iter(covering_chunks(&manifest, off, end))
+            .map(|(hash, from, len)| async move { self.content.get_range(&hash, from, len).await })
+            .buffered(fetch_concurrency());
+        while let Some(part) = parts.next().await {
+            buf.extend_from_slice(&part?);
         }
         Ok(buf.freeze())
     }
@@ -1129,6 +1405,22 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         } else {
             self.unlink(path).await
         }
+    }
+
+    /// [`remove`](Self::remove), first capturing the entry into the trash when the
+    /// workspace has retention enabled (issue #115).
+    ///
+    /// Separate from `remove` rather than folded into it, because `remove` is also
+    /// the internal machinery's demolition primitive — checkout truncating a tree,
+    /// merge materialization replacing a file. Trashing those would fill the trash
+    /// with entries no user ever deleted and pin their content as a GC root, which
+    /// is the opposite of useful. Only a *user-facing* delete goes through here.
+    ///
+    /// The attributed path (`remove_as_unchecked`) captures separately, since it
+    /// has an actor to record.
+    pub async fn remove_trashing(&self, path: &str) -> Result<()> {
+        self.trash_capture(path, None).await?;
+        self.remove(path).await
     }
 
     /// Refuse to move `sino` inside itself.
@@ -1248,10 +1540,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // Inode, its target, and its dentry commit together (C1/M6).
         let mut tx = self.meta.begin().await?;
         let ino = tx
-            .create_inode(InodeInit {
-                kind: FileKind::Symlink,
-                mode: SYMLINK_MODE,
-            })
+            .create_inode(InodeInit::new(FileKind::Symlink, SYMLINK_MODE))
             .await?;
         tx.set_symlink(ino, target).await?;
         tx.add_dentry(parent, name, ino).await?;

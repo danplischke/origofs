@@ -106,6 +106,20 @@ pub trait MetadataStore: Send + Sync {
     /// Set an inode's link count.
     async fn set_nlink(&self, ino: Ino, nlink: i64) -> Result<()>;
 
+    /// Set an inode's permission bits, preserving its file-type bits (issue #121).
+    ///
+    /// `mode` is the low 12 bits (`rwx` plus setuid/setgid/sticky); the format bits
+    /// (`S_IFREG`/`S_IFDIR`/`S_IFLNK`) are the inode's kind and are not a caller's
+    /// to change, so backends mask them in rather than taking the whole word. Bumps
+    /// `ctime`, which is what POSIX says a mode change does.
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()>;
+
+    /// Set an inode's owning uid/gid (issue #122). Bumps `ctime`.
+    ///
+    /// Either half may be left alone by passing `None`, which is what `chown(2)`'s
+    /// `-1` sentinel means and what both mount surfaces forward.
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()>;
+
     /// Delete an inode and any symlink row. The caller ensures `nlink` hit 0.
     /// Reclaiming now-unreferenced content is deferred to GC (M9).
     async fn delete_inode(&self, ino: Ino) -> Result<()>;
@@ -175,6 +189,121 @@ pub trait MetadataStore: Send + Sync {
 
     /// Number of entries directly under `parent`.
     async fn child_count(&self, parent: Ino) -> Result<usize>;
+
+    /// `(inodes, bytes)` for the whole current workspace (issue #116).
+    ///
+    /// One aggregate over the workspace's inode rows — not a tree walk — so it is
+    /// cheap enough to answer `statfs` on every call, which is what a mount needs.
+    /// `bytes` sums `inode.size`, i.e. **logical** size: it is what `df` should
+    /// report and deliberately not the deduplicated on-disk footprint, which is a
+    /// property of the content store and not knowable from here.
+    async fn workspace_usage(&self) -> Result<(u64, u64)>;
+
+    /// `(inodes, bytes)` for the subtree rooted at `ino`, inclusive (issue #116).
+    ///
+    /// The `du` primitive, and what a per-directory quota is checked against. Each
+    /// backend runs it as a single recursive CTE rather than a walk from the
+    /// engine, so it costs one round trip instead of one per directory level.
+    ///
+    /// An inode reachable by several names (a hard link, since #119) is counted
+    /// **once** — the recursion unions inode ids rather than accumulating per
+    /// dentry, which is the same choice `du` makes.
+    async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)>;
+
+    // --- extended attributes (issue #119) --------------------------------
+
+    /// Read one extended attribute, or `None` if the inode has no such name.
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Set (upsert) one extended attribute.
+    ///
+    /// The engine caps `value` at [`MAX_XATTR_LEN`](crate::MAX_XATTR_LEN) before
+    /// this is reached; backends store what they are given.
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()>;
+
+    /// Remove one extended attribute. Returns whether it existed — the FUSE
+    /// surface must answer `ENODATA` for a name that was not set, which it cannot
+    /// do if a removal of a missing name is indistinguishable from a real one.
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool>;
+
+    /// Every extended-attribute name on `ino`, in name order.
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>>;
+
+    // --- portable dump/load (issue #117) ----------------------------------
+
+    /// Every row of `table`, as backend-neutral cells.
+    ///
+    /// `table` **must** be one of [`DUMP_TABLES`](crate::portable::DUMP_TABLES);
+    /// implementations reject anything else. That allowlist is what keeps a
+    /// name-taking method from being an arbitrary-SQL hole.
+    ///
+    /// Rows are returned untyped rather than as structs so a dump survives being
+    /// read by a build that is not this one — see `portable.rs` on why.
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>>;
+
+    /// Insert `rows` into `table`, preserving their explicit primary keys.
+    ///
+    /// Only ever called after [`reset_for_load`](Self::reset_for_load) has emptied
+    /// the dumpable tables, so it inserts rather than upserting: a conflict here
+    /// means that reset did not happen, and failing loudly beats silently merging
+    /// two id spaces.
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()>;
+
+    /// Empty every table a dump restores, in reverse dependency order.
+    ///
+    /// A dump is **whole-store**, and a load is a restore into a pristine store —
+    /// so the rows `init` itself created (the `default` workspace, the root inode,
+    /// the default config) are exactly what has to go before the dumped ones can
+    /// take their place. Without this, a load collides on `workspace.id` before it
+    /// reaches anything interesting.
+    ///
+    /// `Fs::load` verifies the store is pristine before calling this. It is
+    /// destructive by construction, so nothing else should.
+    async fn reset_for_load(&self) -> Result<()>;
+
+    // --- path-scoped ACLs (issue #123) ------------------------------------
+
+    /// Upsert a prefix grant. `path_prefix` is normalized (absolute, no trailing
+    /// slash; `""` is the workspace root).
+    async fn set_acl(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: u32,
+        granted_at: i64,
+        granted_by: Option<i64>,
+    ) -> Result<()>;
+
+    /// Remove a grant, reporting whether one existed.
+    async fn remove_acl(&self, actor_id: i64, path_prefix: &str) -> Result<bool>;
+
+    /// Grants in this workspace, optionally narrowed to one actor.
+    async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>>;
+
+    // --- trash (issue #115) ----------------------------------------------
+
+    /// Record a deleted entry, returning its trash id.
+    async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64>;
+
+    /// One trash entry by id, or `None`.
+    async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>>;
+
+    /// Every trash entry in this workspace, newest deletion first.
+    async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>>;
+
+    /// Drop one trash entry, reporting whether it existed.
+    async fn delete_trash(&self, id: i64) -> Result<bool>;
+
+    /// Drop every trash entry deleted before `cutoff`, returning how many went.
+    async fn purge_trash_before(&self, cutoff: i64) -> Result<usize>;
+
+    /// Every manifest hash a retained trash entry still needs.
+    ///
+    /// A GC root (`gc.rs`, root 5): without it the sweep reclaims a trashed body's
+    /// chunks and a restore finds an entry pointing at content that is gone.
+    /// Store-wide rather than workspace-scoped at the call site — `gc` marks from
+    /// every workspace, since content is shared across all of them.
+    async fn trash_content_hashes(&self) -> Result<Vec<Hash>>;
 
     /// Set (or replace) the target of a symlink inode.
     async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()>;
@@ -550,6 +679,75 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn set_nlink(&self, ino: Ino, nlink: i64) -> Result<()> {
         (**self).set_nlink(ino, nlink).await
+    }
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()> {
+        (**self).set_mode(ino, mode).await
+    }
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        (**self).set_owner(ino, uid, gid).await
+    }
+    async fn workspace_usage(&self) -> Result<(u64, u64)> {
+        (**self).workspace_usage().await
+    }
+    async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
+        (**self).subtree_usage(ino).await
+    }
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
+        (**self).export_table(table).await
+    }
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
+        (**self).import_table(table, rows).await
+    }
+    async fn reset_for_load(&self) -> Result<()> {
+        (**self).reset_for_load().await
+    }
+    async fn set_acl(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: u32,
+        granted_at: i64,
+        granted_by: Option<i64>,
+    ) -> Result<()> {
+        (**self)
+            .set_acl(actor_id, path_prefix, perms, granted_at, granted_by)
+            .await
+    }
+    async fn remove_acl(&self, actor_id: i64, path_prefix: &str) -> Result<bool> {
+        (**self).remove_acl(actor_id, path_prefix).await
+    }
+    async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>> {
+        (**self).list_acl(actor_id).await
+    }
+    async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
+        (**self).push_trash(init).await
+    }
+    async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>> {
+        (**self).get_trash(id).await
+    }
+    async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>> {
+        (**self).list_trash().await
+    }
+    async fn delete_trash(&self, id: i64) -> Result<bool> {
+        (**self).delete_trash(id).await
+    }
+    async fn purge_trash_before(&self, cutoff: i64) -> Result<usize> {
+        (**self).purge_trash_before(cutoff).await
+    }
+    async fn trash_content_hashes(&self) -> Result<Vec<Hash>> {
+        (**self).trash_content_hashes().await
+    }
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        (**self).get_xattr(ino, name).await
+    }
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        (**self).set_xattr(ino, name, value).await
+    }
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
+        (**self).remove_xattr(ino, name).await
+    }
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        (**self).list_xattrs(ino).await
     }
     async fn delete_inode(&self, ino: Ino) -> Result<()> {
         (**self).delete_inode(ino).await

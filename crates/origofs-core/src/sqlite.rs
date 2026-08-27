@@ -92,10 +92,28 @@ impl SqliteMetadataStore {
     }
 }
 
+/// The inode columns every `SELECT` in this backend reads, in the order
+/// [`build_inode`] expects them. One constant so a column added to the row (uid
+/// and gid, in V17) cannot be picked up by some queries and missed by others.
+const INODE_COLS: &str = "ino, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid";
+
 /// Build an [`Inode`] from a raw row tuple.
 #[allow(clippy::type_complexity)]
-fn build_inode(row: (i64, String, i64, i64, i64, Option<String>, i64, i64)) -> Result<Inode> {
-    let (ino, kind, mode, nlink, size, content_hash, mtime, ctime) = row;
+fn build_inode(
+    row: (
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        i64,
+    ),
+) -> Result<Inode> {
+    let (ino, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid) = row;
     let kind = FileKind::parse(&kind)
         .ok_or_else(|| OrigoFSError::Metadata(format!("unknown inode kind {kind:?}")))?;
     let content = match content_hash {
@@ -114,7 +132,118 @@ fn build_inode(row: (i64, String, i64, i64, i64, Option<String>, i64, i64)) -> R
         content,
         mtime,
         ctime,
+        uid: uid as u32,
+        gid: gid as u32,
     })
+}
+
+/// Columns every trash `SELECT` reads, in the order [`build_trash`] expects.
+const TRASH_COLS: &str = "id, path, kind, mode, size, content_hash, symlink_target, \
+                          uid, gid, actor_id, session_id, deleted_at";
+
+type TrashRow = (
+    i64,
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    i64,
+);
+
+fn trash_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrashRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+        r.get(11)?,
+    ))
+}
+
+fn build_trash(row: TrashRow) -> Result<crate::trash::TrashEntry> {
+    let (
+        id,
+        path,
+        kind,
+        mode,
+        size,
+        content_hash,
+        symlink_target,
+        uid,
+        gid,
+        actor_id,
+        session_id,
+        deleted_at,
+    ) = row;
+    Ok(crate::trash::TrashEntry {
+        id,
+        path,
+        kind: FileKind::parse(&kind)
+            .ok_or_else(|| OrigoFSError::Metadata(format!("unknown trash kind {kind:?}")))?,
+        mode: mode as u32,
+        size: size as u64,
+        content: content_hash.as_deref().and_then(Hash::from_hex),
+        symlink_target,
+        owner: crate::types::Owner::new(uid as u32, gid as u32),
+        actor_id,
+        session_id,
+        deleted_at,
+    })
+}
+
+/// Refuse a table name that is not in the dump allowlist (issue #117).
+///
+/// `export_table`/`import_table` interpolate the name into SQL, which is only safe
+/// because of this check — it is the boundary that keeps a name-taking method from
+/// being an arbitrary-SQL hole. Returns the `&'static str` from the allowlist
+/// rather than the caller's string, so what reaches the SQL is a constant from this
+/// binary and never caller-controlled bytes.
+pub(crate) fn validated_dump_table(table: &str) -> Result<&'static str> {
+    crate::portable::DUMP_TABLES
+        .iter()
+        .find(|t| **t == table)
+        .copied()
+        .ok_or_else(|| OrigoFSError::InvalidArgument(format!("{table:?} is not a dumpable table")))
+}
+
+/// Read column `i` of a row as a backend-neutral [`Cell`](crate::portable::Cell).
+fn sqlite_cell(r: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<crate::portable::Cell> {
+    use crate::portable::Cell;
+    use rusqlite::types::ValueRef;
+    Ok(match r.get_ref(i)? {
+        ValueRef::Null => Cell::Null,
+        ValueRef::Integer(v) => Cell::Int(v),
+        // SQLite is dynamically typed, so a REAL can appear in a column every
+        // other backend calls BIGINT. Carried as text rather than silently
+        // truncated to an integer.
+        ValueRef::Real(v) => Cell::Text(v.to_string()),
+        ValueRef::Text(t) => Cell::Text(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => Cell::Bytes(b.to_vec()),
+    })
+}
+
+fn cell_to_sqlite(c: &crate::portable::Cell) -> rusqlite::types::Value {
+    use crate::portable::Cell;
+    use rusqlite::types::Value;
+    match c {
+        Cell::Null => Value::Null,
+        Cell::Int(i) => Value::Integer(*i),
+        Cell::Text(s) => Value::Text(s.clone()),
+        Cell::Bytes(b) => Value::Blob(b.clone()),
+    }
 }
 
 /// True if a DDL error is SQLite's "duplicate column name" — i.e. an
@@ -174,6 +303,11 @@ fn truncate_workspace_tree(conn: &Connection, ws: i64) -> rusqlite::Result<()> {
     )?;
     conn.execute(
         "DELETE FROM symlink WHERE ino IN (SELECT ino FROM inode WHERE workspace_id = ?1)",
+        params![ws],
+    )?;
+    // xattrs are keyed by inode, so a truncated tree takes them with it (#119).
+    conn.execute(
+        "DELETE FROM xattr WHERE ino IN (SELECT ino FROM inode WHERE workspace_id = ?1)",
         params![ws],
     )?;
     conn.execute(
@@ -330,8 +464,7 @@ impl MetadataStore for SqliteMetadataStore {
             let conn = self.lock();
             let row = conn
                 .query_row(
-                    "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
-                     FROM inode WHERE ino = ?1",
+                    &format!("SELECT {INODE_COLS} FROM inode WHERE ino = ?1"),
                     params![ino],
                     |r| {
                         Ok((
@@ -343,6 +476,8 @@ impl MetadataStore for SqliteMetadataStore {
                             r.get::<_, Option<String>>(5)?,
                             r.get::<_, i64>(6)?,
                             r.get::<_, i64>(7)?,
+                            r.get::<_, i64>(8)?,
+                            r.get::<_, i64>(9)?,
                         ))
                     },
                 )
@@ -369,8 +504,7 @@ impl MetadataStore for SqliteMetadataStore {
                     .collect::<Vec<_>>()
                     .join(",");
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
-                     FROM inode WHERE ino IN ({placeholders})"
+                    "SELECT {INODE_COLS} FROM inode WHERE ino IN ({placeholders})"
                 ))?;
                 let binds: Vec<&dyn rusqlite::ToSql> =
                     chunk.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
@@ -384,6 +518,8 @@ impl MetadataStore for SqliteMetadataStore {
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, i64>(6)?,
                         r.get::<_, i64>(7)?,
+                        r.get::<_, i64>(8)?,
+                        r.get::<_, i64>(9)?,
                     ))
                 })?;
                 for row in rows {
@@ -399,9 +535,16 @@ impl MetadataStore for SqliteMetadataStore {
             let conn = self.lock();
             let now = now_secs();
             conn.execute(
-                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES (?1, ?2, ?3, 1, 0, NULL, ?4, ?4)",
-                params![self.workspace_id, init.kind.as_str(), init.mode as i64, now],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid)
+                 VALUES (?1, ?2, ?3, 1, 0, NULL, ?4, ?4, ?5, ?6)",
+                params![
+                    self.workspace_id,
+                    init.kind.as_str(),
+                    init.mode as i64,
+                    now,
+                    init.owner.uid as i64,
+                    init.owner.gid as i64
+                ],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -440,10 +583,44 @@ impl MetadataStore for SqliteMetadataStore {
         })
     }
 
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // Mask in only the permission bits: the format bits are the inode's
+            // kind, not a caller's to rewrite. `& 0o7777` keeps setuid/setgid/sticky.
+            conn.execute(
+                "UPDATE inode SET mode = (mode & ~4095) | ?1, ctime = ?2 WHERE ino = ?3",
+                params![(mode & 0o7777) as i64, now_secs(), ino],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // COALESCE so a `None` half leaves the stored value alone, which is what
+            // chown(2)'s -1 sentinel means.
+            conn.execute(
+                "UPDATE inode SET uid = COALESCE(?1, uid), gid = COALESCE(?2, gid), \
+                 ctime = ?3 WHERE ino = ?4",
+                params![
+                    uid.map(|v| v as i64),
+                    gid.map(|v| v as i64),
+                    now_secs(),
+                    ino
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     async fn delete_inode(&self, ino: Ino) -> Result<()> {
         blocking_section(move || {
             let conn = self.lock();
             conn.execute("DELETE FROM symlink WHERE ino = ?1", params![ino])?;
+            // xattrs are keyed by inode, so they die with it (issue #119).
+            conn.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             conn.execute("DELETE FROM inode WHERE ino = ?1", params![ino])?;
             Ok(())
         })
@@ -608,6 +785,313 @@ impl MetadataStore for SqliteMetadataStore {
                 |r| r.get(0),
             )?;
             Ok(n as usize)
+        })
+    }
+
+    async fn workspace_usage(&self) -> Result<(u64, u64)> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let (n, b): (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM inode WHERE workspace_id = ?1",
+                params![self.workspace_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok((n.max(0) as u64, b.max(0) as u64))
+        })
+    }
+
+    async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // `UNION` (not `UNION ALL`) dedups inode ids, so an inode reachable by
+            // several names -- a hard link -- is counted once, as `du` does.
+            let (n, b): (i64, i64) = conn.query_row(
+                "WITH RECURSIVE sub(ino) AS (
+                     SELECT ?1
+                     UNION
+                     SELECT d.ino FROM dentry d JOIN sub ON d.parent_ino = sub.ino
+                 )
+                 SELECT COUNT(*), COALESCE(SUM(i.size), 0)
+                 FROM inode i JOIN sub ON i.ino = sub.ino",
+                params![ino],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok((n.max(0) as u64, b.max(0) as u64))
+        })
+    }
+
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
+        let table = validated_dump_table(table)?;
+        blocking_section(move || {
+            let conn = self.lock();
+            // Quoted: `ref` is a reserved word in both dialects, and the allowlist
+            // above is what makes interpolating the name here safe at all.
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\""))?;
+            let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(r) = rows.next()? {
+                let mut cells = Vec::with_capacity(cols.len());
+                for (i, name) in cols.iter().enumerate() {
+                    cells.push((name.clone(), sqlite_cell(r, i)?));
+                }
+                out.push(crate::portable::Row(cells));
+            }
+            Ok(out)
+        })
+    }
+
+    async fn reset_for_load(&self) -> Result<()> {
+        blocking_section(move || {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            // Reverse dependency order, so nothing is orphaned mid-way even though
+            // the schema declares no foreign keys to enforce it.
+            for table in crate::portable::DUMP_TABLES.iter().rev() {
+                tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
+        let table = validated_dump_table(table)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        blocking_section(move || {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            for row in rows {
+                let cols: Vec<&str> = row.0.iter().map(|(c, _)| c.as_str()).collect();
+                let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+                let quoted: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
+                let sql = format!(
+                    "INSERT INTO \"{table}\"({}) VALUES ({})",
+                    quoted.join(", "),
+                    placeholders.join(", ")
+                );
+                let vals: Vec<rusqlite::types::Value> =
+                    row.0.iter().map(|(_, v)| cell_to_sqlite(v)).collect();
+                let refs: Vec<&dyn rusqlite::ToSql> =
+                    vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+                tx.execute(&sql, refs.as_slice())?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    async fn set_acl(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: u32,
+        granted_at: i64,
+        granted_by: Option<i64>,
+    ) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO acl(workspace_id, actor_id, path_prefix, perms, granted_at, granted_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(workspace_id, actor_id, path_prefix)
+                 DO UPDATE SET perms = excluded.perms,
+                               granted_at = excluded.granted_at,
+                               granted_by = excluded.granted_by",
+                params![
+                    self.workspace_id,
+                    actor_id,
+                    path_prefix,
+                    perms as i64,
+                    granted_at,
+                    granted_by
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn remove_acl(&self, actor_id: i64, path_prefix: &str) -> Result<bool> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM acl WHERE workspace_id = ?1 AND actor_id = ?2 AND path_prefix = ?3",
+                params![self.workspace_id, actor_id, path_prefix],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT actor_id, path_prefix, perms, granted_at, granted_by FROM acl
+                 WHERE workspace_id = ?1 AND (?2 IS NULL OR actor_id = ?2)
+                 ORDER BY LENGTH(path_prefix) DESC",
+            )?;
+            let rows = stmt.query_map(params![self.workspace_id, actor_id], |r| {
+                Ok(crate::acl::AclGrant {
+                    actor_id: r.get(0)?,
+                    path_prefix: r.get(1)?,
+                    perms: crate::acl::Perms::from_bits(r.get::<_, i64>(2)? as u32),
+                    granted_at: r.get(3)?,
+                    granted_by: r.get(4)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
+        blocking_section(move || {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO trash(workspace_id, path, kind, mode, size, content_hash,
+                                   symlink_target, uid, gid, actor_id, session_id, deleted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    self.workspace_id,
+                    init.path,
+                    init.kind.as_str(),
+                    init.mode as i64,
+                    init.size as i64,
+                    init.content.map(|h| h.to_hex()),
+                    init.symlink_target,
+                    init.owner.uid as i64,
+                    init.owner.gid as i64,
+                    init.actor_id,
+                    init.session_id,
+                    init.deleted_at,
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let row = conn
+                .query_row(
+                    &format!("SELECT {TRASH_COLS} FROM trash WHERE id = ?1 AND workspace_id = ?2"),
+                    params![id, self.workspace_id],
+                    trash_row,
+                )
+                .optional()?;
+            row.map(build_trash).transpose()
+        })
+    }
+
+    async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {TRASH_COLS} FROM trash WHERE workspace_id = ?1
+                 ORDER BY deleted_at DESC, id DESC"
+            ))?;
+            let rows = stmt.query_map(params![self.workspace_id], trash_row)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(build_trash(r?)?);
+            }
+            Ok(out)
+        })
+    }
+
+    async fn delete_trash(&self, id: i64) -> Result<bool> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM trash WHERE id = ?1 AND workspace_id = ?2",
+                params![id, self.workspace_id],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    async fn purge_trash_before(&self, cutoff: i64) -> Result<usize> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM trash WHERE workspace_id = ?1 AND deleted_at < ?2",
+                params![self.workspace_id, cutoff],
+            )?;
+            Ok(n)
+        })
+    }
+
+    async fn trash_content_hashes(&self) -> Result<Vec<Hash>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // Store-wide, not workspace-scoped: `gc` sweeps one shared content
+            // store, so a workspace-scoped root would let it reclaim another
+            // workspace's trashed content.
+            let mut stmt =
+                conn.prepare("SELECT content_hash FROM trash WHERE content_hash IS NOT NULL")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                if let Some(h) = Hash::from_hex(&r?) {
+                    out.push(h);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM xattr WHERE ino = ?1 AND name = ?2",
+                    params![ino, name],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?)
+        })
+    }
+
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO xattr(ino, name, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(ino, name) DO UPDATE SET value = excluded.value",
+                params![ino, name, value],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM xattr WHERE ino = ?1 AND name = ?2",
+                params![ino, name],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let mut stmt = conn.prepare("SELECT name FROM xattr WHERE ino = ?1 ORDER BY name")?;
+            let rows = stmt.query_map(params![ino], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
         })
     }
 
@@ -1493,9 +1977,16 @@ impl MetaTxn for SqliteTxn {
             let ws = self.workspace_id;
             let conn = self.conn();
             conn.execute(
-                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES (?1, ?2, ?3, 1, 0, NULL, ?4, ?4)",
-                params![ws, init.kind.as_str(), init.mode as i64, now_secs()],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid)
+                 VALUES (?1, ?2, ?3, 1, 0, NULL, ?4, ?4, ?5, ?6)",
+                params![
+                    ws,
+                    init.kind.as_str(),
+                    init.mode as i64,
+                    now_secs(),
+                    init.owner.uid as i64,
+                    init.owner.gid as i64
+                ],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -1570,6 +2061,8 @@ impl MetaTxn for SqliteTxn {
         blocking_section(move || {
             let conn = self.conn();
             conn.execute("DELETE FROM symlink WHERE ino = ?1", params![ino])?;
+            // xattrs are keyed by inode, so they die with it (issue #119).
+            conn.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             conn.execute("DELETE FROM inode WHERE ino = ?1", params![ino])?;
             Ok(())
         })
@@ -1595,6 +2088,8 @@ impl MetaTxn for SqliteTxn {
             )?;
             if n == 1 {
                 conn.execute("DELETE FROM symlink WHERE ino = ?1", params![ino])?;
+                // xattrs are keyed by inode, so they die with it (issue #119).
+                conn.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             }
             Ok(n == 1)
         })
@@ -1920,10 +2415,7 @@ mod tests {
         assert_eq!(has_branch, 1);
         // and normal operations still work
         store
-            .create_inode(InodeInit {
-                kind: FileKind::File,
-                mode: 0o100644,
-            })
+            .create_inode(InodeInit::new(FileKind::File, 0o100644))
             .await
             .unwrap();
     }

@@ -245,15 +245,24 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         path: &str,
         summary: Option<&str>,
     ) -> Result<WriteOutcome> {
-        match self.write_policy_of(ctx.actor).await? {
-            WritePolicy::Direct => {
+        // Path-scoped since #123, exactly as `write_or_propose` is — a deletion is
+        // the same destruction one call further along, so the two must not be able
+        // to disagree about what an actor may do at a path.
+        let perms = self.effective_perms(ctx.actor, path).await?;
+        match perms {
+            p if p.contains(crate::acl::Perms::WRITE) => {
                 self.remove_as(ctx, path).await?;
                 Ok(WriteOutcome::Wrote)
             }
-            WritePolicy::Propose => {
+            p if p.contains(crate::acl::Perms::PROPOSE) => {
                 let id = self.suggest_delete(ctx, path, summary).await?;
                 Ok(WriteOutcome::Proposed(id))
             }
+            p => Err(OrigoFSError::Denied(format!(
+                "actor {} may not remove or propose removal at {path} (effective \
+                 permissions: {p})",
+                ctx.actor
+            ))),
         }
     }
 
@@ -273,17 +282,13 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         data: &[u8],
         summary: Option<&str>,
     ) -> Result<WriteOutcome> {
-        // An unknown actor has no policy on record: default to direct (matching the
-        // column default). Identity is resolved server-side before we get here, so
-        // in practice the actor always exists.
-        let policy = self
-            .meta
-            .get_actor(ctx.actor)
-            .await?
-            .map(|a| a.write_policy)
-            .unwrap_or(WritePolicy::Direct);
-        match policy {
-            WritePolicy::Direct => {
+        // Path-scoped since #123. `effective_perms` resolves the longest grant
+        // covering this path and falls back to the actor's whole-workspace
+        // `write_policy` when it has none, so an actor with no grants behaves
+        // exactly as it did before ACLs existed.
+        let perms = self.effective_perms(ctx.actor, path).await?;
+        match perms {
+            p if p.contains(crate::acl::Perms::WRITE) => {
                 // Missing parents are created here, *after* the policy decision.
                 // Surfaces used to do it before calling in, so an edit that was
                 // merely queued for review had already mutated the working tree —
@@ -297,10 +302,20 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 self.write_as(ctx, path, data).await?;
                 Ok(WriteOutcome::Wrote)
             }
-            WritePolicy::Propose => {
+            p if p.contains(crate::acl::Perms::PROPOSE) => {
                 let id = self.suggest(ctx, path, data, summary).await?;
                 Ok(WriteOutcome::Proposed(id))
             }
+            // Neither write nor propose. Only reachable via an explicit grant of
+            // `Perms::NONE` or deny-by-default, since the `write_policy` fallback
+            // always yields at least `PROPOSE`. Refused rather than silently
+            // queued: queueing would tell the actor its edit is under review when
+            // nothing will ever review it.
+            p => Err(OrigoFSError::Denied(format!(
+                "actor {} may not write or propose at {path} (effective \
+                 permissions: {p})",
+                ctx.actor
+            ))),
         }
     }
 
@@ -762,6 +777,68 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             branch: self.current_branch().await.ok().flatten(),
         })
         .await?;
+        Ok(())
+    }
+}
+
+/// Workspace setting: whether a *user-facing surface* must name an actor before
+/// it may mutate the working tree (issue #128).
+pub(crate) const REQUIRE_ATTRIBUTION: &str = "write.require_attribution";
+
+impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
+    /// Whether this workspace requires every surface-initiated mutation to name
+    /// an actor. Off by default.
+    ///
+    /// # What this is, and what it deliberately is not
+    ///
+    /// It is an **attribution-completeness** switch, not an access control. The
+    /// premise of this system is that every edit is recorded against the actor
+    /// that made it; the raw unattributed ops exist for internal machinery, and
+    /// nothing stopped a surface from reaching for them and leaving no trace of
+    /// who acted. Turning this on makes that a refusal instead of a silent gap.
+    ///
+    /// It is **not a security boundary**, and must not be described as one. A
+    /// local process holding the workspace directory has the metadata DB and the
+    /// CAS on disk and can do as it likes with them; an actor id passed on a
+    /// command line is self-asserted by whoever writes the command line.
+    /// `CLAUDE.md` puts the boundary where it actually is — "the server never
+    /// trusts a client-named actor; identity is resolved server-side" — and that
+    /// is the HTTP surface, not a shell.
+    ///
+    /// So this defends against the realistic failure, which is a script or an
+    /// operator that *forgot*, not an adversary that lied. That is worth having:
+    /// on a workspace where attribution matters, "the CLI silently wrote nothing
+    /// to the op-log" is a data-quality bug that shows up much later, when the
+    /// blame trail is the thing you needed.
+    pub async fn require_attribution(&self) -> Result<bool> {
+        Ok(self.meta.get_config(REQUIRE_ATTRIBUTION).await?.as_deref() == Some("1"))
+    }
+
+    /// Turn the requirement on or off.
+    ///
+    /// Off is the right default for the same reason `acl_default_deny` is: turning
+    /// it on for an existing workspace changes what already-written scripts do, so
+    /// it has to be a deliberate act by someone who knows their scripts name an
+    /// actor.
+    pub async fn set_require_attribution(&self, required: bool) -> Result<()> {
+        self.meta
+            .set_config(REQUIRE_ATTRIBUTION, if required { "1" } else { "0" })
+            .await
+    }
+
+    /// Refuse an unattributed surface mutation when this workspace requires
+    /// attribution (issue #128).
+    ///
+    /// Surfaces call this on the path where no actor was named. The error names
+    /// the operation and how to fix it, because the fix is always the same and
+    /// always the caller's: name an actor.
+    pub async fn ensure_attributed(&self, op: &str) -> Result<()> {
+        if self.require_attribution().await? {
+            return Err(OrigoFSError::Denied(format!(
+                "{op} requires an actor: this workspace has write.require_attribution set, \
+                 so every mutation must record who made it"
+            )));
+        }
         Ok(())
     }
 }

@@ -112,11 +112,21 @@ barrier that seals the open pack. Ten thousand small files are ten thousand PUTs
 whatever the pack target. Streaming one archive through `write_reader_as` beats
 writing its members individually by far more than any pack tuning will.
 
-**Do not rewrite large files through a FUSE/NFS mount.** `vfs_write` is a
-read-modify-write of the *entire* file per `write(2)`, retried up to 16 times under
-contention, and the kernel issues those in 128 KiB pages. Rewriting a 1 GiB file
-through a mount is quadratic in allocation and hashing. Mounts are for browsing and
-editing human-scale files; use the SDK or the HTTP API for bulk data.
+**Rewriting large files through a mount is no longer quadratic, but still costs
+more than the SDK.** `vfs_write` used to be a read-modify-write of the *entire*
+file per `write(2)`, which made rewriting a 1 GiB file quadratic in allocation and
+hashing. Since #111 it **splices** the written range into the existing manifest —
+re-chunking only a window around it — so a write costs `O(bytes written)`, and
+since #112 the FUSE mount buffers per file handle so the kernel's small requests
+are coalesced before they reach the engine. Measured: quadrupling a file multiplies
+the work by ~4.5x rather than ~16x, and a 4 KiB write into a 4 MiB file touches
+~270 KiB rather than the whole 8 MiB of read-plus-rewrite.
+
+What remains: two writers at *different* offsets of one file still contend, because
+both compare-and-set the same inode `manifest_hash` (retried up to 16 times); and
+each spliced write still pays for the widened re-chunk window. The SDK and HTTP API
+remain the better path for bulk data, but a mount is no longer the wrong tool for a
+large file.
 
 **Encryption and packing compose with a real cost.** `EncryptedStore::get_range`
 must decrypt a whole object before slicing — AEAD authenticates the whole

@@ -8,6 +8,7 @@
 //!
 //! See `docs/DESIGN.md` for the full architecture and the milestone roadmap.
 
+pub mod acl;
 pub mod attribution;
 pub mod chunk;
 pub mod clock;
@@ -33,18 +34,24 @@ pub mod objectgraph;
 #[cfg(feature = "object-store")]
 pub mod objectstore;
 pub mod pack;
+pub mod perf;
+pub mod portable;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod recover;
 pub mod resync;
 mod retry;
+pub mod scope;
 pub mod sqlite;
+pub mod stats;
 pub mod suggest;
+pub mod trash;
 pub mod types;
 mod util;
 pub mod version;
 pub mod vfs;
 
+pub use acl::{AclGrant, Perms};
 pub use attribution::{
     Actor, ActorInit, ActorKind, BlameRange, EditOp, ToolCallInit, WriteCtx, WritePolicy,
 };
@@ -58,13 +65,32 @@ pub use coedit_tree::{
 };
 pub use collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, PRESENCE_WINDOW_SECS, Presence};
 pub use content::{
-    ContentStore, DEDUP_REFRESH_AFTER_SECS, LocalCasStore, MemStore, TieredStore, VerifyingStore,
+    CacheLimits, ContentStore, DEDUP_REFRESH_AFTER_SECS, LocalCasStore, MemStore, TieredStore,
+    VerifyingStore,
 };
 pub use corpus::{Passage, PassageOptions, Segmentation};
 #[cfg(feature = "encryption")]
 pub use encrypt::EncryptedStore;
 pub use engine::{Fs, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
+pub use portable::{Cell, DUMP_FORMAT, DUMP_TABLES, LoadReport, Row};
+pub use scope::{Scope, ScopeError};
+pub use stats::{FsStat, Quota, STATFS_BLOCK_SIZE, Usage};
+pub use trash::{DEFAULT_TRASH_RETENTION_SECS, TrashEntry, TrashInit};
+
+/// The largest value a single extended attribute may hold (issue #119).
+///
+/// 64 KiB, matching Linux's own per-value ceiling, so nothing that works on ext4
+/// or XFS is refused here.
+///
+/// This is a hard rule rather than a tuning knob. An xattr is stored in the
+/// **metadata** store, and the invariant the whole design rests on is that the
+/// metadata DB references content by hash and never holds large bytes. Without a
+/// cap, `setfattr` would be a supported way to write unbounded,
+/// un-deduplicated, un-chunked data straight into the DB — precisely what the
+/// metadata/content split exists to prevent. Raise it only alongside a decision
+/// about where oversized attribute values would actually live.
+pub const MAX_XATTR_LEN: usize = 64 * 1024;
 pub use gc::{DEFAULT_GC_GRACE_SECS, GcStats};
 pub use merge::{Conflict, MergeOutcome};
 pub use metadata::{MetaTxn, MetadataStore};
@@ -90,4 +116,6 @@ pub use sqlite::SqliteMetadataStore;
 pub use suggest::{
     Suggestion, SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, WriteOutcome,
 };
-pub use types::{DirEntry, DirEntryAttr, DirPage, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit};
+pub use types::{
+    DirEntry, DirEntryAttr, DirPage, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit, Owner,
+};

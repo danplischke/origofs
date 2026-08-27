@@ -53,3 +53,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }
 # tests/remote.rs drives a real `git clone origofs://…` through the git-remote-origofs
 # helper binary (CARGO_BIN_EXE_git-remote-origofs) against a temp workspace.
 tempfile = "3.27.0"
+# tests/cli.rs parses `origofs dump` output to check it really is JSON Lines —
+# "readable with ordinary tools" is a stated goal of the format (issue #117), so
+# the test reads it the way an ordinary tool would rather than trusting the writer.
+serde_json = "1"

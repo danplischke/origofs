@@ -24,6 +24,7 @@ use crate::metadata::MetadataStore;
 use crate::objectgraph::{Commit, Tree, TreeEntry, TreeKind};
 use crate::types::Hash;
 use async_recursion::async_recursion;
+use futures::StreamExt;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// The ref naming the commit being merged in while a conflicted merge is
@@ -203,8 +204,13 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let manifest = self.load_manifest(mhash).await?;
         // Capped hint, not `size`: see `Manifest::capacity_hint`.
         let mut buf = Vec::with_capacity(manifest.capacity_hint());
-        for c in &manifest.chunks {
-            buf.extend_from_slice(&self.content.get(&c.hash).await?);
+        // Bounded-concurrency, ordered fetch (issue #113). This is the widest read
+        // path in the engine — `read`, `vfs_write`'s read-modify-write, and every
+        // three-way merge come through here — so a serial chunk loop cost a round
+        // trip per chunk on every one of them.
+        let mut parts = self.content_stream(manifest);
+        while let Some(part) = parts.next().await {
+            buf.extend_from_slice(&part?);
         }
         Ok(buf)
     }

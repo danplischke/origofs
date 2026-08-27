@@ -489,7 +489,22 @@ jobs:
           aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://origofs-ci || true
 
       # `--run-ignored all` un-gates the #[ignore]d tests; the filterset scopes the
-      # run to just the S3 suite (not the GCS one, which needs a separate backend).
+      # run to just the S3 suite.
+      #
+      # There is deliberately no GCS counterpart to this job (#106), and it is not
+      # for want of trying: no GCS emulator can stand in for a bucket here.
+      # `object_store`'s GCS backend talks the XML API path-style —
+      # `PUT {base}/{bucket}/{object}` with no query — and while
+      # `fsouza/fake-gcs-server` does route path-style GET/HEAD/DELETE and
+      # `?list-type=2` correctly (given `-public-host`), it has no XML-API upload
+      # at all: every path-style PUT lands in its JSON `insertObject`, which
+      # demands `uploadType=media|multipart|resumable` (or a signed-URL
+      # `X-Goog-Algorithm`) and answers `400 invalid uploadType` otherwise. So the
+      # very first `put` fails. `oittaa/gcp-storage-emulator` does implement an XML
+      # PUT, but has no XML DELETE and no bucket-level list, which the content
+      # store's GC path needs. Native GCS is therefore verified against a real
+      # bucket out of band via ORIGOFS_GCS_TEST_*; README.md says so plainly under
+      # "Storage backends" rather than implying coverage this job doesn't give.
       - name: Run the S3 content-store suite
         run: cargo nextest run --profile ci -p origofs-core --run-ignored all -E 'test(/^s3_/)'
 

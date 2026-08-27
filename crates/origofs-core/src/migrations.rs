@@ -170,6 +170,89 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V16_SQLITE,
         postgres: V16_POSTGRES,
     },
+    // V17 — POSIX ownership on `inode` (issue #122). There was no `uid` and no
+    // `gid` anywhere in the schema, so both mounts hardcoded `uid: 0, gid: 0` and
+    // every inode reported as root-owned. That was self-consistent — the FUSE
+    // mount asks the kernel to run real permission checks
+    // (`MountOption::DefaultPermissions`) and `fuse_mountable()` requires root, so
+    // every check passed — but it is precisely why `allow_other` and non-root
+    // mounts could not work: a non-root caller is evaluated against uid 0 in the
+    // *other* class and loses write access to the whole tree. Not fixable with
+    // mount options; it needs real ownership.
+    //
+    // Defaults to 0 so existing workspaces are unchanged: every current inode is
+    // already reported as root-owned, and the backfill states that rather than
+    // altering it. Buys no authorization on its own (see `docs/PERMISSIONS.md` §2
+    // for why a uid must not become the principal) — it stops the mount lying.
+    Migration {
+        version: 17,
+        sqlite: V17_SQLITE,
+        postgres: V17_POSTGRES,
+    },
+    // V18 — extended attributes (issue #119). The only xattr code in the tree was
+    // `sandbox.rs` reading overlayfs whiteout markers off the *host* filesystem;
+    // origofs itself had nowhere to put one, so macOS metadata, SELinux labels, and
+    // git's own use all failed confusingly rather than cleanly.
+    //
+    // Keyed by inode rather than by content hash: an xattr describes *this file at
+    // this path* (a label, a resource fork), not the bytes, and two files that
+    // happen to dedup to one manifest must not share them. Values are bytes, and
+    // deliberately size-capped in the engine rather than here — see `MAX_XATTR_LEN`
+    // for why the metadata/content split makes that a rule and not a preference.
+    Migration {
+        version: 18,
+        sqlite: V18,
+        postgres: V18,
+    },
+    // V19 — trash: an **uncommitted** delete used to be unrecoverable (issue #115).
+    // A committed file can be read back out of history; an uncommitted one was
+    // simply gone. GC's grace period is not an undo — it protects in-flight writes
+    // from the sweep, which is a correctness guard, not a user-facing one.
+    //
+    // That matters more here than it would for an ordinary filesystem, because the
+    // users are agents: an agent that shells out to `rm -rf` on a bad path is a
+    // routine failure mode, and "you should have committed first" is no answer when
+    // the actor that failed to commit is the same one that deleted the tree.
+    //
+    // The row carries everything needed to put the file back — kind, mode,
+    // ownership, the manifest hash, a symlink's target — plus **who deleted it and
+    // in which session**. That last part is what makes trash fit origofs's grain
+    // rather than JuiceFS's: a restore is an attributed operation, and the deletion
+    // is already in the op-log beside it.
+    //
+    // Retention is per-workspace config and **off by default**; see
+    // `Fs::trash_retention` for why turning it on by default would silently change
+    // when space is reclaimed for every existing deployment.
+    Migration {
+        version: 19,
+        sqlite: V19_SQLITE,
+        postgres: V19_POSTGRES,
+    },
+    // V20 — path-scoped write ACLs (issue #123). Until now the only authorization
+    // in the engine was `WritePolicy::{Direct, Propose}`: per **actor**, whole
+    // workspace, binary, writes only, and taking no path. `docs/MULTI_TENANCY.md`
+    // §7 named the gap — "all of a tenant's actors may reach all of its workspaces
+    // by default; a deployment that wants per-workspace scoping enforces it in the
+    // resolver/router" — and nothing in the engine did that.
+    //
+    // A grant is `(workspace, actor, path_prefix) -> perms`, longest matching
+    // prefix wins, matched on **directory boundaries** so `/tenant-a` never covers
+    // `/tenant-abc` (the shared `Scope` does that matching; this is the third and
+    // last copy of that rule to be folded into it).
+    //
+    // **No backfill, deliberately.** The obvious migration gives every existing
+    // actor a root grant carrying its current write policy. Absence-means-fallback
+    // is exactly equivalent and strictly better: an actor with no grant falls back
+    // to its `write_policy` column, so the migration is a pure table create, cannot
+    // half-apply across a large actor table, and leaves `write_policy` as the
+    // single source of truth until an operator actually writes a grant. Grants are
+    // then purely additive refinement rather than a parallel system that must be
+    // kept in sync.
+    Migration {
+        version: 20,
+        sqlite: V20,
+        postgres: V20,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -371,6 +454,94 @@ CREATE TABLE IF NOT EXISTS live_doc(
 // claiming a time it doesn't have.
 const V16_SQLITE: &str = "ALTER TABLE live_doc ADD COLUMN checkpointed_at BIGINT;";
 const V16_POSTGRES: &str = "ALTER TABLE live_doc ADD COLUMN IF NOT EXISTS checkpointed_at BIGINT;";
+
+// V17 — POSIX ownership (see the migration entry above). NOT NULL with a 0 default
+// so it applies to existing rows unchanged; the runner tolerates a re-applied
+// SQLite ADD COLUMN, Postgres expresses idempotency directly.
+const V17_SQLITE: &str = "
+ALTER TABLE inode ADD COLUMN uid INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE inode ADD COLUMN gid INTEGER NOT NULL DEFAULT 0;
+";
+const V17_POSTGRES: &str = "
+ALTER TABLE inode ADD COLUMN IF NOT EXISTS uid BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE inode ADD COLUMN IF NOT EXISTS gid BIGINT NOT NULL DEFAULT 0;
+";
+
+// V18 — extended attributes (see the migration entry above). Identical SQL in both
+// dialects: `BLOB` and `BYTEA` are spelled differently, so the value is stored as
+// the one binary type both accept under the same name — SQLite types are advisory
+// (`BYTEA` is simply an unrecognized name with BLOB affinity) and Postgres has
+// `BYTEA` natively.
+// V20 — path-scoped write ACLs (see the migration entry above). Identical SQL in
+// both dialects. `perms` is a bitset (see `crate::acl::Perms`) rather than an enum
+// column, so "may write here, may only propose there" is representable — which the
+// single `write_policy` column could not express at all.
+const V20: &str = "
+CREATE TABLE IF NOT EXISTS acl(
+    workspace_id BIGINT NOT NULL,
+    actor_id     BIGINT NOT NULL,
+    path_prefix  TEXT   NOT NULL,
+    perms        BIGINT NOT NULL,
+    granted_at   BIGINT NOT NULL,
+    granted_by   BIGINT,
+    PRIMARY KEY (workspace_id, actor_id, path_prefix)
+);
+CREATE INDEX IF NOT EXISTS idx_acl_actor ON acl(workspace_id, actor_id);
+";
+
+// V19 — trash (see the migration entry above). `content_hash` is the manifest
+// address, which is what makes a trashed body a GC root for as long as the entry
+// is retained: without that the sweep reclaims the chunks and a restore finds
+// nothing to restore.
+const V19_SQLITE: &str = "
+CREATE TABLE IF NOT EXISTS trash(
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id   INTEGER NOT NULL,
+    path           TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    mode           INTEGER NOT NULL,
+    size           INTEGER NOT NULL,
+    content_hash   TEXT,
+    symlink_target TEXT,
+    uid            INTEGER NOT NULL DEFAULT 0,
+    gid            INTEGER NOT NULL DEFAULT 0,
+    actor_id       INTEGER,
+    session_id     INTEGER,
+    deleted_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trash_ws ON trash(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_trash_deleted_at ON trash(deleted_at);
+";
+
+const V19_POSTGRES: &str = "
+CREATE TABLE IF NOT EXISTS trash(
+    id             BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    workspace_id   BIGINT NOT NULL,
+    path           TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    mode           BIGINT NOT NULL,
+    size           BIGINT NOT NULL,
+    content_hash   TEXT,
+    symlink_target TEXT,
+    uid            BIGINT NOT NULL DEFAULT 0,
+    gid            BIGINT NOT NULL DEFAULT 0,
+    actor_id       BIGINT,
+    session_id     BIGINT,
+    deleted_at     BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trash_ws ON trash(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_trash_deleted_at ON trash(deleted_at);
+";
+
+const V18: &str = "
+CREATE TABLE IF NOT EXISTS xattr(
+    ino   BIGINT NOT NULL,
+    name  TEXT   NOT NULL,
+    value BYTEA  NOT NULL,
+    PRIMARY KEY (ino, name)
+);
+CREATE INDEX IF NOT EXISTS idx_xattr_ino ON xattr(ino);
+";
 
 // SQLite has no `ADD COLUMN IF NOT EXISTS`; the migration runner tolerates a
 // re-applied ADD COLUMN (duplicate-column) so a re-run is idempotent. Postgres

@@ -13,7 +13,18 @@ extension's dict builders set every key unconditionally. So
 """
 from __future__ import annotations
 import sys
-from typing import Any, Awaitable, Dict, List, Literal, NoReturn, Optional, Tuple, TypedDict
+from typing import (
+    Any,
+    Awaitable,
+    Dict,
+    List,
+    Literal,
+    NoReturn,
+    Optional,
+    Sequence,
+    Tuple,
+    TypedDict,
+)
 
 # --- record shapes ----------------------------------------------------------
 #
@@ -117,7 +128,12 @@ class EditOp(TypedDict):
 
 
 class StatResult(TypedDict):
-    """An inode (``stat``). ``content`` is the manifest hash, ``None`` for a dir."""
+    """An inode (``stat``). ``content`` is the manifest hash, ``None`` for a dir.
+
+    ``uid``/``gid`` are POSIX ownership (issue #122) — ``0``/``0`` for anything
+    created before the ownership migration and for anything created off a mount.
+    They are what ``chown`` sets and the only place its effect can be read back.
+    """
 
     ino: int
     kind: FileKind
@@ -127,6 +143,8 @@ class StatResult(TypedDict):
     content: Optional[str]
     mtime: int
     ctime: int
+    uid: int
+    gid: int
 
 
 class DirEntry(TypedDict):
@@ -295,6 +313,179 @@ class ReadyReport(TypedDict):
     metadata: Optional[str]
     content: Optional[str]
 
+
+class TrashRecord(TypedDict):
+    """One recoverable deletion (``list_trash``, issue #115).
+
+    ``content`` is the manifest address, ``None`` for a directory, an empty file,
+    or a symlink. ``actor_id``/``session_id`` name who deleted it — ``None`` for an
+    unattributed delete, which is what a mount (no actor context) produces.
+    """
+
+    id: int
+    path: str
+    kind: FileKind
+    mode: int
+    size: int
+    content: Optional[str]
+    symlink_target: Optional[str]
+    uid: int
+    gid: int
+    actor_id: Optional[int]
+    session_id: Optional[int]
+    deleted_at: int
+
+
+class UsageRecord(TypedDict):
+    """What a subtree or workspace occupies (``usage``/``du``, issue #116).
+
+    **Logical** bytes — the sum of ``stat`` sizes, not the deduplicated on-disk
+    footprint. An inode reachable by several names (a hard link) counts once.
+    """
+
+    inodes: int
+    bytes: int
+
+
+class QuotaRecord(TypedDict):
+    """Capacity limits (``quota``/``set_quota``). ``None`` means no limit."""
+
+    bytes: Optional[int]
+    inodes: Optional[int]
+
+
+class FsStatRecord(TypedDict):
+    """A ``statfs(2)`` answer (issue #119), denominated in ``block_size`` blocks.
+
+    With no quota set the totals are synthesized from a nominal capacity that
+    grows with usage, so ``df`` never reports a 100%-full filesystem.
+    """
+
+    block_size: int
+    total_blocks: int
+    free_blocks: int
+    total_inodes: int
+    free_inodes: int
+
+
+# One permission name. The bitset is exposed as a list of these rather than an
+# integer: `["read", "write"]` reads the same in a log line, an API response, and
+# a `grant` call. An empty list is an explicit deny, which is a grant.
+Perm = Literal["read", "write", "propose"]
+
+
+class AclGrantRecord(TypedDict):
+    """One path-prefix grant (``list_grants``, issue #123).
+
+    ``path_prefix`` is ``""`` for a grant over the whole workspace — the root
+    prefix, which every more specific grant outranks. ``granted_by`` is ``None``
+    for a grant written by something with no actor (an operator tool).
+    """
+
+    actor_id: int
+    path_prefix: str
+    perms: list[Perm]
+    granted_at: int
+    granted_by: Optional[int]
+
+
+class ResidencyRecord(TypedDict):
+    """Which of a file's chunks the content store still holds.
+
+    **Presence, not cache residency**: a tiered store answers from either tier and
+    nothing on the object-safe trait tells them apart. ``missing_sample`` is a few
+    of the missing addresses to go looking with, not all of them.
+    """
+
+    present: int
+    present_bytes: int
+    missing: int
+    missing_sample: list[str]
+
+
+class FileLayoutRecord(TypedDict):
+    """What one file costs to read (``file_layout``, issue #118).
+
+    ``chunks`` is the read-amplification number: a whole-file read fetches exactly
+    that many objects. ``self_dedup`` and ``distinct_bytes`` describe repetition
+    *within this file* only — what it shares with other files is not measured, so
+    the saving is a lower bound. ``histogram`` is ``(upper_bound_inclusive,
+    count)`` over all chunk references; ``chunker`` is ``(min, avg, max)``.
+    ``residency`` is ``None`` unless the call asked to probe the store.
+    """
+
+    size: int
+    manifest: Optional[str]
+    chunks: int
+    distinct_chunks: int
+    distinct_bytes: int
+    smallest: Optional[int]
+    largest: Optional[int]
+    median: Optional[int]
+    mean: Optional[int]
+    self_dedup: float
+    histogram: list[tuple[int, int]]
+    residency: Optional[ResidencyRecord]
+    chunker: tuple[int, int, int]
+
+
+class BenchStageRecord(TypedDict):
+    """One measured phase of ``bench``. Durations are seconds.
+
+    ``elapsed_secs`` is time *inside* the engine call, not wall time across the
+    phase. The quantiles are nearest-rank over ``ops`` samples — read any of them
+    next to ``ops``.
+    """
+
+    ops: int
+    bytes: int
+    elapsed_secs: float
+    bytes_per_sec: float
+    mean_secs: float
+    p50_secs: float
+    p95_secs: float
+    max_secs: float
+
+
+class TunableRecord(TypedDict):
+    """A concurrency knob as configured. ``value`` is ``None`` when the
+    environment variable is unset and the engine default applies."""
+
+    var: str
+    value: Optional[int]
+
+
+class BenchOptsRecord(TypedDict):
+    """The options a ``bench`` run used, echoed so the report is self-describing."""
+
+    dir: str
+    files: int
+    file_size: int
+    seed: int
+    keep: bool
+    force: bool
+
+
+class BenchReport(TypedDict):
+    """An end-to-end write/read/re-read measurement (``bench``, issue #118).
+
+    ``read`` and ``reread`` are the first and second pass, **not** cold and warm:
+    nothing here evicts a cache. ``distinct_chunks`` below ``chunks`` means the run
+    deduplicated against itself and the write figure is overstated.
+    """
+
+    opts: BenchOptsRecord
+    total_bytes: int
+    chunker: tuple[int, int, int]
+    upload_concurrency: TunableRecord
+    fetch_concurrency: TunableRecord
+    chunks: int
+    distinct_chunks: int
+    write: BenchStageRecord
+    read: BenchStageRecord
+    reread: BenchStageRecord
+    kept: bool
+
 class OrigoFSError(Exception):
     """Base origofs error (raised for errors without a more specific mapping)."""
 
@@ -367,6 +558,43 @@ if sys.platform == "linux":
         def unmount(self) -> None: ...
         def __enter__(self) -> "Mount": ...
         def __exit__(self, *args: Any) -> None: ...
+
+class Scope:
+    """A surface's view of a workspace: everything, or one subtree (issue #125).
+
+    Scoping is **not** authorization: a ``Scope`` restricts *what a surface can
+    address*, an ACL (``Workspace.grant``) restricts *what an actor may do*. This
+    is the engine's own rule rather than a second implementation of it, and the
+    four properties it encodes are each load-bearing:
+
+    1. directory-boundary matching, not ``startswith`` — ``/tenant-a`` does not
+       cover ``/tenant-abc``;
+    2. ``resolve`` prepends the root rather than comparing against it, so another
+       tenant's data is not addressable at all;
+    3. a ``None`` path is outside every scope but the whole one;
+    4. out of scope is **not found**, never forbidden — which is why ``require``
+       raises ``FileNotFoundError`` and never ``PermissionError``.
+    """
+
+    @staticmethod
+    def whole() -> "Scope": ...
+    @staticmethod
+    def at(root: str) -> "Scope":
+        """A scope rooted at ``root``, which must be absolute — a relative root
+        raises ``ValueError`` rather than being read as absolute."""
+        ...
+    @property
+    def root(self) -> str: ...
+    @property
+    def is_whole(self) -> bool: ...
+    def contains(self, path: Optional[str]) -> bool: ...
+    def resolve(self, path: str) -> str:
+        """Resolve a caller-supplied path inside this scope. A ``..`` component
+        raises ``ValueError``, refused before any lookup."""
+        ...
+    def require(self, path: Optional[str]) -> None:
+        """Raise ``FileNotFoundError`` if ``path`` lies outside this scope."""
+        ...
 
 class Subscription:
     """A push subscription to the change feed (Postgres LISTEN/NOTIFY)."""
@@ -813,6 +1041,97 @@ class Workspace:
     async def edit_ops(
         self, actor_id: int, session_id: Optional[int] = None
     ) -> list[EditOp]: ...
+
+    # ── trash: a recoverable delete for uncommitted work (issue #115) ────────
+    # Off by default: enabling retention by default would silently change when
+    # space is reclaimed for every existing deployment.
+    async def trash_retention(self) -> Optional[int]: ...
+    async def set_trash_retention(self, secs: Optional[int]) -> None: ...
+    async def list_trash(self) -> list[TrashRecord]: ...
+    # Returns the path the entry was restored to.
+    async def restore_trash(self, id: int, ctx: WriteCtx) -> str: ...
+    async def purge_trash(self, id: int) -> bool: ...
+    async def empty_trash(self) -> int: ...
+    # The unattributed delete-into-trash. Prefer `remove_or_propose` wherever an
+    # actor is known, so the deletion carries blame.
+    async def remove_trashing(self, path: str) -> None: ...
+
+    # ── usage, quotas, statfs (issues #116, #119) ────────────────────────────
+    async def usage(self) -> UsageRecord: ...
+    async def du(self, path: str) -> UsageRecord: ...
+    async def quota(self) -> QuotaRecord: ...
+    # `None` is "no limit", so set_quota() with no arguments clears both.
+    async def set_quota(
+        self, bytes: Optional[int] = None, inodes: Optional[int] = None
+    ) -> None: ...
+    async def statfs(self) -> FsStatRecord: ...
+
+    # ── ownership, hard links, xattrs (issues #119, #121, #122) ──────────────
+    # The inode-addressed engine ops, exposed by path: an ino is an implementation
+    # detail of the mounts, and a Python caller has a path. Each returns the fresh
+    # inode, so the effect can be read back rather than assumed.
+    async def chmod(self, path: str, mode: int) -> StatResult: ...
+    async def chown(
+        self, path: str, uid: Optional[int] = None, gid: Optional[int] = None
+    ) -> StatResult:
+        """Change ownership; either half ``None`` leaves it alone (``chown(2)``'s
+        ``-1``). This is ownership, **not** authorization — see ``grant``."""
+        ...
+    async def link(self, existing_path: str, new_path: str) -> StatResult:
+        """Hard-link ``new_path`` to the inode at ``existing_path``. Directories
+        are refused (``PermissionError``), as POSIX requires."""
+        ...
+    async def getxattr(self, path: str, name: str) -> Optional[bytes]: ...
+    async def setxattr(self, path: str, name: str, value: bytes) -> None: ...
+    async def listxattr(self, path: str) -> list[str]: ...
+    async def removexattr(self, path: str, name: str) -> bool: ...
+
+    # ── path-scoped write ACLs (issue #123) ──────────────────────────────────
+    # `(actor, path_prefix) -> perms`, longest matching prefix wins. Permissions
+    # are named: "write", "read+write", or ["read", "propose"]. An empty list is an
+    # explicit deny for that subtree.
+    async def grant(
+        self,
+        actor_id: int,
+        path_prefix: str,
+        perms: str | Sequence[str],
+        granted_by: Optional[int] = None,
+    ) -> None: ...
+    async def revoke(
+        self, actor_id: int, path_prefix: str, revoked_by: Optional[int] = None
+    ) -> bool: ...
+    async def list_grants(self, actor_id: Optional[int] = None) -> list[AclGrantRecord]: ...
+    async def effective_perms(self, actor_id: int, path: str) -> list[Perm]:
+        """The permissions ``actor_id`` has at ``path``. With no matching grant
+        this falls back to the actor's write policy rather than denying — flip
+        that with ``set_acl_default_deny(True)``."""
+        ...
+    async def acl_default_deny(self) -> bool: ...
+    async def set_acl_default_deny(self, deny: bool) -> None: ...
+    # Raises PermissionError when the actor may not write at `path`. The denial
+    # never says whether the path exists.
+    async def ensure_may_write_at(self, ctx: WriteCtx, op: str, path: str) -> None: ...
+
+    # ── performance introspection (issue #118) ───────────────────────────────
+    async def file_layout(self, path: str, probe: bool = False) -> FileLayoutRecord:
+        """What ``path`` costs to read. ``probe`` is the only part that touches
+        the content backend — one ``has`` per distinct chunk — so it is off by
+        default."""
+        ...
+    async def bench(
+        self,
+        dir: Optional[str] = None,
+        files: Optional[int] = None,
+        file_size: Optional[int] = None,
+        seed: Optional[int] = None,
+        keep: bool = False,
+        force: bool = False,
+    ) -> BenchReport:
+        """Write, read, and re-read generated files against this workspace's
+        backends. **Mutating**: it writes and then deletes ``bench-NNNN.bin``
+        under ``dir``, and refuses a ``dir`` that already holds anything unless
+        ``force``. Defaults are 8 files of 8 MiB under ``/.origofs-bench``."""
+        ...
 
     if sys.platform == "linux":
         def mount(self, mountpoint: str) -> Mount: ...

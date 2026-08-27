@@ -232,10 +232,18 @@ async fn gcs_store_constructs() {
 /// S3 has had `allow_http` from the start (that is how the MinIO leg works); GCS
 /// simply never got it, and with no GCS test leg nothing noticed.
 ///
-/// (A `fake-gcs-server` CI leg is still not possible: it serves the XML API
-/// virtual-hosted, by `Host` header, while `object_store` addresses GCS
-/// path-style. That is an upstream mismatch, not something origofs can configure
-/// around — so the honest coverage is this, plus a real bucket out of band.)
+/// (A `fake-gcs-server` CI leg is still not possible, but **not** for the
+/// addressing reason previously claimed here. `object_store` addresses GCS
+/// path-style — `format!("{base_url}/{bucket}/{path}")` — and given `-public-host`
+/// fake-gcs-server serves path-style `GET`, `HEAD`, `DELETE` and `?list-type=2`
+/// against it perfectly well; all four were verified returning 200. The real
+/// blocker is uploads: it has no XML-API `PUT` at all, routing every path-style
+/// PUT into its JSON `insertObject`, which demands
+/// `uploadType=media|multipart|resumable` and answers `400 invalid uploadType` to
+/// the bare XML PUT `object_store` sends — so the suite's very first `put` dies.
+/// `oittaa/gcp-storage-emulator` implements an XML PUT but no XML DELETE and no
+/// bucket-level list. So the honest coverage is this, plus a real bucket out of
+/// band; see the caveat in README.md's backend list.)
 #[tokio::test]
 async fn gcs_builder_accepts_a_plaintext_emulator_endpoint() {
     use origofs_core::GcsConfig;

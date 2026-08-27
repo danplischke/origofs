@@ -19,6 +19,7 @@ use crate::content::ContentStore;
 use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
+use crate::scope::Scope;
 use crate::types::{Hash, Ino};
 use similar::{ChangeTag, TextDiff};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -618,6 +619,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
 
+        // Refuse before storing — see `Fs::write_attempt` (issue #116).
+        self.check_quota_for_path(path, data.len() as u64).await?;
         // Content durable first (store_body is idempotent, so it's computed once
         // and reused across create-race retries), then commit blame + content +
         // op-log together with the file's creation, so a crash can never leave a
@@ -865,7 +868,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     where
         R: std::io::Read + Send + 'static,
     {
-        self.ensure_may_write(ctx, "write a file").await?;
+        // Path-scoped since #123: the grant covering this path decides, falling
+        // back to the actor's whole-workspace write policy when it has none.
+        self.ensure_may_write_at(ctx, "write a file", path).await?;
 
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
@@ -957,7 +962,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// accepts requests from possibly-untrusted actors: it queues a propose-only
     /// actor's removal for review instead of refusing it outright.
     pub async fn remove_as(&self, ctx: WriteCtx, path: &str) -> Result<()> {
-        self.ensure_may_write(ctx, "remove files").await?;
+        self.ensure_may_write_at(ctx, "remove files", path).await?;
         self.remove_as_unchecked(ctx, path).await
     }
 
@@ -977,6 +982,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // Capture identity and content *before* the removal: afterwards the inode
         // is gone and the op-log could not name what was destroyed.
         let inode = self.stat(path).await?;
+        // Same reason, one layer up: trash records the whole entry (mode,
+        // ownership, manifest, symlink target) plus who deleted it, and none of
+        // that is readable once the row is gone (issue #115). A no-op when trash
+        // is disabled, which is the default.
+        self.trash_capture(path, Some(ctx)).await?;
         self.remove(path).await?;
         self.meta
             .append_edit_op(EditOpInit {
@@ -1003,7 +1013,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// The source is recoverable from the inode's earlier ops, and the change-feed
     /// event emitted at the workspace boundary carries `from → to` in its `detail`.
     pub async fn rename_as(&self, ctx: WriteCtx, from: &str, to: &str) -> Result<()> {
-        self.ensure_may_write(ctx, "rename files").await?;
+        // Two checks, not one: scoping only the source would let an actor move a
+        // file it controls into a tree it does not (#123).
+        self.ensure_may_rename(ctx, from, to).await?;
         let inode = self.stat(from).await?;
         self.rename(from, to).await?;
         self.meta
@@ -1027,7 +1039,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Create a directory (and any missing parents), attributed to `ctx` and
     /// subject to its write policy.
     pub async fn mkdir_as(&self, ctx: WriteCtx, path: &str) -> Result<Ino> {
-        self.ensure_may_write(ctx, "create directories").await?;
+        self.ensure_may_write_at(ctx, "create directories", path)
+            .await?;
         let ino = self.mkdir_p(path).await?;
         self.meta
             .append_edit_op(EditOpInit {
@@ -1050,7 +1063,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Create a symlink at `linkpath` pointing at `target`, attributed to `ctx`
     /// and subject to its write policy.
     pub async fn symlink_as(&self, ctx: WriteCtx, target: &str, linkpath: &str) -> Result<Ino> {
-        self.ensure_may_write(ctx, "create symlinks").await?;
+        self.ensure_may_write_at(ctx, "create symlinks", linkpath)
+            .await?;
         let ino = self.symlink(target, linkpath).await?;
         self.meta
             .append_edit_op(EditOpInit {
@@ -1184,7 +1198,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         session_id: i64,
         path_prefix: Option<&str>,
     ) -> Result<Vec<String>> {
-        let scope = path_prefix.map(PathScope::new).transpose()?;
+        // One scope implementation for the whole tree (issue #125). This used to be
+        // a local `PathScope` with the same directory-boundary rule, which made three
+        // copies of that rule counting the Python router's; `Scope` is now the single
+        // one, and it additionally refuses a `..` in the prefix.
+        let scope = path_prefix.map(Scope::at).transpose()?;
 
         // Distinct files this actor touched in this session (from the op-log),
         // filtered to the scope *before* any of them is written.
@@ -1192,7 +1210,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let mut paths: Vec<(Ino, String)> = Vec::new();
         for op in ops {
             if let Some(s) = &scope
-                && !s.covers(&op.path)
+                && !s.contains(Some(op.path.as_str()))
             {
                 continue;
             }
@@ -1278,77 +1296,6 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             changed.push(path);
         }
         Ok(changed)
-    }
-}
-
-/// A `/`-boundary path prefix, for scoping an operation to a subtree.
-///
-/// The naive `path.starts_with(prefix)` is wrong in a way that matters for the
-/// multi-tenant case it exists to serve: `/tenant-a` would also match
-/// `/tenant-abc`, so the scope would leak into exactly the neighbouring tenant it
-/// was meant to exclude.
-struct PathScope {
-    /// Normalized: absolute, no trailing slash (so the root is `""`).
-    prefix: String,
-}
-
-impl PathScope {
-    fn new(prefix: &str) -> Result<Self> {
-        if !prefix.starts_with('/') {
-            return Err(OrigoFSError::InvalidArgument(format!(
-                "path prefix must be absolute, got {prefix:?}"
-            )));
-        }
-        Ok(Self {
-            prefix: prefix.trim_end_matches('/').to_string(),
-        })
-    }
-
-    /// Whether `path` is the prefix itself or sits under it.
-    fn covers(&self, path: &str) -> bool {
-        // The root prefix (`/`, normalized to `""`) covers everything.
-        if self.prefix.is_empty() {
-            return true;
-        }
-        path == self.prefix
-            || (path.starts_with(&self.prefix)
-                && path.as_bytes().get(self.prefix.len()) == Some(&b'/'))
-    }
-}
-
-#[cfg(test)]
-mod path_scope_tests {
-    use super::PathScope;
-
-    #[test]
-    fn a_prefix_matches_only_on_directory_boundaries() {
-        let s = PathScope::new("/tenant-a").unwrap();
-        assert!(s.covers("/tenant-a"));
-        assert!(s.covers("/tenant-a/notes.txt"));
-        assert!(s.covers("/tenant-a/deep/nested/f"));
-        // The whole point: a sibling sharing a textual prefix is not covered.
-        assert!(!s.covers("/tenant-abc/notes.txt"));
-        assert!(!s.covers("/tenant-a2"));
-        assert!(!s.covers("/other/tenant-a"));
-    }
-
-    #[test]
-    fn a_trailing_slash_is_accepted_and_means_the_same_thing() {
-        let with = PathScope::new("/tenant-a/").unwrap();
-        assert!(with.covers("/tenant-a/notes.txt"));
-        assert!(!with.covers("/tenant-abc/notes.txt"));
-    }
-
-    #[test]
-    fn the_root_covers_everything() {
-        let s = PathScope::new("/").unwrap();
-        assert!(s.covers("/"));
-        assert!(s.covers("/anything/at/all"));
-    }
-
-    #[test]
-    fn a_relative_prefix_is_refused() {
-        assert!(PathScope::new("tenant-a").is_err());
     }
 }
 

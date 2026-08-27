@@ -16,13 +16,18 @@
 //! JSON-serializable in an API response. Mounting (FUSE) and NFS serving are
 //! exposed so orchestration can live in Python too.
 
-use origofs_core::LocalCasStore;
+// `Perms`/`AclGrant` (issue #123) and the usage/quota/statfs records (issues
+// #116, #119) are the one group of types the sdk does not re-export, because the
+// `Workspace` façade has no wrapper for the engine calls that produce them — see
+// the "engine surface with no `Workspace` wrapper" note further down. They come
+// from `origofs-core` directly, which this crate already depends on.
+use origofs_core::{AclGrant, FsStat, LocalCasStore, Perms, Quota, Usage};
 use origofs_sdk::{
-    Actor, BlameRange, CommitInfo, DiffEntry, DiffStatus, DirEntry, Event, EventSubscription,
-    GcsConfig as CoreGcsConfig, Inode, LiveDoc, Passage, PassageOptions, Presence, RebuildReport,
-    S3Config as CoreS3Config, Segmentation, Suggestion, SuggestionStatus,
-    Workspace as CoreWorkspace, WriteCtx as CoreWriteCtx, WriteOutcome as CoreWriteOutcome,
-    WritePolicy as CoreWritePolicy,
+    Actor, BenchOpts, BenchReport, BenchStage, BlameRange, CommitInfo, DiffEntry, DiffStatus,
+    DirEntry, Event, EventSubscription, FileLayout, GcsConfig as CoreGcsConfig, Inode, LiveDoc,
+    Passage, PassageOptions, Presence, RebuildReport, Residency, S3Config as CoreS3Config,
+    Segmentation, Suggestion, SuggestionStatus, TrashEntry, Tunable, Workspace as CoreWorkspace,
+    WriteCtx as CoreWriteCtx, WriteOutcome as CoreWriteOutcome, WritePolicy as CoreWritePolicy,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::{
@@ -126,7 +131,264 @@ fn inode_dict(py: Python<'_>, i: &Inode) -> PyResult<Py<PyAny>> {
     d.set_item("content", hash_opt(i.content.as_ref()))?;
     d.set_item("mtime", i.mtime)?;
     d.set_item("ctime", i.ctime)?;
+    // Ownership (issue #122). `0`/`0` for anything created before the ownership
+    // migration and for anything created off a mount — see `chown`. Exposed here
+    // because `stat` is the only place a caller can read back what `chown` set,
+    // and a chmod/chown surface whose result you cannot observe is the no-op #122
+    // was about.
+    d.set_item("uid", i.uid)?;
+    d.set_item("gid", i.gid)?;
     Ok(d.into_any().unbind())
+}
+
+// --- trash (issue #115) ------------------------------------------------------
+
+/// One recoverable deletion. `content` is the manifest address (hex) or `None`
+/// for a directory, an empty file, or a symlink; `uid`/`gid` are the ownership the
+/// entry is restored with. `actor_id`/`session_id` name who deleted it — `None`
+/// for an unattributed delete (internal machinery, or a mount, which has no actor
+/// context).
+fn trash_entry_dict(py: Python<'_>, t: &TrashEntry) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("id", t.id)?;
+    d.set_item("path", &t.path)?;
+    d.set_item("kind", t.kind.as_str())?;
+    d.set_item("mode", t.mode)?;
+    d.set_item("size", t.size)?;
+    d.set_item("content", hash_opt(t.content.as_ref()))?;
+    d.set_item("symlink_target", t.symlink_target.clone())?;
+    d.set_item("uid", t.owner.uid)?;
+    d.set_item("gid", t.owner.gid)?;
+    d.set_item("actor_id", t.actor_id)?;
+    d.set_item("session_id", t.session_id)?;
+    d.set_item("deleted_at", t.deleted_at)?;
+    Ok(d.into_any().unbind())
+}
+
+// --- usage, quota, statfs (issues #116, #119) --------------------------------
+
+/// `{inodes, bytes}`. Both figures are **logical** — the sum of `stat` sizes, not
+/// the deduplicated on-disk footprint. That is what `du`/`df` should say and what
+/// a quota is checked against.
+fn usage_dict(py: Python<'_>, u: &Usage) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("inodes", u.inodes)?;
+    d.set_item("bytes", u.bytes)?;
+    Ok(d.unbind())
+}
+
+/// `{bytes, inodes}`, each `None` for "no limit" (the default).
+fn quota_dict(py: Python<'_>, q: &Quota) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("bytes", q.bytes)?;
+    d.set_item("inodes", q.inodes)?;
+    Ok(d.unbind())
+}
+
+/// A `statfs(2)` answer, denominated in `block_size`-byte blocks.
+fn fs_stat_dict(py: Python<'_>, s: &FsStat) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("block_size", s.block_size)?;
+    d.set_item("total_blocks", s.total_blocks)?;
+    d.set_item("free_blocks", s.free_blocks)?;
+    d.set_item("total_inodes", s.total_inodes)?;
+    d.set_item("free_inodes", s.free_inodes)?;
+    Ok(d.unbind())
+}
+
+// --- path-scoped ACLs (issue #123) -------------------------------------------
+
+/// A [`Perms`] bitset as the list of names it contains, in `read`/`write`/
+/// `propose` order — JSON-serializable, and the same vocabulary `grant` accepts.
+/// An empty list is an explicit deny (`Perms::NONE`), which is a grant, not the
+/// absence of one.
+fn perms_list(p: Perms) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for (bit, name) in [
+        (Perms::READ, "read"),
+        (Perms::WRITE, "write"),
+        (Perms::PROPOSE, "propose"),
+    ] {
+        if p.contains(bit) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Parse the Python-facing permission spelling into a [`Perms`] bitset.
+///
+/// Accepts a string (`"write"`, `"read+write"`, `"read,propose"`, `"none"`, `""`)
+/// or any iterable of strings (`["read", "write"]`). A string is *not* left to
+/// pyo3's sequence extraction: a `str` is an iterable of one-character strings, so
+/// `"read"` would silently become four unknown permissions rather than one known
+/// one.
+fn parse_perms(obj: &Bound<'_, PyAny>) -> PyResult<Perms> {
+    let names: Vec<String> = match obj.extract::<String>() {
+        Ok(s) => s
+            .split(['+', ',', ' '])
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| p.trim().to_string())
+            .collect(),
+        Err(_) => obj
+            .try_iter()?
+            .map(|item| item?.extract::<String>())
+            .collect::<PyResult<Vec<_>>>()?,
+    };
+    let mut perms = Perms::NONE;
+    for n in names {
+        perms = perms
+            | match n.to_ascii_lowercase().as_str() {
+                "read" => Perms::READ,
+                "write" => Perms::WRITE,
+                "propose" => Perms::PROPOSE,
+                "none" => Perms::NONE,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown permission {other:?} (expected \"read\", \"write\", \
+                         \"propose\", or \"none\")"
+                    )));
+                }
+            };
+    }
+    Ok(perms)
+}
+
+/// One prefix grant. `path_prefix` is `""` for a grant over the whole workspace —
+/// the root prefix, which every more specific grant outranks.
+fn acl_grant_dict(py: Python<'_>, g: &AclGrant) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("actor_id", g.actor_id)?;
+    d.set_item("path_prefix", &g.path_prefix)?;
+    d.set_item("perms", perms_list(g.perms))?;
+    d.set_item("granted_at", g.granted_at)?;
+    d.set_item("granted_by", g.granted_by)?;
+    Ok(d.into_any().unbind())
+}
+
+// --- performance introspection (issue #118) ----------------------------------
+
+/// Which of a file's chunks the store still holds. **Presence, not cache
+/// residency** — a tiered store answers from either tier and nothing on the
+/// object-safe trait tells them apart.
+fn residency_dict(py: Python<'_>, r: &Residency) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("present", r.present)?;
+    d.set_item("present_bytes", r.present_bytes)?;
+    d.set_item("missing", r.missing)?;
+    d.set_item(
+        "missing_sample",
+        r.missing_sample
+            .iter()
+            .map(|h| h.to_hex())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(d.unbind())
+}
+
+/// What one file costs to read. `chunks` is the read-amplification number: a
+/// whole-file read fetches exactly that many objects.
+fn file_layout_dict(py: Python<'_>, l: &FileLayout) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("size", l.size)?;
+    d.set_item("manifest", hash_opt(l.manifest.as_ref()))?;
+    d.set_item("chunks", l.chunks)?;
+    d.set_item("distinct_chunks", l.distinct_chunks)?;
+    d.set_item("distinct_bytes", l.distinct_bytes)?;
+    d.set_item("smallest", l.smallest)?;
+    d.set_item("largest", l.largest)?;
+    d.set_item("median", l.median)?;
+    // Derived, but derived from a formula a caller should not have to re-guess.
+    d.set_item("mean", l.mean())?;
+    // Repetition *within this file* only — what it shares with other files is not
+    // measured, so this is a lower bound on the real saving.
+    d.set_item("self_dedup", l.self_dedup())?;
+    d.set_item("histogram", l.histogram.clone())?;
+    match &l.residency {
+        Some(r) => d.set_item("residency", residency_dict(py, r)?)?,
+        None => d.set_item("residency", py.None())?,
+    }
+    d.set_item("chunker", l.chunker)?;
+    Ok(d.unbind())
+}
+
+/// One measured phase of a benchmark. Durations are seconds (floats), so the
+/// record stays JSON-serializable and unit-free at the call site.
+fn bench_stage_dict(py: Python<'_>, s: &BenchStage) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("ops", s.ops)?;
+    d.set_item("bytes", s.bytes)?;
+    // Time *inside* the engine call, not wall time across the phase — body
+    // generation between writes is this process's cost, not the store's.
+    d.set_item("elapsed_secs", s.elapsed.as_secs_f64())?;
+    d.set_item("bytes_per_sec", s.bytes_per_sec())?;
+    d.set_item("mean_secs", s.mean().as_secs_f64())?;
+    // Nearest-rank quantiles: at the default 8 ops, interpolating invents a
+    // precision the sample does not have. Read any of these next to `ops`.
+    d.set_item("p50_secs", s.quantile(0.5).as_secs_f64())?;
+    d.set_item("p95_secs", s.quantile(0.95).as_secs_f64())?;
+    d.set_item("max_secs", s.quantile(1.0).as_secs_f64())?;
+    Ok(d.unbind())
+}
+
+/// A concurrency knob as configured: `{var, value}`, `value` `None` when the
+/// environment variable is unset and the engine default applies.
+fn tunable_dict(py: Python<'_>, t: &Tunable) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("var", t.var)?;
+    d.set_item("value", t.value)?;
+    Ok(d.unbind())
+}
+
+/// A benchmark run, echoing the options it ran under so the report is
+/// self-describing.
+fn bench_report_dict(py: Python<'_>, r: &BenchReport) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    let opts = PyDict::new(py);
+    opts.set_item("dir", &r.opts.dir)?;
+    opts.set_item("files", r.opts.files)?;
+    opts.set_item("file_size", r.opts.file_size)?;
+    opts.set_item("seed", r.opts.seed)?;
+    opts.set_item("keep", r.opts.keep)?;
+    opts.set_item("force", r.opts.force)?;
+    d.set_item("opts", opts)?;
+    d.set_item("total_bytes", r.total_bytes)?;
+    d.set_item("chunker", r.chunker)?;
+    d.set_item(
+        "upload_concurrency",
+        tunable_dict(py, &r.upload_concurrency)?,
+    )?;
+    d.set_item("fetch_concurrency", tunable_dict(py, &r.fetch_concurrency)?)?;
+    d.set_item("chunks", r.chunks)?;
+    // Below `chunks` means the run deduplicated against itself and the write
+    // figure is overstated — which is why it is reported rather than assumed.
+    d.set_item("distinct_chunks", r.distinct_chunks)?;
+    d.set_item("write", bench_stage_dict(py, &r.write)?)?;
+    d.set_item("read", bench_stage_dict(py, &r.read)?)?;
+    // Not "warm" against a "cold" first pass: nothing here evicts a cache, so the
+    // honest claim is the narrow one — this pass ran second.
+    d.set_item("reread", bench_stage_dict(py, &r.reread)?)?;
+    d.set_item("kept", r.kept)?;
+    Ok(d.unbind())
+}
+
+/// Split an absolute path into `(parent_dir, name)` for the inode-addressed
+/// engine ops (`link`). The name itself is left to the engine's
+/// `validate_component`, which is the one place that rule lives.
+fn split_parent(path: &str) -> PyResult<(String, String)> {
+    match path.trim_end_matches('/').rsplit_once('/') {
+        Some((dir, name)) if !name.is_empty() => Ok((
+            if dir.is_empty() {
+                "/".to_string()
+            } else {
+                dir.to_string()
+            },
+            name.to_string(),
+        )),
+        _ => Err(PyValueError::new_err(format!(
+            "{path:?} is not an absolute path to a name"
+        ))),
+    }
 }
 
 fn dir_entry_dict(py: Python<'_>, e: &DirEntry) -> PyResult<Py<PyAny>> {
@@ -386,6 +648,130 @@ impl WriteOutcome {
     }
 }
 
+// --- path scoping (issue #125) ----------------------------------------------
+
+/// A surface's view of a workspace: everything, or one subtree.
+///
+/// Scoping is **not** authorization. A `Scope` restricts *what a surface can
+/// address*; an ACL (`Workspace.grant`) restricts *what an actor may do*. A
+/// deployment wants both, and they sit in different places on purpose — a scope
+/// belongs to the router or connection and applies before any engine call, so an
+/// individual handler cannot forget it.
+///
+/// This is the engine's own rule, not a second implementation of it. The four
+/// properties it encodes are each load-bearing, and three are things a hand-rolled
+/// version gets wrong:
+///
+/// 1. **Directory-boundary matching, not `startswith`** — `/tenant-a` does not
+///    cover `/tenant-abc`, precisely the neighbour a scope exists to exclude.
+/// 2. **Prepend, don't compare** — `resolve` puts the caller's path *inside* the
+///    root, so another tenant's data is not addressable at all rather than
+///    addressable and rejected.
+/// 3. **A `None` path is outside every scope but the whole one** — a record naming
+///    no path (an idle presence row) still tells a scoped reader a neighbour
+///    exists.
+/// 4. **Out of scope is "not found", never "forbidden"** — so `require` raises
+///    `FileNotFoundError`, deliberately not `PermissionError`: a 403 confirms
+///    something exists at a path the caller may not see, which is the inference a
+///    scope exists to prevent.
+///
+/// ```python
+/// scope = origofs.Scope.at("/tenant-a")
+/// await ws.read(scope.resolve("notes.txt"))   # -> /tenant-a/notes.txt
+/// scope.require(suggestion["path"])           # FileNotFoundError if not theirs
+/// ```
+#[pyclass(frozen, from_py_object)]
+#[derive(Clone)]
+struct Scope {
+    inner: origofs_sdk::Scope,
+}
+
+#[pymethods]
+impl Scope {
+    /// The whole workspace — no scoping. Every path resolves to itself and every
+    /// record is in scope.
+    #[staticmethod]
+    fn whole() -> Self {
+        Self {
+            inner: origofs_sdk::Scope::whole(),
+        }
+    }
+
+    /// A scope rooted at `root`, which **must be absolute**. A trailing slash is
+    /// ignored, so `"/t"` and `"/t/"` are the same scope and `"/"` is `whole()`.
+    ///
+    /// A *relative* root raises rather than being quietly read as absolute: the
+    /// root decides what a surface can reach at all, and guessing at an ambiguous
+    /// one risks scoping to a subtree the caller did not mean — a scope that is
+    /// wrong in that direction fails open.
+    #[staticmethod]
+    fn at(root: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: origofs_sdk::Scope::at(root).map_err(to_pyerr)?,
+        })
+    }
+
+    /// The normalized root, or `""` for the whole workspace.
+    #[getter]
+    fn root(&self) -> &str {
+        self.inner.root()
+    }
+
+    /// Whether this scope covers the whole workspace.
+    #[getter]
+    fn is_whole(&self) -> bool {
+        self.inner.is_whole()
+    }
+
+    /// Whether `path` is the root itself or sits beneath it. `None` is contained
+    /// only by the whole scope.
+    #[pyo3(signature = (path))]
+    fn contains(&self, path: Option<&str>) -> bool {
+        self.inner.contains(path)
+    }
+
+    /// Resolve a caller-supplied path *inside* this scope. A `..` component raises
+    /// `ValueError` — refused before any lookup, so it reveals nothing about what
+    /// exists.
+    fn resolve(&self, path: &str) -> PyResult<String> {
+        self.inner.resolve(path).map_err(scope_err)
+    }
+
+    /// Refuse a record outside this scope, for anything addressed by something
+    /// other than a path (a suggestion id, a lock) where a caller could otherwise
+    /// probe for a neighbour's records by guessing ids.
+    #[pyo3(signature = (path))]
+    fn require(&self, path: Option<&str>) -> PyResult<()> {
+        self.inner.require(path).map_err(scope_err)
+    }
+
+    fn __repr__(&self) -> String {
+        if self.inner.is_whole() {
+            "Scope(whole)".to_string()
+        } else {
+            format!("Scope(root={:?})", self.inner.root())
+        }
+    }
+}
+
+/// Map a scope refusal onto the exception the property it protects requires.
+///
+/// A traversal is a caller error refused before any lookup, so `ValueError`. Out
+/// of scope is **`FileNotFoundError`** rather than `PermissionError` on purpose:
+/// a scoped caller must not be able to tell "this exists but is not yours" from
+/// "this does not exist", and the exception type is the first place that
+/// distinction leaks.
+fn scope_err(e: origofs_sdk::ScopeError) -> PyErr {
+    match e {
+        origofs_sdk::ScopeError::Traversal => {
+            PyValueError::new_err("path may not contain '..' (refused before any lookup)")
+        }
+        origofs_sdk::ScopeError::OutOfScope => {
+            PyFileNotFoundError::new_err("no such path in this scope")
+        }
+    }
+}
+
 // --- change-feed push subscription ------------------------------------------
 
 /// A live push subscription to the change feed (Postgres `LISTEN/NOTIFY`).
@@ -548,7 +934,12 @@ impl GcsConfig {
 #[cfg(target_os = "linux")]
 #[pyclass]
 struct Mount {
-    session: Option<fuser::BackgroundSession>,
+    /// The SDK's mount guard, which stops the change-feed watcher **before** the
+    /// unmount (issue #75). Holding the guard rather than a bare
+    /// `BackgroundSession` is what carries that ordering into Python: dropping
+    /// this object from Python has the same teardown discipline as dropping it
+    /// from Rust.
+    session: Option<origofs_sdk::fuse::Mount>,
     mountpoint: String,
 }
 
@@ -557,7 +948,8 @@ struct Mount {
 impl Mount {
     /// Unmount now (idempotent).
     fn unmount(&mut self) {
-        self.session.take(); // dropping the BackgroundSession unmounts
+        // Dropping the guard stops the watcher, then unmounts, in that order.
+        self.session.take();
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {
@@ -3281,6 +3673,561 @@ impl Workspace {
             })
         })
     }
+
+    // ── trash: a recoverable delete for uncommitted work (issue #115) ────────
+    //
+    // A committed file can be read back out of history; an *uncommitted* one could
+    // not be recovered at all. That gap matters more here than on an ordinary
+    // filesystem because the users are agents, and "you should have committed
+    // first" is not an answer when the actor that failed to commit is the same one
+    // that deleted the tree.
+
+    /// This workspace's trash retention in seconds, or `None` when trash is off.
+    ///
+    /// Off is the default: enabling it by default would silently change *when
+    /// space is reclaimed* for every existing deployment, and the first anyone
+    /// would learn of it is a storage bill.
+    fn trash_retention<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(
+            py,
+            async move { ws.trash_retention().await.map_err(to_pyerr) },
+        )
+    }
+
+    /// Enable trash with `secs` of retention, or disable it with `None`.
+    ///
+    /// Disabling does **not** purge what is already there — existing entries stay
+    /// restorable until they are purged explicitly.
+    #[pyo3(signature = (secs))]
+    fn set_trash_retention<'py>(
+        &self,
+        py: Python<'py>,
+        secs: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.set_trash_retention(secs).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Everything currently recoverable, newest deletion first. Each entry carries
+    /// the actor and session that deleted it, so a restore is attributable.
+    fn list_trash<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let entries = ws.list_trash().await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                entries
+                    .iter()
+                    .map(|t| trash_entry_dict(py, t))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// Put a trashed entry back at its original path, attributed to `ctx`.
+    /// Returns the path it was restored to.
+    fn restore_trash<'py>(
+        &self,
+        py: Python<'py>,
+        id: i64,
+        ctx: WriteCtx,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.restore_trash(id, ctx.inner).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Permanently drop one trash entry, reporting whether one was there.
+    fn purge_trash<'py>(&self, py: Python<'py>, id: i64) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(
+            py,
+            async move { ws.purge_trash(id).await.map_err(to_pyerr) },
+        )
+    }
+
+    /// Permanently drop every trash entry whatever its age, returning how many.
+    fn empty_trash<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move { ws.empty_trash().await.map_err(to_pyerr) })
+    }
+
+    /// Remove a path, capturing it into the trash first when retention is on.
+    ///
+    /// The unattributed counterpart for a surface with no actor context — prefer
+    /// `remove_or_propose` wherever an actor is known, so the deletion carries
+    /// blame and the trash entry names who made it.
+    fn remove_trashing<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.remove_trashing(&path).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    // ── the engine surface with no `Workspace` wrapper ───────────────────────
+    //
+    // Everything from here down reaches the engine through the sdk's public
+    // `Workspace::fs()` accessor rather than a `Workspace` method, because the
+    // façade does not (yet) wrap these: usage/quota/statfs (issues #116, #119),
+    // ownership and chmod/chown (#121, #122), hard links and xattrs (#119), and
+    // the path-scoped ACLs (#123) all live on `Fs`. Binding them here is issue
+    // #120's whole point — the alternative is a Python surface that is once again
+    // a subset of the Rust one, which is the failure mode `test_parity.py` exists
+    // to catch. If the façade grows wrappers later, these bodies become one-line
+    // forwards and nothing on the Python side changes.
+    //
+    // The inode-addressed engine ops (`vfs_*`) are exposed **by path**: an ino is
+    // an implementation detail of the mounts, and a Python caller has a path.
+
+    /// Usage of the whole workspace: `{inodes, bytes}` (issue #116).
+    ///
+    /// **Logical** bytes — the sum of `stat` sizes, not the deduplicated on-disk
+    /// footprint. That is the number a user can act on and the number a quota is
+    /// checked against; the physical figure is a property of the content store,
+    /// which the metadata store cannot see. An inode reachable by several names
+    /// (a hard link) counts once.
+    fn usage<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let u = ws.fs().usage().await.map_err(to_pyerr)?;
+            Python::attach(|py| usage_dict(py, &u))
+        })
+    }
+
+    /// Recursive usage of the subtree at `path` — the `du` primitive (issue #116).
+    ///
+    /// One recursive query in the store rather than a walk from here, so it costs
+    /// one round trip rather than one per directory level. Still proportional to
+    /// the size of the subtree: a reporting call, not a hot path.
+    fn du<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let u = ws.fs().du(&path).await.map_err(to_pyerr)?;
+            Python::attach(|py| usage_dict(py, &u))
+        })
+    }
+
+    /// The workspace's capacity limits: `{bytes, inodes}`, each `None` for no
+    /// limit (the default, and what every existing workspace has).
+    fn quota<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let q = ws.fs().quota().await.map_err(to_pyerr)?;
+            Python::attach(|py| quota_dict(py, &q))
+        })
+    }
+
+    /// Set (or clear) the workspace's quota. `None` in either field is "no limit",
+    /// so `set_quota()` with no arguments clears both.
+    ///
+    /// Setting a limit **below** current usage is allowed and is not retroactive:
+    /// nothing is deleted and no file becomes unreadable — further growth is
+    /// simply refused until usage falls back under the limit. Refusing it instead
+    /// would make a quota impossible to introduce on a workspace that already has
+    /// data, which is the only interesting case.
+    #[pyo3(signature = (bytes = None, inodes = None))]
+    fn set_quota<'py>(
+        &self,
+        py: Python<'py>,
+        bytes: Option<u64>,
+        inodes: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.fs()
+                .set_quota(Quota { bytes, inodes })
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Answer a `statfs(2)`: `{block_size, total_blocks, free_blocks,
+    /// total_inodes, free_inodes}` (issue #119).
+    ///
+    /// With a quota set the totals are the quota, which makes `df` show a real
+    /// percentage. With none, a workspace has no capacity to report — its ceiling
+    /// is the object store's — so the total is a synthesized nominal figure that
+    /// grows with usage: `df` looks and behaves like `df` instead of printing a
+    /// 100%-full filesystem.
+    fn statfs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let s = ws.fs().statfs().await.map_err(to_pyerr)?;
+            Python::attach(|py| fs_stat_dict(py, &s))
+        })
+    }
+
+    /// Change a path's mode, returning its fresh `stat` (issue #121).
+    ///
+    /// Really changes it: before #122 both mounts accepted a `chmod` and did
+    /// nothing, so `chmod +x build.sh` returned success on a false premise — and
+    /// the mode a file happened to be *created* with was the mode it carried into
+    /// committed tree objects and out through `git clone origofs://…`.
+    ///
+    /// Only the permission bits (`& 0o7777`, so setuid/setgid/sticky included)
+    /// move: the format bits are the inode's kind, not a caller's to rewrite, so
+    /// the returned `mode` still carries them.
+    fn chmod<'py>(&self, py: Python<'py>, path: String, mode: u32) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
+            let inode = ws.fs().vfs_chmod(ino, mode).await.map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// Change a path's owning uid/gid, returning its fresh `stat` (issue #122).
+    ///
+    /// Either half may be `None` to leave it alone — `chown(2)`'s `-1` sentinel,
+    /// which is how `chgrp` reaches this.
+    ///
+    /// This is ownership, **not authorization**: it changes what the kernel
+    /// evaluates its permission checks against on a mount, and nothing about what
+    /// an actor may do. For that, see `grant`/`effective_perms`.
+    #[pyo3(signature = (path, uid = None, gid = None))]
+    fn chown<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
+            let inode = ws.fs().vfs_chown(ino, uid, gid).await.map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// Hard-link `new_path` to the inode already at `existing_path`, returning the
+    /// shared inode's fresh `stat` (issue #119).
+    ///
+    /// Both names then refer to one inode with `nlink == 2`: a write through
+    /// either is visible through both, and the content survives until the last
+    /// name is removed. Directories are refused (`PermissionError`), as POSIX
+    /// requires — a directory hard link would let the dentry graph form a cycle
+    /// nothing here is written to survive.
+    fn link<'py>(
+        &self,
+        py: Python<'py>,
+        existing_path: String,
+        new_path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let ino = ws.stat(&existing_path).await.map_err(to_pyerr)?.ino;
+            let (dir, name) = split_parent(&new_path)?;
+            let parent = ws.stat(&dir).await.map_err(to_pyerr)?.ino;
+            let inode = ws
+                .fs()
+                .vfs_link(ino, parent, &name)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// Read one extended attribute, or `None` when it is not set (issue #119).
+    fn getxattr<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
+            let value = ws.fs().vfs_getxattr(ino, &name).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                Ok(match value {
+                    Some(v) => PyBytes::new(py, &v).into_any().unbind(),
+                    None => py.None(),
+                })
+            })
+        })
+    }
+
+    /// Set one extended attribute (issue #119).
+    ///
+    /// A value larger than the per-value limit is refused rather than stored: an
+    /// xattr lives in the **metadata** store, and the rule the whole design rests
+    /// on is that the metadata database never holds large bytes. The limit matches
+    /// Linux's own, so nothing that works on ext4 is refused here.
+    fn setxattr<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        name: String,
+        value: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
+            ws.fs()
+                .vfs_setxattr(ino, &name, &value)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Every extended-attribute name on a path, in name order (issue #119).
+    fn listxattr<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
+            ws.fs().vfs_listxattr(ino).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Remove one extended attribute, reporting whether it was there (issue #119).
+    fn removexattr<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
+            ws.fs().vfs_removexattr(ino, &name).await.map_err(to_pyerr)
+        })
+    }
+
+    // ── path-scoped write ACLs (issue #123) ──────────────────────────────────
+    //
+    // `set_write_policy` is per **actor**, whole workspace, and takes no path — a
+    // trust gate, not an access-control system. A grant is
+    // `(actor, path_prefix) -> perms` with longest matching prefix winning, which
+    // makes "may write /docs, may only propose under /src" representable.
+    //
+    // Permissions are named, not a bitmask: `"write"`, `"read+write"`, or
+    // `["read", "propose"]`. An empty list is an explicit deny for that subtree.
+
+    /// Grant `perms` to an actor under `path_prefix` (absolute; `"/"` is the whole
+    /// workspace). `granted_by` names the actor making the change, for the audit
+    /// trail — every grant change is recorded in the change feed.
+    ///
+    /// A relative prefix is refused rather than read as absolute: a grant that
+    /// silently applied to a subtree the operator did not mean would fail open.
+    #[pyo3(signature = (actor_id, path_prefix, perms, granted_by = None))]
+    fn grant<'py>(
+        &self,
+        py: Python<'py>,
+        actor_id: i64,
+        path_prefix: String,
+        perms: &Bound<'py, PyAny>,
+        granted_by: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let perms = parse_perms(perms)?;
+        future_into_py(py, async move {
+            ws.fs()
+                .grant(actor_id, &path_prefix, perms, granted_by)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Remove a grant, reporting whether one was there.
+    #[pyo3(signature = (actor_id, path_prefix, revoked_by = None))]
+    fn revoke<'py>(
+        &self,
+        py: Python<'py>,
+        actor_id: i64,
+        path_prefix: String,
+        revoked_by: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.fs()
+                .revoke(actor_id, &path_prefix, revoked_by)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Every grant in this workspace, or just one actor's, as a list of
+    /// `{actor_id, path_prefix, perms, granted_at, granted_by}`.
+    #[pyo3(signature = (actor_id = None))]
+    fn list_grants<'py>(
+        &self,
+        py: Python<'py>,
+        actor_id: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let grants = ws.fs().list_grants(actor_id).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                grants
+                    .iter()
+                    .map(|g| acl_grant_dict(py, g))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// The permissions an actor has at `path`, as a list of names.
+    ///
+    /// Longest matching prefix wins, matched on directory boundaries. With **no**
+    /// matching grant this falls back to the actor's write policy rather than
+    /// denying — grants are additive refinement, so a workspace that has never
+    /// written one behaves exactly as it did before ACLs existed. Flip that with
+    /// `set_acl_default_deny(True)`.
+    fn effective_perms<'py>(
+        &self,
+        py: Python<'py>,
+        actor_id: i64,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let perms = ws
+                .fs()
+                .effective_perms(actor_id, &path)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(perms_list(perms))
+        })
+    }
+
+    /// Whether an actor with no matching grant is denied rather than falling back
+    /// to its write policy.
+    fn acl_default_deny<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.fs().acl_default_deny().await.map_err(to_pyerr)
+        })
+    }
+
+    /// Switch the workspace between fallback (the default) and deny-by-default.
+    ///
+    /// Deny-by-default is the safer posture and the wrong *default*: turning it on
+    /// stops every actor that has no explicit grant, which is all of them until an
+    /// operator writes some. Making it a deliberate switch means the grants get
+    /// written first.
+    fn set_acl_default_deny<'py>(
+        &self,
+        py: Python<'py>,
+        deny: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.fs().set_acl_default_deny(deny).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Refuse an operation at `path` for an actor without `write` there, the
+    /// path-bearing counterpart of `ensure_may_write` (issue #123). Raises
+    /// `PermissionError`, or returns `None` if allowed.
+    ///
+    /// The denial deliberately says only that the actor may not perform the op,
+    /// never whether the path exists — the check runs before any lookup precisely
+    /// so it cannot leak existence.
+    fn ensure_may_write_at<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        op: String,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.fs()
+                .ensure_may_write_at(ctx.inner, &op, &path)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    // ── performance introspection (issue #118) ───────────────────────────────
+
+    /// What one file costs to read: chunk count, size distribution, self-dedup,
+    /// and — when `probe` is set — whether the store still holds the chunks.
+    ///
+    /// `probe` is the only part that touches the content backend, at one `has` per
+    /// distinct chunk (one HEAD each against object storage), so it is a parameter
+    /// and not unconditional; everything else comes from the manifest a read would
+    /// have fetched anyway. Errors the way a read would, so `file_layout` and
+    /// `read` disagree about a path only when the read path itself is broken.
+    #[pyo3(signature = (path, probe = false))]
+    fn file_layout<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        probe: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let layout = ws.file_layout(&path, probe).await.map_err(to_pyerr)?;
+            Python::attach(|py| file_layout_dict(py, &layout))
+        })
+    }
+
+    /// Write, read, and re-read generated files against **this** workspace's
+    /// backends, reporting throughput and latency per phase.
+    ///
+    /// This is a **mutating** call: it writes and then deletes `bench-NNNN.bin`
+    /// under `dir`, and refuses to start in a directory that already holds
+    /// anything unless `force` is set. It is the measurement that cannot be
+    /// borrowed from someone else's hardware — bucket latency, whether packing is
+    /// on, what the concurrency windows are set to.
+    ///
+    /// Defaults are 8 files of 8 MiB under `/.origofs-bench`, sized to finish in
+    /// seconds; raise both for a real measurement. `seed` defaults to a fresh
+    /// value per run — pin it to reproduce one.
+    #[pyo3(signature = (
+        dir = None,
+        files = None,
+        file_size = None,
+        seed = None,
+        keep = false,
+        force = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn bench<'py>(
+        &self,
+        py: Python<'py>,
+        dir: Option<String>,
+        files: Option<usize>,
+        file_size: Option<u64>,
+        seed: Option<u64>,
+        keep: bool,
+        force: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            // Start from the engine's own defaults rather than restating them
+            // here, so the Python surface cannot drift from the Rust one.
+            let mut opts = BenchOpts::new();
+            if let Some(d) = dir {
+                opts.dir = d;
+            }
+            if let Some(n) = files {
+                opts.files = n;
+            }
+            if let Some(n) = file_size {
+                opts.file_size = n;
+            }
+            if let Some(s) = seed {
+                opts.seed = s;
+            }
+            opts.keep = keep;
+            opts.force = force;
+            let report = ws.bench(&opts).await.map_err(to_pyerr)?;
+            Python::attach(|py| bench_report_dict(py, &report))
+        })
+    }
 }
 
 /// `GcStats` as a plain dict, so it is directly JSON-serializable in a response.
@@ -3367,6 +4314,7 @@ fn _origofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Workspace>()?;
     m.add_class::<WriteCtx>()?;
     m.add_class::<WriteOutcome>()?;
+    m.add_class::<Scope>()?;
     m.add_class::<S3Config>()?;
     m.add_class::<GcsConfig>()?;
     m.add_class::<Subscription>()?;

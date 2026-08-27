@@ -3,7 +3,7 @@
 
 use origofs_core::{
     ActorInit, ChunkRef, Fs, Hash, INO_ROOT, Manifest, MemStore, MetadataStore, OrigoFSError,
-    SqliteMetadataStore, WriteCtx,
+    Owner, SqliteMetadataStore, WriteCtx,
 };
 use std::sync::Arc;
 
@@ -154,14 +154,14 @@ async fn traversal_path_components_are_rejected_everywhere() {
     for bad in ["..", ".", "a/b", "x\0y", ""] {
         assert!(
             matches!(
-                fs.vfs_create(INO_ROOT, bad, 0o644).await,
+                fs.vfs_create(INO_ROOT, bad, 0o644, Owner::ROOT).await,
                 Err(OrigoFSError::InvalidPath(_))
             ),
             "vfs_create should reject {bad:?}"
         );
         assert!(
             matches!(
-                fs.vfs_mkdir(INO_ROOT, bad, 0o755).await,
+                fs.vfs_mkdir(INO_ROOT, bad, 0o755, Owner::ROOT).await,
                 Err(OrigoFSError::InvalidPath(_))
             ),
             "vfs_mkdir should reject {bad:?}"

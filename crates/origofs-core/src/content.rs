@@ -8,7 +8,7 @@ use crate::error::{OrigoFSError, Result};
 use crate::types::Hash;
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 // `parking_lot::Mutex` rather than `std::sync::Mutex`: it does not poison, so a
@@ -240,6 +240,24 @@ pub trait ContentStore: Send + Sync {
     /// Delete an object, returning the bytes freed. Idempotent: deleting an
     /// absent hash succeeds and frees `0`.
     async fn delete(&self, hash: &Hash) -> Result<u64>;
+
+    /// The stored size of `hash` **without reading it**, or `None` when the
+    /// backend cannot answer cheaply (issue #114).
+    ///
+    /// Exists so [`TieredStore`]'s bounded cache can seed its LRU index from a
+    /// cache directory that already has contents, which it otherwise could not do:
+    /// `list` gives hashes but no sizes, and reading every object to measure it
+    /// would defeat the point of a cache.
+    ///
+    /// The default reports `None`, which is correct for any backend that would
+    /// have to fetch the object to answer. A `TieredStore` over such a cache falls
+    /// back to counting only what it observes during this process's lifetime, so
+    /// the bound still holds going forward but does not account for what was
+    /// already on disk.
+    async fn size_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        let _ = hash;
+        Ok(None)
+    }
 
     /// Delete `hash` **only if** it is still at least `min_age_secs` old, by the
     /// same clock [`list_with_age`](Self::list_with_age) reports.
@@ -723,6 +741,14 @@ impl ContentStore for LocalCasStore {
         Ok(out)
     }
 
+    /// One `stat`, no read — see [`ContentStore::size_of`].
+    async fn size_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        Ok(tokio::fs::metadata(self.path_for(hash))
+            .await
+            .ok()
+            .map(|m| m.len()))
+    }
+
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         let path = self.path_for(hash);
         let size = match tokio::fs::metadata(&path).await {
@@ -760,6 +786,16 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
     // and calls `replace_keyed` on the repack path, so the omission cost exactly
     // the atomicity the method exists to provide. Covered by
     // `tests/pack.rs::arc_forwards_replace_keyed_atomically`.
+    // Same trap as `replace_keyed` below, and it bit the same way: `size_of` has a
+    // default body returning `None`, so omitting it here compiles fine and quietly
+    // makes every backend reached through an `Arc` report "cannot answer". The
+    // cache tier holds its cache as `Arc<dyn ContentStore>`, so the omission cost
+    // `TieredStore::warm_index` its ability to see a pre-existing cache at all —
+    // it silently accounted for nothing and evicted nothing. Covered by
+    // `tests/cache_tier.rs::a_warmed_index_accounts_for_pre_existing_cache_contents`.
+    async fn size_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        (**self).size_of(hash).await
+    }
     async fn replace_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         (**self).replace_keyed(key, bytes).await
     }
@@ -966,6 +1002,10 @@ impl ContentStore for MemStore {
         Ok(self.map.lock().keys().copied().collect())
     }
 
+    async fn size_of(&self, hash: &Hash) -> Result<Option<u64>> {
+        Ok(self.map.lock().get(hash).map(|b| b.len() as u64))
+    }
+
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         self.born.lock().remove(hash);
         Ok(self
@@ -977,46 +1017,310 @@ impl ContentStore for MemStore {
     }
 }
 
+/// Bounds on a [`TieredStore`]'s local cache tier (issue #114).
+///
+/// Default is unbounded, which is what `TieredStore` did before #114 — and is why
+/// it was not safe to wire into the `open_*` constructors: a cache that grows
+/// without limit eventually fills the user's disk.
+#[derive(Clone, Debug, Default)]
+pub struct CacheLimits {
+    /// Evict least-recently-used entries to keep the cache at or below this many
+    /// bytes. `None` = no size bound.
+    pub max_bytes: Option<u64>,
+    /// Keep at least this many bytes free on the filesystem holding [`dir`](Self::dir),
+    /// evicting when it drops below. `None` = no free-space floor.
+    ///
+    /// This is the bound that matters on a shared machine: a cache sized for a
+    /// laptop's disk is still ruinous on a container with a small writable layer,
+    /// and the disk can also fill for reasons that have nothing to do with origofs.
+    pub min_free_bytes: Option<u64>,
+    /// The cache's directory. Required for [`min_free_bytes`](Self::min_free_bytes)
+    /// to do anything — free space is a property of a filesystem, not of a
+    /// `dyn ContentStore`.
+    pub dir: Option<PathBuf>,
+}
+
+impl CacheLimits {
+    /// A size-bounded cache with no free-space floor.
+    pub fn bytes(max_bytes: u64) -> Self {
+        Self {
+            max_bytes: Some(max_bytes),
+            ..Default::default()
+        }
+    }
+
+    /// The recommended shape: a size bound *and* a floor under the free space of
+    /// the filesystem holding `dir`.
+    pub fn bounded(dir: impl Into<PathBuf>, max_bytes: u64, min_free_bytes: u64) -> Self {
+        Self {
+            max_bytes: Some(max_bytes),
+            min_free_bytes: Some(min_free_bytes),
+            dir: Some(dir.into()),
+        }
+    }
+
+    fn is_unbounded(&self) -> bool {
+        self.max_bytes.is_none() && self.min_free_bytes.is_none()
+    }
+}
+
+/// LRU bookkeeping for the cache tier. Recency is a monotonic counter rather than
+/// a clock: it needs only to order accesses, and a counter cannot go backwards
+/// when the system clock does.
+#[derive(Default)]
+struct CacheIndex {
+    /// hash -> (size, last-use tick)
+    entries: HashMap<Hash, (u64, u64)>,
+    /// (tick, hash) in tick order, so the LRU victim is the first entry.
+    by_age: BTreeMap<(u64, Hash), ()>,
+    bytes: u64,
+    tick: u64,
+}
+
+impl CacheIndex {
+    fn touch(&mut self, hash: &Hash, size: u64) {
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some((old_size, old_tick)) = self.entries.insert(*hash, (size, tick)) {
+            self.by_age.remove(&(old_tick, *hash));
+            self.bytes = self.bytes.saturating_sub(old_size);
+        }
+        self.by_age.insert((tick, *hash), ());
+        self.bytes = self.bytes.saturating_add(size);
+    }
+
+    fn forget(&mut self, hash: &Hash) {
+        if let Some((size, tick)) = self.entries.remove(hash) {
+            self.by_age.remove(&(tick, *hash));
+            self.bytes = self.bytes.saturating_sub(size);
+        }
+    }
+
+    /// The least-recently-used entry, without removing it.
+    fn lru(&self) -> Option<(Hash, u64)> {
+        let (&(_, hash), ()) = self.by_age.iter().next()?;
+        let size = self.entries.get(&hash).map(|(s, _)| *s).unwrap_or(0);
+        Some((hash, size))
+    }
+}
+
+/// Bytes free on the filesystem holding `dir`, or `None` where that cannot be
+/// asked.
+///
+/// Unix-only: `statvfs` is the portable-enough answer there, and Windows would
+/// need `GetDiskFreeSpaceEx`. A `None` result disables the free-space floor rather
+/// than failing — a cache that cannot measure the disk still honours its size
+/// bound, which is the bound a caller actually set a number for.
+#[cfg(unix)]
+fn free_bytes(dir: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call, and
+    // `st` is a caller-owned, correctly-sized, zeroed `statvfs` the call fills in.
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        // f_bavail is what an unprivileged process may actually use, which is the
+        // honest figure here; f_bfree includes root's reserve.
+        //
+        // The casts look redundant on glibc/x86_64, where both fields are already
+        // `u64`, and clippy says so — but `statvfs`'s field widths are libc- and
+        // target-dependent (`fsblkcnt_t`/`c_ulong` are 32-bit on several 32-bit
+        // targets, and musl differs from glibc), so dropping them breaks those
+        // builds. Kept and silenced rather than removed.
+        #[allow(clippy::unnecessary_cast)]
+        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    }
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_dir: &Path) -> Option<u64> {
+    None
+}
+
 /// A two-tier store: a fast local `cache` in front of a (possibly remote)
 /// `backend` (`docs/DESIGN.md` §4a). Reads are served from cache and populate it
 /// on miss; writes are write-through to the backend and cached best-effort.
 ///
 /// M1 is write-through for durability simplicity; write-back batching is a later
 /// optimization. [`TieredStore::prefetch`] warms the cache for a file's chunks.
+///
+/// # Bounds and eviction (issue #114)
+///
+/// The cache is bounded by [`CacheLimits`] and evicts least-recently-used entries
+/// when it would exceed them. Before #114 it was unbounded, which is precisely why
+/// it was complete, tested, and reachable from **no** `open_*` constructor: a
+/// cache that grows forever cannot be turned on by default.
+///
+/// # A failed cache read is a miss, not an error
+///
+/// Every read falls through to the backend if the cache cannot serve it, and evicts
+/// the offending entry on the way. A local cache entry can be truncated by a full
+/// disk, corrupted by bit-rot, or removed by something else on the machine, and
+/// none of those should fail a read that the authoritative backend can satisfy.
+///
+/// Whole reads are additionally re-hashed here, so a *corrupt* cache entry becomes
+/// a refetch rather than an error. That has to happen at this layer: the
+/// `VerifyingStore` in the `open_*` stacks sits **outside** the tier split, so it
+/// sees only the bytes this store returns and cannot tell which tier produced them
+/// — it would reject a corrupt cached copy of an object the backend still holds
+/// intact. Ranged reads cannot be verified without fetching the whole object, so
+/// they fall through on error but are not re-hashed; the outer `VerifyingStore`
+/// remains the backstop there.
 pub struct TieredStore {
     cache: Arc<dyn ContentStore>,
     backend: Arc<dyn ContentStore>,
+    limits: CacheLimits,
+    index: Mutex<CacheIndex>,
 }
 
 impl TieredStore {
+    /// An **unbounded** cache tier — the pre-#114 behaviour.
+    ///
+    /// Suitable when the cache is itself bounded (a fixed-size `MemStore`, a
+    /// tmpfs with its own limit) or in tests. For a local directory prefer
+    /// [`with_limits`](Self::with_limits): an unbounded on-disk cache will fill
+    /// the disk.
     pub fn new(cache: Arc<dyn ContentStore>, backend: Arc<dyn ContentStore>) -> Self {
-        Self { cache, backend }
+        Self::with_limits(cache, backend, CacheLimits::default())
+    }
+
+    /// A cache tier bounded by `limits`.
+    pub fn with_limits(
+        cache: Arc<dyn ContentStore>,
+        backend: Arc<dyn ContentStore>,
+        limits: CacheLimits,
+    ) -> Self {
+        Self {
+            cache,
+            backend,
+            limits,
+            index: Mutex::new(CacheIndex::default()),
+        }
+    }
+
+    /// Account for what a cache directory already holds, so the bound covers
+    /// pre-existing contents rather than only what this process happens to touch.
+    ///
+    /// Costs one `list` plus a `size_of` per entry — cheap for a local directory
+    /// (`size_of` is a `stat`), and skipped entirely for an unbounded cache. A
+    /// cache backend that cannot answer `size_of` is left to lazy accounting,
+    /// which still bounds future growth but cannot see what was already there.
+    pub async fn warm_index(&self) -> Result<()> {
+        if self.limits.is_unbounded() {
+            return Ok(());
+        }
+        for h in self.cache.list().await? {
+            if let Ok(Some(size)) = self.cache.size_of(&h).await {
+                self.index.lock().touch(&h, size);
+            }
+        }
+        self.enforce_limits().await;
+        Ok(())
+    }
+
+    /// Current tracked cache size in bytes, for tests and diagnostics.
+    pub fn cached_bytes(&self) -> u64 {
+        self.index.lock().bytes
+    }
+
+    /// Note that `hash` (of `size` bytes) was just stored or read, then evict if
+    /// that puts the cache over its limits.
+    async fn record(&self, hash: &Hash, size: u64) {
+        if self.limits.is_unbounded() {
+            return;
+        }
+        self.index.lock().touch(hash, size);
+        self.enforce_limits().await;
+    }
+
+    /// Drop the least-recently-used entries until the cache is back inside its
+    /// limits.
+    ///
+    /// Bounded by the number of entries so a cache whose deletes are all failing
+    /// cannot spin: each pass either removes an index entry or stops.
+    async fn enforce_limits(&self) {
+        loop {
+            let over = {
+                let idx = self.index.lock();
+                let over_size = self.limits.max_bytes.is_some_and(|max| idx.bytes > max);
+                let over_disk = match (&self.limits.min_free_bytes, &self.limits.dir) {
+                    (Some(min), Some(dir)) => free_bytes(dir).is_some_and(|f| f < *min),
+                    _ => false,
+                };
+                // Never evict the last entry on a free-space trigger alone: if the
+                // disk is full because of something *else*, emptying the cache
+                // entirely would not help and would throw away every warm read.
+                (over_size || over_disk) && idx.entries.len() > 1
+            };
+            if !over {
+                return;
+            }
+            let Some((victim, _)) = self.index.lock().lru() else {
+                return;
+            };
+            // Forget it either way: a delete that failed leaves an entry this
+            // store can no longer account for, and retrying it forever is worse
+            // than under-counting by one object.
+            let _ = self.cache.delete(&victim).await;
+            self.index.lock().forget(&victim);
+        }
+    }
+
+    /// Drop a cache entry that could not be served, so the next read refetches it
+    /// from the backend rather than tripping over the same bad copy.
+    async fn evict(&self, hash: &Hash) {
+        let _ = self.cache.delete(hash).await;
+        self.index.lock().forget(hash);
     }
 
     /// Warm the cache with `hashes` (e.g. a manifest's chunks, on open).
+    ///
+    /// Concurrent since #114 — it was a sequential `has`/`get`/`put` loop, so
+    /// warming a file's chunks cost one full round trip *per chunk* against the
+    /// very backend latency the cache exists to hide. Bounded by the same window
+    /// the read path uses, and errors are per-chunk: a prefetch is an optimization,
+    /// so one unfetchable chunk must not fail the warm-up of the rest.
     pub async fn prefetch(&self, hashes: &[Hash]) -> Result<()> {
-        for h in hashes {
-            if !self.cache.has(h).await?
-                && let Ok(bytes) = self.backend.get(h).await
-            {
-                let _ = self.cache.put(&bytes).await;
-            }
-        }
+        use futures::StreamExt;
+        futures::stream::iter(hashes)
+            .for_each_concurrent(PREFETCH_CONCURRENCY, |h| async move {
+                if let Ok(false) = self.cache.has(h).await
+                    && let Ok(bytes) = self.backend.get(h).await
+                    && self.cache.put(&bytes).await.is_ok()
+                {
+                    self.record(h, bytes.len() as u64).await;
+                }
+            })
+            .await;
         Ok(())
     }
 }
+
+/// How many chunks [`TieredStore::prefetch`] warms at once. Matches the read
+/// path's default window; the point is to hide backend latency, which a
+/// sequential loop cannot do.
+const PREFETCH_CONCURRENCY: usize = 16;
 
 #[async_trait]
 impl ContentStore for TieredStore {
     async fn put(&self, bytes: &[u8]) -> Result<Hash> {
         let hash = self.backend.put(bytes).await?;
-        let _ = self.cache.put(bytes).await; // best-effort
+        if self.cache.put(bytes).await.is_ok() {
+            // best-effort; only accounted for if it actually landed
+            self.record(&hash, bytes.len() as u64).await;
+        }
         Ok(hash)
     }
 
     async fn put_keyed(&self, key: &Hash, bytes: &[u8]) -> Result<()> {
         self.backend.put_keyed(key, bytes).await?;
-        let _ = self.cache.put_keyed(key, bytes).await; // best-effort
+        if self.cache.put_keyed(key, bytes).await.is_ok() {
+            self.record(key, bytes.len() as u64).await;
+        }
         Ok(())
     }
 
@@ -1025,7 +1329,9 @@ impl ContentStore for TieredStore {
         // The cache holds the *old* value, which is now wrong — replace it too, and
         // drop it on failure rather than leave a stale read in front of the backend.
         if self.cache.replace_keyed(key, bytes).await.is_err() {
-            let _ = self.cache.delete(key).await;
+            self.evict(key).await;
+        } else {
+            self.record(key, bytes.len() as u64).await;
         }
         Ok(())
     }
@@ -1042,22 +1348,52 @@ impl ContentStore for TieredStore {
 
     async fn get(&self, hash: &Hash) -> Result<Bytes> {
         if let Ok(bytes) = self.cache.get(hash).await {
-            return Ok(bytes);
+            // Re-hash here rather than trusting the cached copy. The
+            // `VerifyingStore` in the `open_*` stacks sits *outside* the tier
+            // split, so it cannot tell a corrupt cache entry from a corrupt
+            // backend object and would reject a read the backend could still
+            // serve. Checking at the tier boundary turns that into a refetch.
+            if Hash::of(&bytes) == *hash {
+                self.record(hash, bytes.len() as u64).await;
+                return Ok(bytes);
+            }
+            tracing::warn!(
+                hash = %hash.to_hex(),
+                "cached object failed verification; evicting and refetching from the backend"
+            );
+            self.evict(hash).await;
+        } else {
+            // A cache entry can also be truncated by a full disk or removed by
+            // something else on the machine. Either way it is a miss.
+            self.evict(hash).await;
         }
         let bytes = self.backend.get(hash).await?;
-        let _ = self.cache.put(&bytes).await;
+        if self.cache.put(&bytes).await.is_ok() {
+            self.record(hash, bytes.len() as u64).await;
+        }
         Ok(bytes)
     }
 
     async fn get_range(&self, hash: &Hash, off: u64, len: u64) -> Result<Bytes> {
-        if self.cache.has(hash).await? {
-            return self.cache.get_range(hash, off, len).await;
+        // A ranged read cannot be verified without fetching the whole object, so
+        // this falls through on failure but does not re-hash; the outer
+        // `VerifyingStore` stays the backstop for corruption here.
+        if self.cache.has(hash).await.unwrap_or(false) {
+            match self.cache.get_range(hash, off, len).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(_) => self.evict(hash).await,
+            }
         }
         self.backend.get_range(hash, off, len).await
     }
 
     async fn has(&self, hash: &Hash) -> Result<bool> {
-        Ok(self.cache.has(hash).await? || self.backend.has(hash).await?)
+        // A cache that cannot answer is not evidence of absence — fall through to
+        // the authoritative backend rather than failing the call.
+        if self.cache.has(hash).await.unwrap_or(false) {
+            return Ok(true);
+        }
+        self.backend.has(hash).await
     }
 
     async fn list(&self) -> Result<Vec<Hash>> {

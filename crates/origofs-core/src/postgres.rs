@@ -649,6 +649,106 @@ fn row_to_event(r: &Row) -> Event {
     }
 }
 
+/// An owned parameter for the portable loader, so a `Cell` can be bound without
+/// borrowing from the row it came from.
+#[derive(Debug)]
+enum PgParam {
+    Null,
+    Int(i64),
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl From<&crate::portable::Cell> for PgParam {
+    fn from(c: &crate::portable::Cell) -> Self {
+        use crate::portable::Cell;
+        match c {
+            Cell::Null => PgParam::Null,
+            Cell::Int(i) => PgParam::Int(*i),
+            Cell::Text(s) => PgParam::Text(s.clone()),
+            Cell::Bytes(b) => PgParam::Bytes(b.clone()),
+        }
+    }
+}
+
+impl tokio_postgres::types::ToSql for PgParam {
+    fn to_sql(
+        &self,
+        ty: &tokio_postgres::types::Type,
+        out: &mut bytes::BytesMut,
+    ) -> std::result::Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+    {
+        match self {
+            PgParam::Null => Ok(tokio_postgres::types::IsNull::Yes),
+            PgParam::Int(i) => i.to_sql(ty, out),
+            PgParam::Text(s) => s.to_sql(ty, out),
+            PgParam::Bytes(b) => b.to_sql(ty, out),
+        }
+    }
+
+    fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
+        // Accept whatever the column is; `to_sql` dispatches on the runtime type.
+        true
+    }
+
+    tokio_postgres::types::to_sql_checked!();
+}
+
+/// Read column `i` as a backend-neutral [`Cell`](crate::portable::Cell).
+fn pg_cell(r: &Row, i: usize, ty: &tokio_postgres::types::Type) -> Result<crate::portable::Cell> {
+    use crate::portable::Cell;
+    use tokio_postgres::types::Type;
+    Ok(match *ty {
+        Type::INT2 => r
+            .get::<_, Option<i16>>(i)
+            .map(|v| Cell::Int(v as i64))
+            .unwrap_or(Cell::Null),
+        Type::INT4 => r
+            .get::<_, Option<i32>>(i)
+            .map(|v| Cell::Int(v as i64))
+            .unwrap_or(Cell::Null),
+        Type::INT8 => r
+            .get::<_, Option<i64>>(i)
+            .map(Cell::Int)
+            .unwrap_or(Cell::Null),
+        Type::BYTEA => r
+            .get::<_, Option<Vec<u8>>>(i)
+            .map(Cell::Bytes)
+            .unwrap_or(Cell::Null),
+        Type::BOOL => r
+            .get::<_, Option<bool>>(i)
+            .map(|v| Cell::Int(v as i64))
+            .unwrap_or(Cell::Null),
+        // TEXT/VARCHAR and anything else the schema uses.
+        _ => r
+            .get::<_, Option<String>>(i)
+            .map(Cell::Text)
+            .unwrap_or(Cell::Null),
+    })
+}
+
+/// Build a [`TrashEntry`](crate::trash::TrashEntry) from a row (issue #115).
+fn row_to_trash(r: &Row) -> Result<crate::trash::TrashEntry> {
+    let kind_s: String = r.get(2);
+    Ok(crate::trash::TrashEntry {
+        id: r.get(0),
+        path: r.get(1),
+        kind: FileKind::parse(&kind_s)
+            .ok_or_else(|| OrigoFSError::Metadata(format!("unknown trash kind {kind_s:?}")))?,
+        mode: r.get::<_, i64>(3) as u32,
+        size: r.get::<_, i64>(4) as u64,
+        content: r
+            .get::<_, Option<String>>(5)
+            .as_deref()
+            .and_then(Hash::from_hex),
+        symlink_target: r.get(6),
+        owner: crate::types::Owner::new(r.get::<_, i64>(7) as u32, r.get::<_, i64>(8) as u32),
+        actor_id: r.get(9),
+        session_id: r.get(10),
+        deleted_at: r.get(11),
+    })
+}
+
 fn row_to_inode(r: &Row) -> Result<Inode> {
     let kind_s: String = r.get(1);
     let kind = FileKind::parse(&kind_s)
@@ -669,6 +769,8 @@ fn row_to_inode(r: &Row) -> Result<Inode> {
         content,
         mtime: r.get(6),
         ctime: r.get(7),
+        uid: r.get::<_, i64>(8) as u32,
+        gid: r.get::<_, i64>(9) as u32,
     })
 }
 
@@ -683,6 +785,12 @@ async fn truncate_workspace_tree_pg(c: &tokio_postgres::Client, ws: i64) -> Resu
     .await?;
     c.execute(
         "DELETE FROM symlink WHERE ino IN (SELECT ino FROM inode WHERE workspace_id = $1)",
+        &[&ws],
+    )
+    .await?;
+    // xattrs are keyed by inode, so a truncated tree takes them with it (#119).
+    c.execute(
+        "DELETE FROM xattr WHERE ino IN (SELECT ino FROM inode WHERE workspace_id = $1)",
         &[&ws],
     )
     .await?;
@@ -818,7 +926,7 @@ impl MetadataStore for PostgresMetadataStore {
         let c = self.client().await?;
         let row = c
             .query_opt(
-                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid
                  FROM inode WHERE ino = $1",
                 &[&ino],
             )
@@ -839,7 +947,7 @@ impl MetadataStore for PostgresMetadataStore {
         // plan stays a single index probe per key.
         let rows = c
             .query(
-                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime
+                "SELECT ino, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid
                  FROM inode WHERE ino = ANY($1)",
                 &[&inos],
             )
@@ -857,9 +965,16 @@ impl MetadataStore for PostgresMetadataStore {
         let mode = init.mode as i64;
         let row = c
             .query_one(
-                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4) RETURNING ino",
-                &[&self.workspace_id, &init.kind.as_str(), &mode, &now],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid)
+                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4, $5, $6) RETURNING ino",
+                &[
+                    &self.workspace_id,
+                    &init.kind.as_str(),
+                    &mode,
+                    &now,
+                    &(init.owner.uid as i64),
+                    &(init.owner.gid as i64),
+                ],
             )
             .await?;
         Ok(row.get(0))
@@ -897,9 +1012,42 @@ impl MetadataStore for PostgresMetadataStore {
         Ok(())
     }
 
+    async fn set_mode(&self, ino: Ino, mode: u32) -> Result<()> {
+        let c = self.client().await?;
+        // Mask in only the permission bits: the format bits are the inode's kind,
+        // not a caller's to rewrite. `& 0o7777` keeps setuid/setgid/sticky.
+        c.execute(
+            "UPDATE inode SET mode = (mode & ~4095) | $1, ctime = $2 WHERE ino = $3",
+            &[&((mode & 0o7777) as i64), &now_secs(), &ino],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        let c = self.client().await?;
+        // COALESCE so a `None` half leaves the stored value alone, which is what
+        // chown(2)'s -1 sentinel means.
+        c.execute(
+            "UPDATE inode SET uid = COALESCE($1, uid), gid = COALESCE($2, gid), \
+             ctime = $3 WHERE ino = $4",
+            &[
+                &uid.map(|v| v as i64),
+                &gid.map(|v| v as i64),
+                &now_secs(),
+                &ino,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn delete_inode(&self, ino: Ino) -> Result<()> {
         let c = self.client().await?;
         c.execute("DELETE FROM symlink WHERE ino = $1", &[&ino])
+            .await?;
+        // xattrs are keyed by inode, so they die with it (issue #119).
+        c.execute("DELETE FROM xattr WHERE ino = $1", &[&ino])
             .await?;
         c.execute("DELETE FROM inode WHERE ino = $1", &[&ino])
             .await?;
@@ -1048,6 +1196,323 @@ impl MetadataStore for PostgresMetadataStore {
             )
             .await?;
         Ok(row.get::<_, i64>(0) as usize)
+    }
+
+    async fn workspace_usage(&self) -> Result<(u64, u64)> {
+        let c = self.client().await?;
+        let r = c
+            .query_one(
+                "SELECT COUNT(*)::BIGINT, COALESCE(SUM(size), 0)::BIGINT
+                 FROM inode WHERE workspace_id = $1",
+                &[&self.workspace_id],
+            )
+            .await?;
+        Ok((
+            r.get::<_, i64>(0).max(0) as u64,
+            r.get::<_, i64>(1).max(0) as u64,
+        ))
+    }
+
+    async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
+        let c = self.client().await?;
+        // `UNION` (not `UNION ALL`) dedups inode ids, so an inode reachable by
+        // several names -- a hard link -- is counted once, as `du` does.
+        let r = c
+            .query_one(
+                "WITH RECURSIVE sub(ino) AS (
+                     SELECT $1::BIGINT
+                     UNION
+                     SELECT d.ino FROM dentry d JOIN sub ON d.parent_ino = sub.ino
+                 )
+                 SELECT COUNT(*)::BIGINT, COALESCE(SUM(i.size), 0)::BIGINT
+                 FROM inode i JOIN sub ON i.ino = sub.ino",
+                &[&ino],
+            )
+            .await?;
+        Ok((
+            r.get::<_, i64>(0).max(0) as u64,
+            r.get::<_, i64>(1).max(0) as u64,
+        ))
+    }
+
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
+        let table = crate::sqlite::validated_dump_table(table)?;
+        let c = self.client().await?;
+        // Every column rendered as text by the server, then re-typed from the
+        // catalog below. Postgres's binary protocol would need a `FromSql` impl per
+        // column type, and the point of a *portable* dump is not to care.
+        let rows = c.query(&format!("SELECT * FROM \"{table}\""), &[]).await?;
+        let mut out = Vec::new();
+        for r in &rows {
+            let mut cells = Vec::with_capacity(r.columns().len());
+            for (i, col) in r.columns().iter().enumerate() {
+                cells.push((col.name().to_string(), pg_cell(r, i, col.type_())?));
+            }
+            out.push(crate::portable::Row(cells));
+        }
+        Ok(out)
+    }
+
+    async fn reset_for_load(&self) -> Result<()> {
+        let mut c = self.client().await?;
+        let tx = c.transaction().await?;
+        for table in crate::portable::DUMP_TABLES.iter().rev() {
+            tx.execute(&format!("DELETE FROM \"{table}\""), &[]).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
+        let table = crate::sqlite::validated_dump_table(table)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut c = self.client().await?;
+        let tx = c.transaction().await?;
+        for row in rows {
+            let quoted: Vec<String> = row.0.iter().map(|(cn, _)| format!("\"{cn}\"")).collect();
+            let placeholders: Vec<String> = (1..=row.0.len()).map(|i| format!("${i}")).collect();
+            // Cast every parameter from text and let Postgres coerce to the column
+            // type. Sending a bare text parameter into a BIGINT column is a type
+            // error; `$n` with an explicit cast is not.
+            let sql = format!(
+                "INSERT INTO \"{table}\"({}) VALUES ({})",
+                quoted.join(", "),
+                placeholders.join(", ")
+            );
+            let owned: Vec<PgParam> = row.0.iter().map(|(_, v)| PgParam::from(v)).collect();
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = owned
+                .iter()
+                .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            tx.execute(&sql, &params).await?;
+        }
+        // Identity sequences were bypassed by the explicit ids above, so advance
+        // each past what was inserted -- otherwise the next natural insert collides
+        // with a restored row. Same hazard the V11 bootstrap already handles for
+        // `inode`.
+        for (t, col) in [
+            ("inode", "ino"),
+            ("actor", "id"),
+            ("session", "id"),
+            ("suggestion", "id"),
+            ("trash", "id"),
+            ("workspace", "id"),
+            ("edit_op", "id"),
+            ("tool_calls", "id"),
+        ] {
+            if t == table {
+                let _ = tx
+                    .execute(
+                        &format!(
+                            "SELECT setval(pg_get_serial_sequence('{t}', '{col}'), \
+                             GREATEST((SELECT COALESCE(MAX(\"{col}\"), 1) FROM \"{t}\"), 1))"
+                        ),
+                        &[],
+                    )
+                    .await;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn set_acl(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: u32,
+        granted_at: i64,
+        granted_by: Option<i64>,
+    ) -> Result<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO acl(workspace_id, actor_id, path_prefix, perms, granted_at, granted_by)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (workspace_id, actor_id, path_prefix)
+             DO UPDATE SET perms = EXCLUDED.perms,
+                           granted_at = EXCLUDED.granted_at,
+                           granted_by = EXCLUDED.granted_by",
+            &[
+                &self.workspace_id,
+                &actor_id,
+                &path_prefix,
+                &(perms as i64),
+                &granted_at,
+                &granted_by,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_acl(&self, actor_id: i64, path_prefix: &str) -> Result<bool> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM acl WHERE workspace_id = $1 AND actor_id = $2 AND path_prefix = $3",
+                &[&self.workspace_id, &actor_id, &path_prefix],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT actor_id, path_prefix, perms, granted_at, granted_by FROM acl
+                 WHERE workspace_id = $1 AND ($2::BIGINT IS NULL OR actor_id = $2)
+                 ORDER BY LENGTH(path_prefix) DESC",
+                &[&self.workspace_id, &actor_id],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::acl::AclGrant {
+                actor_id: r.get(0),
+                path_prefix: r.get(1),
+                perms: crate::acl::Perms::from_bits(r.get::<_, i64>(2) as u32),
+                granted_at: r.get(3),
+                granted_by: r.get(4),
+            })
+            .collect())
+    }
+
+    async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
+        let c = self.client().await?;
+        let row = c
+            .query_one(
+                "INSERT INTO trash(workspace_id, path, kind, mode, size, content_hash,
+                                   symlink_target, uid, gid, actor_id, session_id, deleted_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
+                &[
+                    &self.workspace_id,
+                    &init.path,
+                    &init.kind.as_str(),
+                    &(init.mode as i64),
+                    &(init.size as i64),
+                    &init.content.map(|h| h.to_hex()),
+                    &init.symlink_target,
+                    &(init.owner.uid as i64),
+                    &(init.owner.gid as i64),
+                    &init.actor_id,
+                    &init.session_id,
+                    &init.deleted_at,
+                ],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT id, path, kind, mode, size, content_hash, symlink_target,
+                        uid, gid, actor_id, session_id, deleted_at
+                 FROM trash WHERE id = $1 AND workspace_id = $2",
+                &[&id, &self.workspace_id],
+            )
+            .await?;
+        row.as_ref().map(row_to_trash).transpose()
+    }
+
+    async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT id, path, kind, mode, size, content_hash, symlink_target,
+                        uid, gid, actor_id, session_id, deleted_at
+                 FROM trash WHERE workspace_id = $1 ORDER BY deleted_at DESC, id DESC",
+                &[&self.workspace_id],
+            )
+            .await?;
+        rows.iter().map(row_to_trash).collect()
+    }
+
+    async fn delete_trash(&self, id: i64) -> Result<bool> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM trash WHERE id = $1 AND workspace_id = $2",
+                &[&id, &self.workspace_id],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn purge_trash_before(&self, cutoff: i64) -> Result<usize> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM trash WHERE workspace_id = $1 AND deleted_at < $2",
+                &[&self.workspace_id, &cutoff],
+            )
+            .await?;
+        Ok(n as usize)
+    }
+
+    async fn trash_content_hashes(&self) -> Result<Vec<Hash>> {
+        let c = self.client().await?;
+        // Store-wide, not workspace-scoped: `gc` sweeps one shared content store,
+        // so a workspace-scoped root would let it reclaim another workspace's
+        // trashed content.
+        let rows = c
+            .query(
+                "SELECT content_hash FROM trash WHERE content_hash IS NOT NULL",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| Hash::from_hex(&r.get::<_, String>(0)))
+            .collect())
+    }
+
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT value FROM xattr WHERE ino = $1 AND name = $2",
+                &[&ino, &name],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, Vec<u8>>(0)))
+    }
+
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO xattr(ino, name, value) VALUES ($1, $2, $3)
+             ON CONFLICT (ino, name) DO UPDATE SET value = EXCLUDED.value",
+            &[&ino, &name, &value],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM xattr WHERE ino = $1 AND name = $2",
+                &[&ino, &name],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT name FROM xattr WHERE ino = $1 ORDER BY name",
+                &[&ino],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
     async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()> {
@@ -1815,9 +2280,16 @@ impl MetaTxn for PostgresTxn {
         let row = self
             .conn()
             .query_one(
-                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4) RETURNING ino",
-                &[&ws, &init.kind.as_str(), &mode, &now],
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime, uid, gid)
+                 VALUES ($1, $2, $3, 1, 0, NULL, $4, $4, $5, $6) RETURNING ino",
+                &[
+                    &ws,
+                    &init.kind.as_str(),
+                    &mode,
+                    &now,
+                    &(init.owner.uid as i64),
+                    &(init.owner.gid as i64),
+                ],
             )
             .await?;
         Ok(row.get(0))
@@ -1892,6 +2364,9 @@ impl MetaTxn for PostgresTxn {
         let c = self.conn();
         c.execute("DELETE FROM symlink WHERE ino = $1", &[&ino])
             .await?;
+        // xattrs are keyed by inode, so they die with it (issue #119).
+        c.execute("DELETE FROM xattr WHERE ino = $1", &[&ino])
+            .await?;
         c.execute("DELETE FROM inode WHERE ino = $1", &[&ino])
             .await?;
         Ok(())
@@ -1928,6 +2403,9 @@ impl MetaTxn for PostgresTxn {
             .await?;
         if n == 1 {
             c.execute("DELETE FROM symlink WHERE ino = $1", &[&ino])
+                .await?;
+            // xattrs are keyed by inode, so they die with it (issue #119).
+            c.execute("DELETE FROM xattr WHERE ino = $1", &[&ino])
                 .await?;
         }
         Ok(n == 1)
