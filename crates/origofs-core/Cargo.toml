@@ -122,3 +122,9 @@ yrs = "0.23"
 [[bench]]
 name = "engine"
 harness = false
+
+# `statvfs`, for the free-space floor under `TieredStore`'s bounded cache tier
+# (issue #114). Unix-only: Windows would need `GetDiskFreeSpaceEx`, and the floor
+# degrades to "not enforced" there rather than the whole cache being unavailable.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"

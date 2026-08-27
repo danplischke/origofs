@@ -12,7 +12,12 @@ pub const INO_ROOT: Ino = 1;
 ///
 /// In M0 a file body is stored as a single content-addressed blob. M1 replaces
 /// the single blob with a FastCDC chunk manifest addressed the same way.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// `Ord` is the lexicographic order of the 32 address bytes. It carries no
+/// meaning about the content — it exists so a hash can key an ordered collection
+/// (the LRU index in [`TieredStore`](crate::TieredStore)) and so tie-breaks that
+/// need to be deterministic across runs, such as `merge_base`'s choice among
+/// equally-good candidates, can be.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash([u8; 32]);
 
 impl Hash {

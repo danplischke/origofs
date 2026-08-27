@@ -1,12 +1,18 @@
 name: Mutants
 
-# B10 (#70): mutation testing. cargo-mutants rewrites small pieces of
-# origofs-core (a return value, a comparison, a `+` for a `-`) and checks the
-# suite still fails — surfacing behavior the tests don't actually pin down.
-# A full sweep is ~1700 mutants, each rebuilding and re-running the suite, so
-# this runs weekly on a schedule (and on demand) rather than per-PR. It is a
+# B10 (#70): mutation testing. cargo-mutants rewrites small pieces of the code
+# (a return value, a comparison, a `+` for a `-`) and checks the suite still
+# fails — surfacing behavior the tests don't actually pin down.
+# A full sweep is thousands of mutants, each rebuilding and re-running the suite,
+# so this runs weekly on a schedule (and on demand) rather than per-PR. It is a
 # code-quality signal, not a merge gate: surviving mutants are expected and
 # reviewed from the uploaded reports, not treated as a build failure.
+#
+# Two jobs, because the two crates need different builds and neither can cover
+# the other: `mutants` mutates the engine (origofs-core) with default features,
+# and `mutants-sdk` mutates the façade *and every access surface*
+# (origofs-sdk --features full) — see the comment on that job for why the split
+# is deliberate rather than an oversight.
 on:
   schedule:
     - cron: "0 6 * * 1" # Mondays, 06:00 UTC
@@ -67,4 +73,57 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out/
+
+  # #108: the counterpart sweep over origofs-sdk. The job above scopes with
+  # `-p origofs-core` on purpose, so the access surfaces — api, mcp, sandbox,
+  # fuse, nfs, git, feature-gated modules of origofs-sdk — never enter that build
+  # and got no mutation signal at all. They are where a caller is resolved to an
+  # (actor, session) and where `ensure_may_write` is reached from, i.e. exactly
+  # the checks whose weakening is hardest to spot by reading, so they are worth
+  # their own leg rather than folding into the core one.
+  mutants-sdk:
+    name: cargo-mutants (origofs-sdk, shard ${{ matrix.shard }}/10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    strategy:
+      # One slow or survivor-heavy shard must not cancel the others.
+      fail-fast: false
+      matrix:
+        # Same 0-based k/N partition as the core sweep.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants and nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants, nextest
+
+      # `--features full` is the whole point of this leg: without it the surface
+      # modules are `#[cfg]`d out, so cargo-mutants would find nothing in them to
+      # mutate. ubuntu-latest is also what makes `full` complete — three of its
+      # surfaces (fuse/nfs/sandbox) are `cfg(unix)`. It needs no extra system
+      # packages, same as ci.yml's `cargo clippy -p origofs-sdk --features full`.
+      # As above: no Postgres service (cargo-mutants' concurrent test processes
+      # would race on one shared database), so PG-backed mutants show as missed
+      # and are ignored in review; `--shard k/10` gives this leg its slice; and
+      # continue-on-error keeps surviving mutants — the expected, reviewable
+      # signal — from marking the workflow failed.
+      - name: Run cargo-mutants
+        continue-on-error: true
+        run: cargo mutants -p origofs-sdk --features full --test-tool nextest --jobs 2 --shard ${{ matrix.shard }}/10
+
+      # Same per-shard outcomes as above, under a distinct artifact name so the
+      # two sweeps' reports don't collide.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-sdk-shard-${{ matrix.shard }}
           path: mutants.out/

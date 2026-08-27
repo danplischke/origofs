@@ -59,7 +59,8 @@ pub use coedit_tree::{
 };
 pub use collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, PRESENCE_WINDOW_SECS, Presence};
 pub use content::{
-    ContentStore, DEDUP_REFRESH_AFTER_SECS, LocalCasStore, MemStore, TieredStore, VerifyingStore,
+    CacheLimits, ContentStore, DEDUP_REFRESH_AFTER_SECS, LocalCasStore, MemStore, TieredStore,
+    VerifyingStore,
 };
 pub use corpus::{Passage, PassageOptions, Segmentation};
 #[cfg(feature = "encryption")]

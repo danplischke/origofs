@@ -6,7 +6,7 @@
 //! milestones add commits and attribution behind the same façade.
 
 use origofs_core::{Fs, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use bytes::Bytes;
@@ -20,12 +20,13 @@ pub use origofs_core::metrics;
 // `Workspace::open_encrypted` takes. Previously private, so an embedder could not
 // compose one.
 pub use origofs_core::{
-    Actor, ActorInit, ActorKind, BlameRange, CommitInfo, Conflict, DEFAULT_GC_GRACE_SECS,
-    DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event, EventInit, FileKind,
-    GcStats, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError, Owner, PackStore, Passage,
-    PassageOptions, Presence, RebuildReport, ResyncOutcome, ResyncReport, Segmentation, Suggestion,
-    SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit,
-    TransferStats, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    Actor, ActorInit, ActorKind, BlameRange, CacheLimits, CommitInfo, Conflict,
+    DEFAULT_GC_GRACE_SECS, DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event,
+    EventInit, FileKind, GcStats, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError,
+    Owner, PackStore, Passage, PassageOptions, Presence, RebuildReport, ResyncOutcome,
+    ResyncReport, Segmentation, Suggestion, SuggestionContent, SuggestionInit, SuggestionKind,
+    SuggestionStatus, TieredStore, ToolCallInit, TransferStats, VerifyingStore, VersioningMode,
+    WriteCtx, WriteOutcome, WritePolicy,
 };
 // Backend-specific re-exports, gated to match `origofs-core`'s own features.
 #[cfg(feature = "encryption")]
@@ -160,6 +161,53 @@ pub struct Workspace {
     pg: Option<Arc<PostgresMetadataStore>>,
 }
 
+/// Where and how large a local read cache may be (issue #114).
+///
+/// Caching is **opt-in** rather than a default, and deliberately so: turning it on
+/// means writing to the user's disk, and a library that starts doing that without
+/// being asked is a library that fills someone's laptop. The cost of opt-in is that
+/// it gets used less, which is a fair trade against surprising a caller who chose a
+/// remote backend precisely so that nothing landed locally.
+///
+/// The defaults from [`new`](Self::new) are sized for a developer machine. Pick
+/// them explicitly for a container, where the writable layer is usually far smaller
+/// than the disk the numbers below assume.
+#[derive(Clone, Debug)]
+pub struct CacheConfig {
+    /// Directory for the cache tier. Created if absent.
+    pub dir: PathBuf,
+    /// Evict least-recently-used chunks to stay at or below this.
+    pub max_bytes: u64,
+    /// Also evict whenever the filesystem holding `dir` has less than this free,
+    /// so the cache yields to the rest of the machine rather than competing with
+    /// it. Enforced on Unix; on Windows there is no `statvfs` and only `max_bytes`
+    /// applies.
+    pub min_free_bytes: u64,
+}
+
+impl CacheConfig {
+    /// 8 GiB of cache, yielding whenever the disk drops under 2 GiB free.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            max_bytes: 8 << 30,
+            min_free_bytes: 2 << 30,
+        }
+    }
+
+    /// Set the size bound.
+    pub fn max_bytes(mut self, n: u64) -> Self {
+        self.max_bytes = n;
+        self
+    }
+
+    /// Set the free-space floor.
+    pub fn min_free_bytes(mut self, n: u64) -> Self {
+        self.min_free_bytes = n;
+        self
+    }
+}
+
 impl Workspace {
     /// Open (creating if needed) a workspace from explicit metadata + content
     /// backends.
@@ -219,6 +267,81 @@ impl Workspace {
         let salt = read_or_create_salt(&backend).await?;
         let content: Content =
             Arc::new(EncryptedStore::from_passphrase(backend, passphrase, &salt)?);
+        Self::open(meta, content).await
+    }
+
+    /// Wrap a remote content backend in a **bounded local read cache** (issue
+    /// #114), returning the full stack a workspace should use.
+    ///
+    /// The layering is the point, and it is not the obvious one:
+    ///
+    /// ```text
+    /// VerifyingStore( TieredStore( cache: LocalCasStore, backend: <remote> ) )
+    /// ```
+    ///
+    /// `VerifyingStore` stays **outside**, as every other `open_*` recipe arranges,
+    /// so integrity is still checked at the chunk-addressed boundary the caller
+    /// reads by. The cache goes *inside* it, which is why a cache cannot simply be
+    /// bolted onto an already-verified stack — and why the cached constructors are
+    /// separate rather than a decorator a caller applies afterwards.
+    /// `TieredStore` additionally re-verifies its own cache hits, so a corrupt
+    /// cached copy becomes a refetch instead of the hard `Corrupt` the outer layer
+    /// would raise.
+    #[cfg(feature = "object-store")]
+    async fn cached_remote(backend: Content, cache: &CacheConfig) -> Result<Content> {
+        let local: Content = Arc::new(LocalCasStore::open(&cache.dir).await?);
+        let tier = TieredStore::with_limits(
+            local,
+            backend,
+            CacheLimits::bounded(&cache.dir, cache.max_bytes, cache.min_free_bytes),
+        );
+        // Account for whatever the directory already holds, so the bound covers a
+        // cache that survived a restart rather than only this process's own reads.
+        tier.warm_index().await?;
+        Ok(Arc::new(VerifyingStore::new(Arc::new(tier))))
+    }
+
+    /// [`open_s3`](Self::open_s3) with a bounded local read cache (issue #114).
+    #[cfg(feature = "object-store")]
+    pub async fn open_s3_cached(
+        db_path: impl AsRef<Path>,
+        cfg: S3Config,
+        cache: CacheConfig,
+    ) -> Result<Self> {
+        let meta: Meta = Arc::new(SqliteMetadataStore::open(db_path)?);
+        let backend: Content = Arc::new(ObjectContentStore::s3(cfg)?);
+        let content = Self::cached_remote(backend, &cache).await?;
+        Self::open(meta, content).await
+    }
+
+    /// [`open_pg_s3`](Self::open_pg_s3) with a bounded local read cache (#114).
+    #[cfg(all(feature = "object-store", feature = "postgres"))]
+    pub async fn open_pg_s3_cached(dsn: &str, cfg: S3Config, cache: CacheConfig) -> Result<Self> {
+        let meta: Meta = Arc::new(PostgresMetadataStore::connect(dsn).await?);
+        let backend: Content = Arc::new(ObjectContentStore::s3(cfg)?);
+        let content = Self::cached_remote(backend, &cache).await?;
+        Self::open(meta, content).await
+    }
+
+    /// [`open_gcs`](Self::open_gcs) with a bounded local read cache (#114).
+    #[cfg(feature = "object-store")]
+    pub async fn open_gcs_cached(
+        db_path: impl AsRef<Path>,
+        cfg: GcsConfig,
+        cache: CacheConfig,
+    ) -> Result<Self> {
+        let meta: Meta = Arc::new(SqliteMetadataStore::open(db_path)?);
+        let backend: Content = Arc::new(ObjectContentStore::gcs(cfg)?);
+        let content = Self::cached_remote(backend, &cache).await?;
+        Self::open(meta, content).await
+    }
+
+    /// [`open_pg_gcs`](Self::open_pg_gcs) with a bounded local read cache (#114).
+    #[cfg(all(feature = "object-store", feature = "postgres"))]
+    pub async fn open_pg_gcs_cached(dsn: &str, cfg: GcsConfig, cache: CacheConfig) -> Result<Self> {
+        let meta: Meta = Arc::new(PostgresMetadataStore::connect(dsn).await?);
+        let backend: Content = Arc::new(ObjectContentStore::gcs(cfg)?);
+        let content = Self::cached_remote(backend, &cache).await?;
         Self::open(meta, content).await
     }
 
