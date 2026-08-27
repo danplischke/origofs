@@ -15,13 +15,22 @@
 //! serves its own stale caches (see [`TTL`] for exactly why a timeout is not
 //! enough). Constructing an [`OrigoFSFuse`] and handing it to `fuser` yourself
 //! skips that; use [`spawn`] unless you have a reason not to.
+//!
+//! Writes are **buffered per open file handle** ([`DirtyBuffer`], issue #112) and
+//! written out at `flush`/`fsync`/`release`, or sooner if a handle fills
+//! [`HANDLE_BUFFER_CAP`]. Everything reached *through the mount* still reads its
+//! own writes — see [`Filesystem::read`] — but bytes only become visible to the
+//! workspace's other surfaces (the HTTP API, an agent over MCP, a Postgres peer)
+//! once they are flushed. That is the ordinary bargain of a write-back cache, and
+//! it buys a large constant factor off a write path that rewrites the whole file
+//! per request (see [`HANDLE_BUFFER_CAP`] for the arithmetic).
 
 use crate::{Event, FileKind, Inode, OrigoFSError, Owner, Workspace};
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, Notifier, OpenFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs, ReplyWrite,
-    ReplyXattr, Request, TimeOrNow, WriteFlags,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
+    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -92,6 +101,32 @@ const READDIR_PAGE: usize = 128;
 /// past this rather than carrying LRU bookkeeping.
 const READDIR_CURSOR_CAP: usize = 4096;
 
+/// How many dirty bytes one open file handle may hold before `Filesystem::write` stops
+/// buffering and flushes on the spot (issue #112).
+///
+/// The kernel hands a FUSE server one request per `write(2)`, splitting a large
+/// one at whatever the mount negotiated — classically 128 KiB, and at most 1 MiB
+/// on Linux, which caps a request at 256 pages however large a `max_write` the
+/// server advertises. `Fs::vfs_write` answers each of those with a *whole-file*
+/// read-modify-write: read a file of size `n` back, patch the request's slice of
+/// it, re-chunk and re-store all `n` bytes. So the cost of writing a file is the
+/// number of requests times its size.
+///
+/// Buffering divides the first factor. `CAP` bytes of coalesced writes become
+/// one read-modify-write instead of `CAP / request_size` of them — 4× against a
+/// 1 MiB request, 32× against a 128 KiB one, and three orders of magnitude for
+/// an application that writes in 4 KiB pieces (an append loop, a log, an editor
+/// saving line by line), which is where the pathology actually bites. It does
+/// not divide the second factor: each flush still rewrites the whole file, so
+/// this is a large constant, not a change of complexity. Issue #111's slices are
+/// what attack the per-write cost; neither subsumes the other.
+///
+/// The number is a memory/round-trip trade made per *open handle*, so the worst
+/// case is this times the number of files open for writing at once. 4 MiB
+/// matches the block size JuiceFS coalesces to and is small enough that a few
+/// hundred concurrent writers still fit in a normal process.
+const HANDLE_BUFFER_CAP: usize = 4 * 1024 * 1024;
+
 /// A FUSE filesystem backed by an origofs [`Workspace`].
 pub struct OrigoFSFuse {
     ws: Workspace,
@@ -116,6 +151,13 @@ pub struct OrigoFSFuse {
     /// translation for the offsets this mount actually handed out, which is every
     /// offset a sequentially-reading client will come back with.
     cursors: Mutex<HashMap<(i64, u64), String>>,
+    /// Open file handles and the dirty bytes each is holding (issue #112).
+    ///
+    /// Managed exactly like [`Self::cursors`]: a plain `Mutex` behind the shared
+    /// `&self` every [`Filesystem`] callback gets, never held across an `await`
+    /// or a `block_on` (see `OrigoFSFuse::handles_of` for the lock order that
+    /// keeps that true).
+    handles: Mutex<HandleTable>,
 }
 
 impl OrigoFSFuse {
@@ -128,6 +170,7 @@ impl OrigoFSFuse {
             watcher: Arc::new(Watcher::new()),
             rt,
             cursors: Mutex::new(HashMap::new()),
+            handles: Mutex::new(HandleTable::default()),
         })
     }
 
@@ -187,6 +230,367 @@ impl OrigoFSFuse {
                 return Ok(cursor);
             }
         }
+    }
+}
+
+// --- per-handle write buffering (issue #112) --------------------------------
+
+/// One contiguous run of dirty bytes held for an open file handle.
+struct Run {
+    offset: u64,
+    data: Vec<u8>,
+}
+
+impl Run {
+    fn end(&self) -> u64 {
+        // Never overflows: `DirtyBuffer::write_at` refuses a range whose end does
+        // not fit in a u64 before a run can ever be built from it.
+        self.offset + self.data.len() as u64
+    }
+}
+
+/// The dirty bytes one open file handle is holding, as a set of disjoint,
+/// coalesced, ascending byte runs.
+///
+/// This is the whole of the buffering logic, deliberately split out from the
+/// [`Filesystem`] impl so it can be tested without a mount (a FUSE mount needs
+/// root and `/dev/fuse`, which CI does not always have — see
+/// `tests/fuse_buffering.rs`).
+///
+/// # Why runs, and not a single byte vector
+///
+/// A flush must patch **only the bytes the caller actually wrote**. Holding a
+/// materialized image of the file instead — read it, patch it, write it whole —
+/// would take a snapshot at open time and hand it back at close time, silently
+/// erasing everything another writer did to the untouched parts in between. That
+/// is precisely the lost update `Fs::vfs_write`'s compare-and-set loop exists to
+/// prevent, and a whole-file image would defeat it *while still winning the CAS*,
+/// because the write really would be derived from the version it read. Recording
+/// ranges keeps each flush a genuine patch, so the CAS still means what it says.
+///
+/// Runs also bound memory by bytes *written* rather than by file size: two writes
+/// a gigabyte apart merge into nothing, they stay two small runs, and no gap is
+/// ever materialized.
+#[derive(Default)]
+pub struct DirtyBuffer {
+    /// Sorted by offset, pairwise disjoint, and never merely adjacent — two runs
+    /// that touch are always coalesced into one.
+    runs: Vec<Run>,
+    /// Sum of `runs[..].data.len()`, kept incrementally so the cap check in
+    /// `write` is O(1).
+    len: usize,
+}
+
+impl DirtyBuffer {
+    /// Record `data` as written at `offset`, coalescing with anything already
+    /// buffered that it overlaps or touches. A later write to the same byte wins.
+    ///
+    /// Fails with [`OrigoFSError::TooLarge`] if the end offset does not fit in a
+    /// `u64` — a hostile offset must be refused here rather than wrap and corrupt
+    /// the run ordering (`Fs::vfs_write_attempt` makes the same check for the
+    /// unbuffered path).
+    pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), OrigoFSError> {
+        let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
+            OrigoFSError::TooLarge(format!("write at offset {offset} overflows u64"))
+        })?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        // Every run that overlaps *or abuts* the new range is absorbed, so a
+        // sequential writer's 128 KiB pages collapse into one run rather than
+        // accumulating thousands of adjacent ones.
+        let first = self.runs.partition_point(|r| r.end() < offset);
+        let last = self.runs.partition_point(|r| r.offset <= end);
+        let merged: Vec<Run> = self.runs.splice(first..last, std::iter::empty()).collect();
+
+        let start = merged.first().map_or(offset, |r| r.offset.min(offset));
+        let stop = merged.iter().map(Run::end).max().unwrap_or(end).max(end);
+        let mut buf = vec![0u8; (stop - start) as usize];
+        for r in &merged {
+            let at = (r.offset - start) as usize;
+            buf[at..at + r.data.len()].copy_from_slice(&r.data);
+            self.len -= r.data.len();
+        }
+        // New bytes last: this write is the most recent one for its range.
+        let at = (offset - start) as usize;
+        buf[at..at + data.len()].copy_from_slice(data);
+
+        self.len += buf.len();
+        self.runs.insert(
+            first,
+            Run {
+                offset: start,
+                data: buf,
+            },
+        );
+        Ok(())
+    }
+
+    /// Total dirty bytes held.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether anything is buffered.
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// One past the highest dirty byte, or `None` when nothing is buffered.
+    ///
+    /// This is what lets `getattr` report a size that includes bytes not yet
+    /// flushed; see `OrigoFSFuse::attr_of`.
+    pub fn end(&self) -> Option<u64> {
+        self.runs.last().map(Run::end)
+    }
+
+    /// Whether any buffered byte falls inside `[offset, offset + size)`.
+    ///
+    /// The read path's flush predicate — see [`Filesystem::read`] for why an
+    /// overlap is the exact condition under which a read would otherwise be
+    /// served stale bytes.
+    ///
+    /// Both intervals are half-open, so a read that stops exactly where a run
+    /// starts (or starts exactly where one ends) does *not* overlap it — a
+    /// zero-length read overlaps nothing at all.
+    pub fn overlaps(&self, offset: u64, size: u32) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let end = offset.saturating_add(size as u64);
+        self.runs.iter().any(|r| r.offset < end && r.end() > offset)
+    }
+
+    /// The buffered runs as `(offset, bytes)`, ascending and disjoint.
+    pub fn runs(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.runs.iter().map(|r| (r.offset, r.data.as_slice()))
+    }
+
+    /// Remove and return every run, leaving the buffer empty.
+    fn take(&mut self) -> Vec<Run> {
+        self.len = 0;
+        std::mem::take(&mut self.runs)
+    }
+
+    /// Put back runs a failed flush never got to write.
+    ///
+    /// `runs` must be a suffix of what `take` returned and the buffer must
+    /// still be empty — which the flush path guarantees, because it holds the
+    /// handle's lock across the whole flush, so no new write can have landed.
+    fn restore(&mut self, runs: Vec<Run>) {
+        debug_assert!(self.runs.is_empty());
+        self.len = runs.iter().map(|r| r.data.len()).sum();
+        self.runs = runs;
+    }
+}
+
+/// One open file handle: which inode it refers to, and what it has yet to flush.
+///
+/// # Where actor context would go, and why it is not here
+///
+/// A handle is the natural place to capture the actor and session behind a write
+/// — resolve them once at `open`, hold them for the handle's lifetime, and flush
+/// through the *attributed* write path so a mounted edit landed in the blame
+/// trail like any other. This deliberately does **not** do that. The mounts have
+/// no actor context at all today (a kernel mount has no caller identity origofs
+/// can trust; `CLAUDE.md` records the bypass), and inventing one here would put
+/// fabricated names in the attribution log, which is worse than an honest gap.
+///
+/// Buffering does not make that gap worse — an unattributed buffered write is
+/// exactly as unattributed as the unbuffered write it replaces — and it should
+/// not be read as making it better either. It only means that *if* the mounts
+/// ever gain identity, this struct is where it belongs.
+struct OpenFile {
+    ino: i64,
+    /// Guarded independently of [`HandleTable`], and held across the `block_on`
+    /// of a flush: that is what makes a flush atomic with respect to further
+    /// writes on the same handle, and what lets a failed flush put its unwritten
+    /// runs back knowing nothing has landed on top of them.
+    buf: Mutex<DirtyBuffer>,
+}
+
+/// Every handle this mount has handed out, and the reverse index a read needs.
+#[derive(Default)]
+struct HandleTable {
+    /// Last handle id allocated. Ids start at 1 — never 0, which is what `fuser`
+    /// hands out by default for the `opendir` this file leaves unimplemented, so
+    /// a directory handle can never collide with a file handle here.
+    next: u64,
+    open: HashMap<u64, Arc<OpenFile>>,
+    /// `ino → the handles open on it`. A read arrives addressed by inode and has
+    /// to find dirty bytes held by *any* handle on that inode, including one
+    /// another process opened, so the reverse index is not optional.
+    by_ino: HashMap<i64, Vec<u64>>,
+}
+
+impl OrigoFSFuse {
+    /// Allocate a handle for `ino`.
+    fn open_handle(&self, ino: i64) -> FileHandle {
+        let mut t = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+        t.next += 1;
+        let id = t.next;
+        t.open.insert(
+            id,
+            Arc::new(OpenFile {
+                ino,
+                buf: Mutex::new(DirtyBuffer::default()),
+            }),
+        );
+        t.by_ino.entry(ino).or_default().push(id);
+        FileHandle(id)
+    }
+
+    /// The handle `fh` refers to, or `None` if this mount never handed it out.
+    ///
+    /// A miss is not an error: a write-back from the page cache or an `mmap`
+    /// carries a `fh` the kernel explicitly documents as possibly unrelated to
+    /// the one `open` returned, and the callers below fall back to the direct,
+    /// unbuffered path for exactly that case.
+    fn handle(&self, fh: FileHandle) -> Option<Arc<OpenFile>> {
+        self.handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .open
+            .get(&fh.0)
+            .cloned()
+    }
+
+    /// Forget `fh`, returning it so `release` can flush what it still holds.
+    fn close_handle(&self, fh: FileHandle) -> Option<Arc<OpenFile>> {
+        let mut t = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+        let h = t.open.remove(&fh.0)?;
+        if let Some(ids) = t.by_ino.get_mut(&h.ino) {
+            ids.retain(|id| *id != fh.0);
+            if ids.is_empty() {
+                t.by_ino.remove(&h.ino);
+            }
+        }
+        Some(h)
+    }
+
+    /// Every handle currently open on `ino`.
+    ///
+    /// **Lock order.** This returns owned `Arc`s and drops the table lock before
+    /// returning, so a caller only ever holds *one* `OpenFile::buf` lock at a
+    /// time and never holds the table lock while it does. That is what keeps a
+    /// flush (which parks on `buf` across a `block_on`) from blocking an
+    /// unrelated `lookup` or `open`, and rules out a lock cycle between the two.
+    fn handles_of(&self, ino: i64) -> Vec<Arc<OpenFile>> {
+        let t = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+        match t.by_ino.get(&ino) {
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| t.open.get(id).cloned())
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether this mount has any open file handle at all — the cheap guard that
+    /// keeps the buffering machinery off the path of a mount nobody is writing to.
+    fn any_open(&self) -> bool {
+        !self
+            .handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .open
+            .is_empty()
+    }
+
+    /// Write out every run in `buf` and leave it empty.
+    ///
+    /// # Why this does not defeat `VFS_CAS_ATTEMPTS`
+    ///
+    /// Each run goes out as its own `vfs_write(ino, offset, bytes)` — the same
+    /// bounded compare-and-set read-modify-write an unbuffered mount already used,
+    /// on a range covering only bytes this handle really wrote (see
+    /// [`DirtyBuffer`]). So the lost-update guard is untouched: two handles
+    /// flushing disjoint ranges of one file still resolve by whoever loses the CAS
+    /// re-reading and reapplying, and two handles flushing *overlapping* ranges
+    /// still resolve last-writer-wins per byte, exactly as two racing `write(2)`s
+    /// on any filesystem do.
+    ///
+    /// If anything, buffering *relieves* that guard rather than straining it: the
+    /// contention it bounds is per read-modify-write, and coalescing a run of
+    /// kernel requests into one flush replaces that many chances to lose a race
+    /// with one. What changes is the granularity of the interleaving, not its
+    /// correctness.
+    ///
+    /// An error stops the flush and puts the unwritten runs back, so nothing is
+    /// dropped on the floor and a later `flush`/`fsync`/`release` retries them.
+    /// The already-written prefix is not rolled back — a partial `write(2)` is a
+    /// state POSIX allows, and re-writing bytes that landed would be the more
+    /// surprising outcome.
+    fn flush_buf(&self, ino: i64, buf: &mut DirtyBuffer) -> Result<(), OrigoFSError> {
+        let runs = buf.take();
+        for (i, run) in runs.iter().enumerate() {
+            if let Err(e) = self.blk(self.ws.fs().vfs_write(ino, run.offset, &run.data)) {
+                buf.restore(runs.into_iter().skip(i).collect());
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush one handle. Idempotent: a handle with nothing buffered is a no-op,
+    /// which is what makes `flush` correct when the kernel calls it once per
+    /// `close(2)` of a dup'd descriptor.
+    fn flush_handle(&self, h: &OpenFile) -> Result<(), OrigoFSError> {
+        let mut buf = h.buf.lock().unwrap_or_else(PoisonError::into_inner);
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.flush_buf(h.ino, &mut buf)
+    }
+
+    /// Flush every handle open on `ino`.
+    ///
+    /// The first error stops the sweep and is returned; the remaining handles keep
+    /// their buffers, so a retry (or their own `release`) still writes them.
+    fn flush_ino(&self, ino: i64) -> Result<(), OrigoFSError> {
+        for h in self.handles_of(ino) {
+            self.flush_handle(&h)?;
+        }
+        Ok(())
+    }
+
+    /// Flush the handles on `ino` holding bytes inside `[offset, offset + size)`.
+    fn flush_overlapping(&self, ino: i64, offset: u64, size: u32) -> Result<(), OrigoFSError> {
+        for h in self.handles_of(ino) {
+            let mut buf = h.buf.lock().unwrap_or_else(PoisonError::into_inner);
+            if buf.overlaps(offset, size) {
+                self.flush_buf(ino, &mut buf)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The highest buffered byte offset across every handle on `ino`.
+    fn dirty_end(&self, ino: i64) -> Option<u64> {
+        self.handles_of(ino)
+            .iter()
+            .filter_map(|h| h.buf.lock().unwrap_or_else(PoisonError::into_inner).end())
+            .max()
+    }
+
+    /// [`to_attr`], with the file's size widened to include bytes still sitting in
+    /// a handle's buffer.
+    ///
+    /// Without this, a `write` followed by a `stat` would report the pre-write
+    /// size, and — worse — the kernel would clamp subsequent reads to it and never
+    /// ask us for the tail at all. With it, a read past the stored end reaches
+    /// [`Filesystem::read`], which flushes the overlapping buffer and answers from
+    /// the store.
+    fn attr_of(&self, i: &Inode) -> FileAttr {
+        let mut a = to_attr(i);
+        if i.kind == FileKind::File
+            && let Some(end) = self.dirty_end(i.ino)
+            && end > a.size
+        {
+            a.size = end;
+            a.blocks = end.div_ceil(512);
+        }
+        a
     }
 }
 
@@ -620,13 +1024,26 @@ impl Filesystem for OrigoFSFuse {
     /// a notification can be issued at a mount that can no longer answer the
     /// syscall that notification has to wait behind (see [`Watcher`]).
     fn destroy(&mut self) {
+        // Last chance for anything still buffered: after this the session is gone
+        // and nobody will call `release`. Nothing here can be reported to a
+        // caller, so a failure is logged rather than swallowed silently.
+        let handles: Vec<Arc<OpenFile>> = {
+            let mut t = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
+            t.by_ino.clear();
+            t.open.drain().map(|(_, h)| h).collect()
+        };
+        for h in handles {
+            if let Err(e) = self.flush_handle(&h) {
+                tracing::warn!(ino = h.ino, error = %e, "fuse: buffered writes lost at unmount");
+            }
+        }
         self.watcher.shutdown();
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy().to_string();
         match self.blk(self.ws.fs().vfs_lookup(parent.0 as i64, &name)) {
-            Ok(Some(i)) => reply.entry(&TTL, &to_attr(&i), Generation(0)),
+            Ok(Some(i)) => reply.entry(&TTL, &self.attr_of(&i), Generation(0)),
             Ok(None) => reply.error(Errno::ENOENT),
             Err(e) => reply.error(errno(&e)),
         }
@@ -634,7 +1051,7 @@ impl Filesystem for OrigoFSFuse {
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.blk(self.ws.fs().vfs_getattr(ino.0 as i64)) {
-            Ok(i) => reply.attr(&TTL, &to_attr(&i)),
+            Ok(i) => reply.attr(&TTL, &self.attr_of(&i)),
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -659,11 +1076,18 @@ impl Filesystem for OrigoFSFuse {
         reply: ReplyAttr,
     ) {
         let ino = ino.0 as i64;
-        if let Some(sz) = size
-            && let Err(e) = self.blk(self.ws.fs().vfs_truncate(ino, sz))
-        {
-            reply.error(errno(&e));
-            return;
+        if let Some(sz) = size {
+            // Buffered writes have to land *before* the truncate, or a `write`
+            // followed by an `ftruncate` on the same descriptor would flush at
+            // close and resurrect the bytes the truncate was supposed to drop.
+            if let Err(e) = self.flush_ino(ino) {
+                reply.error(errno(&e));
+                return;
+            }
+            if let Err(e) = self.blk(self.ws.fs().vfs_truncate(ino, sz)) {
+                reply.error(errno(&e));
+                return;
+            }
         }
         // Mode and ownership used to be bound as `_mode`/`_uid`/`_gid` and dropped,
         // after which this replied with freshly-read (unchanged) attributes — so a
@@ -683,7 +1107,7 @@ impl Filesystem for OrigoFSFuse {
             return;
         }
         match self.blk(self.ws.fs().vfs_getattr(ino)) {
-            Ok(i) => reply.attr(&TTL, &to_attr(&i)),
+            Ok(i) => reply.attr(&TTL, &self.attr_of(&i)),
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -695,6 +1119,46 @@ impl Filesystem for OrigoFSFuse {
         }
     }
 
+    /// Open a file, allocating the handle the buffering below hangs off (issue
+    /// #112).
+    ///
+    /// Until this existed there was no `open` at all, so `fuser` answered with the
+    /// default `FileHandle(0)` and this filesystem had nowhere to keep per-handle
+    /// state — which is why every write request the kernel issued became a separate
+    /// whole-file read-modify-write. See `OpenFile` for what a handle holds, and
+    /// for the actor context it deliberately does *not*.
+    ///
+    /// No `getattr` is issued to validate `ino`: the kernel only reaches `open`
+    /// through a successful `lookup`, and a file unlinked in between is one POSIX
+    /// requires to stay openable through the reference the caller already has.
+    /// Allocating a handle is pure in-memory bookkeeping, so `open` stays free.
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(self.open_handle(ino.0 as i64), FopenFlags::empty());
+    }
+
+    /// Read, first flushing any buffered write that overlaps the requested range.
+    ///
+    /// # Read-your-own-writes
+    ///
+    /// This is the trap buffering introduces: a process that writes and then reads
+    /// back without closing must not be served the pre-write bytes. Rather than
+    /// overlay the dirty runs onto the reply — which would need the buffer and the
+    /// stored body stitched together on a hot path, and would still leave `getattr`
+    /// to fix — the read simply *flushes first*, so the store is authoritative by
+    /// the time it is asked. It considers every handle on the inode, not just the one
+    /// the read came in on, because a second descriptor (or a second process)
+    /// holding dirty bytes for the same file would otherwise be just as invisible.
+    ///
+    /// Overlap is the exact condition, and it is worth saying why a read *below*
+    /// the dirty region needs no flush even when the buffer has extended the file
+    /// past the stored end. The store answers such a read short; FUSE specifies
+    /// that a short reply is zero-filled up to the requested size, and
+    /// `OrigoFSFuse::attr_of` has already told the kernel the larger size — so
+    /// the hole reads back as the zeroes it is.
+    ///
+    /// The cost is that an alternating read/write workload degrades to a flush per
+    /// read, i.e. to precisely the behaviour this mount had before buffering
+    /// existed. Sequential writes — the case the issue is about — never pay it.
     #[allow(clippy::too_many_arguments)]
     fn read(
         &self,
@@ -707,18 +1171,54 @@ impl Filesystem for OrigoFSFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.blk(self.ws.fs().vfs_read(ino.0 as i64, offset, size)) {
+        let ino = ino.0 as i64;
+        if self.any_open()
+            && let Err(e) = self.flush_overlapping(ino, offset, size)
+        {
+            reply.error(errno(&e));
+            return;
+        }
+        match self.blk(self.ws.fs().vfs_read(ino, offset, size)) {
             Ok(b) => reply.data(&b),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
+    /// Write into the handle's buffer, flushing only when it fills (issue #112).
+    ///
+    /// Accumulating here is the whole point: `Fs::vfs_write` rewrites the entire
+    /// file per request, so answering each of the kernel's requests directly made
+    /// the cost of writing a file its size times the number of writes it took.
+    /// Contiguous requests coalesce into one run ([`DirtyBuffer`]) and go out as a
+    /// single read-modify-write once `HANDLE_BUFFER_CAP` is reached — see
+    /// `OrigoFSFuse::flush_buf` for why that does not weaken the compare-and-set
+    /// guard `vfs_write` uses against concurrent writers.
+    ///
+    /// The cap is what keeps a handle that is never flushed — a process killed
+    /// mid-write — from growing without bound. Losing whatever is still buffered
+    /// at that point is inherent to buffering and is the same bargain every
+    /// page-cached filesystem makes; `flush`, `fsync` and `release` are the points
+    /// at which it is paid off.
+    ///
+    /// Replying `written` before the bytes reach the store means a store error is
+    /// reported at `flush`/`fsync`/`close` instead of at `write(2)`. That is the
+    /// deferral POSIX explicitly allows, and it is why none of those three
+    /// swallows an error. When a *cap* flush fails the error is reported here
+    /// instead, and the buffer keeps every byte — including this call's — so the
+    /// failing `write(2)` may still turn out to have landed once a later flush
+    /// succeeds. Retaining the data is the lesser surprise: the alternative is
+    /// discarding bytes the caller has no way to know were discarded.
+    ///
+    /// An unrecognized `fh` falls through to the direct path: the kernel documents
+    /// a page-cache write-back as carrying a `fh` that need not match `open`'s, and
+    /// serving that from a handle we cannot identify would be a guess. It flushes
+    /// the inode first so the direct write, being the later operation, lands last.
     #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         data: &[u8],
         _write_flags: WriteFlags,
@@ -726,7 +1226,29 @@ impl Filesystem for OrigoFSFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.blk(self.ws.fs().vfs_write(ino.0 as i64, offset, data)) {
+        let ino = ino.0 as i64;
+        if let Some(h) = self.handle(fh).filter(|h| h.ino == ino) {
+            let mut buf = h.buf.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Err(e) = buf.write_at(offset, data) {
+                reply.error(errno(&e));
+                return;
+            }
+            if buf.len() >= HANDLE_BUFFER_CAP
+                && let Err(e) = self.flush_buf(ino, &mut buf)
+            {
+                reply.error(errno(&e));
+                return;
+            }
+            reply.written(data.len() as u32);
+            return;
+        }
+        if self.any_open()
+            && let Err(e) = self.flush_ino(ino)
+        {
+            reply.error(errno(&e));
+            return;
+        }
+        match self.blk(self.ws.fs().vfs_write(ino, offset, data)) {
             Ok(n) => reply.written(n),
             Err(e) => reply.error(errno(&e)),
         }
@@ -817,6 +1339,12 @@ impl Filesystem for OrigoFSFuse {
         reply.ok();
     }
 
+    /// Create and open in one step.
+    ///
+    /// The handle returned is a real one, allocated exactly as `Filesystem::open`
+    /// would: this used to hand back `FileHandle(0)`, which meant the descriptor a
+    /// freshly-created file was written through — the overwhelmingly common way a
+    /// file gets written on a mount — had no state to buffer into.
     fn create(
         &self,
         req: &Request,
@@ -833,13 +1361,10 @@ impl Filesystem for OrigoFSFuse {
                 .fs()
                 .vfs_create(parent.0 as i64, &name, mode, caller_owner(req)),
         ) {
-            Ok(i) => reply.created(
-                &TTL,
-                &to_attr(&i),
-                Generation(0),
-                FileHandle(0),
-                FopenFlags::empty(),
-            ),
+            Ok(i) => {
+                let fh = self.open_handle(i.ino);
+                reply.created(&TTL, &to_attr(&i), Generation(0), fh, FopenFlags::empty());
+            }
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -864,8 +1389,30 @@ impl Filesystem for OrigoFSFuse {
         }
     }
 
+    /// Unlink, first landing anything buffered for the file being removed.
+    ///
+    /// Otherwise a `rm` of a file some descriptor still holds dirty bytes for
+    /// would leave that descriptor's `release` writing into an inode the store has
+    /// already deleted — an `ENOENT` reported nowhere useful, and a confusing one.
+    /// Flushing first makes the removal the last word. The extra lookup is skipped
+    /// entirely unless this mount has a file open at all.
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_string_lossy().to_string();
+        if self.any_open() {
+            match self.blk(self.ws.fs().vfs_lookup(parent.0 as i64, &name)) {
+                Ok(Some(i)) => {
+                    if let Err(e) = self.flush_ino(i.ino) {
+                        reply.error(errno(&e));
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    reply.error(errno(&e));
+                    return;
+                }
+            }
+        }
         match self.blk(self.ws.fs().vfs_unlink(parent.0 as i64, &name)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
@@ -940,7 +1487,7 @@ impl Filesystem for OrigoFSFuse {
                 .fs()
                 .vfs_link(ino.0 as i64, newparent.0 as i64, &newname),
         ) {
-            Ok(i) => reply.entry(&TTL, &to_attr(&i), Generation(0)),
+            Ok(i) => reply.entry(&TTL, &self.attr_of(&i), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -1048,25 +1595,89 @@ impl Filesystem for OrigoFSFuse {
         }
     }
 
+    /// `close(2)` — write the handle's buffer out.
+    ///
+    /// The kernel calls this once per `close` of a descriptor, so a `dup`'d fd
+    /// produces several `flush`es for one `open`. That is why the flush is
+    /// idempotent rather than "write and clear": the first call empties the
+    /// buffer, every later one finds nothing and succeeds. It is also why the
+    /// handle is *not* forgotten here — `release` is the one-per-`open` callback,
+    /// and dropping the state at the first `close` would leave a still-valid
+    /// descriptor writing into a handle this mount no longer knows.
+    ///
+    /// Errors are reported. This is the callback whose whole documented purpose is
+    /// to give a filesystem somewhere to return deferred write errors, and with
+    /// buffering there are now deferred write errors to return.
     fn flush(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        match self.handle(fh) {
+            // An unknown handle has nothing buffered by construction.
+            None => reply.ok(),
+            Some(h) => match self.flush_handle(&h) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            },
+        }
     }
 
+    /// `fsync(2)` — the caller is asking for durability, so the buffer goes out.
+    ///
+    /// `datasync` is ignored: origofs stores an inode's bytes and its metadata in
+    /// the same transaction, so there is no metadata-only half to skip.
     fn fsync(
         &self,
         _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
+        ino: INodeNo,
+        fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        // Fall back to the inode when the handle is unknown (an `fsync` after an
+        // `mmap` write-back can carry one), so the data still lands.
+        let flushed = match self.handle(fh) {
+            Some(h) => self.flush_handle(&h),
+            None => self.flush_ino(ino.0 as i64),
+        };
+        match flushed {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// The last reference to an open file is gone: flush and forget the handle.
+    ///
+    /// Exactly one `release` follows each `open`, so this is the point at which
+    /// per-handle state must be dropped — and the last point at which its buffer
+    /// can still be written. The handle is removed whether or not the flush
+    /// succeeds, since keeping it would leak a buffer nobody can ever reach again;
+    /// a failure is both returned and logged, because `fuser` documents that a
+    /// `release` error never reaches the `close(2)` that triggered it.
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let Some(h) = self.close_handle(fh) else {
+            reply.ok();
+            return;
+        };
+        match self.flush_handle(&h) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                tracing::warn!(ino = h.ino, error = %e, "fuse: flush at release failed");
+                reply.error(errno(&e));
+            }
+        }
     }
 }

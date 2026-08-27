@@ -204,6 +204,48 @@ fn build_trash(row: TrashRow) -> Result<crate::trash::TrashEntry> {
     })
 }
 
+/// Refuse a table name that is not in the dump allowlist (issue #117).
+///
+/// `export_table`/`import_table` interpolate the name into SQL, which is only safe
+/// because of this check — it is the boundary that keeps a name-taking method from
+/// being an arbitrary-SQL hole. Returns the `&'static str` from the allowlist
+/// rather than the caller's string, so what reaches the SQL is a constant from this
+/// binary and never caller-controlled bytes.
+pub(crate) fn validated_dump_table(table: &str) -> Result<&'static str> {
+    crate::portable::DUMP_TABLES
+        .iter()
+        .find(|t| **t == table)
+        .copied()
+        .ok_or_else(|| OrigoFSError::InvalidArgument(format!("{table:?} is not a dumpable table")))
+}
+
+/// Read column `i` of a row as a backend-neutral [`Cell`](crate::portable::Cell).
+fn sqlite_cell(r: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<crate::portable::Cell> {
+    use crate::portable::Cell;
+    use rusqlite::types::ValueRef;
+    Ok(match r.get_ref(i)? {
+        ValueRef::Null => Cell::Null,
+        ValueRef::Integer(v) => Cell::Int(v),
+        // SQLite is dynamically typed, so a REAL can appear in a column every
+        // other backend calls BIGINT. Carried as text rather than silently
+        // truncated to an integer.
+        ValueRef::Real(v) => Cell::Text(v.to_string()),
+        ValueRef::Text(t) => Cell::Text(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Blob(b) => Cell::Bytes(b.to_vec()),
+    })
+}
+
+fn cell_to_sqlite(c: &crate::portable::Cell) -> rusqlite::types::Value {
+    use crate::portable::Cell;
+    use rusqlite::types::Value;
+    match c {
+        Cell::Null => Value::Null,
+        Cell::Int(i) => Value::Integer(*i),
+        Cell::Text(s) => Value::Text(s.clone()),
+        Cell::Bytes(b) => Value::Blob(b.clone()),
+    }
+}
+
 /// True if a DDL error is SQLite's "duplicate column name" — i.e. an
 /// `ADD COLUMN` migration re-applied to a table that already has the column.
 fn is_duplicate_column(e: &rusqlite::Error) -> bool {
@@ -775,6 +817,69 @@ impl MetadataStore for SqliteMetadataStore {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             Ok((n.max(0) as u64, b.max(0) as u64))
+        })
+    }
+
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
+        let table = validated_dump_table(table)?;
+        blocking_section(move || {
+            let conn = self.lock();
+            // Quoted: `ref` is a reserved word in both dialects, and the allowlist
+            // above is what makes interpolating the name here safe at all.
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\""))?;
+            let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(r) = rows.next()? {
+                let mut cells = Vec::with_capacity(cols.len());
+                for (i, name) in cols.iter().enumerate() {
+                    cells.push((name.clone(), sqlite_cell(r, i)?));
+                }
+                out.push(crate::portable::Row(cells));
+            }
+            Ok(out)
+        })
+    }
+
+    async fn reset_for_load(&self) -> Result<()> {
+        blocking_section(move || {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            // Reverse dependency order, so nothing is orphaned mid-way even though
+            // the schema declares no foreign keys to enforce it.
+            for table in crate::portable::DUMP_TABLES.iter().rev() {
+                tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
+        let table = validated_dump_table(table)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        blocking_section(move || {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            for row in rows {
+                let cols: Vec<&str> = row.0.iter().map(|(c, _)| c.as_str()).collect();
+                let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+                let quoted: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
+                let sql = format!(
+                    "INSERT INTO \"{table}\"({}) VALUES ({})",
+                    quoted.join(", "),
+                    placeholders.join(", ")
+                );
+                let vals: Vec<rusqlite::types::Value> =
+                    row.0.iter().map(|(_, v)| cell_to_sqlite(v)).collect();
+                let refs: Vec<&dyn rusqlite::ToSql> =
+                    vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+                tx.execute(&sql, refs.as_slice())?;
+            }
+            tx.commit()?;
+            Ok(())
         })
     }
 

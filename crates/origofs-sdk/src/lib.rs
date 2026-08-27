@@ -22,11 +22,11 @@ pub use origofs_core::metrics;
 pub use origofs_core::{
     Actor, ActorInit, ActorKind, BlameRange, CacheLimits, CommitInfo, Conflict,
     DEFAULT_GC_GRACE_SECS, DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event,
-    EventInit, FileKind, GcStats, Hash, Inode, LiveDoc, MemStore, MergeOutcome, OrigoFSError,
-    Owner, PackStore, Passage, PassageOptions, Presence, RebuildReport, ResyncOutcome,
-    ResyncReport, Scope, ScopeError, Segmentation, Suggestion, SuggestionContent, SuggestionInit,
-    SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats, TrashEntry,
-    VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    EventInit, FileKind, GcStats, Hash, Inode, LiveDoc, LoadReport, MemStore, MergeOutcome,
+    OrigoFSError, Owner, PackStore, Passage, PassageOptions, Presence, RebuildReport,
+    ResyncOutcome, ResyncReport, Scope, ScopeError, Segmentation, Suggestion, SuggestionContent,
+    SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats,
+    TrashEntry, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
 };
 // Backend-specific re-exports, gated to match `origofs-core`'s own features.
 #[cfg(feature = "encryption")]
@@ -901,6 +901,25 @@ impl Workspace {
     #[tracing::instrument(skip_all)]
     pub async fn gc(&self) -> Result<GcStats> {
         self.fs.gc().await
+    }
+
+    // --- portable dump/load (issue #117) ------------------------------------
+
+    /// Write an engine-independent dump of the whole metadata store.
+    ///
+    /// The metadata DB is the half the content store cannot rebuild: `fsck
+    /// --rebuild` recovers committed files, dirs, symlinks and branches from the
+    /// bucket alone, and none of the attribution. This is how that half moves —
+    /// as a backup, or as the SQLite → Postgres migration path that did not
+    /// previously exist.
+    pub async fn dump<W: std::io::Write>(&self, out: W) -> Result<usize> {
+        self.fs.dump(out).await
+    }
+
+    /// Restore a dump into a pristine store. Refuses to merge — see
+    /// [`Fs::load`](origofs_core::Fs::load).
+    pub async fn load<R: std::io::BufRead>(&self, input: R) -> Result<LoadReport> {
+        self.fs.load(input).await
     }
 
     // --- trash (issue #115) ------------------------------------------------

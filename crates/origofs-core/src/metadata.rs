@@ -229,6 +229,38 @@ pub trait MetadataStore: Send + Sync {
     /// Every extended-attribute name on `ino`, in name order.
     async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>>;
 
+    // --- portable dump/load (issue #117) ----------------------------------
+
+    /// Every row of `table`, as backend-neutral cells.
+    ///
+    /// `table` **must** be one of [`DUMP_TABLES`](crate::portable::DUMP_TABLES);
+    /// implementations reject anything else. That allowlist is what keeps a
+    /// name-taking method from being an arbitrary-SQL hole.
+    ///
+    /// Rows are returned untyped rather than as structs so a dump survives being
+    /// read by a build that is not this one — see `portable.rs` on why.
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>>;
+
+    /// Insert `rows` into `table`, preserving their explicit primary keys.
+    ///
+    /// Only ever called after [`reset_for_load`](Self::reset_for_load) has emptied
+    /// the dumpable tables, so it inserts rather than upserting: a conflict here
+    /// means that reset did not happen, and failing loudly beats silently merging
+    /// two id spaces.
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()>;
+
+    /// Empty every table a dump restores, in reverse dependency order.
+    ///
+    /// A dump is **whole-store**, and a load is a restore into a pristine store —
+    /// so the rows `init` itself created (the `default` workspace, the root inode,
+    /// the default config) are exactly what has to go before the dumped ones can
+    /// take their place. Without this, a load collides on `workspace.id` before it
+    /// reaches anything interesting.
+    ///
+    /// `Fs::load` verifies the store is pristine before calling this. It is
+    /// destructive by construction, so nothing else should.
+    async fn reset_for_load(&self) -> Result<()>;
+
     // --- path-scoped ACLs (issue #123) ------------------------------------
 
     /// Upsert a prefix grant. `path_prefix` is normalized (absolute, no trailing
@@ -659,6 +691,15 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
         (**self).subtree_usage(ino).await
+    }
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
+        (**self).export_table(table).await
+    }
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
+        (**self).import_table(table, rows).await
+    }
+    async fn reset_for_load(&self) -> Result<()> {
+        (**self).reset_for_load().await
     }
     async fn set_acl(
         &self,

@@ -35,6 +35,7 @@ pub mod objectgraph;
 pub mod objectstore;
 pub mod pack;
 pub mod perf;
+pub mod portable;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod recover;
@@ -72,6 +73,7 @@ pub use corpus::{Passage, PassageOptions, Segmentation};
 pub use encrypt::EncryptedStore;
 pub use engine::{Fs, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
+pub use portable::{Cell, DUMP_FORMAT, DUMP_TABLES, LoadReport, Row};
 pub use scope::{Scope, ScopeError};
 pub use stats::{FsStat, Quota, STATFS_BLOCK_SIZE, Usage};
 pub use trash::{DEFAULT_TRASH_RETENTION_SECS, TrashEntry, TrashInit};

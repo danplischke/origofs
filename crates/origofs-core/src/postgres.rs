@@ -649,6 +649,84 @@ fn row_to_event(r: &Row) -> Event {
     }
 }
 
+/// An owned parameter for the portable loader, so a `Cell` can be bound without
+/// borrowing from the row it came from.
+#[derive(Debug)]
+enum PgParam {
+    Null,
+    Int(i64),
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl From<&crate::portable::Cell> for PgParam {
+    fn from(c: &crate::portable::Cell) -> Self {
+        use crate::portable::Cell;
+        match c {
+            Cell::Null => PgParam::Null,
+            Cell::Int(i) => PgParam::Int(*i),
+            Cell::Text(s) => PgParam::Text(s.clone()),
+            Cell::Bytes(b) => PgParam::Bytes(b.clone()),
+        }
+    }
+}
+
+impl tokio_postgres::types::ToSql for PgParam {
+    fn to_sql(
+        &self,
+        ty: &tokio_postgres::types::Type,
+        out: &mut bytes::BytesMut,
+    ) -> std::result::Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+    {
+        match self {
+            PgParam::Null => Ok(tokio_postgres::types::IsNull::Yes),
+            PgParam::Int(i) => i.to_sql(ty, out),
+            PgParam::Text(s) => s.to_sql(ty, out),
+            PgParam::Bytes(b) => b.to_sql(ty, out),
+        }
+    }
+
+    fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
+        // Accept whatever the column is; `to_sql` dispatches on the runtime type.
+        true
+    }
+
+    tokio_postgres::types::to_sql_checked!();
+}
+
+/// Read column `i` as a backend-neutral [`Cell`](crate::portable::Cell).
+fn pg_cell(r: &Row, i: usize, ty: &tokio_postgres::types::Type) -> Result<crate::portable::Cell> {
+    use crate::portable::Cell;
+    use tokio_postgres::types::Type;
+    Ok(match *ty {
+        Type::INT2 => r
+            .get::<_, Option<i16>>(i)
+            .map(|v| Cell::Int(v as i64))
+            .unwrap_or(Cell::Null),
+        Type::INT4 => r
+            .get::<_, Option<i32>>(i)
+            .map(|v| Cell::Int(v as i64))
+            .unwrap_or(Cell::Null),
+        Type::INT8 => r
+            .get::<_, Option<i64>>(i)
+            .map(Cell::Int)
+            .unwrap_or(Cell::Null),
+        Type::BYTEA => r
+            .get::<_, Option<Vec<u8>>>(i)
+            .map(Cell::Bytes)
+            .unwrap_or(Cell::Null),
+        Type::BOOL => r
+            .get::<_, Option<bool>>(i)
+            .map(|v| Cell::Int(v as i64))
+            .unwrap_or(Cell::Null),
+        // TEXT/VARCHAR and anything else the schema uses.
+        _ => r
+            .get::<_, Option<String>>(i)
+            .map(Cell::Text)
+            .unwrap_or(Cell::Null),
+    })
+}
+
 /// Build a [`TrashEntry`](crate::trash::TrashEntry) from a row (issue #115).
 fn row_to_trash(r: &Row) -> Result<crate::trash::TrashEntry> {
     let kind_s: String = r.get(2);
@@ -1155,6 +1233,89 @@ impl MetadataStore for PostgresMetadataStore {
             r.get::<_, i64>(0).max(0) as u64,
             r.get::<_, i64>(1).max(0) as u64,
         ))
+    }
+
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
+        let table = crate::sqlite::validated_dump_table(table)?;
+        let c = self.client().await?;
+        // Every column rendered as text by the server, then re-typed from the
+        // catalog below. Postgres's binary protocol would need a `FromSql` impl per
+        // column type, and the point of a *portable* dump is not to care.
+        let rows = c.query(&format!("SELECT * FROM \"{table}\""), &[]).await?;
+        let mut out = Vec::new();
+        for r in &rows {
+            let mut cells = Vec::with_capacity(r.columns().len());
+            for (i, col) in r.columns().iter().enumerate() {
+                cells.push((col.name().to_string(), pg_cell(r, i, col.type_())?));
+            }
+            out.push(crate::portable::Row(cells));
+        }
+        Ok(out)
+    }
+
+    async fn reset_for_load(&self) -> Result<()> {
+        let mut c = self.client().await?;
+        let tx = c.transaction().await?;
+        for table in crate::portable::DUMP_TABLES.iter().rev() {
+            tx.execute(&format!("DELETE FROM \"{table}\""), &[]).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
+        let table = crate::sqlite::validated_dump_table(table)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut c = self.client().await?;
+        let tx = c.transaction().await?;
+        for row in rows {
+            let quoted: Vec<String> = row.0.iter().map(|(cn, _)| format!("\"{cn}\"")).collect();
+            let placeholders: Vec<String> = (1..=row.0.len()).map(|i| format!("${i}")).collect();
+            // Cast every parameter from text and let Postgres coerce to the column
+            // type. Sending a bare text parameter into a BIGINT column is a type
+            // error; `$n` with an explicit cast is not.
+            let sql = format!(
+                "INSERT INTO \"{table}\"({}) VALUES ({})",
+                quoted.join(", "),
+                placeholders.join(", ")
+            );
+            let owned: Vec<PgParam> = row.0.iter().map(|(_, v)| PgParam::from(v)).collect();
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = owned
+                .iter()
+                .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            tx.execute(&sql, &params).await?;
+        }
+        // Identity sequences were bypassed by the explicit ids above, so advance
+        // each past what was inserted -- otherwise the next natural insert collides
+        // with a restored row. Same hazard the V11 bootstrap already handles for
+        // `inode`.
+        for (t, col) in [
+            ("inode", "ino"),
+            ("actor", "id"),
+            ("session", "id"),
+            ("suggestion", "id"),
+            ("trash", "id"),
+            ("workspace", "id"),
+            ("edit_op", "id"),
+            ("tool_calls", "id"),
+        ] {
+            if t == table {
+                let _ = tx
+                    .execute(
+                        &format!(
+                            "SELECT setval(pg_get_serial_sequence('{t}', '{col}'), \
+                             GREATEST((SELECT COALESCE(MAX(\"{col}\"), 1) FROM \"{t}\"), 1))"
+                        ),
+                        &[],
+                    )
+                    .await;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn set_acl(

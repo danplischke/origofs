@@ -1947,6 +1947,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-native-certs",
+ "serde_json",
  "similar",
  "tempfile",
  "thiserror 2.0.19",
