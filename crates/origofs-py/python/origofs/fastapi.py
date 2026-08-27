@@ -109,6 +109,21 @@ class _Name(BaseModel):
     name: str
 
 
+class _RevertSession(BaseModel):
+    """The body of a session revert.
+
+    It names the actor and session *to undo*, which is not the caller: reverting
+    an agent's sitting is a thing a reviewer does to somebody else's work. The
+    caller's own identity still comes from ``authn`` and is never in the body, so
+    the authorization question ("may this reviewer revert here?") is answered
+    server-side while the target stays a parameter.
+    """
+
+    actor: int
+    session: int
+    path_prefix: Optional[str] = None
+
+
 class _Touch(BaseModel):
     """The body of a presence heartbeat. It carries **no** actor and **no**
     session on purpose: like every other mutating route, identity is resolved
@@ -874,43 +889,50 @@ def build_router(
             raise HTTPException(status_code=409, detail=f"not a file: {p}")
         size = st["size"]
 
+        # Both branches stream in bounded pieces. The ranged one used to answer
+        # with a single `read_range(start, end - start + 1)` into a `Response`
+        # body, which reads as "a range is small" and isn't: the open-ended
+        # `bytes=0-` a <video> element sends first parses to the whole file, so
+        # the one request `docs/LIMITS.md` uses as its example materialized every
+        # byte -- roughly 2N, since pyo3 copies the buffer into Python.
+        def chunks(start: int, end: int):
+            async def gen():
+                offset = start
+                while offset <= end:
+                    want = min(_STREAM_CHUNK, end - offset + 1)
+                    try:
+                        chunk = await ws.read_range(p, offset, want)
+                    except Exception:
+                        # The file changed or vanished between stat() and this
+                        # read (a concurrent writer -- origofs is multi-writer by
+                        # design). The response is already committed to its status
+                        # and Content-Length, so a clean status change isn't
+                        # possible here; end the stream rather than let the error
+                        # propagate uncaught into the ASGI layer.
+                        return
+                    if not chunk:
+                        return
+                    yield bytes(chunk)
+                    offset += len(chunk)
+
+            return gen()
+
         parsed = _parse_range(range, size) if range else None
         if parsed is not None:
             start, end = parsed
-            data = await _run(ws.read_range(p, start, end - start + 1))
-            return Response(
-                content=bytes(data),
+            return StreamingResponse(
+                chunks(start, end),
                 status_code=206,
                 media_type=_content_type(p),
                 headers={
                     "Content-Range": f"bytes {start}-{end}/{size}",
+                    "Content-Length": str(end - start + 1),
                     "Accept-Ranges": "bytes",
                 },
             )
 
-        # No (usable) Range header: stream the whole file in bounded chunks
-        # rather than buffering it all in memory -- a large file is otherwise
-        # loaded whole before a single byte reaches the client.
-        async def chunks():
-            offset = 0
-            while offset < size:
-                try:
-                    chunk = await ws.read_range(p, offset, min(_STREAM_CHUNK, size - offset))
-                except Exception:
-                    # The file changed or vanished between stat() and this read
-                    # (a concurrent writer -- origofs is multi-writer by design).
-                    # The response is likely already committed to 200 with a
-                    # Content-Length, so a clean status change isn't possible at
-                    # this point; end the stream rather than let the error
-                    # propagate uncaught into the ASGI layer.
-                    return
-                if not chunk:
-                    return
-                yield bytes(chunk)
-                offset += len(chunk)
-
         return StreamingResponse(
-            chunks(),
+            chunks(0, size - 1),
             media_type=_content_type(p),
             headers={"Content-Length": str(size), "Accept-Ranges": "bytes"},
         )
@@ -1185,6 +1207,14 @@ def build_router(
         )
         return [r for r in rows if _under(root, r.get("path"))]
 
+    @router.get("/suggestions/{sid}", dependencies=[Depends(_read_gate)])
+    async def get_suggestion(sid: int, root: str = Depends(_root)):
+        await _in_scope_suggestion(sid, root)
+        row = await _run(ws.get_suggestion(sid))
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"no suggestion {sid}")
+        return row
+
     @router.get("/suggestions/{sid}/diff", response_class=PlainTextResponse,
                 dependencies=[Depends(_read_gate)])
     async def suggestion_diff(sid: int, root: str = Depends(_root)):
@@ -1202,6 +1232,47 @@ def build_router(
         await _in_scope_suggestion(sid, root)
         await _run(ws.reject_suggestion(sid, ctx))
         return {"rejected": sid}
+
+    @router.post("/revert-session")
+    async def revert_session(
+        req: _RevertSession,
+        ctx: Any = Depends(authn),
+        root: str = Depends(_root),
+    ):
+        """Undo exactly what one actor wrote in one session, leaving others' edits
+        in place — the headline "undo just the agent's work" operation.
+
+        ``path_prefix`` bounds it to a subtree, matched on directory boundaries.
+        On a **scoped** router omitting it does not mean "everywhere": it resolves
+        to the scope's own root, because an unbounded revert walks every file the
+        session touched across every tenant.
+
+        Authorized *after* the prefix is resolved and *against* it — a revert
+        writes to every file under that prefix, so the grant covering that subtree
+        is the one that decides, and an unbounded one is checked at ``/``.
+        """
+        prefix = req.path_prefix
+        if root:
+            if prefix is None:
+                prefix = root
+            else:
+                # Absoluteness is checked before scoping rather than left to
+                # `_scoped`, which would normalize it, so a scoped caller gets the
+                # same error an unscoped one does.
+                if not prefix.startswith("/"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"path prefix must be absolute, got {prefix!r}",
+                    )
+                prefix = _scoped(root, prefix)
+        elif prefix is not None and not prefix.startswith("/"):
+            raise HTTPException(
+                status_code=400, detail=f"path prefix must be absolute, got {prefix!r}"
+            )
+        paths = await _run(
+            ws.revert_session_as(ctx, req.actor, req.session, prefix)
+        )
+        return {"reverted": paths}
 
     # --- live collaboration -------------------------------------------------
 
@@ -1400,6 +1471,41 @@ def build_router(
         # other route gets, rather than a second one that could drift from it.
         await _run(rooms.checkpoint_tree(_tree_key(p, xml_root), ctx, body, spans))
         return {"path": p, "bytes": len(body), "spans": len(spans)}
+
+    # --- liveness and readiness ---------------------------------------------
+    #
+    # Deliberately **ungated**, matching the Rust API where these sit outside
+    # `/v1`: a load balancer and a Kubernetes probe have no bearer token, and a
+    # health endpoint that answers 401 reads as an unhealthy backend. Neither
+    # reveals anything about the workspace's contents -- `/readyz` reports which
+    # *store* is unreachable, not what is in it.
+    #
+    # They carry no scope either. A scoped router is one tenant's view of a
+    # workspace, and whether the process can reach its stores is a property of the
+    # process.
+
+    @router.get("/health")
+    async def health():
+        """Liveness: the process is up and serving. Always 200.
+
+        Distinct from `/readyz` on purpose — a liveness probe that fails when a
+        *dependency* is down gets the container restarted, which fixes nothing and
+        drops the connections it was still serving.
+        """
+        return {"status": "ok"}
+
+    @router.get("/readyz")
+    async def readyz(response: Response):
+        """Readiness: both stores answered a ping. `503` when either did not.
+
+        The status code is the answer — a probe reads that, not the body — and the
+        body names which store failed and why, so the page that follows starts with
+        the cause rather than with a bisect.
+        """
+        report = await _run(ws.ready())
+        if not report.get("ready", False):
+            response.status_code = 503
+        return report
 
     return router
 

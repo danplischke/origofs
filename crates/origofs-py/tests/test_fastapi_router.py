@@ -869,3 +869,173 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+# --- routes the Rust API had and this router did not -------------------------
+#
+# `origofs.fastapi` is a separate hand-written surface rather than a binding of the
+# axum router, so the two drift independently. These are what the diff turned up.
+
+
+def test_revert_session_undoes_one_actors_sitting():
+    """The headline "undo just the agent's work" operation had no route here.
+
+    It is the one thing a host running agents most needs from an HTTP surface,
+    and a Python service had to reach past the router to get it.
+    """
+    c, ws, dan, sess, hdr = _real_client_with_actor()
+
+    async def _setup():
+        agent = await ws.create_agent("claude", "opus", dan)
+        asess = await ws.create_session(agent, "run-1")
+        actx = origofs.WriteCtx.session(agent, asess)
+        await ws.write_as(origofs.WriteCtx.session(dan, sess), "/notes.md", b"human\n")
+        await ws.write_as(actx, "/notes.md", b"human\nagent\n")
+        return agent, asess
+
+    agent, asess = asyncio.run(_setup())
+
+    r = c.post(
+        "/revert-session", json={"actor": agent, "session": asess}, headers=hdr
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["reverted"] == ["/notes.md"]
+    # Exactly the agent's line went; the human's stayed.
+    assert c.get("/files/notes.md").content == b"human\n"
+
+
+def test_revert_session_needs_a_credential_and_an_absolute_prefix():
+    c, _ws, _dan, _sess, hdr = _real_client_with_actor()
+    assert c.post("/revert-session", json={"actor": 1, "session": 1}).status_code == 401
+    r = c.post(
+        "/revert-session",
+        json={"actor": 1, "session": 1, "path_prefix": "docs"},
+        headers=hdr,
+    )
+    assert r.status_code == 400, r.text
+    assert "absolute" in r.json()["detail"]
+
+
+def test_a_scoped_revert_defaults_to_the_scope_not_everywhere():
+    """Omitting the prefix on a scoped router must not mean "every tenant".
+
+    This is the one place a `None` filter must not stay `None`: an unbounded
+    revert walks every file the session touched, across every tenant in the
+    workspace.
+    """
+    c, ws, dan, sess, hdr = _real_client_with_actor(root="/tenant-a")
+
+    async def _setup():
+        ctx = origofs.WriteCtx.session(dan, sess)
+        await ws.mkdir_as(ctx, "/tenant-a")
+        await ws.mkdir_as(ctx, "/tenant-b")
+        await ws.write_as(ctx, "/tenant-a/mine.txt", b"a\n")
+        await ws.write_as(ctx, "/tenant-b/theirs.txt", b"b\n")
+
+    asyncio.run(_setup())
+
+    r = c.post("/revert-session", json={"actor": dan, "session": sess}, headers=hdr)
+    assert r.status_code == 200, r.text
+    # Only the in-scope file was touched.
+    assert r.json()["reverted"] == ["/tenant-a/mine.txt"]
+
+    async def _other_tenant():
+        return bytes(await ws.read("/tenant-b/theirs.txt"))
+
+    assert asyncio.run(_other_tenant()) == b"b\n"
+
+
+def test_a_single_suggestion_is_readable_by_id():
+    c, ws, dan, sess, hdr = _real_client_with_actor()
+
+    async def _setup():
+        agent = await ws.create_agent("claude", "opus", dan)
+        actx = origofs.WriteCtx.actor(agent)
+        await ws.write_as(origofs.WriteCtx.actor(dan), "/f.txt", b"one\n")
+        return await ws.suggest(actx, "/f.txt", b"one\ntwo\n", "add a line")
+
+    sid = asyncio.run(_setup())
+
+    row = c.get(f"/suggestions/{sid}").json()
+    assert row["id"] == sid
+    assert row["path"] == "/f.txt"
+    assert row["status"] == "pending"
+    assert c.get("/suggestions/99999").status_code == 404
+
+
+def test_health_and_readyz_are_distinct_and_ungated():
+    """A probe has no bearer token, so a health route that answers 401 reads as
+    an unhealthy backend. Both sit outside the read gate, matching the Rust API
+    where they sit outside `/v1`."""
+    c, _ws, _dan, _sess, _hdr = _real_client_with_actor(
+        reader=_denying_reader()
+    )
+    assert c.get("/health").json() == {"status": "ok"}
+    r = c.get("/readyz")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ready"] is True
+    assert body["metadata"] is None and body["content"] is None
+    # …while an ordinary read is gated, so the two really are on different paths.
+    assert c.get("/stat/anything").status_code == 401
+
+
+def _denying_reader():
+    async def _reader() -> None:
+        raise HTTPException(status_code=401, detail="unauthenticated")
+
+    return _reader
+
+
+# --- ranged reads stream ------------------------------------------------------
+
+
+def test_a_ranged_read_does_not_materialize_the_range():
+    """`docs/LIMITS.md` claims ranged responses stream and names this router.
+
+    It did not: the 206 branch answered with one `read_range(start, len)` into a
+    `Response` body, and the open-ended `bytes=0-` a <video> element sends first
+    parses to the whole file — so the exact request the doc uses as its example
+    materialized every byte, through pyo3's copy.
+    """
+    ws = FakeWs()
+    # Deliberately several times `_STREAM_CHUNK`: at exactly one chunk the old
+    # whole-range read and the new streaming one are indistinguishable, so the
+    # test would pass against the bug it exists to catch.
+    ws.files["/big.bin"] = bytes(range(256)) * 16384  # 4 MiB
+    reads = []
+    inner = ws.read_range
+
+    async def counting_read_range(path, off, length):
+        reads.append(length)
+        return await inner(path, off, length)
+
+    ws.read_range = counting_read_range
+    c = _client(ws)
+
+    r = c.get("/files/big.bin", headers={"Range": "bytes=0-"})
+    assert r.status_code == 206
+    size = 4 << 20
+    assert r.headers["Content-Range"] == f"bytes 0-{size - 1}/{size}"
+    assert r.headers["Content-Length"] == str(size)
+    assert len(r.content) == size
+    assert r.content == ws.files["/big.bin"]
+    # The body arrived in bounded pieces rather than one whole-file read.
+    assert len(reads) == 4 and max(reads) == 1 << 20, reads
+
+    # A genuinely small range is still one read, and exact.
+    reads.clear()
+    r = c.get("/files/big.bin", headers={"Range": "bytes=10-19"})
+    assert r.status_code == 206
+    assert r.content == ws.files["/big.bin"][10:20]
+    assert reads == [10]
+
+
+def test_an_empty_file_still_answers_cleanly():
+    ws = FakeWs()
+    ws.files["/empty.txt"] = b""
+    c = _client(ws)
+    r = c.get("/files/empty.txt")
+    assert r.status_code == 200 and r.content == b""
+    # A range against a zero-length file is unsatisfiable.
+    assert c.get("/files/empty.txt", headers={"Range": "bytes=0-"}).status_code == 416
