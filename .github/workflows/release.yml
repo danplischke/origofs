@@ -51,7 +51,7 @@ jobs:
     steps:
       # Full history: `merge-base --is-ancestor` needs both the tagged commit and
       # main's, and a tag push checks out at depth 1 by default.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -108,9 +108,9 @@ jobs:
             target: x86_64-pc-windows-msvc
             args: --release --out dist
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -142,7 +142,7 @@ jobs:
           pip install --no-index --find-links dist origofs
           python ../../.github/scripts/wheel_smoke.py
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.name }}
           path: crates/origofs-py/dist/*.whl
@@ -153,14 +153,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
           working-directory: crates/origofs-py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: crates/origofs-py/dist/*.tar.gz
@@ -176,12 +176,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - name: Upload to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
@@ -208,7 +208,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
