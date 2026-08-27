@@ -2428,3 +2428,193 @@ fn load_refuses_a_workspace_that_already_holds_data() {
     dst.run(&["read", "/a.txt"])
         .expect_err("the refused load must not have applied anything");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `serve` deployment options
+//
+// `origofs serve` used to call `api::serve`, which builds the router with
+// `ApiOptions::default()`. Every field of `ApiOptions` was therefore unreachable
+// from the shipped binary — including `gate_reads`, which defaults to *off*. So a
+// server that carefully refused to expose unauthenticated writes off-loopback
+// handed every file's bytes, its blame map, the change feed and the review queue
+// to any unauthenticated caller, and there was no flag to change it.
+//
+// These drive a real server over a real socket, because the bug was precisely
+// that the options never reached one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A port nothing is listening on. Racy in principle; the window is a few
+/// microseconds and the alternative is parsing a port out of the child's stdout.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// `origofs serve` in the background, killed when the guard drops.
+struct Server {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Server {
+    fn start(ws: &Ws, extra: &[&str]) -> Server {
+        Server::start_with_env(ws, extra, &[])
+    }
+
+    fn start_with_env(ws: &Ws, extra: &[&str], env: &[(&str, String)]) -> Server {
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let mut args = vec![
+            "--workspace",
+            ws.dir.to_str().unwrap(),
+            "serve",
+            "--addr",
+            &addr,
+        ];
+        args.extend_from_slice(extra);
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_origofs"));
+        cmd.args(&args)
+            .env("RUST_BACKTRACE", "0")
+            .env_remove("ORIGOFS_AUTH_TOKENS")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("the origofs binary must be built");
+        let server = Server { child, port };
+        // Wait for the listener rather than sleeping a fixed amount.
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return server;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("serve never bound 127.0.0.1:{port}");
+    }
+
+    /// One HTTP/1.1 request, returning the status line. Hand-rolled so the test
+    /// suite does not grow an HTTP client dependency to check two status codes.
+    fn get(&self, path: &str, bearer: Option<&str>) -> String {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let auth = bearer.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{auth}\r\n"
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out.lines().next().unwrap_or_default().to_string()
+    }
+}
+
+/// **The regression.** `--gate-reads` must actually reach the router.
+///
+/// Without it reads are open, which is the documented default; with it a read
+/// needs the same credential a write does. Both halves are asserted, because a
+/// flag that is silently ignored and a flag that is silently always-on are the
+/// same class of bug.
+#[test]
+fn serve_gate_reads_requires_a_credential_for_reads() {
+    let ws = Ws::init();
+    let actor = ws.actor(&["alice"]);
+    ws.write_as("/secret.txt", actor, "classified\n")
+        .expect_ok("write");
+    let token = format!("tok=={actor}");
+
+    let open = Server::start(&ws, &["--auth-token", &token]);
+    assert!(
+        open.get("/v1/files/secret.txt", None).contains("200"),
+        "reads are open by default"
+    );
+    drop(open);
+
+    let gated = Server::start(&ws, &["--auth-token", &token, "--gate-reads"]);
+    let anon = gated.get("/v1/files/secret.txt", None);
+    assert!(
+        anon.contains("401"),
+        "--gate-reads must refuse an unauthenticated read, got {anon:?}"
+    );
+    let authed = gated.get("/v1/files/secret.txt", Some("tok="));
+    assert!(
+        authed.contains("200"),
+        "--gate-reads must still serve a credentialed read, got {authed:?}"
+    );
+}
+
+/// `--root` scopes what the surface can address: a path outside is not
+/// representable, so it reads as **404** rather than 403 — a 403 would confirm
+/// that something is there.
+#[test]
+fn serve_root_scopes_the_surface() {
+    let ws = Ws::init();
+    let actor = ws.actor(&["alice"]);
+    ws.run(&["mkdir", "/tenant-a", "--actor", &actor.to_string()])
+        .expect_ok("mkdir");
+    ws.write_as("/tenant-a/in.txt", actor, "mine\n")
+        .expect_ok("write in scope");
+    ws.write_as("/elsewhere.txt", actor, "theirs\n")
+        .expect_ok("write out of scope");
+
+    let s = Server::start(&ws, &["--root", "/tenant-a"]);
+    assert!(
+        s.get("/v1/files/in.txt", None).contains("200"),
+        "a path inside the root resolves inside it"
+    );
+    let outside = s.get("/v1/files/elsewhere.txt", None);
+    assert!(
+        outside.contains("404"),
+        "a path outside the root must be unreachable, got {outside:?}"
+    );
+}
+
+/// A malformed `--root` is a user error with a message, not a panic.
+///
+/// `router_with` panics on one — right for a library whose caller is code, wrong
+/// for a value someone typed at a shell.
+#[test]
+fn serve_rejects_a_relative_root() {
+    let ws = Ws::init();
+    ws.run(&["serve", "--addr", "127.0.0.1:1", "--root", "tenant-a"])
+        .expect_err("a relative --root")
+        .stderr_has("absolute");
+}
+
+/// Bearer tokens can come from the environment instead of argv, where `ps` and
+/// shell history expose them — the reason `ORIGOFS_ENCRYPTION_KEY` is env-only.
+#[test]
+fn serve_reads_auth_tokens_from_the_environment() {
+    let ws = Ws::init();
+    let actor = ws.actor(&["alice"]);
+    ws.write_as("/f.txt", actor, "hi\n").expect_ok("write");
+
+    let s = Server::start_with_env(
+        &ws,
+        &["--gate-reads"],
+        &[("ORIGOFS_AUTH_TOKENS", format!("envtok={actor}"))],
+    );
+    let authed = s.get("/v1/files/f.txt", Some("envtok"));
+    assert!(
+        authed.contains("200"),
+        "a token from ORIGOFS_AUTH_TOKENS must authenticate, got {authed:?}"
+    );
+    let anon = s.get("/v1/files/f.txt", None);
+    assert!(
+        anon.contains("401"),
+        "and reads must still be gated, got {anon:?}"
+    );
+}
