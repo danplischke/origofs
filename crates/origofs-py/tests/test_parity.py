@@ -33,6 +33,8 @@ makes the next omission fail rather than go unnoticed.
 import asyncio
 import functools
 import os
+import pathlib
+import re
 import tempfile
 
 import pytest
@@ -452,59 +454,135 @@ async def test_encryption_at_rest_round_trips_and_rejects_a_wrong_key():
 
 
 # --- the guard ------------------------------------------------------------
+#
+# This used to be a hand-written set of names, which could only catch the
+# *regression* of a binding somebody had already thought of. The failure #120
+# describes is the opposite one — an engine method nobody noticed — and an
+# allowlist is structurally unable to see it. So the guard reads both surfaces and
+# diffs them, and every deliberately-unbound name has to say why.
+
+SDK = pathlib.Path(__file__).resolve().parents[2] / "origofs-sdk" / "src" / "lib.rs"
+PYO3 = pathlib.Path(__file__).resolve().parents[1] / "src" / "lib.rs"
+STUB = pathlib.Path(__file__).resolve().parents[1] / "python" / "origofs" / "__init__.pyi"
+
+# `Workspace` methods that are Rust-only on purpose, each with the reason. A name
+# lands here when binding it would be meaningless (a Rust-idiom constructor), when
+# Python reaches the same thing under a better name, or -- one case -- when the
+# unauthorized form must not be reachable from a surface.
+#
+# Adding an entry is the deliberate act the check exists to force. Adding one to
+# avoid writing a binding is the thing it exists to prevent, so the reason is
+# prose and is expected to argue.
+RUST_ONLY = {
+    # -- renamed, because the Python spelling says what it does --
+    "get_actor": "bound as `actor`",
+    "list_branches": "bound as `branches`",
+    "open_pg_local": "bound as `open_pg`, whose signature already takes a cas_dir",
+    "read_stream": "bound as `read_to_path`; Python has no BoxStream to return",
+    "read_to_writer": "bound as `read_to_path`",
+    "read_range_stream": "bound as `read_range`, which is already chunk-scoped",
+    "write_reader": "bound as `write_path`",
+    "write_reader_as": "bound as `write_path_as`",
+    "is_ready": "bound as `ready`, which returns the full report rather than a bool",
+    # -- Rust idiom with no Python meaning --
+    "new": "constructor over Arc<dyn ...> backends a Python caller cannot build",
+    "open": "same; the `open_*` constructors are the Python surface",
+    "open_encrypted": "same; `open_local_encrypted` and the `_encrypted` forms are bound",
+    "fs": "returns the `Fs` engine handle; the bindings call through it themselves",
+    "shutdown_signal": "a Rust shutdown future; `serve_nfs` owns its own lifecycle",
+    "latest_schema_version": "a constant, reported inside `migrate`/`schema_version`",
+    "open_for_range": "returns a Manifest to stream from; `read_range` is the Python shape",
+    "max_bytes": "a `CacheConfig` builder method, exposed as a constructor kwarg",
+    "min_free_bytes": "same",
+    # -- deliberately not exposed --
+    "dump": (
+        "only `dump_as` is bound. A dump is whole-store -- every workspace, every "
+        "actor's auth_subject, every ACL grant, all blame -- and nothing about it "
+        "is path-scoped, so binding the unauthorized form would hand any "
+        "authenticated caller of a Python service the entire store."
+    ),
+}
 
 
-def test_the_recent_engine_surface_is_bound():
-    """Every method the recent engine work added is reachable from Python.
+def _sdk_methods() -> set:
+    """Public `Workspace` methods in the Rust SDK."""
+    return set(re.findall(r"^\s*pub (?:async )?fn (\w+)", SDK.read_text(), re.M))
 
-    A presence check, deliberately: the behavioural tests below are the real
-    coverage, but they cannot fail for a method nobody thought to bind — which is
-    exactly the failure #120 describes. Adding a name here costs one line and is
-    the last step of "the engine feature is done".
+
+def _impl_body(text: str, header: str) -> str:
+    """The body of a brace-balanced Rust `impl` block."""
+    lines = text.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith(header))
+    depth = 0
+    out = []
+    for i, line in enumerate(lines[start:], start):
+        depth += line.count("{") - line.count("}")
+        out.append(line)
+        if depth == 0 and i > start:
+            break
+    return "\n".join(out)
+
+
+def _pyo3_methods() -> set:
+    body = _impl_body(PYO3.read_text(), "impl Workspace {")
+    return set(re.findall(r"^\s*(?:pub )?fn (\w+)", body, re.M))
+
+
+def _stub_methods() -> set:
+    # Stop at the next *top-level* statement: module-level functions follow the
+    # class, and `\s+` would happily eat the newline in front of one.
+    m = re.search(r"^class Workspace.*?(?=^class |^def |\Z)", STUB.read_text(), re.M | re.S)
+    assert m, "no `class Workspace` in the stub"
+    return set(re.findall(r"^[ \t]+(?:async )?def (\w+)", m.group(0), re.M))
+
+
+def test_every_sdk_method_is_bound_or_has_a_reason():
+    """The engine surface and the Python surface, diffed.
+
+    An engine feature is done when a Python caller can reach it. This is what
+    makes that a fact rather than an intention: a new `Workspace` method in the
+    Rust SDK fails here until it is either bound or listed in `RUST_ONLY` with a
+    reason somebody had to write down.
     """
-    expected = {
-        # trash (#115)
-        "trash_retention",
-        "set_trash_retention",
-        "list_trash",
-        "restore_trash",
-        "purge_trash",
-        "empty_trash",
-        "remove_trashing",
-        # usage accounting, quotas, statfs (#116, #119)
-        "usage",
-        "du",
-        "quota",
-        "set_quota",
-        "statfs",
-        # ownership and the POSIX metadata ops (#119, #121, #122)
-        "chmod",
-        "chown",
-        "link",
-        "getxattr",
-        "setxattr",
-        "listxattr",
-        "removexattr",
-        # path-scoped write ACLs (#123)
-        "grant",
-        "revoke",
-        "list_grants",
-        "effective_perms",
-        "acl_default_deny",
-        "set_acl_default_deny",
-        "ensure_may_write_at",
-        # origofs info / bench (#118)
-        "file_layout",
-        "bench",
-    }
-    missing = sorted(n for n in expected if not hasattr(origofs.Workspace, n))
-    assert not missing, (
-        f"these engine features have no Python binding: {missing}. The pyo3 method "
-        f"and its test here are part of the feature, not follow-up work (#120)."
+    unbound = _sdk_methods() - _pyo3_methods() - set(RUST_ONLY)
+    assert not unbound, (
+        f"these SDK methods have no Python binding: {sorted(unbound)}. The pyo3 "
+        f"method, its `.pyi` entry and a test here are part of the engine "
+        f"feature, not follow-up work (#120). If one is Rust-only on purpose, add "
+        f"it to RUST_ONLY with the reason."
     )
-    # Path scoping (#125) is a type rather than a Workspace method — it belongs to
-    # the router or connection, not to a workspace handle.
-    assert hasattr(origofs, "Scope")
+
+
+def test_rust_only_entries_are_still_real():
+    """A stale exemption is worse than none: it reads as a considered decision.
+
+    So an entry that has since been bound, or whose method no longer exists, has
+    to be removed rather than left to accumulate.
+    """
+    sdk, pyo3 = _sdk_methods(), _pyo3_methods()
+    gone = sorted(n for n in RUST_ONLY if n not in sdk)
+    assert not gone, f"RUST_ONLY names methods the SDK no longer has: {gone}"
+    now_bound = sorted(n for n in RUST_ONLY if n in pyo3)
+    assert not now_bound, (
+        f"RUST_ONLY still excuses methods that are now bound: {now_bound}. Drop "
+        f"the entries."
+    )
+
+
+def test_the_type_stub_declares_every_binding():
+    """`mypy` checks call sites against the stub and nothing checks the stub.
+
+    A bound method missing from `__init__.pyi` is rejected by a type checker for a
+    method that is right there, which is the drift #95 added the stub to prevent.
+    `test_stub_records.py` covers the record *shapes*; this covers the method list.
+    """
+    undeclared = _pyo3_methods() - _stub_methods()
+    assert not undeclared, (
+        f"bound but missing from __init__.pyi: {sorted(undeclared)}"
+    )
+    # …and the reverse, which type-checks a call that fails at runtime.
+    phantom = _stub_methods() - _pyo3_methods()
+    assert not phantom, f"declared in __init__.pyi but not bound: {sorted(phantom)}"
 
 
 # --- path scoping (#125) --------------------------------------------------
