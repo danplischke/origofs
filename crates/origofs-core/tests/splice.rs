@@ -452,3 +452,168 @@ async fn splicing_preserves_deduplication() {
     );
     assert_eq!(&fs.read("/d.bin").await.unwrap()[..], &body[..]);
 }
+
+// --- zero-length writes ------------------------------------------------------
+
+/// A zero-length write has no effect and, above all, does not panic.
+///
+/// `write(2)` says a zero-count write to a regular file "may return zero and have
+/// no other results". The splice path did not treat it as its own case: no chunk
+/// satisfies `cend > offset && cstart < end` when `end == offset`, so an empty
+/// write *inside* the file fell through to the past-EOF branch and anchored on the
+/// file's tail. `region_start` then sat past `offset`, and `offset - region_start`
+/// underflowed — a subtract-overflow panic in debug, an out-of-bounds slice index
+/// in release.
+///
+/// Offset 0 of any file with three or more chunks was enough, and `nfs.rs` hands a
+/// zero-count NFSv3 WRITE straight through to `vfs_write`, so a client reached it.
+#[tokio::test]
+async fn a_zero_length_write_is_a_no_op_everywhere() {
+    let (fs, _s) = fixture().await;
+    fs.vfs_create(INO_ROOT, "z.bin", 0o644, Owner::ROOT)
+        .await
+        .unwrap();
+    let ino = fs.stat("/z.bin").await.unwrap().ino;
+    let body = media(1 << 20, 23);
+    fs.vfs_write(ino, 0, &body).await.unwrap();
+
+    // Every interesting position: the front (the original repro), mid-chunk,
+    // offsets that land on or near chunk boundaries, exactly EOF, and past EOF —
+    // which must *not* extend the file the way a non-empty write past EOF would.
+    // Which offsets are true boundaries depends on the content, and correctness
+    // here must not depend on knowing them.
+    let offsets = [0u64, 1, 4096, 65_536, 262_144, 700_000]
+        .into_iter()
+        .chain([body.len() as u64, body.len() as u64 + 4096]);
+    for off in offsets {
+        let n = fs.vfs_write(ino, off, &[]).await.unwrap();
+        assert_eq!(n, 0, "a zero-length write at {off} reported bytes written");
+        let got = fs.read("/z.bin").await.unwrap();
+        assert_eq!(
+            got.len(),
+            body.len(),
+            "a zero-length write at {off} changed the size"
+        );
+        assert!(
+            got[..] == body[..],
+            "a zero-length write at {off} changed bytes"
+        );
+    }
+}
+
+/// The same, on a file with no body at all — the degenerate manifest.
+#[tokio::test]
+async fn a_zero_length_write_to_an_empty_file_is_a_no_op() {
+    let (fs, _s) = fixture().await;
+    fs.vfs_create(INO_ROOT, "e.bin", 0o644, Owner::ROOT)
+        .await
+        .unwrap();
+    let ino = fs.stat("/e.bin").await.unwrap().ino;
+    assert_eq!(fs.vfs_write(ino, 0, &[]).await.unwrap(), 0);
+    assert_eq!(fs.vfs_write(ino, 4096, &[]).await.unwrap(), 0);
+    assert_eq!(fs.vfs_getattr(ino).await.unwrap().size, 0);
+    assert!(fs.read("/e.bin").await.unwrap().is_empty());
+}
+
+// --- holes are not materialized ----------------------------------------------
+
+/// Growing a file is a manifest edit, not a write of the hole.
+///
+/// Growth used to be `splice_body` of a one-byte write at the new end, which
+/// materialized the entire gap first: allocating it, zeroing it, and running
+/// FastCDC over all of it. Measured against the content store, so this is a
+/// statement about the algorithm rather than about the runner.
+#[tokio::test]
+async fn growing_a_file_does_not_materialize_the_hole() {
+    let (fs, store) = fixture().await;
+    fs.vfs_create(INO_ROOT, "h.bin", 0o644, Owner::ROOT)
+        .await
+        .unwrap();
+    let ino = fs.stat("/h.bin").await.unwrap().ino;
+    let body = media(50_000, 29);
+    fs.vfs_write(ino, 0, &body).await.unwrap();
+
+    store.reset();
+    let grown = 256 << 20; // 256 MiB
+    fs.vfs_truncate(ino, grown).await.unwrap();
+
+    // A hole of any size stores at most two distinct objects (one full zero chunk
+    // that every whole chunk of the run shares, plus a short remainder) and the
+    // manifest. Anything proportional to the hole means it was materialized.
+    let put = store.put_bytes();
+    assert!(
+        put < 8 << 20,
+        "growing to {grown} bytes stored {put} bytes; the hole was materialized"
+    );
+    assert!(
+        store.get_bytes() < 8 << 20,
+        "growing re-read {} bytes of the body",
+        store.get_bytes()
+    );
+    assert_eq!(fs.vfs_getattr(ino).await.unwrap().size, grown);
+
+    // And it still reads back correctly at both ends of the hole.
+    let head = fs.vfs_read(ino, 0, 50_000).await.unwrap();
+    assert!(head[..] == body[..], "the original bytes moved");
+    let tail = fs.vfs_read(ino, grown - 4096, 4096).await.unwrap();
+    assert_eq!(tail.len(), 4096);
+    assert!(tail.iter().all(|b| *b == 0), "the hole must read as zeroes");
+    let seam = fs.vfs_read(ino, 49_990, 20).await.unwrap();
+    assert!(seam[..10] == body[49_990..], "the seam lost bytes");
+    assert!(seam[10..].iter().all(|b| *b == 0), "the seam is not zeroed");
+}
+
+/// The same for a write that *starts* past EOF, which leaves a hole behind it.
+#[tokio::test]
+async fn a_write_far_past_eof_does_not_materialize_the_gap() {
+    let (fs, store) = fixture().await;
+    fs.vfs_create(INO_ROOT, "p.bin", 0o644, Owner::ROOT)
+        .await
+        .unwrap();
+    let ino = fs.stat("/p.bin").await.unwrap().ino;
+    let body = media(50_000, 31);
+    fs.vfs_write(ino, 0, &body).await.unwrap();
+
+    store.reset();
+    let at = 256u64 << 20;
+    let patch = media(10, 37);
+    fs.vfs_write(ino, at, &patch).await.unwrap();
+
+    let put = store.put_bytes();
+    assert!(
+        put < 8 << 20,
+        "writing 10 bytes at offset {at} stored {put} bytes; the gap was materialized"
+    );
+    assert_eq!(fs.vfs_getattr(ino).await.unwrap().size, at + 10);
+    assert!(fs.vfs_read(ino, 0, 50_000).await.unwrap()[..] == body[..]);
+    assert!(fs.vfs_read(ino, at, 10).await.unwrap()[..] == patch[..]);
+    assert!(
+        fs.vfs_read(ino, at - 4096, 4096)
+            .await
+            .unwrap()
+            .iter()
+            .all(|b| *b == 0),
+        "the gap must read as zeroes"
+    );
+}
+
+/// A hole is ordinary content once written into: the bytes land, and the zeroes
+/// around them survive.
+#[tokio::test]
+async fn writing_into_a_hole_is_exact() {
+    let (fs, _s) = fixture().await;
+    fs.vfs_create(INO_ROOT, "w.bin", 0o644, Owner::ROOT)
+        .await
+        .unwrap();
+    let ino = fs.stat("/w.bin").await.unwrap().ino;
+    fs.vfs_truncate(ino, 4 << 20).await.unwrap();
+
+    let patch = media(5000, 41);
+    fs.vfs_write(ino, 2 << 20, &patch).await.unwrap();
+
+    let mut want = vec![0u8; 4 << 20];
+    want[2 << 20..(2 << 20) + 5000].copy_from_slice(&patch);
+    let got = fs.read("/w.bin").await.unwrap();
+    assert_eq!(got.len(), want.len());
+    assert!(got[..] == want[..], "writing into a hole was not exact");
+}
