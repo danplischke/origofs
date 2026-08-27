@@ -868,7 +868,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     where
         R: std::io::Read + Send + 'static,
     {
-        self.ensure_may_write(ctx, "write a file").await?;
+        // Path-scoped since #123: the grant covering this path decides, falling
+        // back to the actor's whole-workspace write policy when it has none.
+        self.ensure_may_write_at(ctx, "write a file", path).await?;
 
         let (parent, name) = self.resolve_parent(path).await?;
         self.ensure_dir(parent).await?;
@@ -960,7 +962,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// accepts requests from possibly-untrusted actors: it queues a propose-only
     /// actor's removal for review instead of refusing it outright.
     pub async fn remove_as(&self, ctx: WriteCtx, path: &str) -> Result<()> {
-        self.ensure_may_write(ctx, "remove files").await?;
+        self.ensure_may_write_at(ctx, "remove files", path).await?;
         self.remove_as_unchecked(ctx, path).await
     }
 
@@ -1011,7 +1013,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// The source is recoverable from the inode's earlier ops, and the change-feed
     /// event emitted at the workspace boundary carries `from → to` in its `detail`.
     pub async fn rename_as(&self, ctx: WriteCtx, from: &str, to: &str) -> Result<()> {
-        self.ensure_may_write(ctx, "rename files").await?;
+        // Two checks, not one: scoping only the source would let an actor move a
+        // file it controls into a tree it does not (#123).
+        self.ensure_may_rename(ctx, from, to).await?;
         let inode = self.stat(from).await?;
         self.rename(from, to).await?;
         self.meta
@@ -1035,7 +1039,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Create a directory (and any missing parents), attributed to `ctx` and
     /// subject to its write policy.
     pub async fn mkdir_as(&self, ctx: WriteCtx, path: &str) -> Result<Ino> {
-        self.ensure_may_write(ctx, "create directories").await?;
+        self.ensure_may_write_at(ctx, "create directories", path)
+            .await?;
         let ino = self.mkdir_p(path).await?;
         self.meta
             .append_edit_op(EditOpInit {
@@ -1058,7 +1063,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Create a symlink at `linkpath` pointing at `target`, attributed to `ctx`
     /// and subject to its write policy.
     pub async fn symlink_as(&self, ctx: WriteCtx, target: &str, linkpath: &str) -> Result<Ino> {
-        self.ensure_may_write(ctx, "create symlinks").await?;
+        self.ensure_may_write_at(ctx, "create symlinks", linkpath)
+            .await?;
         let ino = self.symlink(target, linkpath).await?;
         self.meta
             .append_edit_op(EditOpInit {

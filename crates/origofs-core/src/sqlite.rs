@@ -778,6 +778,72 @@ impl MetadataStore for SqliteMetadataStore {
         })
     }
 
+    async fn set_acl(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: u32,
+        granted_at: i64,
+        granted_by: Option<i64>,
+    ) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO acl(workspace_id, actor_id, path_prefix, perms, granted_at, granted_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(workspace_id, actor_id, path_prefix)
+                 DO UPDATE SET perms = excluded.perms,
+                               granted_at = excluded.granted_at,
+                               granted_by = excluded.granted_by",
+                params![
+                    self.workspace_id,
+                    actor_id,
+                    path_prefix,
+                    perms as i64,
+                    granted_at,
+                    granted_by
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn remove_acl(&self, actor_id: i64, path_prefix: &str) -> Result<bool> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM acl WHERE workspace_id = ?1 AND actor_id = ?2 AND path_prefix = ?3",
+                params![self.workspace_id, actor_id, path_prefix],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT actor_id, path_prefix, perms, granted_at, granted_by FROM acl
+                 WHERE workspace_id = ?1 AND (?2 IS NULL OR actor_id = ?2)
+                 ORDER BY LENGTH(path_prefix) DESC",
+            )?;
+            let rows = stmt.query_map(params![self.workspace_id, actor_id], |r| {
+                Ok(crate::acl::AclGrant {
+                    actor_id: r.get(0)?,
+                    path_prefix: r.get(1)?,
+                    perms: crate::acl::Perms::from_bits(r.get::<_, i64>(2)? as u32),
+                    granted_at: r.get(3)?,
+                    granted_by: r.get(4)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
     async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
         blocking_section(move || {
             let conn = self.lock();

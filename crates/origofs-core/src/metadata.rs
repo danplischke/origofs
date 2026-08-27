@@ -229,6 +229,25 @@ pub trait MetadataStore: Send + Sync {
     /// Every extended-attribute name on `ino`, in name order.
     async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>>;
 
+    // --- path-scoped ACLs (issue #123) ------------------------------------
+
+    /// Upsert a prefix grant. `path_prefix` is normalized (absolute, no trailing
+    /// slash; `""` is the workspace root).
+    async fn set_acl(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: u32,
+        granted_at: i64,
+        granted_by: Option<i64>,
+    ) -> Result<()>;
+
+    /// Remove a grant, reporting whether one existed.
+    async fn remove_acl(&self, actor_id: i64, path_prefix: &str) -> Result<bool>;
+
+    /// Grants in this workspace, optionally narrowed to one actor.
+    async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>>;
+
     // --- trash (issue #115) ----------------------------------------------
 
     /// Record a deleted entry, returning its trash id.
@@ -640,6 +659,24 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
         (**self).subtree_usage(ino).await
+    }
+    async fn set_acl(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: u32,
+        granted_at: i64,
+        granted_by: Option<i64>,
+    ) -> Result<()> {
+        (**self)
+            .set_acl(actor_id, path_prefix, perms, granted_at, granted_by)
+            .await
+    }
+    async fn remove_acl(&self, actor_id: i64, path_prefix: &str) -> Result<bool> {
+        (**self).remove_acl(actor_id, path_prefix).await
+    }
+    async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>> {
+        (**self).list_acl(actor_id).await
     }
     async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
         (**self).push_trash(init).await

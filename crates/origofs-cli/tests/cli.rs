@@ -1640,3 +1640,240 @@ fn a_malformed_config_file_is_refused_rather_than_ignored() {
     ws.run(&["--config", missing.to_str().unwrap(), "log"])
         .expect_err("a missing --config file");
 }
+
+// ── info / bench (issue #118) ────────────────────────────────────────────────
+
+/// Deterministic, high-entropy bytes. Entropy matters: a low-entropy body gives
+/// FastCDC no cut points, so every chunk runs to `MAX_CHUNK` and a test written
+/// over it would be asserting about a file that chunks nothing like a real one.
+fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// The numbers have to be right for a file whose layout the test already knows.
+/// A body under `MIN_CHUNK` is exactly one chunk, that chunk is the whole file,
+/// and nothing about it deduplicates — so every figure in the report is pinned,
+/// not merely plausible.
+#[test]
+fn info_reports_the_layout_of_a_single_chunk_file() {
+    let ws = Ws::init();
+    ws.run_in(&["write", "/small.txt"], "hello origofs")
+        .expect_ok("write");
+
+    let out = ws.run(&["info", "/small.txt"]).expect_ok("info");
+    out.stdout_has("size            13 (13 B)");
+    out.stdout_has("chunks          1 refs, 1 distinct");
+    out.stdout_has("a whole-file read fetches 1 objects");
+    out.stdout_has("chunk sizes     min 13 B, median 13 B, mean 13 B, max 13 B");
+    out.stdout_has("distinct bytes  13 B (1.00x self-dedup)");
+    out.stdout_has("residency       1/1 distinct chunks present");
+    // The chunker settings travel with the report, so a number pasted into an
+    // issue carries the parameters it was produced under.
+    out.stdout_has("chunker         min 16.0 KiB / avg 64.0 KiB / max 256.0 KiB");
+}
+
+/// A multi-megabyte file is the case `info` exists for: the report must show the
+/// read amplification (many chunks, all present) and a histogram that accounts for
+/// every one of them.
+#[test]
+fn info_reports_a_chunk_histogram_that_accounts_for_every_chunk() {
+    let ws = Ws::init();
+    let src = ws.scratch("big.bin");
+    std::fs::write(&src, pseudo_random(4 << 20, 0xC0FFEE)).unwrap();
+    ws.run(&["write", "/big.bin", "--from", src.to_str().unwrap()])
+        .expect_ok("write");
+
+    let out = ws.run(&["info", "/big.bin"]).expect_ok("info");
+    let chunks: u64 = out
+        .lines()
+        .iter()
+        .find_map(|l| l.strip_prefix("chunks          "))
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no chunk count in:\n{}", out.stdout));
+    assert!(chunks > 16, "4 MiB should span many chunks, got {chunks}");
+
+    // Every histogram bucket count must sum back to the chunk count — a bucket
+    // that silently dropped chunks would make the distribution a lie.
+    let binned: u64 = out
+        .lines()
+        .iter()
+        .filter_map(|l| l.trim().strip_prefix("<= "))
+        .filter_map(|l| l.split_whitespace().nth(2))
+        .filter_map(|n| n.parse::<u64>().ok())
+        .sum();
+    assert_eq!(
+        binned, chunks,
+        "histogram must bin every chunk:\n{}",
+        out.stdout
+    );
+    out.stdout_has(&format!(
+        "residency       {chunks}/{chunks} distinct chunks present"
+    ));
+}
+
+/// Self-dedup has to be measured. Two copies of the same block share chunks, so
+/// the report must show fewer distinct chunks than references — and must still say
+/// out loud that this counts only repetition inside the file, because that caveat
+/// is what stops the figure being read as a claim about the whole store.
+#[test]
+fn info_reports_self_dedup_and_says_what_it_excludes() {
+    let ws = Ws::init();
+    let block = pseudo_random(1 << 20, 11);
+    let src = ws.scratch("dup.bin");
+    std::fs::write(&src, [block.clone(), block].concat()).unwrap();
+    ws.run(&["write", "/dup.bin", "--from", src.to_str().unwrap()])
+        .expect_ok("write");
+
+    let out = ws.run(&["info", "/dup.bin"]).expect_ok("info");
+    let line = out
+        .lines()
+        .into_iter()
+        .find(|l| l.starts_with("chunks          "))
+        .unwrap()
+        .to_string();
+    let nums: Vec<u64> = line
+        .split_whitespace()
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    assert!(
+        nums[1] < nums[0],
+        "two copies of one block must share chunks: {line}"
+    );
+    out.stdout_has("self-dedup)");
+    out.stdout_has("repetition *within this file* only");
+    out.stdout_has("presence, not cache residency");
+}
+
+/// The probe is the only part of `info` that touches the content backend, so
+/// `--no-probe` must genuinely omit the residency line rather than print a guess.
+#[test]
+fn info_no_probe_omits_residency_rather_than_guessing() {
+    let ws = Ws::init();
+    ws.run_in(&["write", "/a.txt"], "x").expect_ok("write");
+
+    ws.run(&["info", "/a.txt", "--no-probe"])
+        .expect_ok("info --no-probe")
+        .stdout_has("residency       not probed")
+        .stdout_lacks("distinct chunks present");
+}
+
+/// `info` is a diagnosis of the read path, so it must refuse exactly what a read
+/// refuses — a directory and a missing path — instead of inventing a report.
+#[test]
+fn info_refuses_what_read_refuses() {
+    let ws = Ws::init();
+    ws.run(&["mkdir", "/d"]).expect_ok("mkdir");
+    ws.run(&["info", "/d"]).expect_err("info on a directory");
+    ws.run(&["info", "/nope"])
+        .expect_err("info on a missing path");
+}
+
+/// The end-to-end smoke test: `bench` runs all three phases, reports the settings
+/// it ran under, prints the caveats, and leaves the workspace as it found it.
+#[test]
+fn bench_runs_all_phases_and_cleans_up_after_itself() {
+    let ws = Ws::init();
+    let out = ws
+        .run(&["bench", "--dir", "/bench", "--files", "2", "--size", "1M"])
+        .expect_ok("bench");
+
+    out.stdout_has("bench: 2 files x 1.0 MiB = 2.0 MiB");
+    out.stdout_has("chunker             min 16.0 KiB / avg 64.0 KiB / max 256.0 KiB");
+    out.stdout_has("chunks produced");
+    // Unset in the test environment, and reported as unset rather than as a copy
+    // of the engine's default that could drift away from it.
+    out.stdout_has("upload concurrency  engine default (ORIGOFS_UPLOAD_CONCURRENCY unset)");
+    out.stdout_has("fetch concurrency   engine default (ORIGOFS_FETCH_CONCURRENCY unset)");
+    for phase in ["write", "read", "read#2"] {
+        assert!(
+            out.lines().iter().any(|l| l.starts_with(phase)),
+            "missing the {phase} row:\n{}",
+            out.stdout
+        );
+    }
+    out.stdout_has("MiB/s");
+    out.stdout_has("NOT cold and warm");
+    out.stdout_has("sample files removed");
+
+    // Nothing left behind — a benchmark that grows the workspace every time it is
+    // run is one nobody can run twice.
+    ws.run(&["ls", "/"]).expect_ok("ls /").stdout_lacks("bench");
+}
+
+/// The one destructive-surface guarantee, at the shell: `bench` refuses a
+/// directory that already holds something, names the escape hatch, and writes
+/// nothing on the way out.
+#[test]
+fn bench_refuses_a_populated_directory_and_names_the_escape_hatch() {
+    let ws = Ws::init();
+    ws.run_in(&["write", "/bench/precious.txt"], "keep me")
+        .expect_ok("write");
+
+    ws.run(&["bench", "--dir", "/bench", "--files", "1", "--size", "64K"])
+        .expect_err("bench in a populated directory")
+        .stderr_has("force");
+    assert_eq!(
+        ws.run(&["ls", "/bench"]).expect_ok("ls").lines().len(),
+        1,
+        "a refusal must not have written a sample file first"
+    );
+
+    ws.run(&[
+        "bench", "--dir", "/bench", "--files", "1", "--size", "64K", "--force",
+    ])
+    .expect_ok("bench --force");
+    // `--force` licenses running there, never deleting someone else's file.
+    ws.run(&["read", "/bench/precious.txt"])
+        .expect_ok("the pre-existing file survived")
+        .stdout_has("keep me");
+}
+
+/// `--keep` is the opposite promise, and it has to hold too: the sample stays so a
+/// slow file can be looked at with `info` afterwards.
+#[test]
+fn bench_keep_leaves_the_sample_for_inspection() {
+    let ws = Ws::init();
+    ws.run(&[
+        "bench", "--dir", "/kept", "--files", "2", "--size", "64K", "--keep",
+    ])
+    .expect_ok("bench --keep")
+    .stdout_has("--keep, so the sample files are still in /kept");
+
+    assert_eq!(ws.run(&["ls", "/kept"]).expect_ok("ls").lines().len(), 2);
+    ws.run(&["info", "/kept/bench-0000.bin"])
+        .expect_ok("info on a kept sample");
+}
+
+/// `--size` is the flag most likely to be typed as a wrong number of zeroes, so
+/// the suffix forms have to work and an unparseable one has to be a clap usage
+/// error (exit 2), not a run that starts and then fails.
+#[test]
+fn bench_size_accepts_binary_suffixes_and_rejects_nonsense() {
+    let ws = Ws::init();
+    for (size, expected) in [
+        ("65536", "64.0 KiB"),
+        ("64K", "64.0 KiB"),
+        ("1MiB", "1.0 MiB"),
+    ] {
+        ws.run(&["bench", "--dir", "/s", "--files", "1", "--size", size])
+            .expect_ok(size)
+            .stdout_has(&format!("1 files x {expected}"));
+    }
+    let bad = ws.run(&["bench", "--size", "banana"]);
+    assert_eq!(
+        bad.code,
+        Some(2),
+        "a bad --size is a usage error, not a failed run: {}",
+        bad.stderr
+    );
+}

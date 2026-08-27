@@ -228,6 +228,31 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V19_SQLITE,
         postgres: V19_POSTGRES,
     },
+    // V20 — path-scoped write ACLs (issue #123). Until now the only authorization
+    // in the engine was `WritePolicy::{Direct, Propose}`: per **actor**, whole
+    // workspace, binary, writes only, and taking no path. `docs/MULTI_TENANCY.md`
+    // §7 named the gap — "all of a tenant's actors may reach all of its workspaces
+    // by default; a deployment that wants per-workspace scoping enforces it in the
+    // resolver/router" — and nothing in the engine did that.
+    //
+    // A grant is `(workspace, actor, path_prefix) -> perms`, longest matching
+    // prefix wins, matched on **directory boundaries** so `/tenant-a` never covers
+    // `/tenant-abc` (the shared `Scope` does that matching; this is the third and
+    // last copy of that rule to be folded into it).
+    //
+    // **No backfill, deliberately.** The obvious migration gives every existing
+    // actor a root grant carrying its current write policy. Absence-means-fallback
+    // is exactly equivalent and strictly better: an actor with no grant falls back
+    // to its `write_policy` column, so the migration is a pure table create, cannot
+    // half-apply across a large actor table, and leaves `write_policy` as the
+    // single source of truth until an operator actually writes a grant. Grants are
+    // then purely additive refinement rather than a parallel system that must be
+    // kept in sync.
+    Migration {
+        version: 20,
+        sqlite: V20,
+        postgres: V20,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -447,6 +472,23 @@ ALTER TABLE inode ADD COLUMN IF NOT EXISTS gid BIGINT NOT NULL DEFAULT 0;
 // the one binary type both accept under the same name — SQLite types are advisory
 // (`BYTEA` is simply an unrecognized name with BLOB affinity) and Postgres has
 // `BYTEA` natively.
+// V20 — path-scoped write ACLs (see the migration entry above). Identical SQL in
+// both dialects. `perms` is a bitset (see `crate::acl::Perms`) rather than an enum
+// column, so "may write here, may only propose there" is representable — which the
+// single `write_policy` column could not express at all.
+const V20: &str = "
+CREATE TABLE IF NOT EXISTS acl(
+    workspace_id BIGINT NOT NULL,
+    actor_id     BIGINT NOT NULL,
+    path_prefix  TEXT   NOT NULL,
+    perms        BIGINT NOT NULL,
+    granted_at   BIGINT NOT NULL,
+    granted_by   BIGINT,
+    PRIMARY KEY (workspace_id, actor_id, path_prefix)
+);
+CREATE INDEX IF NOT EXISTS idx_acl_actor ON acl(workspace_id, actor_id);
+";
+
 // V19 — trash (see the migration entry above). `content_hash` is the manifest
 // address, which is what makes a trashed body a GC root for as long as the entry
 // is retained: without that the sweep reclaims the chunks and a restore finds

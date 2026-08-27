@@ -245,15 +245,24 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         path: &str,
         summary: Option<&str>,
     ) -> Result<WriteOutcome> {
-        match self.write_policy_of(ctx.actor).await? {
-            WritePolicy::Direct => {
+        // Path-scoped since #123, exactly as `write_or_propose` is — a deletion is
+        // the same destruction one call further along, so the two must not be able
+        // to disagree about what an actor may do at a path.
+        let perms = self.effective_perms(ctx.actor, path).await?;
+        match perms {
+            p if p.contains(crate::acl::Perms::WRITE) => {
                 self.remove_as(ctx, path).await?;
                 Ok(WriteOutcome::Wrote)
             }
-            WritePolicy::Propose => {
+            p if p.contains(crate::acl::Perms::PROPOSE) => {
                 let id = self.suggest_delete(ctx, path, summary).await?;
                 Ok(WriteOutcome::Proposed(id))
             }
+            p => Err(OrigoFSError::Denied(format!(
+                "actor {} may not remove or propose removal at {path} (effective \
+                 permissions: {p})",
+                ctx.actor
+            ))),
         }
     }
 
@@ -273,17 +282,13 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         data: &[u8],
         summary: Option<&str>,
     ) -> Result<WriteOutcome> {
-        // An unknown actor has no policy on record: default to direct (matching the
-        // column default). Identity is resolved server-side before we get here, so
-        // in practice the actor always exists.
-        let policy = self
-            .meta
-            .get_actor(ctx.actor)
-            .await?
-            .map(|a| a.write_policy)
-            .unwrap_or(WritePolicy::Direct);
-        match policy {
-            WritePolicy::Direct => {
+        // Path-scoped since #123. `effective_perms` resolves the longest grant
+        // covering this path and falls back to the actor's whole-workspace
+        // `write_policy` when it has none, so an actor with no grants behaves
+        // exactly as it did before ACLs existed.
+        let perms = self.effective_perms(ctx.actor, path).await?;
+        match perms {
+            p if p.contains(crate::acl::Perms::WRITE) => {
                 // Missing parents are created here, *after* the policy decision.
                 // Surfaces used to do it before calling in, so an edit that was
                 // merely queued for review had already mutated the working tree —
@@ -297,10 +302,20 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 self.write_as(ctx, path, data).await?;
                 Ok(WriteOutcome::Wrote)
             }
-            WritePolicy::Propose => {
+            p if p.contains(crate::acl::Perms::PROPOSE) => {
                 let id = self.suggest(ctx, path, data, summary).await?;
                 Ok(WriteOutcome::Proposed(id))
             }
+            // Neither write nor propose. Only reachable via an explicit grant of
+            // `Perms::NONE` or deny-by-default, since the `write_policy` fallback
+            // always yields at least `PROPOSE`. Refused rather than silently
+            // queued: queueing would tell the actor its edit is under review when
+            // nothing will ever review it.
+            p => Err(OrigoFSError::Denied(format!(
+                "actor {} may not write or propose at {path} (effective \
+                 permissions: {p})",
+                ctx.actor
+            ))),
         }
     }
 

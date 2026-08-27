@@ -1157,6 +1157,68 @@ impl MetadataStore for PostgresMetadataStore {
         ))
     }
 
+    async fn set_acl(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: u32,
+        granted_at: i64,
+        granted_by: Option<i64>,
+    ) -> Result<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO acl(workspace_id, actor_id, path_prefix, perms, granted_at, granted_by)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (workspace_id, actor_id, path_prefix)
+             DO UPDATE SET perms = EXCLUDED.perms,
+                           granted_at = EXCLUDED.granted_at,
+                           granted_by = EXCLUDED.granted_by",
+            &[
+                &self.workspace_id,
+                &actor_id,
+                &path_prefix,
+                &(perms as i64),
+                &granted_at,
+                &granted_by,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_acl(&self, actor_id: i64, path_prefix: &str) -> Result<bool> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM acl WHERE workspace_id = $1 AND actor_id = $2 AND path_prefix = $3",
+                &[&self.workspace_id, &actor_id, &path_prefix],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT actor_id, path_prefix, perms, granted_at, granted_by FROM acl
+                 WHERE workspace_id = $1 AND ($2::BIGINT IS NULL OR actor_id = $2)
+                 ORDER BY LENGTH(path_prefix) DESC",
+                &[&self.workspace_id, &actor_id],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::acl::AclGrant {
+                actor_id: r.get(0),
+                path_prefix: r.get(1),
+                perms: crate::acl::Perms::from_bits(r.get::<_, i64>(2) as u32),
+                granted_at: r.get(3),
+                granted_by: r.get(4),
+            })
+            .collect())
+    }
+
     async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
         let c = self.client().await?;
         let row = c

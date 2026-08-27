@@ -502,19 +502,19 @@ fn init_metrics() -> Result<()> {
 /// while. Suffixes are binary (`K` = 1024), matching every size origofs reports.
 fn parse_size(s: &str) -> std::result::Result<u64, String> {
     let s = s.trim();
-    let (digits, shift) = match s.chars().last() {
-        Some('K') | Some('k') => (&s[..s.len() - 1], 10),
-        Some('M') | Some('m') => (&s[..s.len() - 1], 20),
-        Some('G') | Some('g') => (&s[..s.len() - 1], 30),
-        _ => (s, 0),
+    // Strip the unit tail (`B`, `iB`) *before* looking for the scale letter, so
+    // `8MiB` — the spelling this program's own output uses — is read as `8M` and
+    // not as a number ending in `B`.
+    let body = s.strip_suffix(['B', 'b']).unwrap_or(s);
+    let body = body.strip_suffix(['I', 'i']).unwrap_or(body);
+    let (digits, shift) = match body.chars().last() {
+        Some('K') | Some('k') => (&body[..body.len() - 1], 10),
+        Some('M') | Some('m') => (&body[..body.len() - 1], 20),
+        Some('G') | Some('g') => (&body[..body.len() - 1], 30),
+        _ => (body, 0),
     };
-    // Trailing `iB`/`B` (`8MiB`, `8MB`) is what people actually type, so accept it
-    // rather than rejecting the spelling this program's own output uses.
-    let digits = digits
-        .trim_end_matches(['B', 'b'])
-        .trim_end_matches(['I', 'i'])
-        .trim_end();
     let n: u64 = digits
+        .trim_end()
         .parse()
         .map_err(|_| format!("{s:?} is not a byte count (try 4096, 8K, 64M, 2G)"))?;
     n.checked_shl(shift)
@@ -1771,5 +1771,33 @@ mod tests {
         // The empty case is what routes `build_api_auth` into its loopback-only
         // dev path, so it must stay distinguishable from "tokens configured".
         assert!(parse_auth_specs(&[]).expect("no specs").is_empty());
+    }
+
+    /// `origofs bench --size` is the one flag here that scales, and a suffix that
+    /// parsed as the wrong power of two would silently move every throughput
+    /// number in the report by 1024x. Units are binary throughout, matching what
+    /// `human_bytes` prints back.
+    #[test]
+    fn size_suffixes_are_binary_and_round_trip_what_we_print() {
+        assert_eq!(parse_size("4096"), Ok(4096));
+        assert_eq!(parse_size("8K"), Ok(8 << 10));
+        assert_eq!(parse_size("64m"), Ok(64 << 20));
+        assert_eq!(parse_size("2G"), Ok(2 << 30));
+        // The spelling this program's own output uses has to be accepted, or a
+        // user cannot paste a figure back into the flag that produced it.
+        assert_eq!(parse_size("1MiB"), Ok(1 << 20));
+        assert_eq!(parse_size("1MB"), Ok(1 << 20));
+        assert_eq!(human_bytes(parse_size("64M").unwrap()), "64.0 MiB");
+    }
+
+    /// A size that does not fit is refused rather than wrapping to a small one —
+    /// a benchmark that silently ran on 1 MiB after being asked for 16 EiB would
+    /// report a number for the wrong experiment.
+    #[test]
+    fn a_size_that_overflows_is_refused_not_wrapped() {
+        assert!(parse_size("99999999999G").is_err());
+        assert!(parse_size("banana").is_err());
+        assert!(parse_size("").is_err());
+        assert!(parse_size("-1").is_err());
     }
 }
