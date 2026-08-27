@@ -41,7 +41,7 @@ parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 # database, which a plain file copy is not. The metadata DB is the one thing the
 # content store cannot rebuild (blame, the audit log, actors, uncommitted edits),
 # so backing it up correctly matters more than anything else here.
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 # The interchange format for `origofs dump`/`load` (issue #117). Core otherwise
 # hand-rolls its binary encodings, and this stays the exception on purpose: a
 # *portable* metadata dump has to survive being read by something that is not this
