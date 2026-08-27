@@ -934,7 +934,12 @@ impl GcsConfig {
 #[cfg(target_os = "linux")]
 #[pyclass]
 struct Mount {
-    session: Option<fuser::BackgroundSession>,
+    /// The SDK's mount guard, which stops the change-feed watcher **before** the
+    /// unmount (issue #75). Holding the guard rather than a bare
+    /// `BackgroundSession` is what carries that ordering into Python: dropping
+    /// this object from Python has the same teardown discipline as dropping it
+    /// from Rust.
+    session: Option<origofs_sdk::fuse::Mount>,
     mountpoint: String,
 }
 
@@ -943,7 +948,8 @@ struct Mount {
 impl Mount {
     /// Unmount now (idempotent).
     fn unmount(&mut self) {
-        self.session.take(); // dropping the BackgroundSession unmounts
+        // Dropping the guard stops the watcher, then unmounts, in that order.
+        self.session.take();
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {

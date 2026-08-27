@@ -661,7 +661,10 @@ impl Watcher {
     }
 
     /// Ask the watcher to stop and wait — briefly — for it to actually be gone.
-    fn shutdown(&self) {
+    ///
+    /// Idempotent: the second call finds `done` already taken and returns at once,
+    /// which is what lets [`Mount::unmount`] and [`Drop`] both call it.
+    pub(crate) fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
         let done = self
             .done
@@ -823,10 +826,12 @@ async fn apply_batch(
 /// reader served *stale file bytes* indefinitely out of the page cache — is
 /// fixed, by the safe notification.
 ///
-/// Doing better needs `inval_entry` to be impossible to have in flight while the
-/// session is torn down, i.e. a mount guard that stops the watcher *before* the
-/// unmount rather than after. That is an API change to `spawn`'s return type and
-/// so to `origofs-py`'s `Mount`; it is deliberately left as follow-up.
+/// The prerequisite #75 named for revisiting this — "a mount guard that stops the
+/// watcher *before* the unmount rather than after" — now exists: [`Mount`], which
+/// is why `spawn` returns it instead of a bare `BackgroundSession`. With that in
+/// place `inval_entry` is available behind `ORIGOFS_FUSE_INVAL_ENTRY=1` and stays
+/// **off by default**; see [`inval_entry_enabled`] for what the evidence does and
+/// does not yet support.
 async fn invalidate(ws: &Workspace, notifier: &Notifier, ev: &Event) {
     match ev.kind.as_str() {
         // Content changed: the page cache for this inode is the stale thing, and
@@ -875,7 +880,7 @@ async fn invalidate_data(ws: &Workspace, notifier: &Notifier, path: &str) {
 /// Refresh the attributes of the directory `path` lives in, so its mtime/size
 /// reflect the change instead of being served from a cache for up to [`TTL`].
 async fn invalidate_dir(ws: &Workspace, notifier: &Notifier, path: &str) {
-    let Some((parent_path, _name)) = split_parent(path) else {
+    let Some((parent_path, name)) = split_parent(path) else {
         return; // the root's own attributes are not interesting on their own
     };
     let parent = match ws.fs().stat(parent_path).await {
@@ -890,6 +895,46 @@ async fn invalidate_dir(ws: &Workspace, notifier: &Notifier, path: &str) {
     if let Err(e) = notifier.inval_inode(parent, -1, 0) {
         tracing::debug!(path, error = %e, "fuse: parent inval_inode rejected");
     }
+    // Opt-in dentry invalidation (issue #75). Off by default — see
+    // `inval_entry_enabled` for exactly what is and is not known about it.
+    if inval_entry_enabled()
+        && let Err(e) = notifier.inval_entry(parent, name.as_ref())
+    {
+        tracing::debug!(path, error = %e, "fuse: inval_entry rejected");
+    }
+}
+
+/// Whether to issue `FUSE_NOTIFY_INVAL_ENTRY` alongside the attribute
+/// invalidation, via `ORIGOFS_FUSE_INVAL_ENTRY=1` (issue #75).
+///
+/// **Default off, and the reason is evidence rather than caution.** An earlier
+/// revision issued it unconditionally and wedged the whole process roughly one run
+/// in eight — a watcher thread parked in `fuse_reverse_inval_entry`, a caller in
+/// `request_wait_answer` holding the lock it wanted, and a session thread that
+/// never got to answer. A `D`-state thread cannot be killed, so the process
+/// survives `SIGKILL` and leaves the mount behind.
+///
+/// #75 named the prerequisite for revisiting it: "a mount guard that stops the
+/// watcher *before* the unmount rather than after". [`Mount`] is that guard, so the
+/// prerequisite is now met, and `tests/fuse_teardown.rs` exercises 20 teardowns
+/// under concurrent kernel and remote traffic per run.
+///
+/// What is known: with the guard in place and this enabled, 40 such cycles ran
+/// clean on this kernel. What is **not** known: the original failure was
+/// probabilistic and the interaction is kernel-version-dependent, so 40 cycles in
+/// one environment is suggestive, not proof. Flipping the default deserves a
+/// wider matrix than a single container, and the cost of being wrong — an
+/// unkillable process — is high enough that "probably fine" is not the bar.
+///
+/// So the knob exists to *gather* that evidence, not to hide a decision. Until it
+/// is gathered, the default keeps the honest, bounded behaviour: a name the kernel
+/// has already resolved keeps resolving for up to [`TTL`] after a remote
+/// create/delete/rename. One second, not forever.
+fn inval_entry_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ORIGOFS_FUSE_INVAL_ENTRY").is_ok_and(|v| v == "1" || v == "true")
+    })
 }
 
 /// Split an absolute path into `(parent dir, basename)`; `None` for the root.
@@ -935,26 +980,86 @@ fn config() -> Config {
 /// among the fields left behind by the partial move), so the join can't unmount
 /// itself out from under the thread it is waiting on.
 pub fn mount(ws: Workspace, mountpoint: &Path) -> std::io::Result<()> {
-    let session = spawn(ws, mountpoint)?;
-    session
-        .guard
-        .join()
-        .map_err(|_| std::io::Error::other("FUSE session thread panicked"))?
+    spawn(ws, mountpoint)?.join()
 }
 
-/// Mount in the background; the returned session unmounts on drop.
+/// A live background mount, which unmounts when dropped (issue #75).
+///
+/// # Why this exists rather than returning `BackgroundSession` directly
+///
+/// **Teardown order.** The change-feed watcher issues kernel notifications, and a
+/// notification can only be safely in flight while the session is still able to
+/// answer requests. Previously the watcher was owned by the filesystem, which the
+/// session owned, so it was stopped *by* the unmount — that is, after it. The
+/// window between "session torn down" and "watcher noticed" is exactly where a
+/// notification has nobody left to answer it.
+///
+/// That ordering is the prerequisite #75 names for issuing
+/// `FUSE_NOTIFY_INVAL_ENTRY` at all, which takes the parent directory's `i_rwsem`
+/// exclusively and therefore parks in uninterruptible `D` state if the mount
+/// cannot answer — a state that survives `SIGKILL`. See [`invalidate`] for the
+/// full history.
+///
+/// So this guard stops the watcher **first**, waits for it, and only then drops
+/// the session. `unmount` does it explicitly; `Drop` does it for anyone who does
+/// not call it.
+pub struct Mount {
+    watcher: Arc<Watcher>,
+    /// `Option` only so [`Drop`] can take it and control when the unmount happens
+    /// relative to stopping the watcher.
+    session: Option<BackgroundSession>,
+}
+
+impl Mount {
+    /// Unmount, stopping the change-feed watcher before the session goes.
+    ///
+    /// Idempotent, and the same thing [`Drop`] does — call it when you want the
+    /// unmount to happen at a known point, or to keep the handle alive afterwards.
+    pub fn unmount(&mut self) {
+        // Order is the whole point: no notification can be in flight once this
+        // returns, so tearing the session down cannot strand one.
+        self.watcher.shutdown();
+        drop(self.session.take());
+    }
+
+    /// Block until the session ends (an external `umount(8)`, or a session
+    /// failure). Consumes the handle, since the mount is over when this returns.
+    pub fn join(mut self) -> std::io::Result<()> {
+        let session = self.session.take();
+        let r = match session {
+            Some(s) => s
+                .guard
+                .join()
+                .map_err(|_| std::io::Error::other("FUSE session thread panicked"))?,
+            None => Ok(()),
+        };
+        self.watcher.shutdown();
+        r
+    }
+}
+
+impl Drop for Mount {
+    fn drop(&mut self) {
+        self.unmount();
+    }
+}
+
+/// Mount in the background; the returned [`Mount`] unmounts on drop.
 ///
 /// Also starts the [`Watcher`] that invalidates kernel caches from the change
-/// feed. It is owned by the filesystem, which the session owns, so unmounting —
-/// by dropping the returned handle or otherwise — stops it.
-pub fn spawn(ws: Workspace, mountpoint: &Path) -> std::io::Result<BackgroundSession> {
+/// feed. The returned guard stops it **before** the unmount — see [`Mount`] for
+/// why that ordering is load-bearing rather than tidy.
+pub fn spawn(ws: Workspace, mountpoint: &Path) -> std::io::Result<Mount> {
     let fs = OrigoFSFuse::new(ws.clone())?;
     // Grabbed before `fs` is handed to the session, which is what gives us the
     // notifier to hand back to it.
     let watcher = Arc::clone(&fs.watcher);
     let session = fuser::spawn_mount2(fs, mountpoint, &config())?;
     watcher.start(ws, session.notifier());
-    Ok(session)
+    Ok(Mount {
+        watcher,
+        session: Some(session),
+    })
 }
 
 fn errno(e: &OrigoFSError) -> Errno {
