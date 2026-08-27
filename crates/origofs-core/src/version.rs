@@ -219,7 +219,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         author: &str,
         message: &str,
     ) -> Result<Hash> {
-        self.ensure_may_write(ctx, "commit").await?;
+        self.ensure_may_write_workspace(ctx, "commit").await?;
         self.commit(author, message).await
     }
 
@@ -392,7 +392,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// [`checkout`](Self::checkout) remains the unattributed form for the CLI,
     /// tests, and internal machinery (merge materialization, recovery).
     pub async fn checkout_as(&self, ctx: crate::WriteCtx, branch: &str) -> Result<()> {
-        self.ensure_may_write(ctx, "check out a branch").await?;
+        self.ensure_may_write_workspace(ctx, "check out a branch")
+            .await?;
         self.checkout(branch).await
     }
 
@@ -400,7 +401,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// its write policy (§6). Creating a ref mutates shared workspace state, so it
     /// is gated for the same reason `commit_as` is.
     pub async fn create_branch_as(&self, ctx: crate::WriteCtx, name: &str) -> Result<()> {
-        self.ensure_may_write(ctx, "create a branch").await?;
+        self.ensure_may_write_workspace(ctx, "create a branch")
+            .await?;
         self.create_branch(name).await
     }
 

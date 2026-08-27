@@ -1343,16 +1343,26 @@ async fn main() -> Result<()> {
         } => {
             // A revert is performed *on* someone else's work, so the target comes
             // from `--actor` while `--by` is the reviewer doing it. When `--by` is
-            // given its write policy is checked, so a propose-only actor cannot
-            // revert anyone.
-            if let Some(by) = by {
-                let s = ws.create_session(by, Some("cli")).await?;
-                ws.ensure_may_write(WriteCtx::session(by, s), "revert a session")
-                    .await?;
-            }
-            let changed = ws
-                .revert_session(actor, session, path_prefix.as_deref())
-                .await?;
+            // given, the reviewer must hold write permission over what it is
+            // reverting — the named subtree, or the whole workspace when no prefix
+            // bounds it — so a propose-only or ACL-restricted actor cannot revert
+            // anyone.
+            let changed = match by {
+                Some(by) => {
+                    let s = ws.create_session(by, Some("cli")).await?;
+                    ws.revert_session_as(
+                        WriteCtx::session(by, s),
+                        actor,
+                        session,
+                        path_prefix.as_deref(),
+                    )
+                    .await?
+                }
+                None => {
+                    ws.revert_session(actor, session, path_prefix.as_deref())
+                        .await?
+                }
+            };
             println!(
                 "reverted actor {actor} session {session}: {} file(s) changed",
                 changed.len()

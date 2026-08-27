@@ -1165,6 +1165,41 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         self.meta.list_edit_ops(actor_id, session_id).await
     }
 
+    /// [`revert_session`](Self::revert_session), authorized against `ctx`.
+    ///
+    /// The **target** of a revert is not the caller — reverting is a review action
+    /// performed on someone else's work — so `actor_id`/`session_id` stay
+    /// parameters. What `ctx` decides is whether the caller may perform it, and
+    /// **where**: a revert writes to every file the session touched under
+    /// `path_prefix`, so the caller needs `WRITE` over that subtree, or over the
+    /// whole workspace when no prefix bounds it.
+    ///
+    /// The surfaces used to gate this with the path-less
+    /// [`ensure_may_write`](Self::ensure_may_write), which consults only the
+    /// actor's [`WritePolicy`](WritePolicy) and never a grant — so any actor that
+    /// could write anywhere could destroy any other actor's edits everywhere,
+    /// whatever the ACLs said. [`revert_session`] itself stays ungated for the CLI
+    /// and internal callers, like every other raw engine op.
+    pub async fn revert_session_as(
+        &self,
+        ctx: WriteCtx,
+        actor_id: i64,
+        session_id: i64,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<String>> {
+        match path_prefix {
+            Some(prefix) => {
+                self.ensure_may_write_at(ctx, "revert edits under", prefix)
+                    .await?
+            }
+            None => {
+                self.ensure_may_write_workspace(ctx, "revert a session across every path")
+                    .await?
+            }
+        }
+        self.revert_session(actor_id, session_id, path_prefix).await
+    }
+
     /// Revert every line an actor wrote in a session, across all files they
     /// touched. Returns the paths actually changed. The removed lines are
     /// dropped; remaining lines keep their authorship.

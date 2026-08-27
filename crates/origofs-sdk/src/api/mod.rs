@@ -1605,16 +1605,15 @@ struct RevertReq {
 ///
 /// Gated, and the actor being reverted comes from the *body* on purpose: this is a
 /// review action performed *on* someone else's work, so the target is not the
-/// caller. The caller's own identity still has to clear the write policy — a
-/// propose-only actor cannot revert anyone, including itself.
+/// caller. The caller's own identity still has to clear the permission check over
+/// the subtree it is reverting — a propose-only actor cannot revert anyone,
+/// including itself, and neither can one whose grants do not cover that subtree.
 async fn revert_session(
     State(ws): State<Shared>,
     State(scope): State<Scope>,
     Auth(principal): Auth,
     Json(req): Json<RevertReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    ws.ensure_may_write(principal.write_ctx(), "revert a session")
-        .await?;
     // An unscoped revert walks every file the session touched, across every
     // tenant. Under a scope the prefix is resolved inside the root, and an absent
     // prefix becomes the root itself rather than "everything" -- the one place
@@ -1642,8 +1641,19 @@ async fn revert_session(
             Some(scope.resolve(p).map_err(scope_error)?)
         }
     };
+    // Authorized *after* the prefix is resolved, and against that prefix: a revert
+    // writes to every file the named session touched under it, so the grant
+    // covering that subtree is the one that decides. The path-less check this used
+    // before consulted only the caller's write policy and never an ACL grant, so
+    // any actor that could write anywhere could wipe any other actor's edits
+    // everywhere.
     let paths = ws
-        .revert_session(req.actor, req.session, prefix.as_deref())
+        .revert_session_as(
+            principal.write_ctx(),
+            req.actor,
+            req.session,
+            prefix.as_deref(),
+        )
         .await?;
     Ok(Json(json!({
         "actor": req.actor,

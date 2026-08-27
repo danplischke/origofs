@@ -60,6 +60,12 @@ use crate::scope::Scope;
 /// than falling back to its `write_policy`.
 pub(crate) const ACL_DEFAULT_DENY: &str = "acl.default_deny";
 
+/// The path a workspace-wide operation is checked at.
+///
+/// The workspace root, which every path is under, so a grant that covers it
+/// covers everything — see [`Fs::ensure_may_write_workspace`].
+const ROOT_PATH: &str = "/";
+
 /// What an actor may do under a path prefix.
 ///
 /// A bitset rather than an enum, so "may write here, may only propose there" is
@@ -144,6 +150,28 @@ pub struct AclGrant {
     /// Who wrote the grant, for the audit trail. `None` for a grant written by
     /// something with no actor (a migration, an operator tool).
     pub granted_by: Option<i64>,
+}
+
+/// The refusal every write check reports, phrased the same way wherever it comes
+/// from.
+///
+/// An actor that holds `PROPOSE` but not `WRITE` is told so in those words. That
+/// is the single most common denial — it is what a propose-only agent hits on
+/// every direct mutation — and the wording is depended on by the CLI, the HTTP
+/// surface, and the Python router alike.
+///
+/// The message names the path but says nothing about whether anything is *there*:
+/// the check runs before any lookup, so a denial cannot leak existence (#123
+/// invariant 4).
+fn denied(actor: i64, op: &str, at: &str, perms: Perms) -> OrigoFSError {
+    OrigoFSError::Denied(format!(
+        "actor {actor} may not {op} at {at} (effective permissions: {perms}){}",
+        if perms.contains(Perms::PROPOSE) {
+            "; this actor is propose-only here — submit a suggestion for review instead"
+        } else {
+            ""
+        }
+    ))
 }
 
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
@@ -272,15 +300,39 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if perms.contains(Perms::WRITE) {
             return Ok(());
         }
-        Err(OrigoFSError::Denied(format!(
-            "actor {} may not {op} at {path} (effective permissions: {perms}){}",
+        Err(denied(ctx.actor, op, path, perms))
+    }
+
+    /// Refuse a **workspace-wide** `op` for an actor without `WRITE` at the root.
+    ///
+    /// The path-bearing check above needs a path, and four operations genuinely
+    /// have none — `commit`, `checkout`, `create_branch`, and an unbounded
+    /// `revert_session`. They were therefore left on
+    /// [`ensure_may_write`](Self::ensure_may_write), which consults the actor's
+    /// [`WritePolicy`](crate::WritePolicy) and **never looks at a grant at all** —
+    /// so an ACL could not contain them. Under `acl_default_deny` an actor with no
+    /// grant anywhere still reached `checkout`, which its own documentation calls
+    /// "the most destructive operation on the working tree: it truncates and
+    /// rematerializes the whole thing, discarding every uncommitted edit in the
+    /// workspace".
+    ///
+    /// Having no path is not the same as touching none: these reach every path, so
+    /// the honest check is `WRITE` at the root. That keeps the existing default
+    /// exactly as it was — with no grant covering `/`, `effective_perms` falls back
+    /// to the write policy, which is what these called before — and makes
+    /// deny-by-default and subtree grants mean what an operator reading
+    /// `docs/MULTI_TENANCY.md` would assume.
+    pub async fn ensure_may_write_workspace(&self, ctx: crate::WriteCtx, op: &str) -> Result<()> {
+        let perms = self.effective_perms(ctx.actor, ROOT_PATH).await?;
+        if perms.contains(Perms::WRITE) {
+            return Ok(());
+        }
+        Err(denied(
             ctx.actor,
-            if perms.contains(Perms::PROPOSE) {
-                "; submit a suggestion for review instead"
-            } else {
-                ""
-            }
-        )))
+            &format!("{op} (it affects the whole workspace)"),
+            ROOT_PATH,
+            perms,
+        ))
     }
 
     /// A rename is **two** checks, not one.
