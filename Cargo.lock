@@ -1916,6 +1916,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "origofs-sdk",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",

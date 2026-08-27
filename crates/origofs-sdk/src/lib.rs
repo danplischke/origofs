@@ -995,6 +995,27 @@ impl Workspace {
         self.fs.vfs_listxattr(ino).await
     }
 
+    // --- attribution completeness (issue #128) ------------------------------
+
+    /// Whether this workspace requires every surface-initiated mutation to name
+    /// an actor. Off by default; see
+    /// [`Fs::require_attribution`](origofs_core::Fs::require_attribution) for why
+    /// this is an attribution-completeness switch and **not** a security boundary.
+    pub async fn require_attribution(&self) -> Result<bool> {
+        self.fs.require_attribution().await
+    }
+
+    /// Turn the attribution requirement on or off.
+    pub async fn set_require_attribution(&self, required: bool) -> Result<()> {
+        self.fs.set_require_attribution(required).await
+    }
+
+    /// Refuse an unattributed mutation when this workspace requires attribution.
+    /// Surfaces call this on the path where no actor was named.
+    pub async fn ensure_attributed(&self, op: &str) -> Result<()> {
+        self.fs.ensure_attributed(op).await
+    }
+
     // --- path-scoped ACLs (issue #123) --------------------------------------
 
     /// Grant `perms` to an actor under `path_prefix`.

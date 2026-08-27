@@ -467,3 +467,81 @@ fn perms_render_readably() {
         "read+propose"
     );
 }
+
+// --- attribution completeness (issue #128) -----------------------------------
+
+/// `require_attribution` is off by default, and turning it on makes an
+/// unattributed *surface* mutation an error.
+///
+/// The engine half is small on purpose: the setting only ever refuses, and it is
+/// the surfaces that decide when to consult it (a surface calls
+/// `ensure_attributed` on the path where no actor was named). Keeping the
+/// decision here rather than in each CLI arm is what lets the HTTP API or a future
+/// surface honour the same workspace setting without re-deriving it.
+#[tokio::test]
+async fn require_attribution_is_opt_in_and_refuses_when_on() {
+    let (fs, _agent) = fixture().await;
+
+    // Off by default — turning it on for an existing workspace would break every
+    // script that does not name an actor, the same reason `acl_default_deny` is
+    // opt-in.
+    assert!(!fs.require_attribution().await.unwrap());
+    fs.ensure_attributed("rm")
+        .await
+        .expect("while off, an unattributed op is allowed");
+
+    fs.set_require_attribution(true).await.unwrap();
+    assert!(fs.require_attribution().await.unwrap());
+
+    let err = fs.ensure_attributed("rm").await.unwrap_err();
+    assert!(
+        matches!(err, OrigoFSError::Denied(_)),
+        "an unattributed op under this setting must be Denied (403 on the HTTP \
+         surface), got {err:?}"
+    );
+    // The message has to name the operation and the fix, because the fix is always
+    // the caller's and always the same: name an actor.
+    let msg = err.to_string();
+    assert!(msg.contains("rm"), "the error must name the op: {msg}");
+    assert!(
+        msg.contains("actor"),
+        "the error must say an actor is what is missing: {msg}"
+    );
+
+    // Reversible: a workspace is not locked into the stricter mode.
+    fs.set_require_attribution(false).await.unwrap();
+    fs.ensure_attributed("rm").await.expect("off again");
+}
+
+/// The setting governs *unattributed* ops only — it must not add a second gate on
+/// top of the write policy for an actor that named itself.
+///
+/// Conflating the two would make `require_attribution` a stealth access control,
+/// which it explicitly is not: it asks "did anyone say who did this", not "may
+/// this actor do it". The write policy answers the second question, and continues
+/// to be the only thing that does.
+#[tokio::test]
+async fn require_attribution_does_not_second_guess_the_write_policy() {
+    let (fs, agent) = fixture().await;
+    fs.set_require_attribution(true).await.unwrap();
+
+    // An attributed op by a `Direct` actor proceeds untouched.
+    let ctx = WriteCtx::actor(agent);
+    fs.mkdir_as(ctx, "/d").await.unwrap();
+    fs.write_or_propose(ctx, "/d/f.txt", b"x", None)
+        .await
+        .unwrap();
+
+    // And a propose-only actor is still governed by the policy, not by this
+    // setting — it queues, exactly as it would with the setting off.
+    fs.set_write_policy(agent, origofs_core::WritePolicy::Propose)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            fs.write_or_propose(ctx, "/d/f.txt", b"y", None).await,
+            Ok(origofs_core::WriteOutcome::Proposed(_))
+        ),
+        "require_attribution must not turn a queued write into a refusal"
+    );
+}

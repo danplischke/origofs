@@ -164,6 +164,15 @@ impl Ws {
         raw(None, &full, stdin)
     }
 
+    /// Run with one extra environment variable set — for the `ORIGOFS_ACTOR`
+    /// fallback (issue #128), which is environment-shaped by design and so
+    /// cannot be exercised through `run`.
+    fn run_env(&self, args: &[&str], key: &str, value: &str) -> Out {
+        let mut full = vec!["--workspace", self.dir.to_str().unwrap()];
+        full.extend_from_slice(args);
+        raw_env(&full, None, &[(key, value)])
+    }
+
     /// Shorthand for the very common "write these bytes as this actor".
     fn write_as(&self, path: &str, actor: i64, data: &str) -> Out {
         let actor = actor.to_string();
@@ -193,10 +202,23 @@ impl Ws {
 ///   * `RUST_BACKTRACE=0` because cargo sets it for test *children* too, and an
 ///     `anyhow` error would otherwise bury its one-line message under 30 frames.
 ///   * The `ORIGOFS_*` knobs that change behavior (`ORIGOFS_ENCRYPTION_KEY`,
-///     `ORIGOFS_METRICS`) are cleared so a developer's shell cannot alter the
-///     result — an inherited encryption key in particular would make reads fail
-///     in a way that looks like a code bug.
+///     `ORIGOFS_METRICS`, `ORIGOFS_ACTOR`) are cleared so a developer's shell
+///     cannot alter the result — an inherited encryption key would make reads
+///     fail in a way that looks like a code bug, and an inherited
+///     `ORIGOFS_ACTOR` (issue #128) would silently attribute writes that several
+///     tests here assert are *un*attributed, turning a green suite red on one
+///     machine only.
 fn raw(cwd: Option<&Path>, args: &[&str], stdin: Option<&[u8]>) -> Out {
+    raw_full(cwd, args, stdin, &[])
+}
+
+/// [`raw`] with extra environment variables set, applied *after* the clears so a
+/// test can deliberately set one of the knobs `raw` removes.
+fn raw_env(args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Out {
+    raw_full(None, args, stdin, env)
+}
+
+fn raw_full(cwd: Option<&Path>, args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Out {
     let mut cmd = Command::new(BIN);
     cmd.args(args)
         .env("ORIGOFS_LOG", "error")
@@ -204,6 +226,7 @@ fn raw(cwd: Option<&Path>, args: &[&str], stdin: Option<&[u8]>) -> Out {
         .env_remove("RUST_LOG")
         .env_remove("ORIGOFS_ENCRYPTION_KEY")
         .env_remove("ORIGOFS_METRICS")
+        .env_remove("ORIGOFS_ACTOR")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -213,6 +236,9 @@ fn raw(cwd: Option<&Path>, args: &[&str], stdin: Option<&[u8]>) -> Out {
         .stderr(Stdio::piped());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     let mut child = cmd.spawn().expect("the origofs binary must be built");
     if let Some(bytes) = stdin {
@@ -1876,4 +1902,529 @@ fn bench_size_accepts_binary_suffixes_and_rejects_nonsense() {
         "a bad --size is a usage error, not a failed run: {}",
         bad.stderr
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. Attribution completeness on the mutating commands (issue #128)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `rm`, `mv`, `mkdir` and `commit` took no actor at all, so they called the raw
+/// unattributed engine ops and never ran `ensure_may_write`. `CLAUDE.md` states
+/// the rule they broke: *"A new mutating endpoint on any surface must call an
+/// attributed variant"*.
+///
+/// The **attribution** half is the bigger loss and the less obvious one: for a
+/// filesystem whose premise is that every edit is recorded against the actor that
+/// made it, a delete or a rename that leaves no trace of who did it is a hole in
+/// the product, not just in a policy check. You could not express an attributed
+/// `rm` from the CLI at all.
+#[test]
+fn mutating_commands_record_the_actor_that_ran_them() {
+    let ws = Ws::init();
+    let alice = ws.actor(&["alice"]);
+    let a = alice.to_string();
+
+    ws.write_as("/f.txt", alice, "hello\n").expect_ok("write");
+
+    // Each of the four now accepts `--actor` and succeeds through the attributed
+    // engine variant. Before #128 these flags did not exist and clap exited 2.
+    ws.run(&["mkdir", "/d", "--actor", &a])
+        .expect_ok("mkdir --actor");
+    ws.run(&["mv", "/f.txt", "/d/f.txt", "--actor", &a])
+        .expect_ok("mv --actor");
+    ws.run(&["commit", "-m", "first", "--actor", &a])
+        .expect_ok("commit --actor")
+        .stdout_has("first");
+    ws.run(&["rm", "/d/f.txt", "--actor", &a])
+        .expect_ok("rm --actor");
+    ws.run(&["read", "/d/f.txt"])
+        .expect_err("the file is gone after an attributed rm");
+}
+
+/// The gate, which is what #128 reported. A propose-only actor's `mkdir` and
+/// `commit` are refused, and its `rm` is **queued** rather than refused.
+///
+/// The asymmetry is deliberate and worth pinning: `rm` has a propose-shaped
+/// equivalent (`remove_or_propose`) and `mkdir`/`commit` do not, so routing `rm`
+/// through refusal instead of the queue would make it inconsistent with `write`,
+/// which already queues. Same policy, different available shapes.
+#[test]
+fn a_propose_only_actor_cannot_mutate_directly_through_the_cli() {
+    let ws = Ws::init();
+    let alice = ws.actor(&["alice"]);
+    let agent = ws.actor(&["claude", "--agent", "--model", "m"]);
+    let g = agent.to_string();
+    ws.write_as("/f.txt", alice, "original\n")
+        .expect_ok("alice write");
+    ws.run(&["write-policy", &g, "propose"])
+        .expect_ok("write-policy propose");
+
+    // `rm` queues: exit 0, nothing removed, a suggestion appears.
+    ws.run(&["rm", "/f.txt", "--actor", &g])
+        .expect_ok("propose-only rm")
+        .stdout_has("propose-only")
+        .stdout_has("queued suggestion");
+    assert_eq!(
+        ws.run(&["read", "/f.txt"]).stdout,
+        "original\n",
+        "a propose-only rm must not touch the working tree"
+    );
+
+    // `mkdir` and `commit` have no propose-shaped equivalent, so they refuse.
+    ws.run(&["mkdir", "/d", "--actor", &g])
+        .expect_err("propose-only mkdir")
+        .stderr_has("denied");
+    ws.run(&["commit", "-m", "x", "--actor", &g])
+        .expect_err("propose-only commit")
+        .stderr_has("propose-only");
+
+    // `mv` likewise.
+    ws.run(&["mv", "/f.txt", "/g.txt", "--actor", &g])
+        .expect_err("propose-only mv")
+        .stderr_has("denied");
+    ws.run(&["read", "/f.txt"])
+        .expect_ok("the source of a refused mv is still there");
+}
+
+/// `ORIGOFS_ACTOR` stands in for `--actor` (issue #128), so a shell session or an
+/// agent harness sets identity once instead of threading a flag through every
+/// call — the "configured identity" the issue steered at, rather than making
+/// `--actor` required and breaking every existing script.
+///
+/// It is an assertion of identity, not a check of one: whoever writes the command
+/// line writes the environment too. What it buys is that the attribution gets
+/// *recorded*, which it previously could not be at all.
+#[test]
+fn origofs_actor_stands_in_for_the_actor_flag() {
+    let ws = Ws::init();
+    let alice = ws.actor(&["alice"]);
+    let a = alice.to_string();
+
+    ws.run_env(&["mkdir", "/d"], "ORIGOFS_ACTOR", &a)
+        .expect_ok("mkdir via ORIGOFS_ACTOR");
+
+    // And it reaches the policy gate exactly as the flag does.
+    let agent = ws.actor(&["claude", "--agent", "--model", "m"]);
+    ws.run(&["write-policy", &agent.to_string(), "propose"])
+        .expect_ok("write-policy");
+    ws.run_env(&["mkdir", "/e"], "ORIGOFS_ACTOR", &agent.to_string())
+        .expect_err("a propose-only actor named by the environment is still gated")
+        .stderr_has("denied");
+
+    // An explicit `--actor` wins over the environment, so a script can override
+    // the session identity for one call without unsetting anything.
+    ws.run_env(
+        &["mkdir", "/e", "--actor", &a],
+        "ORIGOFS_ACTOR",
+        &agent.to_string(),
+    )
+    .expect_ok("--actor overrides ORIGOFS_ACTOR");
+
+    // A malformed value fails loudly rather than being silently ignored, which
+    // would leave the caller believing writes were attributed when they were not.
+    ws.run_env(&["mkdir", "/f"], "ORIGOFS_ACTOR", "not-an-id")
+        .expect_err("a malformed ORIGOFS_ACTOR")
+        .stderr_has("ORIGOFS_ACTOR");
+}
+
+/// `require-attribution` makes an unattributed mutation an error instead of a
+/// silent gap. Off by default, so nothing existing breaks.
+///
+/// This is the half that makes adding an optional flag worth anything: without
+/// it, every caller who omits `--actor` keeps the old behaviour, which is exactly
+/// the "optional and therefore useless" horn of the dilemma #128 posed.
+#[test]
+fn require_attribution_refuses_unattributed_mutations() {
+    let ws = Ws::init();
+    let alice = ws.actor(&["alice"]);
+    let a = alice.to_string();
+
+    ws.run(&["require-attribution"])
+        .expect_ok("read the default")
+        .stdout_has("off");
+
+    // Off: an unattributed mutation is allowed, as it always was.
+    ws.run_in(&["write", "/anon.txt"], "x\n")
+        .expect_ok("unattributed write while off");
+
+    ws.run(&["require-attribution", "on"])
+        .expect_ok("turn it on")
+        .stdout_has("on");
+    ws.run(&["require-attribution"])
+        .expect_ok("read it back")
+        .stdout_has("on");
+
+    // On: every unattributed mutating command refuses, and says why.
+    for args in [
+        vec!["rm", "/anon.txt"],
+        vec!["mkdir", "/d"],
+        vec!["mv", "/anon.txt", "/b.txt"],
+        vec!["commit", "-m", "x"],
+    ] {
+        ws.run(&args)
+            .expect_err(&format!("unattributed {:?} while required", args[0]))
+            .stderr_has("requires an actor");
+    }
+    // Including `write`, which would otherwise be the one mutating command that
+    // could still slip through unattributed.
+    ws.run_in(&["write", "/anon2.txt"], "x\n")
+        .expect_err("unattributed write while required")
+        .stderr_has("requires an actor");
+
+    // Naming an actor satisfies it.
+    ws.run(&["mkdir", "/d", "--actor", &a])
+        .expect_ok("attributed mkdir while required");
+    ws.run(&["rm", "/anon.txt", "--actor", &a])
+        .expect_ok("attributed rm while required");
+
+    // And it is reversible — a workspace is not locked into the stricter mode.
+    ws.run(&["require-attribution", "off"])
+        .expect_ok("turn it off");
+    ws.run(&["mkdir", "/e"])
+        .expect_ok("unattributed mkdir once off again");
+}
+
+/// A typo must not silently leave the workspace in the permissive state — the
+/// same reasoning as `write_policy_rejects_an_unknown_policy`.
+#[test]
+fn require_attribution_rejects_an_unknown_setting() {
+    let ws = Ws::init();
+    ws.run(&["require-attribution", "yes-please"])
+        .expect_err("a bogus setting")
+        .stderr_has("expected `on` or `off`");
+    ws.run(&["require-attribution"])
+        .expect_ok("still readable")
+        .stdout_has("off");
+}
+
+/// **The structural guard.** Every subcommand the binary ships must be
+/// classified here, and every one classified as an attributed mutation must
+/// actually advertise `--actor`.
+///
+/// #128 ends by noting what was missing: `origofs_rm` shipped ungated on the MCP
+/// surface (#78), and `crates/origofs-sdk/tests/mcp.rs` gained a classification
+/// test so a new ungated tool could not ship silently — *"The CLI has no
+/// equivalent structural guard."* This is it.
+///
+/// The check runs against `--help` rather than the `Cmd` enum, for two reasons.
+/// The enum lives in a binary crate and is not importable from a test; and the
+/// help text is the surface a user and a script actually see, so a flag that
+/// exists on the enum but is hidden from help is not a flag anyone can use.
+///
+/// Adding a subcommand fails this test until it is classified. That is the whole
+/// point: the failure is a prompt to decide *which* of these a new command is,
+/// at the moment it is written, rather than discovering years later that it
+/// quietly took the unattributed path.
+#[test]
+fn every_mutating_subcommand_is_classified_and_attributable() {
+    /// What a subcommand does to the working tree, and so what it owes the
+    /// attribution rule in `CLAUDE.md`.
+    enum Kind {
+        /// Mutates the working tree on behalf of a caller: must take `--actor`.
+        Attributed,
+        /// Mutates, but has no requesting actor to attribute or police. Each
+        /// carries the reason, because "exempt" with no reason is how #78 and
+        /// #128 both happened.
+        Exempt(&'static str),
+        /// Reads only.
+        ReadOnly,
+        /// Runs a server or a mount; identity is resolved per request inside it,
+        /// or the surface is a documented actor-less bypass.
+        Surface(&'static str),
+    }
+    use Kind::*;
+
+    let table: &[(&str, Kind)] = &[
+        // --- mutations that act for a caller -------------------------------
+        ("write", Attributed),
+        ("mkdir", Attributed),
+        ("rm", Attributed),
+        ("mv", Attributed),
+        ("commit", Attributed),
+        ("suggest", Attributed),
+        ("accept", Attributed),
+        ("reject", Attributed),
+        ("sandbox", Attributed),
+        ("overlay", Attributed),
+        // --- mutations with no requesting actor ----------------------------
+        (
+            "init",
+            Exempt("creates the workspace; there is nothing to attribute to yet"),
+        ),
+        (
+            "checkout",
+            Exempt("materializes a commit tree; a system action, per CLAUDE.md"),
+        ),
+        (
+            "merge",
+            Exempt("merge materialization is the canonical actor-less op"),
+        ),
+        (
+            "resync",
+            Exempt("moves objects between workspaces; blame travels with them"),
+        ),
+        ("branch", Exempt("moves a ref, not the working tree")),
+        (
+            "lock",
+            Exempt("LFS-style lock ownership is a free-form `--owner`, not an actor id"),
+        ),
+        (
+            "unlock",
+            Exempt("releases a lock keyed by the same free-form `--owner` string"),
+        ),
+        (
+            "actor",
+            Exempt("mutates the identity registry, which is what actors are made of"),
+        ),
+        (
+            "write-policy",
+            Exempt("administrative: sets the very policy an actor is judged by"),
+        ),
+        (
+            "require-attribution",
+            Exempt("administrative: sets whether attribution is mandatory"),
+        ),
+        (
+            "revert-session",
+            Exempt("takes `--by`, checked against the write policy; see its own test"),
+        ),
+        (
+            "gc",
+            Exempt("reclaims unreferenced content; touches no names"),
+        ),
+        (
+            "repack",
+            Exempt("re-encodes stored objects; content-addressed, so a no-op semantically"),
+        ),
+        (
+            "flush",
+            Exempt("a durability barrier over already-written content; changes no names"),
+        ),
+        (
+            "migrate",
+            Exempt("advances the metadata schema; operates on the store, not the tree"),
+        ),
+        ("backup", Exempt("copies the metadata DB out")),
+        (
+            "fsck",
+            Exempt("repair; `--rebuild` restores from the content store, which has no actors"),
+        ),
+        (
+            "load",
+            Exempt("restores a whole store; the ids are the dump's, not this workspace's"),
+        ),
+        (
+            "dump",
+            Exempt("reads the metadata store out; mutates nothing"),
+        ),
+        // --- read-only ------------------------------------------------------
+        ("read", ReadOnly),
+        ("ls", ReadOnly),
+        ("stat", ReadOnly),
+        ("info", ReadOnly),
+        ("log", ReadOnly),
+        ("status", ReadOnly),
+        ("diff", ReadOnly),
+        ("suggestions", ReadOnly),
+        ("suggestion-diff", ReadOnly),
+        ("conflicts", ReadOnly),
+        ("locks", ReadOnly),
+        ("blame", ReadOnly),
+        ("schema-version", ReadOnly),
+        ("watch", ReadOnly),
+        ("presence", ReadOnly),
+        ("help", ReadOnly),
+        (
+            "bench",
+            Exempt(
+                "writes to a scratch subtree it owns and cleans up; a benchmark, not a user edit",
+            ),
+        ),
+        // --- surfaces -------------------------------------------------------
+        (
+            "serve",
+            Surface(
+                "resolves identity per request; `build_api_auth` refuses an open API off-loopback",
+            ),
+        ),
+        (
+            "mcp",
+            Surface("attributes per tool call; `tests/mcp.rs` guards the classification"),
+        ),
+        (
+            "mount",
+            Surface("a kernel mount has no caller identity; the documented bypass in CLAUDE.md"),
+        ),
+        (
+            "nfs",
+            Surface("an NFS export has no per-caller identity either; the same documented bypass"),
+        ),
+        (
+            "git",
+            Surface("the git bridge speaks git's own author identity"),
+        ),
+    ];
+
+    let help = raw(None, &["--help"], None).expect_ok("--help");
+    // The `Commands:` block of clap's help, one subcommand per line.
+    let shipped: Vec<String> = help
+        .stdout
+        .lines()
+        .skip_while(|l| !l.starts_with("Commands:"))
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let t = l.strip_prefix("  ")?;
+            if t.starts_with(' ') {
+                return None; // a wrapped description line
+            }
+            t.split_whitespace().next().map(str::to_string)
+        })
+        .collect();
+
+    assert!(
+        shipped.len() > 30,
+        "failed to parse the subcommand list out of --help; got {shipped:?}"
+    );
+
+    // 1. Nothing ships unclassified.
+    for name in &shipped {
+        assert!(
+            table.iter().any(|(n, _)| n == name),
+            "subcommand `{name}` is not classified in this test. Decide what it is: \
+             does it mutate the working tree for a caller (give it `--actor` and mark it \
+             Attributed), does it mutate with no actor to attribute to (mark it Exempt \
+             *with the reason*), does it only read, or is it a surface that resolves \
+             identity itself? See CLAUDE.md: a new mutating endpoint on any surface must \
+             call an attributed variant."
+        );
+    }
+
+    // 2. Nothing in the table has been removed from the binary without being
+    //    removed here — otherwise the table rots into a list of ghosts.
+    for (name, _) in table {
+        assert!(
+            shipped.iter().any(|s| s == name),
+            "`{name}` is classified here but the binary no longer ships it; drop the row"
+        );
+    }
+
+    // 3. Every exemption carries a reason. "Exempt" with no reason is precisely
+    //    how #78 and #128 both happened: a command took the unattributed path and
+    //    nobody had written down why that was correct, so nobody could tell it
+    //    was not. Making the reason mandatory forces the thought.
+    for (name, kind) in table {
+        if let Exempt(why) | Surface(why) = kind {
+            assert!(
+                why.len() > 20,
+                "`{name}` is exempt from attribution but gives no real reason ({why:?}).                  Write down why this command has no requesting actor to attribute or                  police — if that is hard to write, it probably is not exempt."
+            );
+        }
+    }
+
+    // 4. Every attributed mutation actually offers `--actor`.
+    for (name, kind) in table {
+        if let Attributed = kind {
+            let sub_help = raw(None, &[name, "--help"], None).expect_ok(name);
+            assert!(
+                sub_help.stdout.contains("--actor"),
+                "`{name}` is classified as an attributed mutation but its --help does not \
+                 offer `--actor`, so a caller cannot attribute it and it necessarily calls \
+                 a raw unattributed engine op. This is exactly issue #128.\n--- help ---\n{}",
+                sub_help.stdout
+            );
+        }
+    }
+}
+
+/// `dump` and `load` had no CLI surface at all: `Workspace::dump`/`load` shipped
+/// with #117, but nothing exposed them, so the feature was unreachable for anyone
+/// using the binary — which `CLAUDE.md` calls "the best index of what the system
+/// can do".
+///
+/// The round trip is the contract, and so is the thing that makes it *look*
+/// broken: a dump carries metadata only. Names, actors and blame all survive; the
+/// bytes do not, because a dump references content by hash and the content store
+/// is a separate thing. Restored against an empty store, every read fails. That
+/// is correct — the intended use is SQLite → Postgres against the same bucket —
+/// but it is surprising enough that `load` says so out loud, and this test pins
+/// both halves.
+#[test]
+fn dump_and_load_round_trip_the_metadata() {
+    let src = Ws::init();
+    let alice = src.actor(&["alice"]);
+    src.write_as("/f.txt", alice, "hello\n").expect_ok("write");
+    src.run(&["mkdir", "/d", "--actor", &alice.to_string()])
+        .expect_ok("mkdir");
+
+    let dump = src.scratch("dump.jsonl");
+    let dump_s = dump.to_str().unwrap();
+    src.run(&["dump", dump_s])
+        .expect_ok("dump")
+        .stdout_has("dumped");
+    assert!(dump.exists(), "dump must have written the file");
+
+    // JSON Lines: readable with ordinary tools, which is a stated goal of #117.
+    let text = std::fs::read_to_string(&dump).unwrap();
+    assert!(
+        text.lines().count() > 5,
+        "a dump should be one record per line, got {} lines",
+        text.lines().count()
+    );
+    for (i, line) in text.lines().enumerate() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|e| panic!("dump line {i} is not JSON: {e}\n{line}"));
+    }
+
+    // Restore into a fresh workspace.
+    let dst = Ws::init();
+    let out = dst.run(&["load", dump_s]).expect_ok("load");
+    out.stdout_has("restored");
+    // The caveat is printed, because the alternative is the user meeting
+    // `content missing for hash ...` with no idea why.
+    out.stdout_has("metadata only");
+
+    // Names and structure survived.
+    dst.run(&["ls", "/"])
+        .expect_ok("ls after load")
+        .stdout_has("f.txt")
+        .stdout_has("d");
+    // …and so did the identity registry, which is the half no `fsck --rebuild`
+    // could ever reconstruct.
+    dst.run(&["stat", "/f.txt"]).expect_ok("stat after load");
+
+    // A second load into the now-populated workspace is refused, not merged.
+    dst.run(&["load", dump_s])
+        .expect_err("loading into a non-pristine workspace")
+        .stderr_has("does not merge");
+}
+
+/// A dump of a workspace is refused by a workspace that already holds data —
+/// pinned separately from the round trip because it is the guard that stops a
+/// load from silently corrupting attribution.
+///
+/// Merging would have to reconcile two independent id spaces (inode numbers,
+/// actor ids, session ids are all local sequences), and getting that wrong
+/// produces blame attributed to the wrong actor — the one failure this system
+/// exists to prevent.
+#[test]
+fn load_refuses_a_workspace_that_already_holds_data() {
+    let src = Ws::init();
+    let alice = src.actor(&["alice"]);
+    src.write_as("/a.txt", alice, "x\n").expect_ok("write");
+    let dump = src.scratch("d.jsonl");
+    src.run(&["dump", dump.to_str().unwrap()]).expect_ok("dump");
+
+    let dst = Ws::init();
+    let bob = dst.actor(&["bob"]);
+    dst.write_as("/b.txt", bob, "y\n").expect_ok("write");
+
+    dst.run(&["load", dump.to_str().unwrap()])
+        .expect_err("load into a populated workspace")
+        .stderr_has("does not merge");
+
+    // And the refusal left the destination exactly as it was.
+    assert_eq!(dst.run(&["read", "/b.txt"]).stdout, "y\n");
+    dst.run(&["read", "/a.txt"])
+        .expect_err("the refused load must not have applied anything");
 }

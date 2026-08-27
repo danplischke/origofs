@@ -58,7 +58,13 @@ enum Cmd {
     /// Initialize the workspace.
     Init,
     /// Create a directory and any missing parents.
-    Mkdir { path: String },
+    Mkdir {
+        path: String,
+        /// Attribute the mkdir to this actor id, and check its write policy.
+        /// Falls back to `ORIGOFS_ACTOR`; see `origofs require-attribution`.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Write a file's contents from `--from <file>` or stdin.
     Write {
         path: String,
@@ -118,15 +124,35 @@ enum Cmd {
         force: bool,
     },
     /// Remove a file or empty directory.
-    Rm { path: String },
+    Rm {
+        path: String,
+        /// Attribute the delete to this actor id, and check its write policy — a
+        /// propose-only actor's delete is queued for review rather than executed.
+        /// Falls back to `ORIGOFS_ACTOR`; see `origofs require-attribution`.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Move/rename a path.
-    Mv { from: String, to: String },
+    Mv {
+        from: String,
+        to: String,
+        /// Attribute the rename to this actor id, and check its write policy.
+        /// Falls back to `ORIGOFS_ACTOR`; see `origofs require-attribution`.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Snapshot the working tree into a commit.
     Commit {
         #[arg(short, long)]
         message: String,
+        /// The name recorded *in* the commit object. Free-form, and not an
+        /// identity — use `--actor` for that.
         #[arg(long, default_value = "origofs")]
         author: String,
+        /// Attribute the commit to this actor id, and check its write policy.
+        /// Falls back to `ORIGOFS_ACTOR`; see `origofs require-attribution`.
+        #[arg(long)]
+        actor: Option<i64>,
     },
     /// Show commit history (HEAD, first-parent).
     Log,
@@ -250,6 +276,17 @@ enum Cmd {
         /// `direct` or `propose`.
         policy: String,
     },
+    /// Require every mutating CLI command to name an actor (`on`), or allow
+    /// unattributed ones (`off`); with no argument, print the current setting.
+    ///
+    /// This is an attribution-completeness switch, not access control: an actor id
+    /// on a command line is self-asserted, and a local process holding the
+    /// workspace directory can bypass the CLI entirely. It catches the script that
+    /// forgot, which is the failure that actually happens.
+    RequireAttribution {
+        /// `on` or `off`. Omit to print the current setting.
+        setting: Option<String>,
+    },
     /// Show per-line authorship (blame) for a file.
     Blame { path: String },
     /// Undo exactly the lines one actor authored in one session, across every file
@@ -329,6 +366,38 @@ enum Cmd {
     Git {
         #[command(subcommand)]
         cmd: GitCmd,
+    },
+    /// Write an engine-independent dump of the whole metadata store to a file
+    /// (or stdout with `-`), as JSON Lines.
+    ///
+    /// The metadata DB is the half the content store cannot rebuild: `fsck
+    /// --rebuild` recovers committed files, dirs, symlinks and branches from the
+    /// bucket alone, and none of the attribution. This is how that half moves —
+    /// as a backup, or as the SQLite → Postgres migration path.
+    ///
+    /// **Metadata only.** File bytes stay in the content store, which this does
+    /// not touch: a dump references content by hash. Restoring it against a
+    /// different, empty content store gives you the names and the blame with
+    /// nothing to read — point the restored workspace at the same store, or copy
+    /// the store across too.
+    Dump {
+        /// Where to write. `-` writes to stdout.
+        #[arg(default_value = "-")]
+        out: String,
+    },
+    /// Restore a dump written by `origofs dump` into a **pristine** workspace
+    /// (or stdin with `-`).
+    ///
+    /// Refuses to merge into a workspace that already holds data: inode numbers,
+    /// actor ids and session ids are all local sequences, and reconciling two id
+    /// spaces silently wrong would produce blame attributed to the wrong actor.
+    ///
+    /// **Metadata only** — see `dump`. The restored workspace needs the same
+    /// content store, or reads fail with `content missing for hash ...`.
+    Load {
+        /// Where to read from. `-` reads stdin.
+        #[arg(default_value = "-")]
+        input: String,
     },
     /// Reclaim content unreachable from any branch or the working tree.
     Gc,
@@ -440,6 +509,45 @@ enum GitCmd {
 /// never corrupt a data channel on stdout — notably the `origofs mcp` JSON-RPC
 /// transport. origofs-core/-sdk only *emit* spans and events; this is the one
 /// place they are shown (a Rust embedder installs its own subscriber instead).
+/// The actor a mutating command should act as: `--actor` if given, else
+/// `ORIGOFS_ACTOR` (issue #128).
+///
+/// # Why an environment fallback rather than a required flag
+///
+/// #128 framed the choice as required-and-breaking versus optional-and-useless,
+/// and steered at "a configured identity, as `serve` does for the API". This is
+/// that: a shell session, a CI job, or an agent harness exports `ORIGOFS_ACTOR`
+/// once and every subsequent command is attributed, without every existing script
+/// breaking on the next release.
+///
+/// **It is not an identity check.** Whoever writes the command line also writes
+/// the environment, so this asserts identity, it does not verify it. Verification
+/// needs a server that resolves the caller — which is what `build_api_auth` does
+/// for the HTTP surface, and why that one refuses to expose an unauthenticated
+/// API off-loopback. A shell has nobody to do the resolving. What this buys is
+/// that the attribution *gets recorded* — see `origofs require-attribution` for
+/// making that mandatory rather than merely available.
+fn resolve_actor(flag: Option<i64>) -> anyhow::Result<Option<i64>> {
+    if let Some(a) = flag {
+        return Ok(Some(a));
+    }
+    match std::env::var("ORIGOFS_ACTOR") {
+        Ok(v) if !v.trim().is_empty() => v.trim().parse::<i64>().map(Some).map_err(|_| {
+            anyhow::anyhow!("ORIGOFS_ACTOR is set to {v:?}, which is not an actor id")
+        }),
+        _ => Ok(None),
+    }
+}
+
+/// Open a CLI session for `actor` and return the write context to act under.
+///
+/// Every attributed CLI command opens its own session labelled `cli`, matching
+/// what `write` already did, so a `revert-session` can undo one command's work.
+async fn cli_ctx(ws: &origofs_sdk::Workspace, actor: i64) -> anyhow::Result<WriteCtx> {
+    let session = ws.create_session(actor, Some("cli")).await?;
+    Ok(WriteCtx::session(actor, session))
+}
+
 fn init_tracing(format: LogFormat) {
     use tracing_subscriber::fmt::format::FmtSpan;
     use tracing_subscriber::{EnvFilter, fmt};
@@ -756,9 +864,16 @@ async fn main() -> Result<()> {
                 cli.workspace.display()
             );
         }
-        Cmd::Mkdir { path } => {
-            ws.mkdir_p(&path).await?;
-        }
+        Cmd::Mkdir { path, actor } => match resolve_actor(actor)? {
+            Some(actor) => {
+                let ctx = cli_ctx(&ws, actor).await?;
+                ws.mkdir_as(ctx, &path).await?;
+            }
+            None => {
+                ws.ensure_attributed("mkdir").await?;
+                ws.mkdir_p(&path).await?;
+            }
+        },
         Cmd::Write { path, from, actor } => {
             // Convenience: ensure the parent directory exists before writing.
             if let Some(parent) = path
@@ -768,9 +883,13 @@ async fn main() -> Result<()> {
             {
                 ws.mkdir_p(parent).await?;
             }
+            // `write` resolves its actor the same way the other mutating commands
+            // do since #128, so `ORIGOFS_ACTOR` attributes it too.
+            let actor = resolve_actor(actor)?;
             match (from, actor) {
                 // Unattributed streaming from a file (large files stay off-heap).
                 (Some(p), None) => {
+                    ws.ensure_attributed("write").await?;
                     let file = std::fs::File::open(p)?;
                     ws.write_reader(&path, file).await?;
                 }
@@ -824,6 +943,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 (None, None) => {
+                    ws.ensure_attributed("write").await?;
                     let mut buf = Vec::new();
                     std::io::stdin().read_to_end(&mut buf)?;
                     ws.write(&path, &buf).await?;
@@ -871,14 +991,52 @@ async fn main() -> Result<()> {
             opts.force = force;
             print_bench(&ws.bench(&opts).await?);
         }
-        Cmd::Rm { path } => {
-            ws.remove(&path).await?;
-        }
-        Cmd::Mv { from, to } => {
-            ws.rename(&from, &to).await?;
-        }
-        Cmd::Commit { message, author } => {
-            let hash = ws.commit(&author, &message).await?;
+        Cmd::Rm { path, actor } => match resolve_actor(actor)? {
+            Some(actor) => {
+                let ctx = cli_ctx(&ws, actor).await?;
+                // `remove_or_propose`, not `remove`: a propose-only actor's delete
+                // is queued for review rather than refused, which is how `write`
+                // already behaves. Refusing would make the two inconsistent in the
+                // opposite direction.
+                match ws.remove_or_propose(ctx, &path, None).await? {
+                    origofs_sdk::WriteOutcome::Wrote => {}
+                    origofs_sdk::WriteOutcome::Proposed(id) => {
+                        println!(
+                            "actor {actor} is propose-only: queued suggestion #{id} to delete {path} (pending review)"
+                        );
+                    }
+                }
+            }
+            None => {
+                ws.ensure_attributed("rm").await?;
+                ws.remove(&path).await?;
+            }
+        },
+        Cmd::Mv { from, to, actor } => match resolve_actor(actor)? {
+            Some(actor) => {
+                let ctx = cli_ctx(&ws, actor).await?;
+                ws.rename_as(ctx, &from, &to).await?;
+            }
+            None => {
+                ws.ensure_attributed("mv").await?;
+                ws.rename(&from, &to).await?;
+            }
+        },
+        Cmd::Commit {
+            message,
+            author,
+            actor,
+        } => {
+            let hash = match resolve_actor(actor)? {
+                Some(actor) => {
+                    let ctx = cli_ctx(&ws, actor).await?;
+                    ws.commit_as(ctx, &author, &message).await?
+                }
+                None => {
+                    ws.ensure_attributed("commit").await?;
+                    ws.commit(&author, &message).await?
+                }
+            };
             let branch = ws.current_branch().await?.unwrap_or_else(|| "?".into());
             println!("[{branch} {}] {message}", &hash.to_hex()[..12]);
         }
@@ -1203,6 +1361,76 @@ async fn main() -> Result<()> {
                 println!("  {p}");
             }
         }
+        Cmd::Dump { out } => {
+            let n = if out == "-" {
+                let stdout = std::io::stdout();
+                ws.dump(std::io::BufWriter::new(stdout.lock())).await?
+            } else {
+                let f = std::fs::File::create(&out)?;
+                let n = ws.dump(std::io::BufWriter::new(f)).await?;
+                println!("dumped {n} records to {out}");
+                n
+            };
+            let _ = n;
+        }
+        Cmd::Load { input } => {
+            let report = if input == "-" {
+                let stdin = std::io::stdin();
+                ws.load(std::io::BufReader::new(stdin.lock())).await?
+            } else {
+                let f = std::fs::File::open(&input)?;
+                ws.load(std::io::BufReader::new(f)).await?
+            };
+            println!(
+                "restored {} rows (dump taken at schema v{})",
+                report.total_rows(),
+                report.source_schema_version
+            );
+            for (table, n) in &report.tables {
+                println!("  {table}: {n}");
+            }
+            // The single most likely way to be confused by a successful load: the
+            // names and the blame are all here, and every read fails, because the
+            // bytes were never in the dump. Say so at the moment it matters rather
+            // than letting the user meet `content missing for hash ...` cold.
+            println!(
+                "note: this restored metadata only. File bytes live in the content \
+                 store, which a dump references by hash and does not carry — point \
+                 this workspace at the same content store, or reads will fail."
+            );
+            if !report.skipped_tables.is_empty() {
+                // A dump from a newer build may carry tables this one does not
+                // know. Skipping is deliberate (see `Fs::load`), but silence
+                // would let a partial restore look complete.
+                println!(
+                    "  skipped unknown tables: {}",
+                    report.skipped_tables.join(", ")
+                );
+            }
+        }
+        Cmd::RequireAttribution { setting } => match setting.as_deref() {
+            None => {
+                let on = ws.require_attribution().await?;
+                println!("require-attribution is {}", if on { "on" } else { "off" });
+            }
+            Some(v) => {
+                let on = match v {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(origofs_sdk::OrigoFSError::InvalidArgument(format!(
+                            "unknown setting {other:?} (expected `on` or `off`)"
+                        ))
+                        .into());
+                    }
+                };
+                ws.set_require_attribution(on).await?;
+                println!(
+                    "require-attribution set to {}",
+                    if on { "on" } else { "off" }
+                );
+            }
+        },
         Cmd::Blame { path } => {
             for r in ws.blame(&path).await? {
                 let who = format!("{}:{}", r.actor.kind.as_str(), r.actor.display_name);

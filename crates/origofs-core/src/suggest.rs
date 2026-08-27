@@ -780,3 +780,65 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         Ok(())
     }
 }
+
+/// Workspace setting: whether a *user-facing surface* must name an actor before
+/// it may mutate the working tree (issue #128).
+pub(crate) const REQUIRE_ATTRIBUTION: &str = "write.require_attribution";
+
+impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
+    /// Whether this workspace requires every surface-initiated mutation to name
+    /// an actor. Off by default.
+    ///
+    /// # What this is, and what it deliberately is not
+    ///
+    /// It is an **attribution-completeness** switch, not an access control. The
+    /// premise of this system is that every edit is recorded against the actor
+    /// that made it; the raw unattributed ops exist for internal machinery, and
+    /// nothing stopped a surface from reaching for them and leaving no trace of
+    /// who acted. Turning this on makes that a refusal instead of a silent gap.
+    ///
+    /// It is **not a security boundary**, and must not be described as one. A
+    /// local process holding the workspace directory has the metadata DB and the
+    /// CAS on disk and can do as it likes with them; an actor id passed on a
+    /// command line is self-asserted by whoever writes the command line.
+    /// `CLAUDE.md` puts the boundary where it actually is — "the server never
+    /// trusts a client-named actor; identity is resolved server-side" — and that
+    /// is the HTTP surface, not a shell.
+    ///
+    /// So this defends against the realistic failure, which is a script or an
+    /// operator that *forgot*, not an adversary that lied. That is worth having:
+    /// on a workspace where attribution matters, "the CLI silently wrote nothing
+    /// to the op-log" is a data-quality bug that shows up much later, when the
+    /// blame trail is the thing you needed.
+    pub async fn require_attribution(&self) -> Result<bool> {
+        Ok(self.meta.get_config(REQUIRE_ATTRIBUTION).await?.as_deref() == Some("1"))
+    }
+
+    /// Turn the requirement on or off.
+    ///
+    /// Off is the right default for the same reason `acl_default_deny` is: turning
+    /// it on for an existing workspace changes what already-written scripts do, so
+    /// it has to be a deliberate act by someone who knows their scripts name an
+    /// actor.
+    pub async fn set_require_attribution(&self, required: bool) -> Result<()> {
+        self.meta
+            .set_config(REQUIRE_ATTRIBUTION, if required { "1" } else { "0" })
+            .await
+    }
+
+    /// Refuse an unattributed surface mutation when this workspace requires
+    /// attribution (issue #128).
+    ///
+    /// Surfaces call this on the path where no actor was named. The error names
+    /// the operation and how to fix it, because the fix is always the same and
+    /// always the caller's: name an actor.
+    pub async fn ensure_attributed(&self, op: &str) -> Result<()> {
+        if self.require_attribution().await? {
+            return Err(OrigoFSError::Denied(format!(
+                "{op} requires an actor: this workspace has write.require_attribution set, \
+                 so every mutation must record who made it"
+            )));
+        }
+        Ok(())
+    }
+}

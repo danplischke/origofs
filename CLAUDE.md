@@ -174,8 +174,23 @@ write path enforces this and you must not weaken it:
   `rename`/`mkdir_p`/`symlink`/`commit` — those take no actor, exist for internal
   machinery (checkout, merge materialization, applying an accepted suggestion),
   and are exempt by construction. `tests/mcp.rs` fails on an unclassified MCP tool
-  so a new ungated one can't ship silently; the FUSE/NFS mounts remain a
-  deliberate bypass (a mount has no actor context). Issue #78.
+  so a new ungated one can't ship silently, and
+  `origofs-cli/tests/cli.rs::every_mutating_subcommand_is_classified_and_attributable`
+  does the same for the CLI — every subcommand must be classified, every exemption
+  must carry a *reason*, and every attributed one must actually offer `--actor`.
+  The FUSE/NFS mounts remain a deliberate bypass (a mount has no actor context).
+  Issues #78, #128.
+- **CLI identity is asserted, not verified, and the CLI is not a boundary.**
+  Mutating subcommands take `--actor`, falling back to `ORIGOFS_ACTOR` so a shell
+  or an agent harness sets identity once (issue #128). None of that is an identity
+  *check*: whoever writes the argv writes the environment, and a local process
+  holding the workspace directory has `meta.db` and the CAS on disk anyway. The
+  boundary is the HTTP surface, where `build_api_auth` resolves identity
+  server-side and refuses an unauthenticated API off-loopback. What the CLI flags
+  buy is that attribution **gets recorded** — previously `rm`/`mv`/`mkdir` could
+  not be attributed at all. `origofs require-attribution on` (workspace setting,
+  default off) turns an unattributed mutation into an error; treat it as
+  attribution completeness, never as access control.
 
 ## Versioning
 

@@ -251,6 +251,21 @@ routed into the review queue instead of landing:
 origofs --workspace "$WS" write-policy "$AGENT" propose   # now its writes must be reviewed
 ```
 
+The gate applies to any mutation that **names an actor** — `write`, `rm`, `mv`,
+`mkdir` and `commit` all take `--actor` (or read `ORIGOFS_ACTOR`), and route
+through the same engine check. A command that names nobody is unattributed and
+records no blame; to make that an error rather than a silent gap:
+
+```bash
+origofs --workspace "$WS" require-attribution on   # every mutation must say who
+```
+
+That is an attribution-completeness switch, **not** access control. An actor id on
+a command line is asserted by whoever writes the command line, and a process that
+can reach the workspace directory can reach `meta.db` directly. Identity is only
+*verified* where something resolves it server-side — the HTTP API, which refuses
+to run unauthenticated off-loopback.
+
 Over **MCP**, an agent gets the whole loop as tools — `origofs_read`,
 `origofs_write`, `origofs_edit` (exact string search-and-replace), `origofs_suggest`,
 `origofs_suggestion_diff`, `origofs_accept`, `origofs_reject` — under the same
