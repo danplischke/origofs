@@ -17,8 +17,9 @@ import tempfile
 from types import SimpleNamespace
 
 import origofs
-from origofs.fastapi import build_router
+from origofs.fastapi import SPOOL_MAX, build_router
 
+import pytest
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.testclient import TestClient
 
@@ -1039,3 +1040,98 @@ def test_an_empty_file_still_answers_cleanly():
     assert r.status_code == 200 and r.content == b""
     # A range against a zero-length file is unsatisfiable.
     assert c.get("/files/empty.txt", headers={"Range": "bytes=0-"}).status_code == 416
+
+
+def _grant_scoped_proposer():
+    """A real workspace where bob's *policy* is Direct but his *grant* at /x
+    allows PROPOSE only — the case that separates the two write checks."""
+    d = tempfile.mkdtemp()
+
+    async def _setup():
+        ws = await origofs.Workspace.open_local(
+            os.path.join(d, "meta.db"), os.path.join(d, "cas")
+        )
+        owner = await ws.create_human("owner", None)
+        await ws.grant(owner, "/", "read+write", None)
+        await ws.mkdir_as(origofs.WriteCtx.actor(owner), "/x")
+        bob = await ws.create_human("bob", None)
+        await ws.grant(bob, "/x", "read+propose", owner)
+        return ws, bob
+
+    ws, bob = asyncio.run(_setup())
+    return _client(ws), ws, {"X-Actor-Id": str(bob)}
+
+
+def test_a_grant_scoped_proposer_gets_a_suggestion_not_a_403():
+    """The router must not reconstruct the write-or-propose fork from the wrong check.
+
+    `write_or_propose` forks on the *path-scoped* check, where the grant covering
+    the path decides and the write policy is only the fallback. The router asked
+    the path-*less* `ensure_may_write`, which consults the policy alone — so for an
+    actor whose policy is Direct but whose grant here allows PROPOSE only it
+    answered "may write directly", took the direct path, and the engine's real
+    check refused it. The engine queues a suggestion for this actor; the router
+    returned 403.
+    """
+    c, ws, hdr = _grant_scoped_proposer()
+    r = c.put("/files/x/small.md", content=b"a" * 16, headers=hdr)
+    assert r.status_code == 200, r.text
+    assert r.json().get("proposed"), f"expected a queued suggestion, got {r.json()}"
+
+    # And the working tree is untouched: a proposal is not a write.
+    async def _read():
+        return await ws.read("/x/small.md")
+
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(_read())
+
+
+def test_the_propose_fork_is_the_same_either_side_of_spool_max():
+    """A body over SPOOL_MAX must fork the same way a small one does.
+
+    The streaming branch is the only caller that relies on the probe, so a wrong
+    answer showed up as a size-dependent status for one actor and path.
+    """
+    c, _ws, hdr = _grant_scoped_proposer()
+    small = c.put("/files/x/small.md", content=b"a" * 16, headers=hdr)
+    large = c.put("/files/x/big.md", content=b"a" * (SPOOL_MAX + 1024), headers=hdr)
+    assert small.status_code == large.status_code == 200, (small.text, large.text)
+    assert small.json().get("proposed") and large.json().get("proposed"), (
+        small.json(), large.json()
+    )
+
+
+def test_a_write_granted_actor_still_writes_directly():
+    """The counterpart: the fix must not turn real writes into proposals."""
+    d = tempfile.mkdtemp()
+
+    async def _setup():
+        ws = await origofs.Workspace.open_local(
+            os.path.join(d, "meta.db"), os.path.join(d, "cas")
+        )
+        owner = await ws.create_human("owner", None)
+        await ws.grant(owner, "/", "read+write", None)
+        return ws, owner
+
+    ws, owner = asyncio.run(_setup())
+    c = _client(ws)
+    hdr = {"X-Actor-Id": str(owner)}
+
+    r = c.put("/files/deep/dir/note.md", content=b"hello", headers=hdr)
+    assert r.status_code == 200, r.text
+    assert r.json().get("written") == 5, r.json()
+
+    async def _small():
+        return await ws.read("/deep/dir/note.md")
+
+    assert asyncio.run(_small()) == b"hello"
+
+    big = b"b" * (SPOOL_MAX + 1024)
+    r = c.put("/files/deep/dir/big.md", content=big, headers=hdr)
+    assert r.status_code == 200, r.text
+    assert r.json().get("written") == len(big), r.json()
+
+    async def _big():
+        return await ws.read("/deep/dir/big.md")
+
+    assert len(asyncio.run(_big())) == len(big)

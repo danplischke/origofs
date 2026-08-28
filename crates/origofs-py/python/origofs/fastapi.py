@@ -971,36 +971,31 @@ def build_router(
         # workspace-like object (that is how it is tested without the compiled
         # extension), the same way the co-editing rooms probe `is_postgres`.
         #
+        # **`ensure_may_write_at`, not `ensure_may_write`.** This reconstructs the
+        # fork `write_or_propose` makes internally, so it has to ask the question
+        # the engine will actually answer: the *path-scoped* one, where the grant
+        # covering `p` decides and the actor's write policy is only the fallback.
+        # The path-less check consults the policy alone, so for an actor whose
+        # policy is Direct but whose grant here allows PROPOSE only, it answered
+        # "may write directly" — and the request then took the direct path and was
+        # refused by the engine's real check, turning what the engine would have
+        # queued as a suggestion into a 403. The `mkdir_as` below is where it
+        # actually bit, so even a small body into an existing directory 403'd.
+        #
         # Defaulting to True when absent is safe: the buffered branch below goes
         # through `write_or_propose`, which enforces the policy itself. Only the
         # streaming branch relies on this check, and it is reached solely on a real
         # workspace — which has the method.
         # Awaited directly, *not* through `_run`: `_run` maps `PermissionError` to
-        # a 409 for the caller, which is right for a real request but would swallow
+        # a 403 for the caller, which is right for a real request but would swallow
         # the answer this probe exists to get.
         may_write_directly = True
-        probe = getattr(ws, "ensure_may_write", None)
+        probe = getattr(ws, "ensure_may_write_at", None)
         if probe is not None:
             try:
-                await probe(ctx, "write a file")
+                await probe(ctx, "write a file", p)
             except PermissionError:
                 may_write_directly = False
-
-        # Missing parents are created only *after* the policy decision, so a queued
-        # suggestion leaves the working tree untouched -- the same ordering the
-        # engine uses inside `write_or_propose`, and the property
-        # `tests/mcp.rs::a_queued_write_creates_no_directories` pins on the MCP
-        # surface. Attributed, so the directory carries an actor like any other
-        # namespace mutation.
-        #
-        # Only the streaming branch below strictly needs this (`write_reader_as`
-        # resolves an existing parent rather than creating one); the buffered
-        # branch's `write_or_propose` creates parents itself. Doing it once here
-        # keeps both branches identical from the caller's side.
-        if may_write_directly:
-            parent, _, _ = p.rpartition("/")
-            if parent:
-                await _run(ws.mkdir_as(ctx, parent))
 
         buf = bytearray()
         spill = None
@@ -1021,6 +1016,20 @@ def build_router(
                     buf = bytearray()
             if spill is not None:
                 spill.close()
+                # Only the streaming path needs the parent to exist:
+                # `write_path_as` resolves an existing parent rather than creating
+                # one, while the buffered branch's `write_or_propose` creates
+                # parents itself. Creating it *here* rather than up front is what
+                # makes "a queued suggestion leaves the working tree untouched"
+                # hold structurally instead of resting on the probe above — the
+                # buffered branch never reaches this line, so it cannot mkdir for
+                # a write it is only proposing. (Parity with
+                # `tests/mcp.rs::a_queued_write_creates_no_directories`.)
+                # Attributed, so the directory carries an actor like any other
+                # namespace mutation.
+                parent, _, _ = p.rpartition("/")
+                if parent:
+                    await _run(ws.mkdir_as(ctx, parent))
                 await _run(ws.write_path_as(ctx, p, spill_path))
                 return {"path": p, "written": size}
 
