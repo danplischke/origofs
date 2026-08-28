@@ -4592,6 +4592,154 @@ impl Workspace {
         })
     }
 
+    /// Whether reads are checked against `read` grants (issue #124). Off by
+    /// default; see `set_acl_enforce_reads`.
+    fn acl_enforce_reads<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(
+            py,
+            async move { ws.acl_enforce_reads().await.map_err(to_pyerr) },
+        )
+    }
+
+    /// Turn read enforcement on or off for this workspace.
+    ///
+    /// Off by default, and deliberately a switch rather than a default: reads have
+    /// never been checked, so an existing workspace holds no read grants and
+    /// turning this on without writing them first stops every actor at once — the
+    /// same hazard `set_acl_default_deny` carries.
+    fn set_acl_enforce_reads<'py>(&self, py: Python<'py>, on: bool) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.set_acl_enforce_reads(on).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Refuse a read of `path` for an actor without `read` there. Raises
+    /// `PermissionError`, or returns `None` if allowed. A no-op unless the
+    /// workspace has read enforcement on.
+    fn ensure_may_read_at<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        op: String,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.ensure_may_read_at(ctx.inner, &op, &path)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// `read`, checked against `read` at the path.
+    fn read_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let bytes = ws.read_as(c, &path).await.map_err(to_pyerr)?;
+            Python::attach(|py| Ok(PyBytes::new(py, &bytes).into_any().unbind()))
+        })
+    }
+
+    /// `read_range`, checked against `read` at the path.
+    fn read_range_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        off: u64,
+        len: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let bytes = ws
+                .read_range_as(c, &path, off, len)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Ok(PyBytes::new(py, &bytes).into_any().unbind()))
+        })
+    }
+
+    /// `stat`, checked against `read` at the path.
+    fn stat_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let inode = ws.stat_as(c, &path).await.map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// `readlink`, checked against `read` at the path.
+    fn readlink_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.readlink_as(c, &path).await.map_err(to_pyerr)
+        })
+    }
+
+    /// `blame`, checked against `read` at the path — blame reports who wrote which
+    /// bytes, so it is a read of the file by another name.
+    fn blame_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let ranges = ws.blame_as(c, &path).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                let out: PyResult<Vec<_>> = ranges.iter().map(|b| blame_dict(py, b)).collect();
+                Ok(out?.into_pyobject(py)?.unbind().into_any())
+            })
+        })
+    }
+
+    /// `ls`, checked against `read` at the directory.
+    ///
+    /// Checks the directory, not its entries: an actor that may read `/a` gets all
+    /// of `/a`'s entries. Per-entry filtering has to be designed together with
+    /// `stat_as` so the two agree about a denied path, or the difference between
+    /// them is an existence oracle.
+    fn ls_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let entries = ws.ls_as(c, &path).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                let out: PyResult<Vec<_>> = entries.iter().map(|e| dir_entry_dict(py, e)).collect();
+                Ok(out?.into_pyobject(py)?.unbind().into_any())
+            })
+        })
+    }
+
     /// Refuse an op that reaches **every** path for an actor without `write` at
     /// `/` — the path-less counterpart of `ensure_may_write_at` (issue #123).
     ///

@@ -229,6 +229,33 @@ write path enforces this and you must not weaken it:
   without a session, use `load_coedit_as` — propose right, no live marker; that
   is what the `origofs_suggest_coedit` MCP tool does, and gating it on write
   would have broken the propose-only agents the tool exists for.
+- **Reads are checked only where a workspace opts in.** `Perms::READ` went from a
+  bit nothing consulted to one `ensure_may_read_at` enforces, behind
+  `acl_enforce_reads` (workspace setting, **default off**) — reads have never been
+  checked, so no existing workspace holds read grants and enforcing on upgrade
+  would stop every actor at once. The attributed reads (`read_as`,
+  `read_range_as`, `stat_as`, `ls_as`, `readlink_as`, `blame_as`) run it; the
+  unattributed ones stay open by construction like `remove`/`rename`/`mkdir_p`,
+  because checkout, merge, gc and the CRDT coordinator are built from them. Like
+  the write checks it runs **before** any lookup, so a denial cannot leak
+  existence — which matters more here, since probing for existence is the point of
+  an unauthorized read. `ls_as` checks the directory, not its entries; per-entry
+  filtering must land together with `stat_as` or the two disagree and become an
+  oracle. Issue #124.
+- **`effective_perms` is cached, and the cache is exact rather than fresh-ish.**
+  It was up to three round trips — `list_acl` returns *every* grant the actor
+  holds — with a linear prefix match over the result: 16% of a read at one grant,
+  **228%** at 201, growing with exactly the per-project grants a multi-tenant
+  deployment accumulates. Affordable on the write path, not on the read path. The
+  cache is keyed on `acl.generation`, a counter in the store bumped by `grant`,
+  `revoke`, `set_write_policy` and both ACL switches, so a revoke on one worker is
+  seen by the next check on every other — a TTL would have traded the exactness
+  every write check has today for speed. Two things had to be true for it to be
+  *constant* in grant count rather than merely cheaper: prefixes are parsed once at
+  load and indexed by prefix (a grant covers a path exactly when it is one of that
+  path's ancestors, so a match is a few map lookups), and a cache hit resolves
+  **under the read lock** — handing the entry back meant cloning the grant map per
+  check, which put the linear cost straight back.
 - **CLI identity is asserted, not verified, and the CLI is not a boundary.**
   Mutating subcommands take `--actor`, falling back to `ORIGOFS_ACTOR` so a shell
   or an agent harness sets identity once (issue #128). None of that is an identity

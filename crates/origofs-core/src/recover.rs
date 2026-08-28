@@ -249,6 +249,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 content: self.content.clone(),
                 clock: self.clock.clone(),
                 root_ino: root,
+                // A *different* workspace, with its own scoped metadata store and
+                // so its own grants: a fresh cache, never `self`'s.
+                acl_cache: Default::default(),
             };
             recover_into(&sub, &scan.mirrors[name], &scan.commits, &mut report).await?;
             report.extra_workspaces += 1;

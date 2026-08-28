@@ -1067,6 +1067,65 @@ impl Workspace {
         self.fs.ensure_may_write_at(ctx, op, path).await
     }
 
+    /// Whether reads are checked against `READ` (issue #124). Off by default.
+    pub async fn acl_enforce_reads(&self) -> Result<bool> {
+        self.fs.acl_enforce_reads().await
+    }
+
+    /// Turn read enforcement on or off for this workspace.
+    ///
+    /// Off by default: reads have never been checked, so switching this on without
+    /// writing read grants first stops every actor at once — the same hazard, and
+    /// the same deliberate switch, as `set_acl_default_deny`.
+    pub async fn set_acl_enforce_reads(&self, on: bool) -> Result<()> {
+        self.fs.set_acl_enforce_reads(on).await
+    }
+
+    /// Refuse a read of a path for an actor without `READ` there. A no-op unless
+    /// the workspace has read enforcement on.
+    pub async fn ensure_may_read_at(&self, ctx: WriteCtx, op: &str, path: &str) -> Result<()> {
+        self.fs.ensure_may_read_at(ctx, op, path).await
+    }
+
+    /// [`read`](Self::read), checked against `READ` at the path.
+    pub async fn read_as(&self, ctx: WriteCtx, path: &str) -> Result<Bytes> {
+        self.fs.read_as(ctx, path).await
+    }
+
+    /// [`read_range`](Self::read_range), checked against `READ` at the path.
+    pub async fn read_range_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        off: u64,
+        len: u64,
+    ) -> Result<Bytes> {
+        self.fs.read_range_as(ctx, path, off, len).await
+    }
+
+    /// [`stat`](Self::stat), checked against `READ` at the path.
+    pub async fn stat_as(&self, ctx: WriteCtx, path: &str) -> Result<Inode> {
+        self.fs.stat_as(ctx, path).await
+    }
+
+    /// [`readlink`](Self::readlink), checked against `READ` at the path.
+    pub async fn readlink_as(&self, ctx: WriteCtx, path: &str) -> Result<String> {
+        self.fs.readlink_as(ctx, path).await
+    }
+
+    /// [`blame`](Self::blame), checked against `READ` at the path — blame returns
+    /// who wrote which bytes, so it is a read of the file by another name.
+    pub async fn blame_as(&self, ctx: WriteCtx, path: &str) -> Result<Vec<BlameRange>> {
+        self.fs.blame_as(ctx, path).await
+    }
+
+    /// [`ls`](Self::ls), checked against `READ` at the directory. Checks the
+    /// directory, not its entries — see `Fs::ls_as` on why per-entry filtering is
+    /// not here yet.
+    pub async fn ls_as(&self, ctx: WriteCtx, path: &str) -> Result<Vec<DirEntry>> {
+        self.fs.ls_as(ctx, path).await
+    }
+
     // --- portable dump/load (issue #117) ------------------------------------
 
     /// Write an engine-independent dump of the whole metadata store.
