@@ -190,6 +190,32 @@ A `Scope` resolves *paths*, so an operation without one is outside it entirely:
 - The same reasoning is why `commit`, `checkout`, `create_branch` and an
   unbounded `revert_session` take `ensure_may_write_workspace` rather than the
   path-less policy check: having no path is not the same as touching none.
+- **Live co-editing is a write channel and is scoped like one.** The y-sync
+  WebSocket authenticates the upgrade but has no notion of "read-only", so
+  `open_coedit`/`open_coedit_tree` take the ordinary path-scoped write check and
+  both checkpoints re-check. Until they did, a tenant's actor with a
+  read-only grant — or none at all under `acl_default_deny` — could edit any path
+  it could name by opening it as a co-edited document, because the checkpoint
+  lands through `write_as_blamed`, which is deliberately ungated as the CRDT
+  coordinator's own write path. There is deliberately **no view-only socket**: a
+  reader that should watch a document without editing it has no mode to do so
+  today, and inventing one by allowing the socket and dropping its content frames
+  would have to be built rather than assumed.
+- **Grants gate writes, not reads — know this before you rely on them.** There is
+  no read-side check anywhere in the engine: `ensure_may_read` does not exist.
+  `Perms::READ` is a real bit, it is grantable, and it is reported in
+  `effective permissions`, but nothing consults it. Under `acl_default_deny` an
+  actor with *no grant at all* is correctly refused every write and can still
+  `read`, `blame`, `ls` and `log` any path it can name. Read isolation therefore
+  comes from **routing**, not from the ACL: the tenant `root` prefix each request
+  resolves to (`_scoped`/`_require_in_scope` in the FastAPI router, the same idea
+  in any host) is what keeps one tenant out of another's files. An ACL is not a
+  substitute for that scoping, and a `READ` grant does not narrow anything —
+  granting it says what an actor *should* see, not what the engine enforces.
+- Suggestions are scoped at `record_suggestion`, which every shape of them (bytes,
+  delete, CRDT) funnels through, satisfied by `WRITE` or `PROPOSE` at the path.
+  The queue is not the working tree, but it is reviewer-visible state that an
+  actor holding `Perms::NONE` there should not be able to create.
 
 ---
 

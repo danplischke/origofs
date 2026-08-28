@@ -80,6 +80,14 @@ impl RoomDoc {
         }
     }
 
+    /// The whole-state frame used to catch up a socket dropped from the fan-out.
+    fn state_frame(&self) -> Vec<u8> {
+        match self {
+            Self::Flat(d) => d.state_frame(),
+            Self::Tree(d) => d.state_frame(),
+        }
+    }
+
     fn handle_sync(&self, ctx: WriteCtx, data: &[u8]) -> Result<crate::SyncReply, OrigoFSError> {
         match self {
             Self::Flat(d) => d.handle_sync(ctx, data),
@@ -479,7 +487,10 @@ impl Coordinator {
         };
         let room = self.rooms.lock().await.get(&key).map(|s| s.room.clone());
         let Some(room) = room else {
-            let doc = self.ws.open_coedit_tree(ctx, path, root).await?;
+            // `load_…`, not `open_…`: this flow never reaches the socket disconnect
+            // that clears the marker, so opening here left the path marked live for
+            // good. Same write check, no claim.
+            let doc = self.ws.load_coedit_tree_as(ctx, path, root).await?;
             return self
                 .ws
                 .checkpoint_coedit_tree(ctx, path, &doc, body, spans)
@@ -984,8 +995,30 @@ async fn serve_socket(coord: Coordinator, ctx: WriteCtx, key: RoomKey, socket: W
                         }
                     }
                     Ok(_) => {}
-                    // Fell too far behind: the CRDT reconverges on the next edit.
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    // Fell too far behind and lost frames. This does *not* heal
+                    // itself: the dropped frames carried the only copy of those
+                    // items, and a later delta is encoded against a state vector
+                    // the client never reached, so Yjs parks it as pending on
+                    // origins that will never arrive. The client then shows a
+                    // document frozen at the moment it lagged while its user keeps
+                    // typing into it — and nothing on the server ever notices.
+                    // Push the whole state instead: idempotent, needs no round
+                    // trip, and unlike a `SyncStep1` it pushes in the direction
+                    // the client is actually missing.
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            path = key.path(),
+                            dropped = n,
+                            "coedit: socket fell behind the fan-out; resyncing it"
+                        );
+                        let catch_up = {
+                            let doc = room.doc.lock().await;
+                            doc.state_frame()
+                        };
+                        if sink.send(Message::Binary(catch_up.into())).await.is_err() {
+                            break;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }

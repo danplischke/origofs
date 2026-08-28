@@ -338,6 +338,12 @@ impl CoeditTreeDoc {
         crate::coedit::sync_start(&self.doc)
     }
 
+    /// The y-sync frame carrying this document's whole state, to catch up a client
+    /// that missed frames. See [`crate::coedit::state_frame`].
+    pub fn state_frame(&self) -> Vec<u8> {
+        crate::coedit::state_frame(&self.doc)
+    }
+
     /// Drive one inbound y-sync payload from a connection authenticated as `ctx`.
     /// Content the client contributes is attributed to `ctx` by
     /// [`apply_update_as`](Self::apply_update_as).
@@ -707,9 +713,32 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         path: &str,
         root: &str,
     ) -> Result<CoeditTreeDoc> {
+        // Same path-scoped check the flat shape takes in `open_coedit`, and for
+        // the same reason: this socket is a write channel onto `path` (#123).
+        self.ensure_may_write_at(ctx, "co-edit", path).await?;
         let doc = self.load_coedit_tree(path, root).await?;
         self.mark_live(ctx, path).await?;
         Ok(doc)
+    }
+
+    /// Resume a tree document to **check point** against, without opening a
+    /// session on it: the write check [`open_coedit_tree`](Self::open_coedit_tree)
+    /// takes, without the live marker it claims.
+    ///
+    /// This is what a host's checkpoint route wants when no socket is attached —
+    /// the editor closed, or the app is landing bytes from a "Save" button. Using
+    /// `open_coedit_tree` there marked the path live and never cleared it, because
+    /// the matching `end_coedit` lives on the socket's disconnect path that this
+    /// flow never reaches: every socket-less checkpoint leaked a permanent marker
+    /// telling readers the durable bytes may lag an editor that is not there.
+    pub async fn load_coedit_tree_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        root: &str,
+    ) -> Result<CoeditTreeDoc> {
+        self.ensure_may_write_at(ctx, "co-edit", path).await?;
+        self.load_coedit_tree(path, root).await
     }
 
     /// The read-only half of [`open_coedit_tree`](Self::open_coedit_tree): resume
@@ -763,6 +792,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         body: &[u8],
         spans: &[TreeSpan],
     ) -> Result<()> {
+        // The backstop to `open_coedit_tree`'s check — and it carries more weight
+        // here than on the flat shape, because this call takes the host's `body`
+        // and replaces the file with it wholesale.
+        self.ensure_may_write_at(ctx, "check point a co-edited document to", path)
+            .await?;
         let text = std::str::from_utf8(body).map_err(|_| {
             OrigoFSError::InvalidArgument("co-edit tree checkpoint requires UTF-8 text".into())
         })?;

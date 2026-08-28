@@ -734,7 +734,11 @@ class _Rooms:
         room = self._rooms.get(key)
         path, xml_root = key[2], key[1]
         if room is None:
-            doc = await self._ws.open_coedit_tree(ctx, path, xml_root)
+            # `load_`, not `open_`: a socket-less checkpoint never reaches `leave()`,
+            # which is what clears the live marker, so opening here marked the path
+            # live for good -- every "Save" with no editor attached leaked one. Same
+            # write check, no claim.
+            doc = await self._ws.load_coedit_tree_as(ctx, path, xml_root)
             await self._ws.checkpoint_coedit_tree(ctx, path, doc, body, spans)
             return
         await self._ws.checkpoint_coedit_tree(ctx, path, room.doc, body, spans)

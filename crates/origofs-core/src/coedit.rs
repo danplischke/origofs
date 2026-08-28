@@ -299,6 +299,12 @@ impl CoeditDoc {
         sync_start(&self.doc)
     }
 
+    /// The y-sync frame carrying this document's whole state, to catch up a client
+    /// that missed frames. See [`state_frame`].
+    pub fn state_frame(&self) -> Vec<u8> {
+        state_frame(&self.doc)
+    }
+
     /// Drive one inbound y-sync payload from a connection authenticated as `ctx`.
     /// A payload may pack several messages; each is handled in order.
     ///
@@ -897,6 +903,24 @@ pub(crate) fn apply_relayed(doc: &Doc, frame: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The y-sync frame carrying `doc`'s **whole** state as an `Update`, for a client
+/// that has to be caught up unconditionally.
+///
+/// This is the recovery frame for a socket dropped from the fan-out. Unlike
+/// [`sync_start`], it needs no round trip and no knowledge of what the client
+/// already has: a Yjs update is idempotent, so applying the full state is always
+/// safe and always sufficient. That matters because the alternative — a
+/// `SyncStep1` — only asks the client for what *we* lack, which is the wrong
+/// direction to heal a client that is behind.
+pub(crate) fn state_frame(doc: &Doc) -> Vec<u8> {
+    let state = doc
+        .transact()
+        .encode_state_as_update_v1(&StateVector::default());
+    let mut encoder = EncoderV1::new();
+    Message::Sync(SyncMessage::Update(state)).encode(&mut encoder);
+    encoder.to_vec()
+}
+
 /// The y-sync `SyncStep1` frame greeting a freshly-connected client with `doc`'s
 /// state vector. Shared by both document shapes.
 pub(crate) fn sync_start(doc: &Doc) -> Vec<u8> {
@@ -1100,6 +1124,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         path: &str,
         doc: &CoeditDoc,
     ) -> Result<()> {
+        // The backstop to `open_coedit`'s check, for a caller holding a
+        // `CoeditDoc` it did not open through this workspace. `write_as_blamed`
+        // below is deliberately ungated — it is the coordinator's own write — so
+        // this is the only thing standing between a doc and the working tree.
+        self.ensure_may_write_at(ctx, "check point a co-edited document to", path)
+            .await?;
         self.reconcile_out_of_band(ctx, path, doc).await?;
         let (text, mut spans) = doc.snapshot();
         for span in &mut spans {
@@ -1178,22 +1208,46 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if current == live.content_hash {
             return Ok(()); // nobody wrote around us
         }
+        // Past this point the file is *not* what this document was last coherent
+        // with, so writing the document's text over it would destroy whatever
+        // landed. Fold that write in where we can, and refuse where we cannot.
+        //
+        // Every arm below used to `return Ok(())`: "I could not reconcile" was read
+        // by the caller as "there was nothing to reconcile", and it went on to
+        // overwrite. A branch checkout makes it concrete — `checkout` rematerializes
+        // the file *and* swaps the sidecar away (it lives in the working tree),
+        // while the live marker is metadata and survives, so the one input
+        // reconciliation needs is missing exactly when it is needed. A room opened
+        // on the old branch then wrote its content onto the new one, silently. The
+        // tree shape has always refused here (`refuse_out_of_band`); this is the
+        // flat shape holding the same line, reconciling first where it can.
+        let refuse = |why: &str| -> Result<()> {
+            Err(OrigoFSError::Conflict(format!(
+                "{path} was written outside the co-editing session since its last \
+                 checkpoint, and the two versions cannot be merged ({why}) — re-open \
+                 the document to pick up the current file, then checkpoint again"
+            )))
+        };
         let bytes = match self.read(path).await {
             Ok(b) => b,
-            Err(OrigoFSError::NotFound(_)) => return Ok(()), // removed: nothing to fold in
+            // Resurrecting a file somebody deleted is as much a surprise as
+            // clobbering one they wrote.
+            Err(OrigoFSError::NotFound(_)) => return refuse("the file was removed"),
             Err(e) => return Err(e),
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
-            return Ok(()); // binary now: not reconcilable as text
+            return refuse("it is no longer valid UTF-8 and cannot be merged as text");
         };
         // The replica: this document as it stood at the last checkpoint.
         let sidecar = match self.read(&coedit_sidecar_path(path)).await {
             Ok(b) => b,
-            Err(OrigoFSError::NotFound(_)) => return Ok(()),
+            Err(OrigoFSError::NotFound(_)) => {
+                return refuse("its CRDT sidecar is gone, leaving no common base to merge from");
+            }
             Err(e) => return Err(e),
         };
         let Some((_, ydoc)) = parse_sidecar(&sidecar) else {
-            return Ok(());
+            return refuse("its CRDT sidecar is unreadable");
         };
         let replica = CoeditDoc::load(ydoc)?;
         let ranges = self.blame(path).await.unwrap_or_default();
@@ -1244,9 +1298,32 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// so a byte reader can tell that the durable blob may lag this document. Call
     /// [`end_coedit`](Self::end_coedit) when the session finishes to clear it.
     pub async fn open_coedit(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
+        // A co-editing document is a *write* channel onto `path`, so opening one
+        // takes the same path-scoped check every other attributed mutation takes.
+        // Without it the whole surface was an ACL bypass: an actor refused by
+        // `write_or_propose` opened the same path here and its edits landed
+        // through `checkpoint_coedit`'s `write_as_blamed`, which is exempt by
+        // construction (it is the CRDT coordinator's own path). Checked here
+        // rather than only at checkpoint so the refusal arrives when the socket
+        // connects, instead of after a session's worth of typing (#123).
+        self.ensure_may_write_at(ctx, "co-edit", path).await?;
         let doc = self.load_coedit(ctx, path).await?;
         self.mark_live(ctx, path).await?;
         Ok(doc)
+    }
+
+    /// Load a co-edited document to **propose** against: the same reconstruction
+    /// [`open_coedit`](Self::open_coedit) does, but it neither requires write
+    /// rights nor marks the path live.
+    ///
+    /// Proposing is what a propose-only actor is *for*, so it must not take the
+    /// write check — and a throwaway replica built to compute a proposal is not a
+    /// co-editing session, so claiming the path for it would tell every reader the
+    /// durable bytes may lag when nothing is editing them.
+    pub async fn load_coedit_as(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
+        self.ensure_may_propose_at(ctx, "propose changes to", path)
+            .await?;
+        self.load_coedit(ctx, path).await
     }
 
     // --- CRDT-shaped suggestions (issue #75 §3.2) -------------------------

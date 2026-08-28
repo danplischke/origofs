@@ -2613,6 +2613,62 @@ impl Workspace {
         })
     }
 
+    /// Load a co-edited document to **propose** against, without opening a session
+    /// on it: the same reconstruction `open_coedit` does, but it needs only the
+    /// propose right (not write) and does not mark the path live. This is the
+    /// document to build a `suggest_coedit` proposal from.
+    fn load_coedit_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let doc = ws.load_coedit_as(c, &path).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    CoeditDoc {
+                        inner: Arc::new(tokio::sync::Mutex::new(doc)),
+                    },
+                )
+            })
+        })
+    }
+
+    /// Resume a tree document to **checkpoint** against without opening a session
+    /// on it: the same write check `open_coedit_tree` takes, without the live
+    /// marker it claims. This is what a checkpoint route uses when no socket is
+    /// attached, so a "Save" with no editor open leaks no live marker.
+    #[pyo3(signature = (ctx, path, root=None))]
+    fn load_coedit_tree_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        root: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let root = root.unwrap_or_else(|| origofs_core::DEFAULT_TREE_ROOT.to_string());
+            let doc = ws
+                .load_coedit_tree_as(c, &path, &root)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    CoeditTreeDoc {
+                        inner: Arc::new(tokio::sync::Mutex::new(doc)),
+                    },
+                )
+            })
+        })
+    }
+
     /// Open a live co-editing document for `path` (roadmap M8): resume the CRDT
     /// from its persisted sidecar if one exists, else promote the file's current
     /// text into a fresh document attributed to `ctx`. Returns a [`CoeditDoc`] to

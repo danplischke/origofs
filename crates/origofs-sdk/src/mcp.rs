@@ -306,10 +306,13 @@ impl McpServer {
                         "suggest_coedit: `old` and `new` are identical — nothing to propose".into(),
                     ));
                 }
-                // Was somebody already editing this? If not, we must not leave a
-                // live marker behind for the throwaway replica we open below.
-                let was_live = self.ws.live_doc(p).await?.is_some();
-                let doc = self.ws.open_coedit(self.ctx(), p).await?;
+                // A throwaway replica to compute the proposal against — not a
+                // co-editing session. `load_coedit_as` reconstructs the document
+                // without claiming the path live (so no marker has to be restored
+                // afterwards) and takes the *propose* check rather than the write
+                // one, which is the whole point on this tool: proposing is exactly
+                // what a propose-only actor is allowed to do.
+                let doc = self.ws.load_coedit_as(self.ctx(), p).await?;
                 let text = doc.text();
                 let count = text.matches(old).count();
                 if count == 0 {
@@ -335,16 +338,6 @@ impl McpServer {
                 doc.remove(index, old.len() as u32);
                 doc.insert(self.ctx(), index, new);
                 let id = self.ws.suggest_coedit(self.ctx(), p, &doc, summary).await?;
-                // Restore the marker to what we found. Only if it is still *ours*:
-                // if a real room claimed the path meanwhile, leaving the marker set
-                // is the safe direction (a reader is told the bytes may lag when
-                // they may not), clearing a live room's marker is not.
-                if !was_live
-                    && let Some(l) = self.ws.live_doc(p).await?
-                    && l.session_id == Some(self.session)
-                {
-                    self.ws.end_coedit(p).await?;
-                }
                 Ok(format!(
                     "proposed co-edit suggestion #{id} for {p} (a CRDT merge, pending review)"
                 ))

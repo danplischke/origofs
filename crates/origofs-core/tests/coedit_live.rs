@@ -19,7 +19,7 @@
 #![cfg(feature = "coedit")]
 
 use origofs_core::{
-    Fs, MemStore, MetadataStore, PostgresMetadataStore, SqliteMetadataStore, WriteCtx,
+    CoeditDoc, Fs, MemStore, MetadataStore, PostgresMetadataStore, SqliteMetadataStore, WriteCtx,
 };
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -288,4 +288,58 @@ async fn the_live_marker_is_workspace_scoped() {
         "another workspace's path of the same name is not live"
     );
     assert!(other.live_paths().await.unwrap().is_empty());
+}
+
+// ─── catching up a socket dropped from the fan-out ───────────────────────────
+
+/// A client that misses a broadcast frame does **not** reconverge by itself, and
+/// `state_frame` is what repairs it.
+///
+/// The fan-out is a bounded `broadcast` channel, so a socket that falls behind is
+/// dropped from it with `RecvError::Lagged` and loses those frames permanently.
+/// The arm used to do nothing, on the reasoning that the CRDT would reconverge on
+/// the next edit. It does not: a later delta is encoded against a state vector the
+/// client never reached, so Yjs parks it as pending on origins that never arrive
+/// — and every subsequent edit parks behind it too. The client's document freezes
+/// at the moment it lagged while its user keeps typing into it.
+///
+/// This is at the document level rather than driven through a real socket on
+/// purpose: forcing a genuine `Lagged` means overflowing a 256-frame channel by
+/// filling the peer's TCP receive buffer, which makes the test a hostage to socket
+/// buffer sizes. The property the fix rests on is exactly what is asserted here.
+#[test]
+fn a_client_that_missed_a_frame_is_repaired_by_the_state_frame() {
+    let ctx = WriteCtx::actor(1);
+    let server = CoeditDoc::new();
+    let client = CoeditDoc::load(&server.state_update()).unwrap();
+    let peer = CoeditDoc::load(&server.state_update()).unwrap();
+
+    // Frame 1 is broadcast — and dropped for this client.
+    peer.insert(ctx, 0, "AAA");
+    let _dropped = server.apply_update_as(ctx, &peer.state_update()).unwrap();
+
+    // Frame 2 is delivered, but lands on a gap.
+    peer.insert(ctx, 3, "BBB");
+    let delivered = server.apply_update_as(ctx, &peer.state_update()).unwrap();
+    client.apply_update(&delivered).unwrap();
+
+    assert_eq!(server.text(), "AAABBB");
+    assert_eq!(
+        client.text(),
+        "",
+        "a missed frame leaves the client stuck, not merely one edit behind"
+    );
+
+    // A further edit does not heal it either — the gap is permanent.
+    peer.insert(ctx, 6, "CCC");
+    let next = server.apply_update_as(ctx, &peer.state_update()).unwrap();
+    client.apply_update(&next).unwrap();
+    assert_eq!(client.text(), "", "later edits pile up behind the same gap");
+
+    // The whole-state frame the `Lagged` arm now sends closes it in one shot.
+    // `apply_relayed` is the y-sync frame decoder, which is what a client's own
+    // protocol handler does with it.
+    client.apply_relayed(&server.state_frame()).unwrap();
+    assert_eq!(client.text(), server.text());
+    assert_eq!(client.text(), "AAABBBCCC");
 }
