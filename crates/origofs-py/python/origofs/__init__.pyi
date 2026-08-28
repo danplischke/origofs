@@ -973,6 +973,9 @@ class Workspace:
     # `open_coedit` also marks the path *live* (see `live_doc`); `end_coedit`
     # clears that marker once the session's final checkpoint has landed.
     async def open_coedit(self, ctx: WriteCtx, path: str) -> CoeditDoc: ...
+    # Load to *propose* against: needs only the propose right, and does not mark
+    # the path live. `open_coedit` is a co-editing session and takes the write check.
+    async def load_coedit_as(self, ctx: WriteCtx, path: str) -> CoeditDoc: ...
     async def checkpoint_coedit(self, ctx: WriteCtx, path: str, doc: CoeditDoc) -> None: ...
     # The tree shape (#92): a Y.XmlFragment a rich-text editor binds to natively.
     # origofs does not own the document schema, so the *host* serializes and says

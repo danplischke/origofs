@@ -168,7 +168,9 @@ write path enforces this and you must not weaken it:
   Every *attributed* mutation on `Fs` — `write_or_propose`, `remove_or_propose`,
   `rename_as`, `mkdir_as`, `symlink_as`, `commit_as`, `checkout_as`,
   `create_branch_as`, `revert_session_as`, `accept_suggestion`,
-  `reject_suggestion` — runs one of three checks, all refusing with
+  `reject_suggestion`, `open_coedit`, `open_coedit_tree`, `checkpoint_coedit`,
+  `checkpoint_coedit_tree`, and `record_suggestion` (every suggestion funnels
+  through it) — runs one of four checks, all refusing with
   `OrigoFSError::Denied` (`403` on the HTTP API). Ops with a propose-shaped
   equivalent queue instead of refusing.
   - `ensure_may_write_at` (`acl.rs`) — the default. Takes the path and consults
@@ -179,6 +181,11 @@ write path enforces this and you must not weaken it:
     unbounded `revert_session`); checks the grant at `/`. **Having no path is not
     the same as touching none** — these used to take the path-less check below,
     so no ACL could contain them.
+  - `ensure_may_propose_at` (`acl.rs`) — the suggestion queue's counterpart to
+    the first, satisfied by `WRITE` or `PROPOSE`. On `record_suggestion`, so it
+    covers byte, delete and CRDT suggestions at once — calling `suggest*`
+    directly used to queue a proposal for an actor denied both rights, since the
+    check lived only inside `write_or_propose`.
   - `ensure_may_write` (`suggest.rs`) — policy only, no grant. Now *only* for
     path-free administration (registering an actor, setting a policy). Reach for
     it last, and never for something that touches the working tree. **A new mutating endpoint
@@ -192,6 +199,17 @@ write path enforces this and you must not weaken it:
   must carry a *reason*, and every attributed one must actually offer `--actor`.
   The FUSE/NFS mounts remain a deliberate bypass (a mount has no actor context).
   Issues #78, #128.
+- **A co-editing socket is a write channel, and takes the write check to open.**
+  `open_coedit`/`open_coedit_tree` require `WRITE` at the path, not merely a
+  valid credential — the WebSocket upgrade authenticates but does not authorize,
+  so without this any authenticated caller edited any path: `write_or_propose`
+  refused them and the identical bytes landed through `checkpoint_coedit`, whose
+  `write_as_blamed` is exempt by construction (it is the CRDT coordinator's own
+  write). Both checkpoints re-check as a backstop for a caller holding a
+  `CoeditDoc` from elsewhere. To build a *proposal* against a co-edited document
+  without a session, use `load_coedit_as` — propose right, no live marker; that
+  is what the `origofs_suggest_coedit` MCP tool does, and gating it on write
+  would have broken the propose-only agents the tool exists for.
 - **CLI identity is asserted, not verified, and the CLI is not a boundary.**
   Mutating subcommands take `--actor`, falling back to `ORIGOFS_ACTOR` so a shell
   or an agent harness sets identity once (issue #128). None of that is an identity

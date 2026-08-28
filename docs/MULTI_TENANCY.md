@@ -190,6 +190,21 @@ A `Scope` resolves *paths*, so an operation without one is outside it entirely:
 - The same reasoning is why `commit`, `checkout`, `create_branch` and an
   unbounded `revert_session` take `ensure_may_write_workspace` rather than the
   path-less policy check: having no path is not the same as touching none.
+- **Live co-editing is a write channel and is scoped like one.** The y-sync
+  WebSocket authenticates the upgrade but has no notion of "read-only", so
+  `open_coedit`/`open_coedit_tree` take the ordinary path-scoped write check and
+  both checkpoints re-check. Until they did, a tenant's actor with a
+  read-only grant — or none at all under `acl_default_deny` — could edit any path
+  it could name by opening it as a co-edited document, because the checkpoint
+  lands through `write_as_blamed`, which is deliberately ungated as the CRDT
+  coordinator's own write path. There is deliberately **no view-only socket**: a
+  reader that should watch a document without editing it has no mode to do so
+  today, and inventing one by allowing the socket and dropping its content frames
+  would have to be built rather than assumed.
+- Suggestions are scoped at `record_suggestion`, which every shape of them (bytes,
+  delete, CRDT) funnels through, satisfied by `WRITE` or `PROPOSE` at the path.
+  The queue is not the working tree, but it is reviewer-visible state that an
+  actor holding `Perms::NONE` there should not be able to create.
 
 ---
 

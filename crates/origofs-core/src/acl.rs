@@ -303,6 +303,26 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Err(denied(ctx.actor, op, path, perms))
     }
 
+    /// Refuse `op` at `path` for an actor that may neither write nor propose there.
+    ///
+    /// The suggestion queue's counterpart to
+    /// [`ensure_may_write_at`](Self::ensure_may_write_at). `WRITE` satisfies it
+    /// too: an actor allowed to land a change directly is plainly allowed to
+    /// propose one instead, and `write_or_propose` reaches the queue exactly that
+    /// way for a propose-only actor.
+    pub async fn ensure_may_propose_at(
+        &self,
+        ctx: crate::WriteCtx,
+        op: &str,
+        path: &str,
+    ) -> Result<()> {
+        let perms = self.effective_perms(ctx.actor, path).await?;
+        if perms.contains(Perms::WRITE) || perms.contains(Perms::PROPOSE) {
+            return Ok(());
+        }
+        Err(denied(ctx.actor, op, path, perms))
+    }
+
     /// Refuse a **workspace-wide** `op` for an actor without `WRITE` at the root.
     ///
     /// The path-bearing check above needs a path, and four operations genuinely

@@ -397,6 +397,15 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         summary: Option<&str>,
         kind: SuggestionKind,
     ) -> Result<i64> {
+        // Every suggestion funnels through here — bytes, deletion, and CRDT — so
+        // this is the one place the propose right has to be checked. It was
+        // checked only inside `write_or_propose`, which meant calling `suggest`,
+        // `suggest_delete` or `suggest_coedit` *directly* queued a proposal for an
+        // actor an ACL had denied both write and propose at that path. The queue
+        // is not the working tree, but it is reviewer-visible state an actor with
+        // `Perms::NONE` there should not be able to create.
+        self.ensure_may_propose_at(ctx, "propose changes to", path)
+            .await?;
         let branch = self.current_branch().await.ok().flatten();
         let id = self
             .meta

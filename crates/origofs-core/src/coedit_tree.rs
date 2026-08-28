@@ -338,6 +338,12 @@ impl CoeditTreeDoc {
         crate::coedit::sync_start(&self.doc)
     }
 
+    /// The y-sync frame carrying this document's whole state, to catch up a client
+    /// that missed frames. See [`crate::coedit::state_frame`].
+    pub fn state_frame(&self) -> Vec<u8> {
+        crate::coedit::state_frame(&self.doc)
+    }
+
     /// Drive one inbound y-sync payload from a connection authenticated as `ctx`.
     /// Content the client contributes is attributed to `ctx` by
     /// [`apply_update_as`](Self::apply_update_as).
@@ -707,6 +713,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         path: &str,
         root: &str,
     ) -> Result<CoeditTreeDoc> {
+        // Same path-scoped check the flat shape takes in `open_coedit`, and for
+        // the same reason: this socket is a write channel onto `path` (#123).
+        self.ensure_may_write_at(ctx, "co-edit", path).await?;
         let doc = self.load_coedit_tree(path, root).await?;
         self.mark_live(ctx, path).await?;
         Ok(doc)
@@ -763,6 +772,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         body: &[u8],
         spans: &[TreeSpan],
     ) -> Result<()> {
+        // The backstop to `open_coedit_tree`'s check — and it carries more weight
+        // here than on the flat shape, because this call takes the host's `body`
+        // and replaces the file with it wholesale.
+        self.ensure_may_write_at(ctx, "check point a co-edited document to", path)
+            .await?;
         let text = std::str::from_utf8(body).map_err(|_| {
             OrigoFSError::InvalidArgument("co-edit tree checkpoint requires UTF-8 text".into())
         })?;

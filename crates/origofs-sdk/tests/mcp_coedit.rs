@@ -154,10 +154,11 @@ async fn suggest_coedit_rejects_an_ambiguous_or_empty_edit() {
 
 #[tokio::test]
 async fn suggest_coedit_does_not_leave_a_live_marker_behind() {
-    // The tool opens a throwaway replica to compute the update. Opening marks the
-    // path live; since nothing was live before, the marker must be put back the
-    // way it was found — otherwise every agent proposal would permanently tell
-    // byte readers (and the git export) that the file may lag an open editor.
+    // The tool builds a throwaway replica to compute the update. It must not claim
+    // the path while doing so — otherwise every agent proposal would permanently
+    // tell byte readers (and the git export) that the file may lag an open editor.
+    // It used to open a real session and restore the marker afterwards; it now
+    // loads without claiming, so there is nothing to put back.
     let (s, ws) = server_and_ws().await;
     let dan = ws.create_human("dan", None).await.unwrap();
     let h = WriteCtx::actor(dan);
@@ -299,4 +300,51 @@ async fn suggest_coedit_splices_at_the_right_offset_in_a_non_ascii_document() {
 
     let after = String::from_utf8(ws.read("/notes.md").await.unwrap().to_vec()).unwrap();
     assert_eq!(after, "ééééé origofs\n");
+}
+
+/// A propose-only actor can use the co-edit proposal tool.
+///
+/// This is the tool's entire reason for existing — an agent that may not write
+/// directly proposes a CRDT merge instead — so it must not take the *write* check
+/// that guards a genuine co-editing session. It briefly did: gating `open_coedit`
+/// against the ACL bypass (#123) caught this path too, because the tool opened a
+/// real session just to read the document's text.
+#[tokio::test]
+async fn a_propose_only_agent_can_still_propose_a_coedit() {
+    let (s, ws) = server_and_ws().await;
+    let dan = ws.create_human("dan", None).await.unwrap();
+    let h = WriteCtx::actor(dan);
+    let doc = ws.open_coedit(h, "/notes.md").await.unwrap();
+    doc.insert(h, 0, "hello\n");
+    ws.checkpoint_coedit(h, "/notes.md", &doc).await.unwrap();
+    ws.end_coedit("/notes.md").await.unwrap();
+
+    // The agent the MCP server registered may propose, but not write.
+    let agent = ws
+        .list_actors()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.display_name == "claude")
+        .expect("the MCP server registers its agent")
+        .id;
+    ws.grant(agent, "/", origofs_sdk::Perms::PROPOSE, Some(dan))
+        .await
+        .unwrap();
+
+    let r = s
+        .handle(call(
+            "origofs_suggest_coedit",
+            json!({"path": "/notes.md", "old": "hello", "new": "hi"}),
+        ))
+        .await
+        .unwrap();
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(ws.list_suggestions(None, None).await.unwrap().len(), 1);
+
+    // And it still cannot open a real co-editing session on that path.
+    assert!(matches!(
+        ws.open_coedit(WriteCtx::actor(agent), "/notes.md").await,
+        Err(origofs_sdk::OrigoFSError::Denied(_))
+    ));
 }

@@ -1739,6 +1739,14 @@ impl Workspace {
         self.fs.open_coedit(ctx, path).await
     }
 
+    /// Load a co-edited document to **propose** against — no write rights needed
+    /// and no live marker claimed, unlike [`open_coedit`](Self::open_coedit),
+    /// which is a co-editing session. Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn load_coedit_as(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
+        self.fs.load_coedit_as(ctx, path).await
+    }
+
     /// Checkpoint a live co-editing document into `path`, landing each
     /// collaborator's exact character spans in the byte-range blame index and
     /// persisting the CRDT sidecar so the session is durable and resumable. `ctx`
