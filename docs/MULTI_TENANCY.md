@@ -201,6 +201,17 @@ A `Scope` resolves *paths*, so an operation without one is outside it entirely:
   reader that should watch a document without editing it has no mode to do so
   today, and inventing one by allowing the socket and dropping its content frames
   would have to be built rather than assumed.
+- **Grants gate writes, not reads — know this before you rely on them.** There is
+  no read-side check anywhere in the engine: `ensure_may_read` does not exist.
+  `Perms::READ` is a real bit, it is grantable, and it is reported in
+  `effective permissions`, but nothing consults it. Under `acl_default_deny` an
+  actor with *no grant at all* is correctly refused every write and can still
+  `read`, `blame`, `ls` and `log` any path it can name. Read isolation therefore
+  comes from **routing**, not from the ACL: the tenant `root` prefix each request
+  resolves to (`_scoped`/`_require_in_scope` in the FastAPI router, the same idea
+  in any host) is what keeps one tenant out of another's files. An ACL is not a
+  substitute for that scoping, and a `READ` grant does not narrow anything —
+  granting it says what an actor *should* see, not what the engine enforces.
 - Suggestions are scoped at `record_suggestion`, which every shape of them (bytes,
   delete, CRDT) funnels through, satisfied by `WRITE` or `PROPOSE` at the path.
   The queue is not the working tree, but it is reviewer-visible state that an

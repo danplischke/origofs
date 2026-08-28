@@ -487,7 +487,10 @@ impl Coordinator {
         };
         let room = self.rooms.lock().await.get(&key).map(|s| s.room.clone());
         let Some(room) = room else {
-            let doc = self.ws.open_coedit_tree(ctx, path, root).await?;
+            // `load_…`, not `open_…`: this flow never reaches the socket disconnect
+            // that clears the marker, so opening here left the path marked live for
+            // good. Same write check, no claim.
+            let doc = self.ws.load_coedit_tree_as(ctx, path, root).await?;
             return self
                 .ws
                 .checkpoint_coedit_tree(ctx, path, &doc, body, spans)

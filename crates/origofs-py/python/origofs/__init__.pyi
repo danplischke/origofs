@@ -984,6 +984,11 @@ class Workspace:
     async def open_coedit_tree(
         self, ctx: WriteCtx, path: str, root: Optional[str] = None
     ) -> CoeditTreeDoc: ...
+    # Resume to *checkpoint* against, with no live marker claimed: what a
+    # checkpoint route uses when no socket is attached.
+    async def load_coedit_tree_as(
+        self, ctx: WriteCtx, path: str, root: Optional[str] = None
+    ) -> CoeditTreeDoc: ...
     async def checkpoint_coedit_tree(
         self,
         ctx: WriteCtx,

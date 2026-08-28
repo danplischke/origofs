@@ -1747,6 +1747,19 @@ impl Workspace {
         self.fs.load_coedit_as(ctx, path).await
     }
 
+    /// Resume a tree document to **check point** against without opening a session
+    /// on it — the write check, without the live marker. This is what a checkpoint
+    /// route uses when no socket is attached. Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn load_coedit_tree_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        root: &str,
+    ) -> Result<CoeditTreeDoc> {
+        self.fs.load_coedit_tree_as(ctx, path, root).await
+    }
+
     /// Checkpoint a live co-editing document into `path`, landing each
     /// collaborator's exact character spans in the byte-range blame index and
     /// persisting the CRDT sidecar so the session is durable and resumable. `ctx`

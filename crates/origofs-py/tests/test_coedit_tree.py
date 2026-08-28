@@ -285,3 +285,30 @@ def test_a_bad_span_map_is_refused():
     assert "non-overlapping" in resp.text
     with pytest.raises(FileNotFoundError):
         _run(lambda: ws.read("/doc.md"))
+
+
+def test_a_socketless_tree_checkpoint_leaves_no_live_marker():
+    """A "Save" with no editor attached must not mark the path live for good.
+
+    The route's no-room fallback used to `open_coedit_tree`, which claims the
+    path. The matching clear lives in `leave()`, on the socket disconnect path a
+    socket-less checkpoint never reaches -- so every such save leaked a marker
+    telling readers (and the git export) the file may lag an editor that is not
+    there, and `live_paths` grew without bound.
+    """
+    app, ws, (alice, alice_s), _ = _app()
+    a_ctx = origofs.WriteCtx.session(alice, alice_s)
+
+    client = origofs.CoeditTreeDoc("content")
+    _run(lambda: client.append_text(a_ctx, "p", "drafted offline"))
+
+    with TestClient(app) as tc:
+        resp = tc.post(
+            "/coedit-tree-checkpoint/solo.md?token=alice-token",
+            json={"body": "drafted offline\n", "spans": [], "root": "content"},
+        )
+        assert resp.status_code == 200, resp.text
+
+    assert _run(lambda: ws.read("/solo.md")) == b"drafted offline\n"
+    assert _run(lambda: ws.live_doc("/solo.md")) is None
+    assert _run(lambda: ws.live_paths()) == []

@@ -169,7 +169,7 @@ write path enforces this and you must not weaken it:
   `rename_as`, `mkdir_as`, `symlink_as`, `commit_as`, `checkout_as`,
   `create_branch_as`, `revert_session_as`, `accept_suggestion`,
   `reject_suggestion`, `open_coedit`, `open_coedit_tree`, `checkpoint_coedit`,
-  `checkpoint_coedit_tree`, and `record_suggestion` (every suggestion funnels
+  `checkpoint_coedit_tree`, `load_coedit_tree_as`, and `record_suggestion` (every suggestion funnels
   through it) — runs one of four checks, all refusing with
   `OrigoFSError::Denied` (`403` on the HTTP API). Ops with a propose-shaped
   equivalent queue instead of refusing.
@@ -199,6 +199,25 @@ write path enforces this and you must not weaken it:
   must carry a *reason*, and every attributed one must actually offer `--actor`.
   The FUSE/NFS mounts remain a deliberate bypass (a mount has no actor context).
   Issues #78, #128.
+- **A checkpoint never overwrites a file that changed underneath it.** Both shapes
+  compare the file against the live marker's coherence hash. The tree shape
+  refuses (`refuse_out_of_band`) — origofs cannot parse bytes back into nodes. The
+  flat shape folds the foreign write in (`reconcile_out_of_band`, replaying the
+  CRDT sidecar), and **refuses when it cannot** — a missing or unreadable sidecar,
+  a removed file, bytes that are no longer UTF-8. Those arms used to
+  `return Ok(())`, which the caller read as "nothing to reconcile" before
+  overwriting. **A branch checkout is the case that makes it bite:** `checkout`
+  rematerializes the file *and* swaps away the sidecar (it lives in the working
+  tree, under `/.origofs/ydoc/`), while the live marker is metadata and survives —
+  so reconciliation's one input is gone exactly when it is needed, and a room
+  opened on the old branch wrote its content onto the new branch. `commit` and
+  `checkout` are otherwise blind to live rooms by design; the checkpoint is where
+  that is caught, and the caller recovers by re-opening the document.
+- **A socket-less checkpoint must not claim the path.** A host landing tree bytes
+  with no editor attached (a "Save" button) goes through `load_coedit_tree_as` —
+  the write check, no live marker. `open_coedit_tree` there leaked a permanent
+  marker, because the matching `end_coedit` lives on the socket disconnect path
+  that flow never reaches. Same rule as `load_coedit_as` on the flat side.
 - **A co-editing socket is a write channel, and takes the write check to open.**
   `open_coedit`/`open_coedit_tree` require `WRITE` at the path, not merely a
   valid credential — the WebSocket upgrade authenticates but does not authorize,

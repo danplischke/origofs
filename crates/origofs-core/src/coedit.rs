@@ -1208,22 +1208,46 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if current == live.content_hash {
             return Ok(()); // nobody wrote around us
         }
+        // Past this point the file is *not* what this document was last coherent
+        // with, so writing the document's text over it would destroy whatever
+        // landed. Fold that write in where we can, and refuse where we cannot.
+        //
+        // Every arm below used to `return Ok(())`: "I could not reconcile" was read
+        // by the caller as "there was nothing to reconcile", and it went on to
+        // overwrite. A branch checkout makes it concrete — `checkout` rematerializes
+        // the file *and* swaps the sidecar away (it lives in the working tree),
+        // while the live marker is metadata and survives, so the one input
+        // reconciliation needs is missing exactly when it is needed. A room opened
+        // on the old branch then wrote its content onto the new one, silently. The
+        // tree shape has always refused here (`refuse_out_of_band`); this is the
+        // flat shape holding the same line, reconciling first where it can.
+        let refuse = |why: &str| -> Result<()> {
+            Err(OrigoFSError::Conflict(format!(
+                "{path} was written outside the co-editing session since its last \
+                 checkpoint, and the two versions cannot be merged ({why}) — re-open \
+                 the document to pick up the current file, then checkpoint again"
+            )))
+        };
         let bytes = match self.read(path).await {
             Ok(b) => b,
-            Err(OrigoFSError::NotFound(_)) => return Ok(()), // removed: nothing to fold in
+            // Resurrecting a file somebody deleted is as much a surprise as
+            // clobbering one they wrote.
+            Err(OrigoFSError::NotFound(_)) => return refuse("the file was removed"),
             Err(e) => return Err(e),
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
-            return Ok(()); // binary now: not reconcilable as text
+            return refuse("it is no longer valid UTF-8 and cannot be merged as text");
         };
         // The replica: this document as it stood at the last checkpoint.
         let sidecar = match self.read(&coedit_sidecar_path(path)).await {
             Ok(b) => b,
-            Err(OrigoFSError::NotFound(_)) => return Ok(()),
+            Err(OrigoFSError::NotFound(_)) => {
+                return refuse("its CRDT sidecar is gone, leaving no common base to merge from");
+            }
             Err(e) => return Err(e),
         };
         let Some((_, ydoc)) = parse_sidecar(&sidecar) else {
-            return Ok(());
+            return refuse("its CRDT sidecar is unreadable");
         };
         let replica = CoeditDoc::load(ydoc)?;
         let ranges = self.blame(path).await.unwrap_or_default();

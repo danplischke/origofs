@@ -721,6 +721,26 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(doc)
     }
 
+    /// Resume a tree document to **check point** against, without opening a
+    /// session on it: the write check [`open_coedit_tree`](Self::open_coedit_tree)
+    /// takes, without the live marker it claims.
+    ///
+    /// This is what a host's checkpoint route wants when no socket is attached —
+    /// the editor closed, or the app is landing bytes from a "Save" button. Using
+    /// `open_coedit_tree` there marked the path live and never cleared it, because
+    /// the matching `end_coedit` lives on the socket's disconnect path that this
+    /// flow never reaches: every socket-less checkpoint leaked a permanent marker
+    /// telling readers the durable bytes may lag an editor that is not there.
+    pub async fn load_coedit_tree_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        root: &str,
+    ) -> Result<CoeditTreeDoc> {
+        self.ensure_may_write_at(ctx, "co-edit", path).await?;
+        self.load_coedit_tree(path, root).await
+    }
+
     /// The read-only half of [`open_coedit_tree`](Self::open_coedit_tree): resume
     /// the document without marking the path live.
     pub async fn load_coedit_tree(&self, path: &str, root: &str) -> Result<CoeditTreeDoc> {
