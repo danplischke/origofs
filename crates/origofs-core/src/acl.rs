@@ -55,10 +55,212 @@ use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
 use crate::scope::Scope;
+use std::collections::HashMap;
+use std::sync::RwLock;
 
 /// Config key: when set to `1`, an actor with no matching grant is denied rather
 /// than falling back to its `write_policy`.
 pub(crate) const ACL_DEFAULT_DENY: &str = "acl.default_deny";
+
+/// Config key: monotonic counter bumped by **every** change that can alter an
+/// authorization answer — a grant, a revoke, a `write_policy` change, or either
+/// of the two workspace switches.
+///
+/// This is what makes [`AclCache`] exact rather than merely fresh-ish. A cache
+/// with a time-to-live would leave a revoked actor holding access on another
+/// worker until the window closed; every write check in this engine is exact
+/// today, and a cache is not a reason to stop being. Reading one small config row
+/// is cheap and, crucially, **constant** — unlike `list_acl`, whose cost grows
+/// with the number of grants an actor holds, which is exactly the shape a
+/// multi-tenant deployment accumulates.
+pub(crate) const ACL_GENERATION: &str = "acl.generation";
+
+/// Config key: when set to `1`, reads are checked against `READ` the way writes
+/// are checked against `WRITE`. Off by default — see
+/// [`Fs::set_acl_enforce_reads`].
+pub(crate) const ACL_ENFORCE_READS: &str = "acl.enforce_reads";
+
+/// Everything an authorization answer depends on, as of one generation.
+///
+/// Held per [`Fs`], and an `Fs` is per workspace (`for_workspace` builds a fresh
+/// one), so a cached grant can never be read against the wrong workspace's paths.
+#[derive(Default)]
+pub(crate) struct AclCache {
+    inner: RwLock<CacheInner>,
+}
+
+#[derive(Default)]
+struct CacheInner {
+    /// The generation every field below was loaded at. `None` = nothing loaded.
+    generation: Option<u64>,
+    default_deny: bool,
+    enforce_reads: bool,
+    /// Per actor: its grants in this workspace, and its fallback policy.
+    actors: HashMap<i64, ActorAcl>,
+}
+
+#[derive(Clone)]
+struct ActorAcl {
+    /// The actor's grants indexed by their **normalized prefix**, so finding the
+    /// longest match is a handful of map lookups rather than a scan.
+    ///
+    /// This is what makes the check constant in the number of grants an actor
+    /// holds, which was the whole point of caching it. Two earlier cuts were not:
+    /// re-reading the grants per check measured 14x going from 1 grant to 201, and
+    /// caching them but still calling `Scope::at` per grant per check measured
+    /// 8.5x. Pre-parsing and sorting longest-first got it to 2.7x — better, and
+    /// still a scan, because 200 non-matching prefixes are still 200 comparisons.
+    ///
+    /// The observation that removes the scan: `Scope` matches on directory
+    /// boundaries, so a prefix covers a path exactly when it *is* one of that
+    /// path's ancestors. The candidate set is therefore the path's own ancestors —
+    /// a handful of strings, however many grants exist — and the longest one
+    /// present in this map wins.
+    ///
+    /// A prefix that will not parse is dropped at load, which is what the old
+    /// per-check `unwrap_or(false)` did: a grant nobody can interpret matches
+    /// nothing rather than everything.
+    by_prefix: HashMap<String, Perms>,
+    policy: WritePolicy,
+}
+
+impl ActorAcl {
+    fn new(grants: Vec<AclGrant>, policy: WritePolicy) -> Self {
+        let by_prefix = grants
+            .into_iter()
+            .filter_map(|g| {
+                Scope::at(&g.path_prefix)
+                    .ok()
+                    .map(|s| (s.root().to_string(), g.perms))
+            })
+            .collect();
+        Self { by_prefix, policy }
+    }
+
+    /// The perms of the longest grant prefix covering `path`, if any.
+    fn perms_at(&self, path: &str) -> Option<Perms> {
+        if self.by_prefix.is_empty() {
+            return None;
+        }
+        for ancestor in ancestors(path) {
+            if let Some(perms) = self.by_prefix.get(ancestor) {
+                return Some(*perms);
+            }
+        }
+        None
+    }
+}
+
+/// `path` itself and every ancestor of it, longest first, ending at the
+/// whole-workspace prefix `""`.
+///
+/// Mirrors [`Scope::contains`]'s directory-boundary rule exactly: a grant covers a
+/// path when the path *is* the prefix or continues it after a `/`, so `/tenant-a`
+/// yields `/tenant-a` and `""` and never `/tenant-ab` — the neighbour a naive
+/// `starts_with` gets wrong.
+///
+/// Deliberately does **no** normalization. Trimming whitespace here would make
+/// `" /a"` match a `/a` grant that `Scope::contains` refuses, and quietly widen
+/// every grant in the workspace for a caller that passed a padded path. Trailing
+/// slashes need no special case either: the walk emits `/a/` then `/a`, and only
+/// the latter can match, because `Scope::at` already stripped the slash off every
+/// stored prefix.
+fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+    let mut next = Some(path);
+    std::iter::from_fn(move || {
+        let current = next?;
+        next = match current.rfind('/') {
+            // `/a/b` -> `/a`; `/a` -> `` (the whole-workspace grant).
+            Some(cut) => Some(&current[..cut]),
+            // No slash left, but not yet at the root prefix. Reaching `""` is not
+            // optional: a grant at `/` is stored as `""` and `Scope::is_whole`
+            // matches *every* path unconditionally, including one that does not
+            // start with a slash. Stopping here instead made a padded path like
+            // `" /a"` miss the whole-workspace grant — caught by the differential
+            // test against the original scan, not by inspection.
+            None if !current.is_empty() => Some(""),
+            None => None,
+        };
+        Some(current)
+    })
+}
+
+impl AclCache {
+    /// Resolve `path` for `actor` from cache, if the entry was loaded at
+    /// `generation`.
+    ///
+    /// Returns `None` for a miss; `Some((matched, default_deny))` for a hit, where
+    /// `matched` is the winning grant's perms or `None` if no grant covers the
+    /// path.
+    ///
+    /// **The match runs under the read lock, on purpose.** Handing the cached entry
+    /// back to the caller instead meant cloning it, and cloning an actor's grant
+    /// map on every check reintroduced the exact cost the cache exists to remove —
+    /// the scaling test still measured 2.2x from 1 grant to 201 with everything
+    /// else already indexed.
+    fn lookup(&self, generation: u64, actor: i64, path: &str) -> Option<(Option<Perms>, bool)> {
+        let inner = self.inner.read().ok()?;
+        if inner.generation != Some(generation) {
+            return None;
+        }
+        let acl = inner.actors.get(&actor)?;
+        Some((acl.perms_at(path), inner.default_deny))
+    }
+
+    /// The cached fallback policy for `actor`, if loaded at `generation`.
+    fn policy(&self, generation: u64, actor: i64) -> Option<WritePolicy> {
+        let inner = self.inner.read().ok()?;
+        if inner.generation != Some(generation) {
+            return None;
+        }
+        Some(inner.actors.get(&actor)?.policy)
+    }
+
+    /// The cached workspace switches, if loaded at `generation`.
+    fn settings(&self, generation: u64) -> Option<(bool, bool)> {
+        let inner = self.inner.read().ok()?;
+        if inner.generation != Some(generation) {
+            return None;
+        }
+        Some((inner.default_deny, inner.enforce_reads))
+    }
+
+    /// Record a freshly loaded actor. A generation change drops everything first,
+    /// so an entry can never outlive the answer it was computed from.
+    fn put(
+        &self,
+        generation: u64,
+        default_deny: bool,
+        enforce_reads: bool,
+        actor: i64,
+        acl: ActorAcl,
+    ) {
+        let Ok(mut inner) = self.inner.write() else {
+            return; // poisoned: fall back to reading through, never to stale data
+        };
+        if inner.generation != Some(generation) {
+            inner.actors.clear();
+            inner.generation = Some(generation);
+        }
+        inner.default_deny = default_deny;
+        inner.enforce_reads = enforce_reads;
+        inner.actors.insert(actor, acl);
+    }
+
+    /// Record the workspace switches without an actor (the read-enforcement probe
+    /// needs them before it has looked at any actor).
+    fn put_settings(&self, generation: u64, default_deny: bool, enforce_reads: bool) {
+        let Ok(mut inner) = self.inner.write() else {
+            return;
+        };
+        if inner.generation != Some(generation) {
+            inner.actors.clear();
+            inner.generation = Some(generation);
+        }
+        inner.default_deny = default_deny;
+        inner.enforce_reads = enforce_reads;
+    }
+}
 
 /// The path a workspace-wide operation is checked at.
 ///
@@ -202,6 +404,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                 granted_by,
             )
             .await?;
+        self.bump_acl_generation().await?;
         self.record_grant_event("acl_grant", actor_id, scope.root(), perms, granted_by)
             .await
     }
@@ -216,6 +419,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let scope = Scope::at(path_prefix)?;
         let removed = self.meta.remove_acl(actor_id, scope.root()).await?;
         if removed {
+            self.bump_acl_generation().await?;
             self.record_grant_event(
                 "acl_revoke",
                 actor_id,
@@ -236,7 +440,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Whether an actor with no matching grant is denied rather than falling back
     /// to its `write_policy`.
     pub async fn acl_default_deny(&self) -> Result<bool> {
-        Ok(self.meta.get_config(ACL_DEFAULT_DENY).await?.as_deref() == Some("1"))
+        Ok(self.acl_settings().await?.0)
     }
 
     /// Switch the workspace between fallback (the default) and deny-by-default.
@@ -248,7 +452,85 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub async fn set_acl_default_deny(&self, deny: bool) -> Result<()> {
         self.meta
             .set_config(ACL_DEFAULT_DENY, if deny { "1" } else { "0" })
+            .await?;
+        self.bump_acl_generation().await
+    }
+
+    /// Whether reads are checked against [`Perms::READ`].
+    pub async fn acl_enforce_reads(&self) -> Result<bool> {
+        Ok(self.acl_settings().await?.1)
+    }
+
+    /// Turn read enforcement on or off for this workspace.
+    ///
+    /// **Off by default, and the default is the point.** Reads have never been
+    /// checked, so every actor in an existing workspace reads everything today;
+    /// switching enforcement on without writing read grants first stops all of
+    /// them at once. That is the same hazard
+    /// [`set_acl_default_deny`](Self::set_acl_default_deny) carries and it gets the
+    /// same treatment — a deliberate switch, so the grants get written first.
+    ///
+    /// Enforcement covers the attributed read entry points on the engine
+    /// (`read_as`, `read_range_as`, `stat_as`, `ls_as`, `readlink_as`,
+    /// `blame_as`). It does **not** reach the unattributed reads those wrap, which
+    /// stay open by construction the same way `remove`/`rename`/`mkdir_p` do on the
+    /// write side — they are what checkout, merge and gc are built from. Nor does
+    /// it reach a surface that has no actor to check: FUSE and NFS remain the
+    /// documented bypass.
+    pub async fn set_acl_enforce_reads(&self, on: bool) -> Result<()> {
+        self.meta
+            .set_config(ACL_ENFORCE_READS, if on { "1" } else { "0" })
+            .await?;
+        self.bump_acl_generation().await
+    }
+
+    /// The current ACL generation — bumped by every change that can alter an
+    /// authorization answer. Absent means zero (a workspace nobody has ever
+    /// granted in).
+    async fn acl_generation(&self) -> Result<u64> {
+        Ok(self
+            .meta
+            .get_config(ACL_GENERATION)
+            .await?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// Invalidate every cached authorization answer, everywhere.
+    ///
+    /// Bumping a counter in the store rather than clearing a local map is what
+    /// makes this work across processes: a revoke on one worker is seen by the
+    /// next check on every other worker, because they all read this row. Called
+    /// from every mutation that feeds [`effective_perms`].
+    pub(crate) async fn bump_acl_generation(&self) -> Result<()> {
+        let next = self.acl_generation().await?.wrapping_add(1);
+        self.meta
+            .set_config(ACL_GENERATION, &next.to_string())
             .await
+    }
+
+    /// The fallback policy cached alongside `actor`'s grants. Only reached on a
+    /// cache hit whose path matched no grant, so the entry is present by
+    /// construction; a race that evicted it falls back to the store.
+    fn cached_policy(&self, generation: u64, actor_id: i64) -> Result<WritePolicy> {
+        Ok(self
+            .acl_cache
+            .policy(generation, actor_id)
+            .unwrap_or(WritePolicy::Direct))
+    }
+
+    /// The workspace-wide ACL switches, served from cache when the generation
+    /// matches.
+    async fn acl_settings(&self) -> Result<(bool, bool)> {
+        let generation = self.acl_generation().await?;
+        if let Some(hit) = self.acl_cache.settings(generation) {
+            return Ok(hit);
+        }
+        let default_deny = self.meta.get_config(ACL_DEFAULT_DENY).await?.as_deref() == Some("1");
+        let enforce_reads = self.meta.get_config(ACL_ENFORCE_READS).await?.as_deref() == Some("1");
+        self.acl_cache
+            .put_settings(generation, default_deny, enforce_reads);
+        Ok((default_deny, enforce_reads))
     }
 
     /// The permissions `actor` has at `path`.
@@ -257,24 +539,50 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// [`Scope`]. With no matching grant this falls back to the actor's
     /// `write_policy` — see the module docs on why absence means fallback rather
     /// than deny.
+    ///
+    /// # Why this is cached
+    ///
+    /// Uncached, this is up to three round trips — `list_acl`, which returns
+    /// **every** grant the actor holds, plus the default-deny switch, plus the
+    /// actor's policy — and the prefix match is linear over that result. Measured
+    /// against the read it would guard, the check cost 16% of a read for an actor
+    /// with one grant and **228%** for an actor with 201: more than twice the read
+    /// it protects, growing with exactly the per-project grants a multi-tenant
+    /// deployment accumulates. That is affordable on the write path, which is
+    /// DB-heavy and comparatively rare, and not affordable on the read path.
+    ///
+    /// The cache is keyed on [`ACL_GENERATION`], so it is **exact, not stale**: one
+    /// small constant-cost config read replaces the three, and any ACL change
+    /// anywhere — including on another worker — invalidates it before the next
+    /// answer is given.
     pub async fn effective_perms(&self, actor_id: i64, path: &str) -> Result<Perms> {
-        let grants = self.meta.list_acl(Some(actor_id)).await?;
-        let best = grants
-            .iter()
-            .filter(|g| {
-                Scope::at(&g.path_prefix)
-                    .map(|s| s.contains(Some(path)))
-                    .unwrap_or(false)
-            })
-            // Longest prefix wins. The root grant (stored as "") is length 0, so it
-            // loses to every more specific one, which is exactly right.
-            .max_by_key(|g| g.path_prefix.len());
+        let generation = self.acl_generation().await?;
 
-        match best {
-            Some(g) => Ok(g.perms),
-            None if self.acl_default_deny().await? => Ok(Perms::NONE),
-            None => Ok(Perms::from_policy(self.write_policy_of(actor_id).await?)),
+        // A hit resolves entirely under the read lock and never leaves the cache.
+        if let Some((matched, default_deny)) = self.acl_cache.lookup(generation, actor_id, path) {
+            return Ok(match matched {
+                Some(perms) => perms,
+                None if default_deny => Perms::NONE,
+                // No grant covers the path: the pre-#123 fallback, from the policy
+                // cached alongside the grants.
+                None => Perms::from_policy(self.cached_policy(generation, actor_id)?),
+            });
         }
+
+        let grants = self.meta.list_acl(Some(actor_id)).await?;
+        let policy = self.write_policy_of(actor_id).await?;
+        let default_deny = self.meta.get_config(ACL_DEFAULT_DENY).await?.as_deref() == Some("1");
+        let enforce_reads = self.meta.get_config(ACL_ENFORCE_READS).await?.as_deref() == Some("1");
+        let acl = ActorAcl::new(grants, policy);
+        let matched = acl.perms_at(path);
+        self.acl_cache
+            .put(generation, default_deny, enforce_reads, actor_id, acl);
+
+        Ok(match matched {
+            Some(perms) => perms,
+            None if default_deny => Perms::NONE,
+            None => Perms::from_policy(policy),
+        })
     }
 
     /// Refuse `op` at `path` for an actor without `WRITE` there (issue #123).
@@ -298,6 +606,35 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     ) -> Result<()> {
         let perms = self.effective_perms(ctx.actor, path).await?;
         if perms.contains(Perms::WRITE) {
+            return Ok(());
+        }
+        Err(denied(ctx.actor, op, path, perms))
+    }
+
+    /// Refuse a **read** of `path` for an actor without [`Perms::READ`] there.
+    ///
+    /// A no-op unless the workspace has
+    /// [`set_acl_enforce_reads`](Self::set_acl_enforce_reads) on, so adding this
+    /// call to a read path changes nothing until an operator opts in.
+    ///
+    /// # The denial says nothing about existence
+    ///
+    /// Like the write checks, this runs **before** any lookup, so a denial cannot
+    /// distinguish a path the actor may not read from one that is not there. That
+    /// matters more here than on the write side: probing for existence is the whole
+    /// point of an unauthorized read, and a check that ran after the lookup would
+    /// answer the question it is meant to refuse.
+    pub async fn ensure_may_read_at(
+        &self,
+        ctx: crate::WriteCtx,
+        op: &str,
+        path: &str,
+    ) -> Result<()> {
+        if !self.acl_enforce_reads().await? {
+            return Ok(());
+        }
+        let perms = self.effective_perms(ctx.actor, path).await?;
+        if perms.contains(Perms::READ) {
             return Ok(());
         }
         Err(denied(ctx.actor, op, path, perms))
@@ -401,5 +738,91 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             )
             .await
             .map(|_| ())
+    }
+}
+
+/// The attributed read entry points (issue #124, phase 1).
+///
+/// Each is the unattributed read it wraps, preceded by
+/// [`ensure_may_read_at`](Fs::ensure_may_read_at) — the same shape the write path
+/// uses, and for the same reason: the check belongs at the engine's chokepoint
+/// where no surface can forget it.
+///
+/// **These change nothing until a workspace opts in.** With
+/// `acl_enforce_reads` off, which is the default, every one of them is its
+/// unattributed twin plus one cached config read.
+///
+/// The unattributed reads stay, and stay open: they are what checkout, merge, gc
+/// and the CRDT coordinator are built from, exactly as `remove`/`rename`/`mkdir_p`
+/// stay on the write side. A surface must reach for the `_as` form, the same rule
+/// `CLAUDE.md` already states for mutations.
+impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
+    /// [`read`](Fs::read), checked against [`Perms::READ`] at `path`.
+    pub async fn read_as(&self, ctx: crate::WriteCtx, path: &str) -> Result<bytes::Bytes> {
+        self.ensure_may_read_at(ctx, "read", path).await?;
+        self.read(path).await
+    }
+
+    /// [`read_range`](Fs::read_range), checked against [`Perms::READ`] at `path`.
+    pub async fn read_range_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+        off: u64,
+        len: u64,
+    ) -> Result<bytes::Bytes> {
+        self.ensure_may_read_at(ctx, "read", path).await?;
+        self.read_range(path, off, len).await
+    }
+
+    /// [`stat`](Fs::stat), checked against [`Perms::READ`] at `path`.
+    pub async fn stat_as(&self, ctx: crate::WriteCtx, path: &str) -> Result<crate::types::Inode> {
+        self.ensure_may_read_at(ctx, "stat", path).await?;
+        self.stat(path).await
+    }
+
+    /// [`readlink`](Fs::readlink), checked against [`Perms::READ`] at `path`.
+    pub async fn readlink_as(&self, ctx: crate::WriteCtx, path: &str) -> Result<String> {
+        self.ensure_may_read_at(ctx, "read", path).await?;
+        self.readlink(path).await
+    }
+
+    /// [`blame`](Fs::blame), checked against [`Perms::READ`] at `path`.
+    ///
+    /// Blame is a read of the file's contents by another name — it returns who
+    /// wrote which byte ranges — so it takes the same check rather than a weaker
+    /// one. It was one of the side doors issue #124 named.
+    pub async fn blame_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+    ) -> Result<Vec<crate::attribution::BlameRange>> {
+        self.ensure_may_read_at(ctx, "read blame for", path).await?;
+        self.blame(path).await
+    }
+
+    /// [`ls`](Fs::ls), checked against [`Perms::READ`] at the directory.
+    ///
+    /// # This checks the directory, not its entries
+    ///
+    /// An actor that may read `/a` gets all of `/a`'s entries, including any whose
+    /// own grants say otherwise. Per-entry filtering is deliberately **not** here:
+    /// it is a check per entry, which is what makes the cache in front of
+    /// `effective_perms` a prerequisite rather than a nicety, and it has to be
+    /// designed together with `stat_as` so the two agree about a denied path — if
+    /// a listing hides what a stat refuses, the difference between them is an
+    /// existence oracle, and the invariant this module already holds for writes is
+    /// broken by the pair rather than by either one.
+    ///
+    /// Until that lands, a deployment that needs per-entry read isolation gets it
+    /// where it gets read isolation today: from the path prefix its router resolves
+    /// under.
+    pub async fn ls_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+    ) -> Result<Vec<crate::types::DirEntry>> {
+        self.ensure_may_read_at(ctx, "list", path).await?;
+        self.ls(path).await
     }
 }

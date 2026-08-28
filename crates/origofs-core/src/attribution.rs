@@ -410,7 +410,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// `propose` (writes are routed through the suggestion queue for review by a
     /// different actor). A bounded, actor-agnostic trust gate (§6).
     pub async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()> {
-        self.meta.set_write_policy(actor_id, policy).await
+        self.meta.set_write_policy(actor_id, policy).await?;
+        // The policy is the fallback `effective_perms` uses where no grant
+        // applies, so it feeds authorization answers and must invalidate them.
+        self.bump_acl_generation().await
     }
 
     /// Look up an actor by external identity (`auth_subject`), if registered.

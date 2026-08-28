@@ -201,17 +201,33 @@ A `Scope` resolves *paths*, so an operation without one is outside it entirely:
   reader that should watch a document without editing it has no mode to do so
   today, and inventing one by allowing the socket and dropping its content frames
   would have to be built rather than assumed.
-- **Grants gate writes, not reads — know this before you rely on them.** There is
-  no read-side check anywhere in the engine: `ensure_may_read` does not exist.
-  `Perms::READ` is a real bit, it is grantable, and it is reported in
-  `effective permissions`, but nothing consults it. Under `acl_default_deny` an
-  actor with *no grant at all* is correctly refused every write and can still
-  `read`, `blame`, `ls` and `log` any path it can name. Read isolation therefore
-  comes from **routing**, not from the ACL: the tenant `root` prefix each request
-  resolves to (`_scoped`/`_require_in_scope` in the FastAPI router, the same idea
-  in any host) is what keeps one tenant out of another's files. An ACL is not a
-  substitute for that scoping, and a `READ` grant does not narrow anything —
-  granting it says what an actor *should* see, not what the engine enforces.
+- **Grants gate reads only where a workspace opts in** (`acl_enforce_reads`,
+  default **off**). `ensure_may_read_at` checks `Perms::READ` at the path exactly
+  as `ensure_may_write_at` checks `WRITE`, and the attributed reads on the engine
+  — `read_as`, `read_range_as`, `stat_as`, `ls_as`, `readlink_as`, `blame_as` —
+  run it. Off is the right default and not a hedge: reads have never been checked,
+  so no existing workspace holds read grants, and enforcing on upgrade would stop
+  every actor at once — the same hazard `acl_default_deny` carries, given the same
+  deliberate switch so the grants get written first.
+  Three limits are worth stating plainly. `ls_as` checks the **directory**, not
+  its entries, so per-entry filtering is not here yet — it has to be designed
+  together with `stat_as` so the two agree about a denied path, or the difference
+  between them is an existence oracle. The **unattributed** reads stay open by
+  construction, exactly as `remove`/`rename`/`mkdir_p` do on the write side: they
+  are what checkout, merge, gc and the CRDT coordinator are built from. And a
+  surface with no actor cannot check one, so **FUSE and NFS remain the documented
+  bypass**. Until a surface threads an actor into its read routes, read isolation
+  still comes from routing — see below.
+- **Where reads are not enforced, isolation is routing, not the ACL.** With
+  `acl_enforce_reads` off (the default) there is no read-side check at all.
+  An actor with *no grant at all* is refused every write and can still `read`,
+  `blame`, `ls` and `log` any path it can name. Isolation then comes from the
+  tenant `root` prefix each request resolves to (`_scoped`/`_require_in_scope` in
+  the FastAPI router, the same idea in any host), which is what keeps one tenant
+  out of another's files. That scoping stays load-bearing even with enforcement
+  on, because it covers the reads that have no single path — `log`, `status`,
+  `diff`, `events`, `presence`, `list_suggestions` — which a path-scoped check
+  does not reach.
 - Suggestions are scoped at `record_suggestion`, which every shape of them (bytes,
   delete, CRDT) funnels through, satisfied by `WRITE` or `PROPOSE` at the path.
   The queue is not the working tree, but it is reviewer-visible state that an

@@ -243,6 +243,12 @@ pub struct Fs<M: MetadataStore, C: ContentStore> {
     /// same store, so many workspaces coexist (`docs/MULTI_TENANCY.md`). Every
     /// path walk starts here, so a workspace only ever reaches its own subtree.
     pub(crate) root_ino: Ino,
+    /// Authorization answers, keyed on the store's ACL generation so they are
+    /// exact rather than merely fresh. Scoped to one workspace — an `Fs` is per
+    /// workspace, so a cached grant is never matched against another workspace's
+    /// paths — and shared across clones of that workspace's handle, which is what
+    /// lets a cloned `Workspace` reuse a warm cache rather than refill its own.
+    pub(crate) acl_cache: Arc<crate::acl::AclCache>,
 }
 
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
@@ -252,6 +258,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             content,
             clock: Arc::new(SystemClock),
             root_ino: INO_ROOT,
+            acl_cache: Default::default(),
         }
     }
 
@@ -264,6 +271,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             content,
             clock,
             root_ino: INO_ROOT,
+            acl_cache: Default::default(),
         }
     }
 
@@ -280,6 +288,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             content: self.content.clone(),
             clock: self.clock.clone(),
             root_ino,
+            acl_cache: Default::default(),
         }
     }
 

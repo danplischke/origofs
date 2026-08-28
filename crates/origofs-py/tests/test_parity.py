@@ -1010,6 +1010,100 @@ async def test_the_longest_matching_prefix_wins():
         )
 
 
+# --- read enforcement (#124, phase 1) --------------------------------------
+
+
+@asyncio_test
+async def test_reads_are_open_until_the_workspace_opts_in():
+    # The migration invariant, through the bindings: adding the check changes
+    # nothing for an existing workspace. `Perms.READ` was a bit nothing consulted,
+    # so no workspace has read grants and enforcing on upgrade would stop every
+    # actor at once.
+    ws = await workspace()
+    owner = await ws.create_human("owner", None)
+    await ws.grant(owner, "/", "read+write", None)
+    await ws.write_as(origofs.WriteCtx.actor(owner), "/doc.md", b"secret\n")
+
+    bob = await ws.create_agent("bob", "opus", None)
+    ctx = origofs.WriteCtx.actor(bob)
+    await ws.set_acl_default_deny(True)  # bob has no grant anywhere
+
+    assert await ws.acl_enforce_reads() is False
+    assert bytes(await ws.read_as(ctx, "/doc.md")) == b"secret\n"
+    assert await ws.stat_as(ctx, "/doc.md")
+    assert await ws.ls_as(ctx, "/")
+    assert await ws.blame_as(ctx, "/doc.md")
+    # ...while writing is refused, so this is the switch being off rather than an
+    # accidental grant.
+    with pytest.raises(PermissionError):
+        await ws.write_or_propose(ctx, "/doc.md", b"x", None)
+
+
+@asyncio_test
+async def test_read_enforcement_gates_every_attributed_read():
+    ws = await workspace()
+    owner = await ws.create_human("owner", None)
+    octx = origofs.WriteCtx.actor(owner)
+    await ws.grant(owner, "/", "read+write", None)
+    await ws.write_as(octx, "/doc.md", b"secret\n")
+    await ws.symlink_as(octx, "/doc.md", "/link")
+
+    bob = await ws.create_agent("bob", "opus", None)
+    ctx = origofs.WriteCtx.actor(bob)
+    await ws.set_acl_default_deny(True)
+    await ws.set_acl_enforce_reads(True)
+    assert await ws.acl_enforce_reads() is True
+
+    for call in (
+        ws.read_as(ctx, "/doc.md"),
+        ws.read_range_as(ctx, "/doc.md", 0, 3),
+        ws.stat_as(ctx, "/doc.md"),
+        ws.ls_as(ctx, "/"),
+        ws.readlink_as(ctx, "/link"),
+        ws.blame_as(ctx, "/doc.md"),
+        ws.ensure_may_read_at(ctx, "read", "/doc.md"),
+    ):
+        with pytest.raises(PermissionError):
+            await call
+
+    # A read grant admits all of them, and still is not a write grant.
+    await ws.grant(bob, "/", "read", None)
+    assert bytes(await ws.read_as(ctx, "/doc.md")) == b"secret\n"
+    assert bytes(await ws.read_range_as(ctx, "/doc.md", 0, 3)) == b"sec"
+    assert await ws.stat_as(ctx, "/doc.md")
+    assert await ws.ls_as(ctx, "/")
+    assert await ws.readlink_as(ctx, "/link") == "/doc.md"
+    assert await ws.blame_as(ctx, "/doc.md")
+    # Returns without raising, which is the whole contract. (It resolves to an
+    # empty tuple rather than None, matching its sibling `ensure_may_write_at`.)
+    await ws.ensure_may_read_at(ctx, "read", "/doc.md")
+    with pytest.raises(PermissionError):
+        await ws.write_or_propose(ctx, "/doc.md", b"x", None)
+
+
+@asyncio_test
+async def test_a_denied_read_does_not_reveal_whether_the_path_exists():
+    # The property the check is for: an unauthorized read is usually a probe, and
+    # a refusal that differed between a real and a missing path would answer it.
+    ws = await workspace()
+    owner = await ws.create_human("owner", None)
+    await ws.grant(owner, "/", "read+write", None)
+    await ws.write_as(origofs.WriteCtx.actor(owner), "/doc.md", b"secret\n")
+
+    bob = await ws.create_agent("bob", "opus", None)
+    ctx = origofs.WriteCtx.actor(bob)
+    await ws.set_acl_default_deny(True)
+    await ws.set_acl_enforce_reads(True)
+
+    with pytest.raises(PermissionError) as real:
+        await ws.read_as(ctx, "/doc.md")
+    with pytest.raises(PermissionError) as ghost:
+        await ws.read_as(ctx, "/no-such-file.md")
+    assert str(real.value).replace("/doc.md", "<p>") == str(ghost.value).replace(
+        "/no-such-file.md", "<p>"
+    )
+
+
 @asyncio_test
 async def test_grants_are_listable_and_revocable():
     ws = await workspace()
