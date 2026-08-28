@@ -117,10 +117,20 @@ def test_serve_nfs_closes_connections_on_cancel():
             with pytest.raises(asyncio.CancelledError):
                 await task
 
+            # A peer observes a closed connection one of two ways, and which one
+            # it gets is a race the kernel decides: a clean FIN, where `recv`
+            # returns b"", or an RST, where it raises ConnectionResetError. Both
+            # mean the socket went away with the server; only the *timing* loop
+            # below is the actual assertion (that it went away at all). Accepting
+            # just the FIN made this test fail under CI load — the connection was
+            # torn down exactly as intended, and the test called it an error.
             deadline = time.monotonic() + 10.0
             while True:
                 try:
                     left = client.recv(1)
+                    break
+                except ConnectionResetError:
+                    left = b""  # RST: torn down, just less politely
                     break
                 except BlockingIOError:
                     assert time.monotonic() < deadline, (
