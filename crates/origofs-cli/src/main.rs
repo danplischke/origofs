@@ -1832,6 +1832,15 @@ async fn main() -> Result<()> {
             }
             let auth = build_api_auth(&ws, &addr, &auth_tokens_with_env(auth_tokens)).await?;
             let defaults = origofs_sdk::api::ApiOptions::default();
+            // `ApiOptions` has a feature-gated field (`checkpoint`, under
+            // `coedit`), so a literal naming every other field is *exhaustive*
+            // under one feature set and not another: `..defaults` is load-bearing
+            // with `coedit` on and `needless_update` with it off. Clippy only ever
+            // sees the set it was compiled with, so one of the two readings is
+            // always wrong — hence the allow rather than a different shape.
+            // Dropping the update would break the `coedit` build; rebuilding this
+            // by field assignment trades it for `field_reassign_with_default`.
+            #[allow(clippy::needless_update)]
             let options = origofs_sdk::api::ApiOptions {
                 gate_reads,
                 root,
