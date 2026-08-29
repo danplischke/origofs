@@ -223,7 +223,10 @@ fn every_mutating_route_binds_its_principal() {
             from = start;
             // `post(` also appears in the `use axum::routing::{get, post}` import
             // and in doc comments; a real registration names an fn defined below.
-            if !name.is_empty() && src.contains(&format!("async fn {name}(")) {
+            // Anchored at column 0: a route handler is a free function, while
+            // `ReadAuth`'s helper methods are named after the handlers they
+            // dispatch and are indented. Matching unanchored finds those.
+            if !name.is_empty() && src.contains(&format!("\nasync fn {name}(")) {
                 handlers.push(name);
             }
         }
@@ -245,7 +248,7 @@ fn every_mutating_route_binds_its_principal() {
         }
         // Take the handler's signature: from `async fn <name>(` to the closing
         // `) ->` of its parameter list.
-        let at = src.find(&format!("async fn {name}(")).unwrap();
+        let at = src.find(&format!("\nasync fn {name}(")).unwrap();
         let sig_end = src[at..].find(") ->").map(|e| at + e).unwrap_or(at);
         let sig = &src[at..sig_end];
 

@@ -276,12 +276,18 @@ const ROOT_PATH: &str = "/";
 pub struct Perms(u32);
 
 impl Perms {
-    /// May read. Reserved and **not yet enforced**: gating reads needs a read
-    /// context threaded through every read path, every surface, and every binding,
-    /// and blame/the change feed/presence are all side doors that would have to be
-    /// covered on day one or the whole thing is decoration (issue #124). The bit
-    /// exists so a grant written today does not have to be rewritten if that
-    /// requirement ever arrives; nothing consults it.
+    /// May read. Enforced only where a workspace turns
+    /// [`set_acl_enforce_reads`](Fs::set_acl_enforce_reads) on, which is **off by
+    /// default**: reads went unchecked for long enough that no existing workspace
+    /// holds read grants, so enforcing on upgrade would stop every actor at once
+    /// (issue #124).
+    ///
+    /// The attributed reads consult it — [`read_as`](Fs::read_as),
+    /// [`read_range_as`](Fs::read_range_as), [`stat_as`](Fs::stat_as),
+    /// [`ls_as`](Fs::ls_as), [`readlink_as`](Fs::readlink_as) and
+    /// [`blame_as`](Fs::blame_as) — and the unattributed reads deliberately do
+    /// not, because checkout, merge, gc and the CRDT coordinator are built from
+    /// them.
     pub const READ: Perms = Perms(1);
     /// May write directly to the working tree.
     pub const WRITE: Perms = Perms(2);
@@ -301,6 +307,33 @@ impl Perms {
 
     pub fn contains(self, other: Perms) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    /// Parse a permission set written as names: `"read"`, `"read+write"`,
+    /// `"read, propose"`, `"none"`. Case-insensitive; `+`, `,` and whitespace all
+    /// separate. `None` for an unknown name.
+    ///
+    /// Lives here rather than in a surface because more than one needs it — the
+    /// CLI's `acl grant` and the Python binding's `perms=` argument — and two
+    /// parsers for one vocabulary drift into accepting different spellings.
+    pub fn parse(s: &str) -> Option<Perms> {
+        let mut out = Perms::NONE;
+        let mut saw = false;
+        for name in s
+            .split(['+', ',', ' ', '|'])
+            .filter(|p| !p.trim().is_empty())
+        {
+            saw = true;
+            out = out
+                | match name.trim().to_ascii_lowercase().as_str() {
+                    "read" | "r" => Perms::READ,
+                    "write" | "w" => Perms::WRITE,
+                    "propose" | "p" => Perms::PROPOSE,
+                    "none" => Perms::NONE,
+                    _ => return None,
+                };
+        }
+        saw.then_some(out)
     }
 
     /// The permissions an actor's legacy [`WritePolicy`] corresponds to, so the
@@ -908,28 +941,251 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         self.blame(path).await
     }
 
-    /// [`ls`](Fs::ls), checked against [`Perms::READ`] at the directory.
+    /// [`ls`](Fs::ls), checked against [`Perms::READ`] at the directory **and at
+    /// every entry it would return**.
     ///
-    /// # This checks the directory, not its entries
+    /// # The directory check and the per-entry filter answer different questions
     ///
-    /// An actor that may read `/a` gets all of `/a`'s entries, including any whose
-    /// own grants say otherwise. Per-entry filtering is deliberately **not** here:
-    /// it is a check per entry, which is what makes the cache in front of
-    /// `effective_perms` a prerequisite rather than a nicety, and it has to be
-    /// designed together with `stat_as` so the two agree about a denied path — if
-    /// a listing hides what a stat refuses, the difference between them is an
-    /// existence oracle, and the invariant this module already holds for writes is
-    /// broken by the pair rather than by either one.
+    /// The check at `path` decides whether the actor may list this directory at
+    /// all; like every other read check it runs before any lookup, so a refusal
+    /// does not reveal whether the directory is there. The filter then decides
+    /// which of its entries the actor may see, and that one is a *filter* rather
+    /// than a refusal: an entry the actor may not read is simply absent, exactly as
+    /// it would be if it did not exist.
     ///
-    /// Until that lands, a deployment that needs per-entry read isolation gets it
-    /// where it gets read isolation today: from the path prefix its router resolves
-    /// under.
+    /// # Why filtering here is not optional
+    ///
+    /// `ls_as` and [`stat_as`](Fs::stat_as) have to agree about a denied path.
+    /// While `ls_as` listed everything under a readable directory, the pair
+    /// disagreed in the safe direction — a listing showed a name `stat_as` then
+    /// refused — which is merely useless. Hiding a name `stat_as` *serves* would be
+    /// the dangerous direction, and the two stay in step because both ask the same
+    /// question of the same resolver: does this actor hold [`Perms::READ`] at the
+    /// entry's own full path. Neither can drift without the other.
+    ///
+    /// # Cost
+    ///
+    /// One `effective_perms` call per entry, which is a few map lookups against the
+    /// generation-keyed cache — the reason that cache had to land first. With
+    /// enforcement off the loop is skipped entirely, so an unenforced workspace
+    /// pays a single cached config read and nothing per entry.
     pub async fn ls_as(
         &self,
         ctx: crate::WriteCtx,
         path: &str,
     ) -> Result<Vec<crate::types::DirEntry>> {
         self.ensure_may_read_at(ctx, "list", path).await?;
-        self.ls(path).await
+        let entries = self.ls(path).await?;
+        if !self.acl_enforce_reads().await? {
+            return Ok(entries);
+        }
+        let mut visible = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let child = join_child(path, &entry.name);
+            if self
+                .effective_perms(ctx.actor, &child)
+                .await?
+                .contains(Perms::READ)
+            {
+                visible.push(entry);
+            }
+        }
+        Ok(visible)
+    }
+}
+
+/// Join a directory path and an entry name into the child's absolute path.
+///
+/// The entry name comes from a dentry row, and `validate_component` refused a
+/// `/` in one before it could ever be stored, so this is a concatenation rather
+/// than a path parse. `path` may or may not carry a trailing slash — `/` itself
+/// always does — and doubling it would make the child no longer a
+/// [`Scope::contains`](crate::scope::Scope::contains) match for the grants that
+/// cover it.
+fn join_child(path: &str, name: &str) -> String {
+    format!("{}/{name}", path.trim_end_matches('/'))
+}
+
+/// The attributed reads that answer with *collections* of paths, rather than with
+/// one path's bytes (issue #124, phase 2).
+///
+/// `ls_as` is the shape: check where the caller asked, then filter what comes
+/// back to the paths the actor may read. These are the routes that made read
+/// enforcement decoration while only the six per-path reads were gated — a
+/// diff, a review queue, or a presence roster names the same paths a `stat`
+/// would refuse, and naming them is the whole of what an existence probe wants.
+///
+/// Like the six, every one of them is its unattributed twin plus one cached
+/// config read while `acl_enforce_reads` is off.
+impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
+    /// Drop the rows whose path the actor may not read.
+    ///
+    /// # A row with no path is dropped too
+    ///
+    /// The only such row today is a [`Presence`](crate::collab::Presence) for a
+    /// session that has not announced where it is. Keeping it looks harmless —
+    /// it names no path — but it still tells a restricted reader that a
+    /// neighbour is connected, which is exactly the inference the filter exists
+    /// to withhold. [`Scope::contains`](crate::scope::Scope::contains) already
+    /// made this ruling for tenancy by answering `false` for `None`; this is the
+    /// same ruling for permissions, so the two boundaries cannot disagree about
+    /// the same row.
+    async fn retain_readable<T>(
+        &self,
+        ctx: crate::WriteCtx,
+        rows: Vec<T>,
+        path_of: impl Fn(&T) -> Option<&str>,
+    ) -> Result<Vec<T>> {
+        if !self.acl_enforce_reads().await? {
+            return Ok(rows);
+        }
+        let mut visible = Vec::with_capacity(rows.len());
+        for row in rows {
+            let keep = match path_of(&row) {
+                None => false,
+                Some(p) => self
+                    .effective_perms(ctx.actor, p)
+                    .await?
+                    .contains(Perms::READ),
+            };
+            if keep {
+                visible.push(row);
+            }
+        }
+        Ok(visible)
+    }
+
+    /// [`diff`](Fs::diff), with the entries the actor may not read removed.
+    pub async fn diff_as(
+        &self,
+        ctx: crate::WriteCtx,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<crate::objectgraph::DiffEntry>> {
+        let out = self.diff(from, to).await?;
+        self.retain_readable(ctx, out, |e| Some(e.path.as_str()))
+            .await
+    }
+
+    /// [`diff_file`](Fs::diff_file), checked against [`Perms::READ`] at `path`.
+    ///
+    /// A per-path read like the six: a unified diff of a file is that file's
+    /// content in another arrangement, so it takes the refusal rather than the
+    /// filter.
+    pub async fn diff_file_as(
+        &self,
+        ctx: crate::WriteCtx,
+        from: &str,
+        to: &str,
+        path: &str,
+    ) -> Result<String> {
+        self.ensure_may_read_at(ctx, "diff", path).await?;
+        self.diff_file(from, to, path).await
+    }
+
+    /// [`presence`](Fs::presence), with sessions at unreadable paths removed.
+    ///
+    /// Presence is a live map of who is editing what, so under enforcement an
+    /// actor sees exactly the sessions it could have found by listing — and not
+    /// the ones that name no path, per `retain_readable`.
+    pub async fn presence_as(
+        &self,
+        ctx: crate::WriteCtx,
+        window_secs: i64,
+    ) -> Result<Vec<crate::collab::Presence>> {
+        let out = self.presence(window_secs).await?;
+        self.retain_readable(ctx, out, |p| p.path.as_deref()).await
+    }
+
+    /// [`list_suggestions`](Fs::list_suggestions), with proposals against
+    /// unreadable paths removed.
+    pub async fn list_suggestions_as(
+        &self,
+        ctx: crate::WriteCtx,
+        status: Option<crate::suggest::SuggestionStatus>,
+        path: Option<&str>,
+    ) -> Result<Vec<crate::suggest::Suggestion>> {
+        let out = self.list_suggestions(status, path).await?;
+        self.retain_readable(ctx, out, |s| Some(s.path.as_str()))
+            .await
+    }
+
+    /// [`get_suggestion`](Fs::get_suggestion), answering `None` for a proposal
+    /// against a path the actor may not read.
+    ///
+    /// # Not found, not denied
+    ///
+    /// The other reads take a path the caller already named, so refusing tells it
+    /// nothing it did not supply. A suggestion id is an opaque, workspace-global,
+    /// guessable handle, and a `Denied` on one would confirm that *some* proposal
+    /// exists at that id — the existence answer the check is there to withhold.
+    /// The HTTP surface already made this ruling for its scope check, which 404s
+    /// an out-of-scope id for the same reason; this puts it in the engine so every
+    /// surface inherits it.
+    pub async fn get_suggestion_as(
+        &self,
+        ctx: crate::WriteCtx,
+        id: i64,
+    ) -> Result<Option<crate::suggest::Suggestion>> {
+        let Some(s) = self.get_suggestion(id).await? else {
+            return Ok(None);
+        };
+        if !self.acl_enforce_reads().await? {
+            return Ok(Some(s));
+        }
+        if self
+            .effective_perms(ctx.actor, &s.path)
+            .await?
+            .contains(Perms::READ)
+        {
+            Ok(Some(s))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// [`live_doc`](Fs::live_doc), answering `None` for a path the actor may not
+    /// read.
+    ///
+    /// A filter rather than a refusal, like the collections: "is this path being
+    /// co-edited right now" is an existence question with a path in it, and
+    /// answering `Denied` to it would confirm the path is there.
+    pub async fn live_doc_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+    ) -> Result<Option<crate::collab::LiveDoc>> {
+        if self.acl_enforce_reads().await?
+            && !self
+                .effective_perms(ctx.actor, path)
+                .await?
+                .contains(Perms::READ)
+        {
+            return Ok(None);
+        }
+        self.live_doc(path).await
+    }
+
+    /// [`live_paths`](Fs::live_paths), with the paths the actor may not read
+    /// removed. Unfiltered, it is a workspace-wide list of exactly which files
+    /// someone is editing right now.
+    pub async fn live_paths_as(&self, ctx: crate::WriteCtx) -> Result<Vec<crate::collab::LiveDoc>> {
+        let out = self.live_paths().await?;
+        self.retain_readable(ctx, out, |l| Some(l.path.as_str()))
+            .await
+    }
+
+    /// [`suggestion_diff`](Fs::suggestion_diff), refusing a proposal against a
+    /// path the actor may not read.
+    ///
+    /// The refusal is the same [`OrigoFSError::NotFound`] the unattributed form
+    /// raises for an id that is not there, and for the reason
+    /// [`get_suggestion_as`](Fs::get_suggestion_as) spells out: a distinguishable
+    /// error would answer the existence question rather than withhold it.
+    pub async fn suggestion_diff_as(&self, ctx: crate::WriteCtx, id: i64) -> Result<String> {
+        match self.get_suggestion_as(ctx, id).await? {
+            Some(_) => self.suggestion_diff(id).await,
+            None => Err(OrigoFSError::NotFound(format!("suggestion #{id}"))),
+        }
     }
 }

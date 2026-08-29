@@ -76,14 +76,36 @@ enum Cmd {
         actor: Option<i64>,
     },
     /// Print a file's contents to stdout.
-    Read { path: String },
+    Read {
+        path: String,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// List a directory.
     Ls {
         #[arg(default_value = "/")]
         path: String,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
     },
     /// Show inode metadata for a path.
-    Stat { path: String },
+    Stat {
+        path: String,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Explain what a file costs to read: chunk count, chunk-size distribution,
     /// self-dedup, and whether the content store still holds the chunks.
     Info {
@@ -166,6 +188,12 @@ enum Cmd {
         /// Show a unified line diff of just this path.
         #[arg(long)]
         path: Option<String>,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
     },
     /// Propose an edit to a path for review (bytes from `--from`/stdin),
     /// attributed to `--actor`. `--delete` proposes removing the path instead.
@@ -188,9 +216,23 @@ enum Cmd {
         status: Option<String>,
         #[arg(long)]
         path: Option<String>,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
     },
     /// Show a suggestion's unified diff (base → proposed).
-    SuggestionDiff { id: i64 },
+    SuggestionDiff {
+        id: i64,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Accept a pending suggestion, attributed to `--actor` as the approver.
     Accept {
         id: i64,
@@ -276,6 +318,23 @@ enum Cmd {
         /// `direct` or `propose`.
         policy: String,
     },
+    /// Inspect and change the workspace's path ACLs (issues #123, #124).
+    ///
+    /// The ACLs are the one part of the engine no surface exposed: no HTTP route,
+    /// no MCP tool, and until now no subcommand. `CLAUDE.md` calls that out —
+    /// safety by absence of a route is not safety, and it also meant a workspace
+    /// could not be *configured* without writing Rust or Python.
+    ///
+    /// Every mutating form takes `--actor` and goes through the gated `_as`
+    /// variant, so granting is itself authorized: you need `WRITE` at the prefix,
+    /// and you cannot hand out a bit you do not hold there. Omitting `--actor`
+    /// uses the ungated provisioning form, which is correct for exactly one case
+    /// — the first grant in a fresh workspace, which by construction precedes
+    /// anyone holding rights in it — and says so when it does.
+    Acl {
+        #[command(subcommand)]
+        cmd: AclCmd,
+    },
     /// Require every mutating CLI command to name an actor (`on`), or allow
     /// unattributed ones (`off`); with no argument, print the current setting.
     ///
@@ -288,7 +347,15 @@ enum Cmd {
         setting: Option<String>,
     },
     /// Show per-line authorship (blame) for a file.
-    Blame { path: String },
+    Blame {
+        path: String,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Undo exactly the lines one actor authored in one session, across every file
     /// that session touched, leaving other actors' edits intact. `--by` is the
     /// actor performing the revert (must be permitted to write).
@@ -453,6 +520,12 @@ enum Cmd {
         /// Consider sessions seen within this many seconds active.
         #[arg(long, default_value_t = 60)]
         window: i64,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
     },
     /// Serve the workspace over HTTP/JSON (blocks until stopped).
     Serve {
@@ -546,6 +619,66 @@ enum GitCmd {
 /// transport. origofs-core/-sdk only *emit* spans and events; this is the one
 /// place they are shown (a Rust embedder installs its own subscriber instead).
 /// The actor a mutating command should act as: `--actor` if given, else
+#[derive(Subcommand)]
+enum AclCmd {
+    /// Show the grants in the workspace, or one actor's, plus the two switches.
+    Show {
+        /// Only this actor's grants.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
+    /// What an actor may actually do at a path, after longest-prefix matching and
+    /// the write-policy fallback. The question an ACL bug is usually asking.
+    Check {
+        /// The actor to resolve for.
+        actor: i64,
+        /// The path to resolve at.
+        path: String,
+    },
+    /// Grant permissions to an actor under a path prefix.
+    Grant {
+        /// The actor receiving the grant.
+        actor: i64,
+        /// The path prefix it applies to, matched on directory boundaries.
+        prefix: String,
+        /// `read`, `write`, `propose`, `none`, or a combination: `read+write`.
+        perms: String,
+        /// Grant *as* this actor, which requires `WRITE` at the prefix and
+        /// refuses to hand out a bit the granter does not hold there. Falls back
+        /// to `ORIGOFS_ACTOR`. Omit only to provision a fresh workspace.
+        #[arg(long)]
+        by: Option<i64>,
+    },
+    /// Remove an actor's grant at exactly this prefix.
+    Revoke {
+        actor: i64,
+        prefix: String,
+        /// Revoke *as* this actor; same check as `grant`. Falls back to
+        /// `ORIGOFS_ACTOR`.
+        #[arg(long)]
+        by: Option<i64>,
+    },
+    /// Deny an actor with no matching grant (`on`), or fall back to its write
+    /// policy (`off`, the default). With no argument, print the current setting.
+    DefaultDeny {
+        setting: Option<String>,
+        #[arg(long)]
+        by: Option<i64>,
+    },
+    /// Check `READ` on the attributed reads (`on`), or leave reads open (`off`,
+    /// the default). With no argument, print the current setting.
+    ///
+    /// Off by default because reads went unchecked for long enough that no
+    /// existing workspace holds read grants; enforcing on upgrade would stop
+    /// every actor at once. Turn it on once the grants are in place — `acl check`
+    /// is how you confirm that before you do.
+    EnforceReads {
+        setting: Option<String>,
+        #[arg(long)]
+        by: Option<i64>,
+    },
+}
+
 /// `ORIGOFS_ACTOR` (issue #128).
 ///
 /// # Why an environment fallback rather than a required flag
@@ -573,6 +706,162 @@ fn resolve_actor(flag: Option<i64>) -> anyhow::Result<Option<i64>> {
         }),
         _ => Ok(None),
     }
+}
+
+/// Parse the `on`/`off` argument the two ACL switches share.
+fn parse_switch(v: &str) -> anyhow::Result<bool> {
+    match v {
+        "on" | "true" | "1" => Ok(true),
+        "off" | "false" | "0" => Ok(false),
+        other => Err(anyhow::anyhow!(
+            "unknown setting {other:?} (expected `on` or `off`)"
+        )),
+    }
+}
+
+/// Run one `origofs acl …` subcommand.
+///
+/// Every mutating arm takes the same shape: with an actor, call the gated `_as`
+/// form; without one, call the raw form and say out loud that nothing checked it.
+/// The raw forms are not a fallback for convenience — they exist because
+/// provisioning has no actor, and a caller who reaches them by forgetting
+/// `--by` should be able to tell from the output that they did.
+async fn run_acl(ws: &Workspace, cmd: AclCmd) -> anyhow::Result<()> {
+    use origofs_sdk::Perms;
+    let unchecked = "(unchecked: no --by given, so this ran as provisioning)";
+    match cmd {
+        AclCmd::Show { actor } => {
+            println!(
+                "default-deny is {}; read enforcement is {}",
+                if ws.acl_default_deny().await? {
+                    "on"
+                } else {
+                    "off"
+                },
+                if ws.acl_enforce_reads().await? {
+                    "on"
+                } else {
+                    "off"
+                },
+            );
+            let grants = ws.list_grants(actor).await?;
+            if grants.is_empty() {
+                println!("no grants");
+            }
+            for g in grants {
+                let prefix = if g.path_prefix.is_empty() {
+                    "/"
+                } else {
+                    &g.path_prefix
+                };
+                let by = g.granted_by.map(|b| format!(" by={b}")).unwrap_or_default();
+                println!("actor={:<5} {:<30} {}{by}", g.actor_id, prefix, g.perms);
+            }
+        }
+        AclCmd::Check { actor, path } => {
+            let perms = ws.effective_perms(actor, &path).await?;
+            println!("actor {actor} at {path}: {perms}");
+        }
+        AclCmd::Grant {
+            actor,
+            prefix,
+            perms,
+            by,
+        } => {
+            let p = Perms::parse(&perms).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown permissions {perms:?} (expected `read`, `write`, `propose`, \
+                     `none`, or a combination like `read+write`)"
+                )
+            })?;
+            match resolve_actor(by)? {
+                Some(granter) => {
+                    ws.grant_as(WriteCtx::actor(granter), actor, &prefix, p)
+                        .await?;
+                    println!("granted {p} at {prefix} to actor {actor} (by actor {granter})");
+                }
+                None => {
+                    ws.grant(actor, &prefix, p, None).await?;
+                    println!("granted {p} at {prefix} to actor {actor} {unchecked}");
+                }
+            }
+        }
+        AclCmd::Revoke { actor, prefix, by } => {
+            let existed = match resolve_actor(by)? {
+                Some(revoker) => {
+                    ws.revoke_as(WriteCtx::actor(revoker), actor, &prefix)
+                        .await?
+                }
+                None => ws.revoke(actor, &prefix, None).await?,
+            };
+            if existed {
+                println!("revoked actor {actor}'s grant at {prefix}");
+            } else {
+                println!("actor {actor} had no grant at exactly {prefix}");
+            }
+        }
+        AclCmd::DefaultDeny { setting, by } => match setting.as_deref() {
+            None => println!(
+                "acl default-deny is {}",
+                if ws.acl_default_deny().await? {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            Some(v) => {
+                let on = parse_switch(v)?;
+                match resolve_actor(by)? {
+                    Some(a) => ws.set_acl_default_deny_as(WriteCtx::actor(a), on).await?,
+                    None => ws.set_acl_default_deny(on).await?,
+                }
+                println!("acl default-deny is now {}", if on { "on" } else { "off" });
+            }
+        },
+        AclCmd::EnforceReads { setting, by } => match setting.as_deref() {
+            None => println!(
+                "acl read enforcement is {}",
+                if ws.acl_enforce_reads().await? {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            Some(v) => {
+                let on = parse_switch(v)?;
+                match resolve_actor(by)? {
+                    Some(a) => ws.set_acl_enforce_reads_as(WriteCtx::actor(a), on).await?,
+                    None => ws.set_acl_enforce_reads(on).await?,
+                }
+                println!(
+                    "acl read enforcement is now {}",
+                    if on { "on" } else { "off" }
+                );
+            }
+        },
+    }
+    Ok(())
+}
+
+/// The context a **read** runs under, or `None` for an unattributed read.
+///
+/// No session, unlike [`cli_ctx`]: a read records nothing, so opening a session
+/// row per `origofs ls` would be a write in service of a read.
+///
+/// `None` is a real answer rather than a failure. Reads are open unless a
+/// workspace turns `acl_enforce_reads` on, and the overwhelming majority of CLI
+/// use is a developer looking at their own workspace, where demanding an actor id
+/// would be friction with nothing behind it. Where enforcement *is* on, the
+/// engine refuses an unattributed read on its own — the flag is how you get an
+/// answer, not how you get past the check.
+///
+/// It is not an identity check either, and cannot be: whoever writes the argv
+/// writes the environment, and a local process holding the workspace directory
+/// has `meta.db` and the CAS on disk anyway. What it buys is that
+/// `origofs read --actor 7` answers what actor 7 would actually be served, so an
+/// ACL can be verified with the same binary that enforces it.
+fn read_ctx(flag: Option<i64>) -> anyhow::Result<Option<WriteCtx>> {
+    Ok(resolve_actor(flag)?.map(WriteCtx::actor))
 }
 
 /// Open a CLI session for `actor` and return the write context to act under.
@@ -986,17 +1275,27 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Read { path } => {
-            let bytes = ws.read(&path).await?;
+        Cmd::Read { path, actor } => {
+            let bytes = match read_ctx(actor)? {
+                Some(ctx) => ws.read_as(ctx, &path).await?,
+                None => ws.read(&path).await?,
+            };
             std::io::stdout().write_all(&bytes)?;
         }
-        Cmd::Ls { path } => {
-            for e in ws.ls(&path).await? {
+        Cmd::Ls { path, actor } => {
+            let entries = match read_ctx(actor)? {
+                Some(ctx) => ws.ls_as(ctx, &path).await?,
+                None => ws.ls(&path).await?,
+            };
+            for e in entries {
                 println!("{}\t{}", e.kind.as_str(), e.name);
             }
         }
-        Cmd::Stat { path } => {
-            let i = ws.stat(&path).await?;
+        Cmd::Stat { path, actor } => {
+            let i = match read_ctx(actor)? {
+                Some(ctx) => ws.stat_as(ctx, &path).await?,
+                None => ws.stat(&path).await?,
+            };
             println!(
                 "ino={} kind={} mode={:o} nlink={} size={}",
                 i.ino,
@@ -1095,9 +1394,17 @@ async fn main() -> Result<()> {
                 println!("{} {}", d.status.sigil(), d.path);
             }
         }
-        Cmd::Diff { from, to, path } => match path {
+        Cmd::Diff {
+            from,
+            to,
+            path,
+            actor,
+        } => match path {
             Some(p) => {
-                let patch = ws.diff_file(&from, &to, &p).await?;
+                let patch = match read_ctx(actor)? {
+                    Some(ctx) => ws.diff_file_as(ctx, &from, &to, &p).await?,
+                    None => ws.diff_file(&from, &to, &p).await?,
+                };
                 if patch.is_empty() {
                     println!("{p}: unchanged between {from} and {to}");
                 } else {
@@ -1105,7 +1412,10 @@ async fn main() -> Result<()> {
                 }
             }
             None => {
-                let changes = ws.diff(&from, &to).await?;
+                let changes = match read_ctx(actor)? {
+                    Some(ctx) => ws.diff_as(ctx, &from, &to).await?,
+                    None => ws.diff(&from, &to).await?,
+                };
                 if changes.is_empty() {
                     println!("no differences between {from} and {to}");
                 }
@@ -1141,7 +1451,11 @@ async fn main() -> Result<()> {
             };
             println!("suggestion #{id} created (pending review)");
         }
-        Cmd::Suggestions { status, path } => {
+        Cmd::Suggestions {
+            status,
+            path,
+            actor,
+        } => {
             let st = match status.as_deref() {
                 Some(s) => Some(
                     SuggestionStatus::parse(s)
@@ -1149,7 +1463,10 @@ async fn main() -> Result<()> {
                 ),
                 None => None,
             };
-            let list = ws.list_suggestions(st, path.as_deref()).await?;
+            let list = match read_ctx(actor)? {
+                Some(ctx) => ws.list_suggestions_as(ctx, st, path.as_deref()).await?,
+                None => ws.list_suggestions(st, path.as_deref()).await?,
+            };
             if list.is_empty() {
                 println!("no suggestions");
             }
@@ -1168,8 +1485,11 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::SuggestionDiff { id } => {
-            let patch = ws.suggestion_diff(id).await?;
+        Cmd::SuggestionDiff { id, actor } => {
+            let patch = match read_ctx(actor)? {
+                Some(ctx) => ws.suggestion_diff_as(ctx, id).await?,
+                None => ws.suggestion_diff(id).await?,
+            };
             if patch.is_empty() {
                 println!("(no change)");
             } else {
@@ -1454,6 +1774,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Cmd::Acl { cmd } => run_acl(&ws, cmd).await?,
         Cmd::RequireAttribution { setting } => match setting.as_deref() {
             None => {
                 let on = ws.require_attribution().await?;
@@ -1477,8 +1798,12 @@ async fn main() -> Result<()> {
                 );
             }
         },
-        Cmd::Blame { path } => {
-            for r in ws.blame(&path).await? {
+        Cmd::Blame { path, actor } => {
+            let ranges = match read_ctx(actor)? {
+                Some(ctx) => ws.blame_as(ctx, &path).await?,
+                None => ws.blame(&path).await?,
+            };
+            for r in ranges {
                 let who = format!("{}:{}", r.actor.kind.as_str(), r.actor.display_name);
                 if r.line_start == r.line_end {
                     println!("{:>4}       {who}", r.line_start);
@@ -1802,8 +2127,12 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
-        Cmd::Presence { window } => {
-            for p in ws.presence(window).await? {
+        Cmd::Presence { window, actor } => {
+            let rows = match read_ctx(actor)? {
+                Some(ctx) => ws.presence_as(ctx, window).await?,
+                None => ws.presence(window).await?,
+            };
+            for p in rows {
                 let path = p.path.unwrap_or_else(|| "-".to_string());
                 println!(
                     "{}\t{}\t{path}\t(seen {})",

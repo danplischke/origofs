@@ -338,3 +338,153 @@ async fn the_enforcement_switch_is_seen_across_handles() {
         "handle B kept reading after handle A turned enforcement on"
     );
 }
+
+// --- ls and stat agree, entry by entry ---------------------------------------
+//
+// `ls_as` used to check only the directory, so a readable directory handed back
+// every name under it and `stat_as` then refused the ones the actor could not
+// read. That disagreement was in the safe direction — a listing that promises
+// more than a stat delivers is useless, not dangerous — but the pair still has
+// to be built as a pair, because the *other* direction (a listing that hides a
+// name `stat_as` serves) is the existence oracle the module refuses to become.
+
+/// `/pub` readable, `/dir/secret.md` not: the entry is absent, not refused.
+async fn split_dir() -> (TestFs, i64, WriteCtx) {
+    let (fs, octx, bob) = fixture().await;
+    fs.mkdir_as(octx, "/dir").await.unwrap();
+    fs.write_as(octx, "/dir/open.md", b"anyone\n")
+        .await
+        .unwrap();
+    fs.write_as(octx, "/dir/secret.md", b"nobody\n")
+        .await
+        .unwrap();
+    fs.set_acl_default_deny(true).await.unwrap();
+    fs.set_acl_enforce_reads(true).await.unwrap();
+    fs.grant(bob, "/dir", Perms::READ, None).await.unwrap();
+    (fs, bob, WriteCtx::actor(bob))
+}
+
+#[tokio::test]
+async fn a_listing_hides_an_entry_the_actor_may_not_read() {
+    let (fs, bob, ctx) = split_dir().await;
+    // A deeper deny: bob reads /dir, but not this one name under it.
+    fs.grant(bob, "/dir/secret.md", Perms::NONE, None)
+        .await
+        .unwrap();
+
+    let names: Vec<String> = fs
+        .ls_as(ctx, "/dir")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, vec!["open.md".to_string()]);
+}
+
+#[tokio::test]
+async fn every_listed_entry_is_one_stat_would_serve() {
+    // The agreement itself, asserted as the property rather than as a case: for
+    // every name in the directory, presence in the listing and success of
+    // `stat_as` are the same bit. Neither side can drift without failing here.
+    let (fs, bob, ctx) = split_dir().await;
+    fs.grant(bob, "/dir/secret.md", Perms::NONE, None)
+        .await
+        .unwrap();
+
+    let all: Vec<String> = fs
+        .ls("/dir")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let listed: Vec<String> = fs
+        .ls_as(ctx, "/dir")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(all.len(), 2, "the directory really does hold both");
+
+    for name in all {
+        let statted = fs.stat_as(ctx, &format!("/dir/{name}")).await.is_ok();
+        assert_eq!(
+            listed.contains(&name),
+            statted,
+            "{name}: listed={} but stat_as ok={statted}",
+            listed.contains(&name)
+        );
+    }
+}
+
+#[tokio::test]
+async fn filtering_leaves_a_fully_readable_directory_untouched() {
+    let (fs, _bob, ctx) = split_dir().await;
+    let mut names: Vec<String> = fs
+        .ls_as(ctx, "/dir")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["open.md".to_string(), "secret.md".to_string()]);
+}
+
+#[tokio::test]
+async fn an_unreadable_directory_is_still_refused_not_emptied() {
+    // The directory check and the per-entry filter answer different questions,
+    // and the first must stay a refusal: an empty listing would say "this
+    // directory is here and holds nothing", which is more than a denied actor
+    // may learn.
+    let (fs, _bob, ctx) = split_dir().await;
+    let e = fs.ls_as(ctx, "/").await.unwrap_err(); // bob's grant is at /dir only
+    assert!(denied(&e), "expected Denied, got {e:?}");
+}
+
+#[tokio::test]
+async fn filtering_does_not_run_while_enforcement_is_off() {
+    // The cost argument: with the switch off nothing is filtered, so a workspace
+    // that never opts in pays one cached config read and nothing per entry.
+    let (fs, bob, _ctx) = split_dir().await;
+    fs.grant(bob, "/dir/secret.md", Perms::NONE, None)
+        .await
+        .unwrap();
+    fs.set_acl_enforce_reads(false).await.unwrap();
+
+    assert_eq!(
+        fs.ls_as(WriteCtx::actor(bob), "/dir").await.unwrap().len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn the_root_directory_joins_its_children_without_doubling_a_slash() {
+    // `join_child` concatenates, and `/` is the one path that already ends in a
+    // separator. `//doc.md` is not a `Scope::contains` match for a grant at
+    // `/doc.md`, so a doubled slash would resolve a root-level entry against the
+    // grant at `/` instead of its own — silently ignoring every deny written
+    // directly against a file in the root.
+    let (fs, _octx, bob) = fixture().await;
+    fs.set_acl_default_deny(true).await.unwrap();
+    fs.set_acl_enforce_reads(true).await.unwrap();
+    fs.grant(bob, "/", Perms::READ, None).await.unwrap();
+    fs.grant(bob, "/doc.md", Perms::NONE, None).await.unwrap();
+    let ctx = WriteCtx::actor(bob);
+
+    let names: Vec<String> = fs
+        .ls_as(ctx, "/")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(
+        !names.contains(&"doc.md".to_string()),
+        "the deny at /doc.md was not applied to the root listing: {names:?}"
+    );
+    // And the pair still agrees: what the listing hides, the stat refuses.
+    assert!(denied(&fs.stat_as(ctx, "/doc.md").await.unwrap_err()));
+}

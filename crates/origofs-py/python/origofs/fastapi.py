@@ -29,7 +29,9 @@ Every mutating route depends on ``authn`` and attributes the change to the
 :class:`~origofs.WriteCtx` it returns — so blame and the audit log reflect the
 authenticated principal, and a client cannot forge attribution by naming an
 actor id in the request. Read routes are open by default; pass ``reader`` (any
-dependency) to gate them too.
+dependency) to gate them too — and if it returns a ``WriteCtx``, reads run *as*
+that actor, so a workspace with ``acl_enforce_reads`` on applies ``Perms.READ``
+to what comes back.
 
 Attribution is not decoration: every mutating route calls an **attributed**
 workspace method, so the caller's :class:`~origofs.WritePolicy` governs it in the
@@ -796,8 +798,20 @@ def build_router(
         can't be forged. May be sync or async and may declare its own
         dependencies (headers, cookies, a JWT-decode dependency, …).
     reader:
-        Optional dependency gating read-only routes. Its return value is
-        ignored; raise to reject. Omit to leave reads open.
+        Optional dependency gating read-only routes; raise to reject. Omit to
+        leave reads open.
+
+        If it returns a :class:`origofs.WriteCtx`, reads run **as** that actor:
+        the router calls ``read_as``/``ls_as``/``stat_as``/… so a workspace with
+        ``acl_enforce_reads`` on actually applies ``Perms.READ`` to the answer,
+        and a listing hides what a stat would refuse. Returning anything else
+        (``None``, a bool) keeps the older gate-only behaviour, where the value
+        is ignored and reads are anonymous.
+
+        Anonymous reads stop being served the moment the workspace turns read
+        enforcement on: a read that cannot be checked is a 401, not an open
+        door. Passing ``reader=authn`` is usually what you want — the same
+        dependency that identifies a writer identifies a reader.
     root:
         Scope every route to one subtree, for a host that puts many tenants in
         one workspace (issue #93). Either a fixed path — mount one router per
@@ -841,13 +855,49 @@ def build_router(
     # Shared, long-lived co-editing rooms — created once here, not per request.
     rooms = _Rooms(ws, checkpoint)
 
-    # Read-route gate: a dependency whose value we don't use. When no `reader`
-    # is given, a no-op keeps the signature uniform.
+    # Read-route gate: when no `reader` is given, a no-op keeps the signature
+    # uniform. Its *value* now matters as well as its success — see `_read_ctx`.
     if reader is None:
         async def _read_gate() -> None:
             return None
     else:
         _read_gate = reader  # type: ignore[assignment]
+
+    async def _read_ctx(who: Any = Depends(_read_gate)) -> Any:
+        """The context a read runs under, or ``None`` for an anonymous read.
+
+        Reads are open on this router by default, so a read route cannot demand
+        a credential unconditionally — that would turn every anonymous ``GET``
+        into a 401 for every existing deployment. It cannot ignore identity
+        either: the workspace's ``_as`` reads consult ``Perms.READ`` where
+        ``acl_enforce_reads`` is on, and a route calling the unattributed twin
+        makes that switch decoration on the one surface facing a network.
+
+        So: use whatever ``reader`` returned when it looks like a ``WriteCtx``,
+        and otherwise decide by the workspace's own switch — anonymous while
+        enforcement is off, 401 once it is on. A ``reader`` that returns
+        ``None`` keeps working exactly as before, which is what the existing
+        gate-only readers do.
+        """
+        if who is not None and hasattr(who, "actor_id"):
+            return who
+        if await _reads_enforced():
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "this workspace enforces read permissions, so a read needs a "
+                    "credential to check them against"
+                ),
+            )
+        return None
+
+    async def _reads_enforced() -> bool:
+        # `getattr` rather than a bare call: `build_router` accepts "any object
+        # with the same async methods", and a test double predating read
+        # enforcement has no such method. Absent means off, which is the default
+        # a real workspace reports anyway.
+        probe = getattr(ws, "acl_enforce_reads", None)
+        return bool(await _run(probe())) if probe is not None else False
 
     # The scope every path resolves under. Normalized once for a fixed root;
     # resolved per request when it's a dependency. `""` means unscoped, which is
@@ -882,8 +932,15 @@ def build_router(
         path: str,
         range: Optional[str] = Header(default=None),
         root: str = Depends(_root),
+        who: Any = Depends(_read_ctx),
     ):
         p = _scoped(root, path)
+        # Before the stat below, not after: the check has to precede the lookup
+        # or a refusal and a miss become distinguishable, which is the existence
+        # answer the check exists to withhold. The streaming bodies below take a
+        # manifest rather than a path, so this is where the gate belongs.
+        if who is not None:
+            await _run(ws.ensure_may_read_at(who, "read", p))
         # stat() first so a missing file or a directory is a clean error BEFORE
         # any bytes are sent -- once a StreamingResponse has started, the status
         # code can't change (this is the same guarantee the Rust HTTP API's
@@ -1066,8 +1123,13 @@ def build_router(
     # --- directories --------------------------------------------------------
 
     @router.get("/dirs/{path:path}", dependencies=[Depends(_read_gate)])
-    async def list_dir(path: str, root: str = Depends(_root)):
-        return await _run(ws.ls(_scoped(root, path)))
+    async def list_dir(
+        path: str, root: str = Depends(_root), who: Any = Depends(_read_ctx)
+    ):
+        p = _scoped(root, path)
+        if who is not None:
+            return await _run(ws.ls_as(who, p))
+        return await _run(ws.ls(p))
 
     @router.post("/dirs/{path:path}")
     async def make_dir(
@@ -1077,8 +1139,13 @@ def build_router(
         return {"created": _abs(path)}
 
     @router.get("/stat/{path:path}", dependencies=[Depends(_read_gate)])
-    async def stat(path: str, root: str = Depends(_root)):
-        return await _run(ws.stat(_scoped(root, path)))
+    async def stat(
+        path: str, root: str = Depends(_root), who: Any = Depends(_read_ctx)
+    ):
+        p = _scoped(root, path)
+        if who is not None:
+            return await _run(ws.stat_as(who, p))
+        return await _run(ws.stat(p))
 
     @router.post("/rename")
     async def rename(
@@ -1092,8 +1159,13 @@ def build_router(
     # --- attribution --------------------------------------------------------
 
     @router.get("/blame/{path:path}", dependencies=[Depends(_read_gate)])
-    async def blame(path: str, root: str = Depends(_root)):
-        return await _run(ws.blame(_scoped(root, path)))
+    async def blame(
+        path: str, root: str = Depends(_root), who: Any = Depends(_read_ctx)
+    ):
+        p = _scoped(root, path)
+        if who is not None:
+            return await _run(ws.blame_as(who, p))
+        return await _run(ws.blame(p))
 
     # --- versioning ---------------------------------------------------------
 
@@ -1131,8 +1203,11 @@ def build_router(
         from_: str = Query(..., alias="from"),
         to: str = Query(...),
         root: str = Depends(_root),
+        who: Any = Depends(_read_ctx),
     ):
-        entries = await _run(ws.diff(from_, to))
+        entries = await _run(
+            ws.diff_as(who, from_, to) if who is not None else ws.diff(from_, to)
+        )
         return [e for e in entries if _under(root, e.get("path"))]
 
     @router.get("/diff/file", response_class=PlainTextResponse, dependencies=[Depends(_read_gate)])
@@ -1141,8 +1216,12 @@ def build_router(
         from_: str = Query(..., alias="from"),
         to: str = Query(...),
         root: str = Depends(_root),
+        who: Any = Depends(_read_ctx),
     ):
-        return await _run(ws.diff_file(from_, to, _scoped(root, path)))
+        p = _scoped(root, path)
+        if who is not None:
+            return await _run(ws.diff_file_as(who, from_, to, p))
+        return await _run(ws.diff_file(from_, to, p))
 
     @router.get("/branches", dependencies=[Depends(_read_gate)])
     async def branches(root: str = Depends(_root)):
@@ -1211,27 +1290,42 @@ def build_router(
         status: Optional[str] = Query(default=None),
         path: Optional[str] = Query(default=None),
         root: str = Depends(_root),
+        who: Any = Depends(_read_ctx),
     ):
         # Filtering after the fact rather than trusting the `path` filter: a
         # caller can simply omit it, and omitting it used to return every
         # tenant's queue.
+        scoped_filter = _scoped(root, path) if path else None
         rows = await _run(
-            ws.list_suggestions(status, _scoped(root, path) if path else None)
+            ws.list_suggestions_as(who, status, scoped_filter)
+            if who is not None
+            else ws.list_suggestions(status, scoped_filter)
         )
         return [r for r in rows if _under(root, r.get("path"))]
 
     @router.get("/suggestions/{sid}", dependencies=[Depends(_read_gate)])
-    async def get_suggestion(sid: int, root: str = Depends(_root)):
+    async def get_suggestion(
+        sid: int, root: str = Depends(_root), who: Any = Depends(_read_ctx)
+    ):
         await _in_scope_suggestion(sid, root)
-        row = await _run(ws.get_suggestion(sid))
+        # `get_suggestion_as` answers None for a proposal at a path the actor may
+        # not read, so the 404 below covers a denial as well as an absence — the
+        # same answer `_in_scope_suggestion` gives, for the same reason.
+        row = await _run(
+            ws.get_suggestion_as(who, sid) if who is not None else ws.get_suggestion(sid)
+        )
         if row is None:
             raise HTTPException(status_code=404, detail=f"no suggestion {sid}")
         return row
 
     @router.get("/suggestions/{sid}/diff", response_class=PlainTextResponse,
                 dependencies=[Depends(_read_gate)])
-    async def suggestion_diff(sid: int, root: str = Depends(_root)):
+    async def suggestion_diff(
+        sid: int, root: str = Depends(_root), who: Any = Depends(_read_ctx)
+    ):
         await _in_scope_suggestion(sid, root)
+        if who is not None:
+            return await _run(ws.suggestion_diff_as(who, sid))
         return await _run(ws.suggestion_diff(sid))
 
     @router.post("/suggestions/{sid}/accept")
@@ -1295,8 +1389,14 @@ def build_router(
         return [e for e in evs if _under(root, e.get("path"))]
 
     @router.get("/presence", dependencies=[Depends(_read_gate)])
-    async def presence(window: int = Query(default=60), root: str = Depends(_root)):
-        rows = await _run(ws.presence(window))
+    async def presence(
+        window: int = Query(default=60),
+        root: str = Depends(_root),
+        who: Any = Depends(_read_ctx),
+    ):
+        rows = await _run(
+            ws.presence_as(who, window) if who is not None else ws.presence(window)
+        )
         # A row whose `path` is None names no file, so it says "somebody is
         # active" without saying where — which is exactly the cross-tenant leak
         # this scope exists to close. `_under` treats None as out of scope.
