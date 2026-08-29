@@ -488,6 +488,18 @@ RUST_ONLY = {
     "new": "constructor over Arc<dyn ...> backends a Python caller cannot build",
     "open": "same; the `open_*` constructors are the Python surface",
     "open_encrypted": "same; `open_local_encrypted` and the `_encrypted` forms are bound",
+    "open_pg_store": (
+        "takes an already-connected Arc<PostgresMetadataStore>, which exists so a "
+        "Rust caller assembling its own content stack (the CLI's --config) does not "
+        "lose the pg handle that `subscribe` and the co-edit relay need. A Python "
+        "caller has no such store to hand over -- `open_pg` is its shape."
+    ),
+    "encrypted_content": (
+        "returns an Arc<dyn ContentStore> for a Rust caller to pair with a metadata "
+        "store itself; Python gets the assembled stacks through the `open_*` "
+        "constructors"
+    ),
+    "cached_content": "same",
     "fs": "returns the `Fs` engine handle; the bindings call through it themselves",
     "shutdown_signal": "a Rust shutdown future; `serve_nfs` owns its own lifecycle",
     "latest_schema_version": "a constant, reported inside `migrate`/`schema_version`",

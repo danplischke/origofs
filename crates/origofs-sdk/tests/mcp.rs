@@ -408,6 +408,7 @@ async fn propose_only_agent_cannot_delete_mkdir_or_commit() {
 async fn every_mutating_mcp_tool_is_policy_classified() {
     // Read-only: no working-tree mutation, safe for any actor.
     const READ_ONLY: &[&str] = &[
+        "origofs_trash",
         "origofs_read",
         "origofs_ls",
         "origofs_blame",
@@ -430,6 +431,9 @@ async fn every_mutating_mcp_tool_is_policy_classified() {
         "origofs_commit",
         "origofs_accept",
         "origofs_reject",
+        // A restore writes a file back into the working tree, so it is a
+        // mutation like any other and takes the attributed `restore_trash`.
+        "origofs_restore",
     ];
 
     let s = server().await;
@@ -696,4 +700,54 @@ async fn a_commit_names_the_agent() {
 
     let log = s.handle(call("origofs_log", json!({}))).await.unwrap();
     assert!(text(&log).contains("first"));
+}
+
+/// The trash is reachable from an agent, and scoped like every other listing.
+///
+/// The engine has had a recoverable delete since #115 and no tool exposed it,
+/// so the population it exists for — an agent that deleted the wrong path —
+/// had nothing to reach for. The scoping half is not optional: a trash id is a
+/// workspace-global integer, so without a path check a scoped agent could
+/// materialize a neighbour's deleted file by guessing one.
+#[tokio::test]
+async fn an_agent_can_list_and_restore_its_own_deletes() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let agent = ws.create_agent("agent", "opus", None).await.unwrap();
+    let session = ws.create_session(agent, Some("mcp")).await.unwrap();
+    ws.write_as(WriteCtx::session(agent, session), "/doc.txt", b"precious\n")
+        .await
+        .unwrap();
+    let s = McpServer::new(ws.clone(), agent, session);
+
+    // Disabled by default, and it says so rather than reporting an empty list:
+    // "nothing was deleted" and "nothing is being kept" are different answers,
+    // and only one of them is something the agent can act on.
+    let out = text(&s.handle(call("origofs_trash", json!({}))).await.unwrap());
+    assert!(out.contains("disabled"), "{out}");
+
+    ws.set_trash_retention(Some(3600)).await.unwrap();
+    s.handle(call("origofs_rm", json!({ "path": "/doc.txt" })))
+        .await
+        .unwrap();
+    assert!(ws.read("/doc.txt").await.is_err());
+
+    let listed = text(&s.handle(call("origofs_trash", json!({}))).await.unwrap());
+    assert!(listed.contains("/doc.txt"), "{listed}");
+    assert!(listed.contains(&format!("actor {agent}")), "{listed}");
+    let id: i64 = listed
+        .split_whitespace()
+        .next()
+        .and_then(|t| t.trim_start_matches('#').parse().ok())
+        .unwrap_or_else(|| panic!("no id in: {listed}"));
+
+    let restored = text(
+        &s.handle(call("origofs_restore", json!({ "id": id })))
+            .await
+            .unwrap(),
+    );
+    assert!(restored.contains("/doc.txt"), "{restored}");
+    assert_eq!(&ws.read("/doc.txt").await.unwrap()[..], b"precious\n");
 }

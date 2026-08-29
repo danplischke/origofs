@@ -318,6 +318,22 @@ enum Cmd {
         /// `direct` or `propose`.
         policy: String,
     },
+    /// Inspect, restore from, and configure the trash (issue #115).
+    ///
+    /// A committed file can be read back out of history; an **uncommitted** one
+    /// could not be recovered at all, which matters more here than it would for
+    /// an ordinary filesystem because the users are agents and `rm -rf` on a bad
+    /// path is a routine failure mode. Retention is off by default — turning it
+    /// on silently would change when space is reclaimed for every existing
+    /// deployment — so `origofs trash retention 7d` is the first call.
+    ///
+    /// The engine and the SDK have had all of this since #115. Nothing exposed
+    /// it: no subcommand, no route, no tool. A recovery path nobody can reach
+    /// does not recover anything.
+    Trash {
+        #[command(subcommand)]
+        cmd: TrashCmd,
+    },
     /// Inspect and change the workspace's path ACLs (issues #123, #124).
     ///
     /// The ACLs are the one part of the engine no surface exposed: no HTTP route,
@@ -620,6 +636,38 @@ enum GitCmd {
 /// place they are shown (a Rust embedder installs its own subscriber instead).
 /// The actor a mutating command should act as: `--actor` if given, else
 #[derive(Subcommand)]
+enum TrashCmd {
+    /// List everything currently recoverable, newest deletion first.
+    List,
+    /// Put a trashed entry back at the path it was deleted from.
+    Restore {
+        /// The entry id, from `origofs trash list`.
+        id: i64,
+        /// Attribute the restore to this actor; falls back to `ORIGOFS_ACTOR`.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
+    /// Permanently drop one entry, or every entry with `--all`.
+    Purge {
+        /// The entry id. Omit with `--all`.
+        id: Option<i64>,
+        /// Drop everything instead of one entry.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show the retention window, or set it. `off` disables trash; a duration
+    /// (`7d`, `48h`, `3600s`, or bare seconds) enables it.
+    ///
+    /// Disabling does not purge what is already retained — use `trash purge
+    /// --all` for that, so "stop collecting" and "throw away what I have" stay
+    /// separate decisions.
+    Retention {
+        /// `off`, or a duration. Omit to print the current setting.
+        setting: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum AclCmd {
     /// Show the grants in the workspace, or one actor's, plus the two switches.
     Show {
@@ -706,6 +754,124 @@ fn resolve_actor(flag: Option<i64>) -> anyhow::Result<Option<i64>> {
         }),
         _ => Ok(None),
     }
+}
+
+/// Parse a retention window: `off`, or `7d`/`48h`/`30m`/`3600s`/`3600`.
+///
+/// Bare seconds are accepted because that is what the API takes, but a retention
+/// window is a human-scale quantity and `604800` is not a number anyone should
+/// have to recognise.
+fn parse_retention(v: &str) -> anyhow::Result<Option<i64>> {
+    let v = v.trim();
+    if matches!(v, "off" | "none" | "0" | "disabled") {
+        return Ok(None);
+    }
+    let (digits, mult) = match v.strip_suffix(['d', 'h', 'm', 's']) {
+        Some(d) => (
+            d,
+            match v.chars().last() {
+                Some('d') => 86_400,
+                Some('h') => 3_600,
+                Some('m') => 60,
+                _ => 1,
+            },
+        ),
+        None => (v, 1),
+    };
+    let n: i64 = digits.trim().parse().map_err(|_| {
+        anyhow::anyhow!("unknown retention {v:?} (expected `off`, or a duration like `7d`)")
+    })?;
+    if n <= 0 {
+        anyhow::bail!("retention must be positive (use `off` to disable)");
+    }
+    Ok(Some(n * mult))
+}
+
+/// Render a retention window back the way it would be typed.
+fn format_retention(secs: i64) -> String {
+    for (unit, n) in [("d", 86_400), ("h", 3_600), ("m", 60)] {
+        if secs % n == 0 {
+            return format!("{}{unit}", secs / n);
+        }
+    }
+    format!("{secs}s")
+}
+
+/// Run one `origofs trash …` subcommand.
+async fn run_trash(ws: &Workspace, cmd: TrashCmd) -> anyhow::Result<()> {
+    match cmd {
+        TrashCmd::List => {
+            let entries = ws.list_trash().await?;
+            if entries.is_empty() {
+                // Distinguish "nothing deleted" from "not collecting", because
+                // the second is a configuration answer and the first is not.
+                match ws.trash_retention().await? {
+                    Some(_) => println!("trash is empty"),
+                    None => println!(
+                        "trash is disabled (nothing is being retained); enable it with \
+                         `origofs trash retention 7d`"
+                    ),
+                }
+            }
+            for e in entries {
+                let who = e
+                    .actor_id
+                    .map(|a| format!("actor={a}"))
+                    .unwrap_or_else(|| "actor=-".to_string());
+                println!(
+                    "#{:<5} {:<6} {:<10} {who}\t{}",
+                    e.id,
+                    e.kind.as_str(),
+                    e.size,
+                    e.path
+                );
+            }
+        }
+        TrashCmd::Restore { id, actor } => {
+            // Attributed: a restore is a write to the working tree, so it is
+            // blamed like any other. `cli_ctx` opens a session so the restore can
+            // itself be reverted.
+            let ctx = match resolve_actor(actor)? {
+                Some(a) => cli_ctx(ws, a).await?,
+                None => {
+                    ws.ensure_attributed("trash restore").await?;
+                    WriteCtx::actor(0)
+                }
+            };
+            let path = ws.restore_trash(id, ctx).await?;
+            println!("restored {path}");
+        }
+        TrashCmd::Purge { id, all } => match (id, all) {
+            (Some(_), true) => anyhow::bail!("pass an id or --all, not both"),
+            (None, false) => anyhow::bail!("pass an entry id, or --all to drop everything"),
+            (Some(id), false) => {
+                if ws.purge_trash(id).await? {
+                    println!("purged entry #{id}");
+                } else {
+                    println!("no trash entry #{id}");
+                }
+            }
+            (None, true) => println!("purged {} entries", ws.empty_trash().await?),
+        },
+        TrashCmd::Retention { setting } => match setting.as_deref() {
+            None => match ws.trash_retention().await? {
+                Some(secs) => println!("trash retention is {}", format_retention(secs)),
+                None => println!("trash is disabled"),
+            },
+            Some(v) => {
+                let secs = parse_retention(v)?;
+                ws.set_trash_retention(secs).await?;
+                match secs {
+                    Some(s) => println!("trash retention is now {}", format_retention(s)),
+                    None => println!(
+                        "trash is now disabled; already-retained entries are kept \
+                         (use `origofs trash purge --all` to drop them)"
+                    ),
+                }
+            }
+        },
+    }
+    Ok(())
 }
 
 /// Parse the `on`/`off` argument the two ACL switches share.
@@ -1774,6 +1940,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Cmd::Trash { cmd } => run_trash(&ws, cmd).await?,
         Cmd::Acl { cmd } => run_acl(&ws, cmd).await?,
         Cmd::RequireAttribution { setting } => match setting.as_deref() {
             None => {
