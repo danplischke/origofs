@@ -1130,6 +1130,26 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // this is the only thing standing between a doc and the working tree.
         self.ensure_may_write_at(ctx, "check point a co-edited document to", path)
             .await?;
+        self.checkpoint_coedit_unchecked(ctx, path, doc).await
+    }
+
+    /// [`checkpoint_coedit`](Self::checkpoint_coedit) with the write check
+    /// already made by the caller.
+    ///
+    /// Exactly one caller: accepting a CRDT suggestion, which lands the bytes as
+    /// the **author** while the *approver* is the one that had to be authorized —
+    /// and `accept_suggestion` has already checked `WRITE` at the suggestion's own
+    /// path for that approver. Re-checking as the author refused every proposal
+    /// from a propose-only actor, which is the entire population the review queue
+    /// exists for: `suggest_coedit` recorded the proposal happily and
+    /// `accept_suggestion` then failed with `Denied` naming the *author*, so a
+    /// reviewer with full rights could not accept a proposal it had just read.
+    pub(crate) async fn checkpoint_coedit_unchecked(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditDoc,
+    ) -> Result<()> {
         self.reconcile_out_of_band(ctx, path, doc).await?;
         let (text, mut spans) = doc.snapshot();
         for span in &mut spans {
@@ -1396,7 +1416,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Store an opaque blob in the CAS and return its manifest hash in hex. An
     /// empty blob still gets an explicit empty manifest, so `Some(hash)` never
     /// collapses into the `None` that means "propose a deletion".
-    async fn put_opaque(&self, blob: &[u8]) -> Result<String> {
+    pub(crate) async fn put_opaque(&self, blob: &[u8]) -> Result<String> {
         Ok(match self.store_body(blob).await?.0 {
             Some(h) => h.to_hex(),
             // `store_empty_manifest` puts *and* flushes, so this path keeps the
@@ -1406,7 +1426,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// Read a suggestion's proposed Yjs update back out of the CAS.
-    async fn coedit_suggestion_update(
+    pub(crate) async fn coedit_suggestion_update(
         &self,
         s: &crate::suggest::Suggestion,
     ) -> Result<bytes::Bytes> {
@@ -1439,7 +1459,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let update = self.coedit_suggestion_update(s).await?;
         let doc = self.load_coedit(author, &s.path).await?;
         doc.apply_update_as(author, &update)?;
-        self.checkpoint_coedit(author, &s.path, &doc).await
+        // Unchecked *as the author*: `accept_suggestion` already required the
+        // approver to hold `WRITE` at this path, and the author is by definition
+        // someone who could only propose.
+        self.checkpoint_coedit_unchecked(author, &s.path, &doc)
+            .await
     }
 
     /// The `(before, after)` text of applying a CRDT suggestion, for review. The

@@ -62,6 +62,21 @@ pub enum SuggestionKind {
     Bytes,
     /// A Yjs update to merge into a co-edited document.
     Crdt,
+    /// A Yjs update to merge into a **tree-shaped** co-edited document (an
+    /// `XmlFragment`, issue #92).
+    ///
+    /// Stored exactly like [`Crdt`](SuggestionKind::Crdt) — the CAS holds a state
+    /// vector and an opaque update, and the review row holds their addresses —
+    /// but it accepts differently, and that is why it is a separate kind rather
+    /// than a flag. Landing a flat proposal is `applyUpdate` then serialize the
+    /// `Y.Text`, which origofs can do. Landing a tree proposal needs the document
+    /// serialized back to bytes, and only the host knows the schema for that, so
+    /// [`accept_suggestion`](Fs::accept_suggestion) refuses one and
+    /// `accept_coedit_tree_suggestion` — which takes the host's `body` and
+    /// `spans`, exactly as `checkpoint_coedit_tree` does — is what lands it.
+    /// Applying a tree update to a flat `Y.Text` document, which is what one kind
+    /// for both would have done, produces a document nobody can read.
+    CrdtTree,
 }
 
 impl SuggestionKind {
@@ -69,6 +84,7 @@ impl SuggestionKind {
         match self {
             SuggestionKind::Bytes => "bytes",
             SuggestionKind::Crdt => "crdt",
+            SuggestionKind::CrdtTree => "crdt-tree",
         }
     }
 
@@ -76,6 +92,7 @@ impl SuggestionKind {
         Some(match s {
             "bytes" => SuggestionKind::Bytes,
             "crdt" => SuggestionKind::Crdt,
+            "crdt-tree" => SuggestionKind::CrdtTree,
             _ => return None,
         })
     }
@@ -503,6 +520,18 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             }
             #[cfg(not(feature = "coedit"))]
             SuggestionKind::Crdt => Err(crdt_needs_feature(s.id)),
+            // The tree shape previews as the document's *plain text* before and
+            // after the merge. That is less than the host renders — it has the
+            // nodes — but it is what a reviewer with no schema can be shown, and
+            // it is recomputed against the document as it stands now, so it stays
+            // truthful as the document moves on.
+            #[cfg(feature = "coedit")]
+            SuggestionKind::CrdtTree => {
+                let (before, after) = self.preview_coedit_tree_suggestion(s).await?;
+                Ok((before, Some(after)))
+            }
+            #[cfg(not(feature = "coedit"))]
+            SuggestionKind::CrdtTree => Err(crdt_needs_feature(s.id)),
         }
     }
 
@@ -597,6 +626,18 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             SuggestionKind::Crdt => self.apply_coedit_suggestion(&s, author).await?,
             #[cfg(not(feature = "coedit"))]
             SuggestionKind::Crdt => return Err(crdt_needs_feature(s.id)),
+            // Refused rather than applied: landing a tree proposal means writing
+            // the document back out as bytes, and only the host knows the schema
+            // to do that. `accept_coedit_tree_suggestion` takes those bytes and
+            // resolves the row in one call.
+            SuggestionKind::CrdtTree => {
+                return Err(OrigoFSError::InvalidArgument(format!(
+                    "suggestion #{id} is a tree-shaped co-edit proposal; origofs \
+                     cannot serialize a tree to bytes, so accept it with \
+                     accept_coedit_tree_suggestion (which takes the host's body \
+                     and spans, like checkpoint_coedit_tree does)"
+                )));
+            }
         }
 
         // `resolve_suggestion` is a compare-and-set on `status = 'pending'`, and its

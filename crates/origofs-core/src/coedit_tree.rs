@@ -797,6 +797,22 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // and replaces the file with it wholesale.
         self.ensure_may_write_at(ctx, "check point a co-edited document to", path)
             .await?;
+        self.checkpoint_coedit_tree_unchecked(ctx, path, doc, body, spans)
+            .await
+    }
+
+    /// [`checkpoint_coedit_tree`](Self::checkpoint_coedit_tree) with the write
+    /// check already made by the caller — see
+    /// [`checkpoint_coedit_unchecked`](Fs::checkpoint_coedit_unchecked) for why
+    /// accepting a proposal needs it.
+    pub(crate) async fn checkpoint_coedit_tree_unchecked(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditTreeDoc,
+        body: &[u8],
+        spans: &[TreeSpan],
+    ) -> Result<()> {
         let text = std::str::from_utf8(body).map_err(|_| {
             OrigoFSError::InvalidArgument("co-edit tree checkpoint requires UTF-8 text".into())
         })?;
@@ -842,7 +858,257 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         self.write(&coedit_tree_sidecar_path(path), &blob).await
     }
 
-    /// Refuse the checkpoint if somebody wrote `path` around the live document.
+    // --- tree-shaped suggestions (issues #75 §3.2, #92) -------------------
+
+    /// Resume a tree document to **propose against**, without opening a session
+    /// on it: the *propose* check, and no live marker.
+    ///
+    /// The tree counterpart of [`load_coedit_as`](Fs::load_coedit_as), and note
+    /// the deliberate asymmetry with [`load_coedit_tree_as`](Fs::load_coedit_tree_as)
+    /// next to it — that one exists for a host's socket-less *checkpoint* and so
+    /// takes the write check. Proposing is what a propose-only actor is for, so
+    /// gating this on `WRITE` would refuse exactly the callers it exists to
+    /// serve; and a throwaway replica built to compute a proposal is not a
+    /// session, so claiming the path for it would tell every reader the durable
+    /// bytes may lag an editor that is not there.
+    pub async fn load_coedit_tree_to_propose(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        root: &str,
+    ) -> Result<CoeditTreeDoc> {
+        self.ensure_may_propose_at(ctx, "propose changes to", path)
+            .await?;
+        self.load_coedit_tree(path, root).await
+    }
+
+    /// Propose a change to a tree-shaped co-edited `path` as a **CRDT merge**.
+    ///
+    /// The tree counterpart of [`suggest_coedit`](Fs::suggest_coedit), and the
+    /// reason it had to exist: without it a propose-only actor could propose
+    /// against a flat `Y.Text` document and had no way at all to propose against
+    /// an `XmlFragment` one — so on the shape a rich-text editor actually uses,
+    /// the review queue was unreachable and the only paths open to such an actor
+    /// were a byte suggestion (whose base goes stale on every keystroke and whose
+    /// acceptance discards concurrent work) or nothing.
+    pub async fn suggest_coedit_tree(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditTreeDoc,
+        summary: Option<&str>,
+    ) -> Result<i64> {
+        // Where the *workspace's* document stood when this was proposed — the
+        // reviewer's "you were looking at this much of it". Not a gate: a CRDT
+        // merge is defined against any later state.
+        let base = self
+            .load_coedit_tree(path, doc.root())
+            .await?
+            .state_vector();
+        self.suggest_coedit_tree_update(ctx, path, &base, &doc.state_update(), summary)
+            .await
+    }
+
+    /// The primitive behind [`suggest_coedit_tree`](Fs::suggest_coedit_tree), for
+    /// a client that already holds the two Yjs blobs — a browser editor proposes
+    /// with `encodeStateVector(doc)` as `base_sv` and `encodeStateAsUpdate(doc)`
+    /// as `update`.
+    pub async fn suggest_coedit_tree_update(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        base_sv: &[u8],
+        update: &[u8],
+        summary: Option<&str>,
+    ) -> Result<i64> {
+        if update.is_empty() {
+            return Err(OrigoFSError::InvalidArgument(
+                "co-edit tree suggestion: empty update proposes nothing".into(),
+            ));
+        }
+        // Refuse a malformed blob at propose time rather than at review time: a
+        // suggestion nobody can apply is worse than a refused proposal.
+        yrs::Update::decode_v1(update)
+            .map_err(|e| OrigoFSError::InvalidArgument(format!("bad co-edit update: {e}")))?;
+        let base_hash = Some(self.put_opaque(base_sv).await?);
+        let proposed_hash = Some(self.put_opaque(update).await?);
+        self.record_suggestion(
+            ctx,
+            path,
+            base_hash,
+            proposed_hash,
+            summary,
+            crate::suggest::SuggestionKind::CrdtTree,
+        )
+        .await
+    }
+
+    /// The proposed Yjs update behind a tree suggestion, for a host that wants to
+    /// merge it into a document it already holds — the live room, say, rather
+    /// than a resumed replica.
+    ///
+    /// Public, unlike the flat shape's equivalent, because on this shape the host
+    /// is *required* to be in the loop: it owns the schema, so it owns the merge
+    /// and the serialization that follows.
+    pub async fn coedit_tree_suggestion_update(&self, id: i64) -> Result<bytes::Bytes> {
+        let s = self
+            .get_suggestion(id)
+            .await?
+            .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
+        if s.kind != crate::suggest::SuggestionKind::CrdtTree {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "suggestion #{id} is a {} suggestion, not a tree co-edit proposal",
+                s.kind.as_str()
+            )));
+        }
+        self.coedit_suggestion_update(&s).await
+    }
+
+    /// Merge a tree suggestion into a resumed replica and hand it back, for a
+    /// host that would rather origofs did the resume than do it itself.
+    ///
+    /// Persists nothing. The document that comes back is the workspace's document
+    /// **plus** the proposal; serialize it and pass the bytes to
+    /// [`accept_coedit_tree_suggestion`](Fs::accept_coedit_tree_suggestion).
+    pub async fn merge_coedit_tree_suggestion(&self, id: i64, root: &str) -> Result<CoeditTreeDoc> {
+        let update = self.coedit_tree_suggestion_update(id).await?;
+        let s = self
+            .get_suggestion(id)
+            .await?
+            .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
+        let doc = self.load_coedit_tree(&s.path, root).await?;
+        doc.apply_update(&update)?;
+        Ok(doc)
+    }
+
+    /// The `(before, after)` plain text of applying a tree suggestion, for review.
+    ///
+    /// Computed on a throwaway replica and never persisted, so previewing has no
+    /// effect on the workspace — and because it re-merges against the document as
+    /// it stands now, the preview stays truthful as the document moves on. The
+    /// replica resumes under the sidecar's own root, so a reviewer does not have
+    /// to know the host's schema to render a diff.
+    pub(crate) async fn preview_coedit_tree_suggestion(
+        &self,
+        s: &crate::suggest::Suggestion,
+    ) -> Result<(String, String)> {
+        let update = self.coedit_suggestion_update(s).await?;
+        let root = self
+            .coedit_tree_root(&s.path)
+            .await?
+            .unwrap_or_else(|| DEFAULT_TREE_ROOT.to_string());
+        let doc = self.load_coedit_tree(&s.path, &root).await?;
+        let before = doc.plain_text();
+        doc.apply_update(&update)?;
+        Ok((before, doc.plain_text()))
+    }
+
+    /// The `XmlFragment` name a path's tree sidecar was written under, or `None`
+    /// when there is no readable sidecar.
+    ///
+    /// The root is not stored on the suggestion row because the document already
+    /// knows it: two proposals against one path must resume under the same root
+    /// or they are not proposals against the same document, and the sidecar is
+    /// the one place that fact is recorded.
+    pub async fn coedit_tree_root(&self, path: &str) -> Result<Option<String>> {
+        let blob = match self.read(&coedit_tree_sidecar_path(path)).await {
+            Ok(b) => b,
+            Err(OrigoFSError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(parse_tree_sidecar(&blob).map(|(root, _, _)| root.to_string()))
+    }
+
+    /// Accept a tree suggestion: land the host's serialized `body` **attributed to
+    /// the proposal's author**, and resolve the row, in one call.
+    ///
+    /// Why the host supplies the bytes is the same reason
+    /// [`checkpoint_coedit_tree`](Fs::checkpoint_coedit_tree) does: origofs does
+    /// not own the document schema, so it cannot turn a tree back into a file.
+    /// The host merges (its own room, or
+    /// [`merge_coedit_tree_suggestion`](Fs::merge_coedit_tree_suggestion)),
+    /// serializes, and calls this.
+    ///
+    /// The two review rules the flat path has hold here too, and are checked
+    /// before anything is written: the approver must not be the author, and the
+    /// row must still be pending. The bytes land as the *author*, with `ctx`
+    /// recorded as the approver — an acceptance credits the person who wrote the
+    /// change, not the one who waved it through.
+    pub async fn accept_coedit_tree_suggestion(
+        &self,
+        ctx: WriteCtx,
+        id: i64,
+        doc: &CoeditTreeDoc,
+        body: &[u8],
+        spans: &[TreeSpan],
+    ) -> Result<()> {
+        let s = self
+            .get_suggestion(id)
+            .await?
+            .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
+        if s.kind != crate::suggest::SuggestionKind::CrdtTree {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "suggestion #{id} is a {} suggestion; accept it with accept_suggestion",
+                s.kind.as_str()
+            )));
+        }
+        if s.status != crate::suggest::SuggestionStatus::Pending {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "suggestion #{id} is already {}",
+                s.status.as_str()
+            )));
+        }
+        // The review gate, part one, exactly as `accept_suggestion` applies it:
+        // accepting lands a real attributed edit, so a propose-only approver would
+        // be a direct write wearing a review as a costume — and two propose-only
+        // agents could rubber-stamp each other into full write access (#78).
+        // Checked at the suggestion's own path, because that is where the write
+        // lands.
+        self.ensure_may_write_at(ctx, "accept suggestions for", &s.path)
+            .await?;
+        if ctx.actor == s.actor_id {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "suggestion #{id} cannot be accepted by its author (actor {}); \
+                 acceptance requires a different reviewer",
+                s.actor_id
+            )));
+        }
+        let author = WriteCtx {
+            actor: s.actor_id,
+            session: s.session_id,
+            tool_call: None,
+        };
+        // Unchecked *as the author*: the approver's right to land these bytes was
+        // established above, and the author is by definition someone who could
+        // only propose — checking as them would refuse every proposal the queue
+        // exists to carry.
+        self.checkpoint_coedit_tree_unchecked(author, &s.path, doc, body, spans)
+            .await?;
+        // Resolve after the write, like the byte and flat-CRDT paths, and check
+        // the compare-and-set: a lost CAS means an accept raced a reject, and the
+        // caller must not be told the acceptance worked while the row reads
+        // "rejected". The write has already landed by then — inherent to applying
+        // before resolving — so this cannot be undone, but it must not be silent.
+        if !self
+            .meta
+            .resolve_suggestion(
+                id,
+                crate::suggest::SuggestionStatus::Accepted,
+                Some(ctx.actor),
+                self.now_secs(),
+            )
+            .await?
+        {
+            return Err(OrigoFSError::Conflict(format!(
+                "suggestion #{id} was resolved by someone else while it was being \
+                 accepted; the proposed body has already been written to {}",
+                s.path
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse the checkpoint if somebody wrote `path` around the live document.    /// Refuse the checkpoint if somebody wrote `path` around the live document.
     async fn refuse_out_of_band(&self, path: &str) -> Result<()> {
         let Some(live) = self.meta.get_live_doc(path).await? else {
             return Ok(()); // not live: nothing claims to own these bytes

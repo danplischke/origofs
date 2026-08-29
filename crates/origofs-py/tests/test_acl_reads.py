@@ -184,3 +184,67 @@ async def test_a_gate_only_reader_still_works():
     c = _app(ws, owner, bob, reader_returns_ctx=False)
     r = c.get("/files/secret.md", headers={"X-Actor": str(bob)})
     assert r.status_code == 200 and r.content == b"private v2\n"
+
+
+# --- tree proposals over the router (#92) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_propose_only_agent_proposes_and_a_reviewer_accepts_over_http():
+    """The route a Plate/y-prosemirror app needs: an agent with `propose` and no
+    `write` suggests a change to a rich-text document, and a human lands it.
+
+    Before this the tree shape had no proposal route at all, so the only way an
+    agent could suggest a change to such a document was a whole-file byte
+    suggestion — stale on every keystroke elsewhere in the file, and clobbering
+    concurrent work when accepted."""
+    d = tempfile.mkdtemp()
+    ws = await origofs.Workspace.open_local(
+        os.path.join(d, "meta.db"), os.path.join(d, "cas")
+    )
+    owner = await ws.create_human("owner", None)
+    agent = await ws.create_agent("agent", "opus", owner)
+    octx, actx = origofs.WriteCtx.actor(owner), origofs.WriteCtx.actor(agent)
+    await ws.grant(owner, "/", "read+write", None)
+    await ws.grant(agent, "/", "read+propose", owner)
+    await ws.set_acl_default_deny(True)
+
+    doc = await ws.open_coedit_tree(octx, "/doc.md")
+    doc.append_text(octx, "p", "hello\n")
+    await ws.checkpoint_coedit_tree(octx, "/doc.md", doc, b"hello\n", [])
+    await ws.end_coedit("/doc.md")
+
+    c = _app(ws, owner, agent)
+
+    # The agent builds its proposal against the document as it stands.
+    replica = await ws.load_coedit_tree_to_propose(actx, "/doc.md")
+    replica.append_text(actx, "p", "proposed\n")
+    r = c.post(
+        "/coedit-tree-suggest/doc.md",
+        headers={"X-Actor": str(agent)},
+        json={
+            "base_sv": list(await replica.state_vector()),
+            "update": list(await replica.state_update()),
+            "summary": "add a line",
+        },
+    )
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
+
+    # A reviewer can fetch the raw update to merge into a room it already holds.
+    raw = c.get(
+        f"/coedit-tree-suggestions/{sid}/update", headers={"X-Actor": str(owner)}
+    )
+    assert raw.status_code == 200 and len(raw.content) > 0
+
+    # …and accepts by handing back its own serialization.
+    r = c.post(
+        f"/coedit-tree-suggestions/{sid}/accept",
+        headers={"X-Actor": str(owner)},
+        json={"body": "hello\nproposed\n", "spans": []},
+    )
+    assert r.status_code == 200, r.text
+    assert bytes(await ws.read("/doc.md")) == b"hello\nproposed\n"
+    assert (await ws.get_suggestion(sid))["status"] == "accepted"
+    # Attributed to the proposer, not the approver.
+    assert any(b["actor"]["id"] == agent for b in await ws.blame("/doc.md"))
