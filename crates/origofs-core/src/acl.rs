@@ -432,6 +432,113 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(removed)
     }
 
+    /// The permissions an actor may hand on, given what it holds at a prefix.
+    ///
+    /// `WRITE` implies `PROPOSE` here for the same reason
+    /// [`ensure_may_propose_at`](Self::ensure_may_propose_at) accepts it — an actor
+    /// allowed to land a change directly is plainly allowed to propose one — so
+    /// alice, holding `READ|WRITE` at `/proj`, can give her agent
+    /// `READ|PROPOSE` there. `WRITE` deliberately does **not** imply `READ`:
+    /// a write-only grant is an odd but expressible configuration, and letting its
+    /// holder mint itself `READ` would make it mean nothing.
+    fn delegatable(perms: Perms) -> Perms {
+        if perms.contains(Perms::WRITE) {
+            perms | Perms::PROPOSE
+        } else {
+            perms
+        }
+    }
+
+    /// [`grant`](Self::grant), performed **by** `ctx` and checked.
+    ///
+    /// The raw `grant` takes no authorization at all — `granted_by` is an audit
+    /// field the caller fills in, not a claim anything verifies — so an actor that
+    /// reaches it can hand itself `WRITE` at `/`. That is survivable only because
+    /// no network surface exposes it: there is no ACL route on the HTTP API, no
+    /// MCP tool, and no CLI subcommand. Safety by absence of a route is not safety,
+    /// and the first admin endpoint anyone adds would inherit an unguarded
+    /// primitive, so this is the entry point a surface must use.
+    ///
+    /// Two conditions, and both are needed:
+    ///
+    /// 1. **`WRITE` at the prefix.** Delegation is an administrative act over a
+    ///    subtree, so it is gated on being able to write that subtree. Holding
+    ///    `READ` at `/proj` does not let you decide who else reads it.
+    /// 2. **No amplification.** Every bit granted must be one the granter holds
+    ///    there (per [`delegatable`](Self::delegatable)). Without this, condition 1
+    ///    alone would let a write-only actor grant itself `READ`.
+    ///
+    /// `granted_by` is `ctx`'s actor rather than a parameter: the audit trail
+    /// records who the engine authorized, not who the caller named.
+    ///
+    /// The unattributed `grant` stays for provisioning, which by construction has
+    /// no actor to check — the first grant in a fresh workspace is written before
+    /// anyone can hold rights in it.
+    pub async fn grant_as(
+        &self,
+        ctx: crate::WriteCtx,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: Perms,
+    ) -> Result<()> {
+        // Normalize first, so both checks and the stored row agree on the prefix.
+        let scope = Scope::at(path_prefix)?;
+        self.ensure_may_write_at(ctx, "grant permissions at", scope.root())
+            .await?;
+        let held = Self::delegatable(self.effective_perms(ctx.actor, scope.root()).await?);
+        if !held.contains(perms) {
+            return Err(OrigoFSError::Denied(format!(
+                "actor {} may not grant {perms} at {path_prefix}: it holds only {held} there,                  and a grant cannot hand on a permission the granter does not have",
+                ctx.actor
+            )));
+        }
+        self.grant(actor_id, path_prefix, perms, Some(ctx.actor))
+            .await
+    }
+
+    /// [`revoke`](Self::revoke), performed **by** `ctx` and checked.
+    ///
+    /// Takes `WRITE` at the prefix, the same administrative gate as
+    /// [`grant_as`](Self::grant_as), and no amplification rule: revoking removes
+    /// rights rather than conferring them. An actor that administers a subtree can
+    /// therefore withdraw a grant another actor holds *at that prefix* — the
+    /// ordinary consequence of being able to delegate there, and it confers nothing
+    /// on the revoker.
+    pub async fn revoke_as(
+        &self,
+        ctx: crate::WriteCtx,
+        actor_id: i64,
+        path_prefix: &str,
+    ) -> Result<bool> {
+        let scope = Scope::at(path_prefix)?;
+        self.ensure_may_write_at(ctx, "revoke permissions at", scope.root())
+            .await?;
+        self.revoke(actor_id, path_prefix, Some(ctx.actor)).await
+    }
+
+    /// [`set_acl_default_deny`](Self::set_acl_default_deny), checked at the root.
+    ///
+    /// A workspace switch reaches every path, so it takes the whole-workspace check
+    /// rather than a path-scoped one — the argument
+    /// [`ensure_may_write_workspace`](Self::ensure_may_write_workspace) already
+    /// makes for `commit` and `checkout`. Ungated, turning this *off* would widen
+    /// every ungranted actor's rights in one call.
+    pub async fn set_acl_default_deny_as(&self, ctx: crate::WriteCtx, deny: bool) -> Result<()> {
+        self.ensure_may_write_workspace(ctx, "change the ACL default")
+            .await?;
+        self.set_acl_default_deny(deny).await
+    }
+
+    /// [`set_acl_enforce_reads`](Self::set_acl_enforce_reads), checked at the root.
+    ///
+    /// Ungated, an actor denied a read could simply switch read enforcement off
+    /// and try again, which would make the check in front of every read decorative.
+    pub async fn set_acl_enforce_reads_as(&self, ctx: crate::WriteCtx, on: bool) -> Result<()> {
+        self.ensure_may_write_workspace(ctx, "change read enforcement")
+            .await?;
+        self.set_acl_enforce_reads(on).await
+    }
+
     /// Every grant in this workspace, or just `actor`'s.
     pub async fn list_grants(&self, actor_id: Option<i64>) -> Result<Vec<AclGrant>> {
         self.meta.list_acl(actor_id).await

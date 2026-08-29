@@ -4497,6 +4497,105 @@ impl Workspace {
         })
     }
 
+    /// `grant`, performed **by** `ctx` and checked: the granter needs `write` at
+    /// the prefix, and may not hand on a permission it does not hold there.
+    /// `granted_by` is recorded from `ctx`, not supplied by the caller.
+    ///
+    /// **This is the form a service must use.** Plain `grant` takes no
+    /// authorization at all — it exists for provisioning, which has no actor to
+    /// check — so an admin endpoint built on it would let any authenticated caller
+    /// grant itself `write` at `/`. Raises `PermissionError` when refused.
+    fn grant_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        actor_id: i64,
+        path_prefix: String,
+        perms: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        let perms = parse_perms(perms)?;
+        future_into_py(py, async move {
+            ws.grant_as(c, actor_id, &path_prefix, perms)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// `revoke`, performed **by** `ctx` and checked: `write` at the prefix, the
+    /// same administrative gate as `grant_as`.
+    fn revoke_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        actor_id: i64,
+        path_prefix: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.revoke_as(c, actor_id, &path_prefix)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// `set_acl_default_deny`, checked at the root — a workspace switch reaches
+    /// every path, so it takes the whole-workspace check.
+    fn set_acl_default_deny_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        deny: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.set_acl_default_deny_as(c, deny).await.map_err(to_pyerr)
+        })
+    }
+
+    /// `set_acl_enforce_reads`, checked at the root. Ungated, an actor denied a
+    /// read could switch enforcement off and retry.
+    fn set_acl_enforce_reads_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        on: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.set_acl_enforce_reads_as(c, on).await.map_err(to_pyerr)
+        })
+    }
+
+    /// `set_write_policy`, checked at the root — the policy is the fallback
+    /// wherever no grant applies, so setting it reaches every path.
+    fn set_write_policy_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        actor_id: i64,
+        policy: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let p = CoreWritePolicy::parse(&policy).ok_or_else(|| {
+                to_pyerr(origofs_sdk::OrigoFSError::InvalidArgument(format!(
+                    "unknown write policy {policy:?} (expected `direct` or `propose`)"
+                )))
+            })?;
+            ws.set_write_policy_as(c, actor_id, p)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
     /// Every grant in this workspace, or just one actor's, as a list of
     /// `{actor_id, path_prefix, perms, granted_at, granted_by}`.
     #[pyo3(signature = (actor_id = None))]

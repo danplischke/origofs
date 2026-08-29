@@ -229,6 +229,26 @@ write path enforces this and you must not weaken it:
   without a session, use `load_coedit_as` — propose right, no live marker; that
   is what the `origofs_suggest_coedit` MCP tool does, and gating it on write
   would have broken the propose-only agents the tool exists for.
+- **Changing an ACL is itself a gated operation — use the `_as` form.** `grant`,
+  `revoke`, `set_acl_default_deny`, `set_acl_enforce_reads` and `set_write_policy`
+  take **no** authorization: `granted_by` is an audit field the caller fills in,
+  not a claim anything verifies, so an actor reaching them hands itself `WRITE` at
+  `/` (measured: a propose-only agent self-granted and went from `Proposed` to
+  `Wrote` in two calls). That is survivable only because no network surface exposes
+  them — no ACL route on the HTTP API, no MCP tool, no CLI subcommand — and safety
+  by absence of a route is not safety. `grant_as`/`revoke_as`/
+  `set_acl_default_deny_as`/`set_acl_enforce_reads_as`/`set_write_policy_as` are
+  what a surface must call. Two conditions on a grant, both load-bearing (a test
+  fails for each alone): **`WRITE` at the prefix**, because delegation is
+  administrative — being able to read a subtree does not make you the one who
+  decides who else reads it; and **no amplification** — every bit granted must be
+  one the granter holds there, or a write-only actor mints itself `READ`. `WRITE`
+  implies `PROPOSE` for delegation (as in `ensure_may_propose_at`) so a holder of
+  `READ|WRITE` can hand on `READ|PROPOSE`; it deliberately does **not** imply
+  `READ`. The workspace switches take `ensure_may_write_workspace`: ungated, an
+  actor denied a read would simply turn enforcement off. The raw forms stay for
+  provisioning, which by construction has no actor — the first grant in a fresh
+  workspace precedes anyone holding rights in it.
 - **Reads are checked only where a workspace opts in.** `Perms::READ` went from a
   bit nothing consulted to one `ensure_may_read_at` enforces, behind
   `acl_enforce_reads` (workspace setting, **default off**) — reads have never been

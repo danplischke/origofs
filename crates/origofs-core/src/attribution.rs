@@ -409,6 +409,26 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Set an actor's write policy — `direct` (may write straight to the tree) or
     /// `propose` (writes are routed through the suggestion queue for review by a
     /// different actor). A bounded, actor-agnostic trust gate (§6).
+    /// [`set_write_policy`](Self::set_write_policy), performed **by** `ctx` and
+    /// checked at the workspace root.
+    ///
+    /// The policy is the fallback `effective_perms` uses wherever no grant applies,
+    /// so setting it changes authorization across the whole workspace for that
+    /// actor — including, ungated, an actor moving *itself* from `Propose` to
+    /// `Direct`. Having no path is not the same as touching none, which is the
+    /// argument [`ensure_may_write_workspace`](Self::ensure_may_write_workspace)
+    /// already makes for `commit` and `checkout`.
+    pub async fn set_write_policy_as(
+        &self,
+        ctx: WriteCtx,
+        actor_id: i64,
+        policy: WritePolicy,
+    ) -> Result<()> {
+        self.ensure_may_write_workspace(ctx, "set a write policy")
+            .await?;
+        self.set_write_policy(actor_id, policy).await
+    }
+
     pub async fn set_write_policy(&self, actor_id: i64, policy: WritePolicy) -> Result<()> {
         self.meta.set_write_policy(actor_id, policy).await?;
         // The policy is the fallback `effective_perms` uses where no grant
