@@ -318,6 +318,34 @@ enum Cmd {
         /// `direct` or `propose`.
         policy: String,
     },
+    /// Recursive usage of a subtree (`du`), or of the whole workspace.
+    ///
+    /// Counts an inode with several names once, and sums *logical* size — what
+    /// the files say they are, not what the deduplicated, chunked content store
+    /// actually holds. A quota expressed in physical bytes would move under a
+    /// user who changed nothing, because someone else's write can dedup against
+    /// theirs; see `stats.rs`.
+    Du {
+        /// The subtree to measure. Defaults to the whole workspace.
+        #[arg(default_value = "/")]
+        path: String,
+        /// Report as this actor, so `acl_enforce_reads` applies. Falls back to
+        /// `ORIGOFS_ACTOR`.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
+    /// Show the workspace's capacity limits and what it is using, or set them.
+    ///
+    /// No limit is the default and what every existing workspace has. `off`
+    /// clears a limit.
+    Quota {
+        /// Byte limit: a size (`10G`, `500M`), `off`, or omit to leave unchanged.
+        #[arg(long)]
+        bytes: Option<String>,
+        /// Inode limit: a count, `off`, or omit to leave unchanged.
+        #[arg(long)]
+        inodes: Option<String>,
+    },
     /// Inspect, restore from, and configure the trash (issue #115).
     ///
     /// A committed file can be read back out of history; an **uncommitted** one
@@ -754,6 +782,40 @@ fn resolve_actor(flag: Option<i64>) -> anyhow::Result<Option<i64>> {
         }),
         _ => Ok(None),
     }
+}
+
+/// Parse a quota limit: `off`/`none` for no limit, or a count with an optional
+/// binary suffix (`10G`, `500M`, `2T`). Bare numbers are the unit the field
+/// counts — bytes for `--bytes`, inodes for `--inodes`.
+fn parse_limit(v: &str) -> anyhow::Result<Option<u64>> {
+    let v = v.trim();
+    if matches!(
+        v.to_ascii_lowercase().as_str(),
+        "off" | "none" | "unlimited"
+    ) {
+        return Ok(None);
+    }
+    let (digits, mult) = match v
+        .chars()
+        .last()
+        .map(|c| c.to_ascii_uppercase())
+        .filter(|c| "KMGT".contains(*c))
+    {
+        Some(c) => (
+            &v[..v.len() - 1],
+            match c {
+                'K' => 1u64 << 10,
+                'M' => 1 << 20,
+                'G' => 1 << 30,
+                _ => 1u64 << 40,
+            },
+        ),
+        None => (v, 1),
+    };
+    let n: u64 = digits.trim().parse().map_err(|_| {
+        anyhow::anyhow!("unknown limit {v:?} (expected `off`, a count, or a size like `10G`)")
+    })?;
+    Ok(Some(n * mult))
 }
 
 /// Parse a retention window: `off`, or `7d`/`48h`/`30m`/`3600s`/`3600`.
@@ -1937,6 +1999,63 @@ async fn main() -> Result<()> {
                 println!(
                     "  skipped unknown tables: {}",
                     report.skipped_tables.join(", ")
+                );
+            }
+        }
+        Cmd::Du { path, actor } => {
+            // Through `stat_as` first, so a subtree the actor may not read is
+            // refused rather than measured — a byte count is a fact about a
+            // subtree, and `du` would otherwise report on one `ls` hides.
+            if let Some(ctx) = read_ctx(actor)? {
+                ws.ensure_may_read_at(ctx, "measure", &path).await?;
+            }
+            let u = if path == "/" {
+                ws.usage().await?
+            } else {
+                ws.du(&path).await?
+            };
+            println!("{}\t{} inodes\t{} bytes", path, u.inodes, u.bytes);
+        }
+        Cmd::Quota { bytes, inodes } => {
+            let current = ws.quota().await?;
+            if bytes.is_none() && inodes.is_none() {
+                let u = ws.usage().await?;
+                println!(
+                    "bytes:  {} / {}",
+                    u.bytes,
+                    current
+                        .bytes
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "unlimited".into())
+                );
+                println!(
+                    "inodes: {} / {}",
+                    u.inodes,
+                    current
+                        .inodes
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| "unlimited".into())
+                );
+            } else {
+                let next = origofs_sdk::Quota {
+                    bytes: match bytes.as_deref() {
+                        None => current.bytes,
+                        Some(v) => parse_limit(v)?,
+                    },
+                    inodes: match inodes.as_deref() {
+                        None => current.inodes,
+                        Some(v) => parse_limit(v)?,
+                    },
+                };
+                ws.set_quota(next).await?;
+                println!(
+                    "quota set: bytes={} inodes={}",
+                    next.bytes
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "unlimited".into()),
+                    next.inodes
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| "unlimited".into())
                 );
             }
         }

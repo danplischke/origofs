@@ -2194,6 +2194,10 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
             Exempt("administrative: sets whether attribution is mandatory"),
         ),
         (
+            "quota",
+            Exempt("administrative: sets the workspace's capacity limits, not its contents"),
+        ),
+        (
             "revert-session",
             Exempt("takes `--by`, checked against the write policy; see its own test"),
         ),
@@ -2245,6 +2249,7 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         ("conflicts", ReadOnly),
         ("locks", ReadOnly),
         ("blame", ReadOnly),
+        ("du", ReadOnly),
         ("schema-version", ReadOnly),
         ("watch", ReadOnly),
         ("presence", ReadOnly),
@@ -2408,6 +2413,7 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
     //    The split is the same discipline as `Exempt`: a read that reveals no
     //    path needs no actor, and saying which it is forces the thought.
     const READS_A_PATH: &[&str] = &[
+        "du",
         "read",
         "ls",
         "stat",
@@ -2970,4 +2976,64 @@ fn trash_retention_parses_human_durations() {
         .expect_err("nonsense");
     // clap eats a leading `-`, so a zero window is the reachable "not positive".
     ws.run(&["trash", "retention", "0h"]).expect_err("zero");
+}
+
+/// `du` and `quota` reach the usage accounting from the binary (issue #116).
+///
+/// The engine has had recursive usage, `statfs` and quotas since #116, and the
+/// mounts answer `df` from them — but nothing on the CLI did, so a workspace
+/// could not be measured or capped without writing code.
+#[test]
+fn du_and_quota_report_and_cap_the_workspace() {
+    let ws = Ws::init();
+    let alice = ws.actor(&["alice"]);
+    let a = alice.to_string();
+    ws.write_as("/a.txt", alice, "0123456789")
+        .expect_ok("write a");
+    ws.run(&["mkdir", "/d", "--actor", &a]).expect_ok("mkdir");
+    ws.write_as("/d/b.txt", alice, "0123456789")
+        .expect_ok("write b");
+
+    // The whole workspace, and a subtree of it.
+    ws.run(&["du"]).expect_ok("du /").stdout_has("20 bytes");
+    ws.run(&["du", "/d"])
+        .expect_ok("du /d")
+        .stdout_has("10 bytes");
+
+    // Unlimited by default, which is what every existing workspace has.
+    ws.run(&["quota"])
+        .expect_ok("quota")
+        .stdout_has("unlimited")
+        .stdout_has("20");
+
+    // Sizes are readable: `10G`, not ten digits.
+    ws.run(&["quota", "--bytes", "10G"])
+        .expect_ok("set bytes")
+        .stdout_has(&(10u64 << 30).to_string());
+    ws.run(&["quota", "--inodes", "500"])
+        .expect_ok("set inodes")
+        .stdout_has("500");
+    // Setting one leaves the other alone.
+    ws.run(&["quota"])
+        .expect_ok("show")
+        .stdout_has(&(10u64 << 30).to_string())
+        .stdout_has("500");
+
+    ws.run(&["quota", "--bytes", "off"])
+        .expect_ok("clear bytes")
+        .stdout_has("unlimited");
+    ws.run(&["quota", "--bytes", "lots"]).expect_err("nonsense");
+}
+
+/// A quota actually refuses the write that would exceed it — otherwise the
+/// number is decoration.
+#[test]
+fn a_byte_quota_refuses_the_write_that_would_exceed_it() {
+    let ws = Ws::init();
+    let alice = ws.actor(&["alice"]);
+    ws.run(&["quota", "--bytes", "16"]).expect_ok("cap");
+    ws.write_as("/small.txt", alice, "0123456789")
+        .expect_ok("under the cap");
+    ws.write_as("/big.txt", alice, "0123456789abcdef0123456789")
+        .expect_err("over the cap");
 }

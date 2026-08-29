@@ -260,6 +260,13 @@ write path enforces this and you must not weaken it:
   then refused at acceptance with a `Denied` naming the author — the review queue
   was unusable for exactly the population it exists for. The approver's right is
   established before that point; re-checking as the author asks the wrong actor.
+- **Usage accounting reaches the CLI too.** `#116` built recursive usage,
+  `statfs` and quotas, and the mounts answer `df` from them — but nothing on the
+  CLI did, so a workspace could not be measured or capped without writing code.
+  `origofs du [path]` and `origofs quota [--bytes|--inodes]`. Both count an inode
+  with several names once and sum **logical** size, never physical: a quota in
+  deduplicated bytes would move under a user who changed nothing, because
+  someone else's write can dedup against theirs.
 - **The trash is a recovery path, so it has to be reachable.** A committed file
   can be read back out of history; an **uncommitted** one could not be recovered
   at all, which matters more here than for an ordinary filesystem because the
