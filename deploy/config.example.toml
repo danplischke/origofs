@@ -42,6 +42,23 @@ region = "us-east-1"
 packed = true                     # batch chunks into pack objects (recommended for object stores)
 # index_dir = "/data/index"       # per-chunk pack index (default <workspace>/index)
 
+# --- read cache (optional) --------------------------------------------------
+# A bounded local LRU cache in front of the object store. Without it every read
+# fetches every covering chunk over the network, every time. Bounded and
+# LRU-evicting, so it cannot fill the disk; it also yields when the filesystem
+# runs low, which matters when the cache shares a volume with anything else.
+#
+# Refused, deliberately, in two combinations: with `backend = "local"` (it would
+# copy every chunk twice and speed up nothing) and with ORIGOFS_ENCRYPTION_KEY
+# (encrypted objects are addressed by their plaintext hash, so a cache below the
+# encryption layer fails its own integrity check on every hit and one above it
+# writes plaintext to local disk).
+#
+# [cache]
+# dir = "/var/cache/origofs"      # default <workspace>/cache
+# max_bytes = 8589934592          # 8 GiB (default)
+# min_free_bytes = 2147483648     # yield below 2 GiB free (default; Unix only)
+
 # --- tuning (environment variables) -----------------------------------------
 # Postgres pool. Sizing is a deployment property: 16 is far too many for a dozen
 # sidecars sharing one small database and far too few for a busy single writer.

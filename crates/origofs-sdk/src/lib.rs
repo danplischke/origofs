@@ -280,10 +280,22 @@ impl Workspace {
     /// `VerifyingStore` belongs *outside* this, as the `open_*` recipes arrange:
     /// integrity is checked at the chunk-addressed boundary the caller reads by.
     pub async fn open_encrypted(meta: Meta, backend: Content, passphrase: &str) -> Result<Self> {
-        let salt = read_or_create_salt(&backend).await?;
-        let content: Content =
-            Arc::new(EncryptedStore::from_passphrase(backend, passphrase, &salt)?);
+        let content = Self::encrypted_content(backend, passphrase).await?;
         Self::open(meta, content).await
+    }
+
+    /// The encrypted content stack [`open_encrypted`](Self::open_encrypted)
+    /// builds, for a caller that has to pair it with a metadata store this
+    /// constructor cannot see the type of — a Postgres one, where
+    /// [`open_pg_store`](Self::open_pg_store) is what must do the opening.
+    ///
+    /// Reads or creates the key-derivation salt sidecar as a side effect, so
+    /// calling it twice against one backend is idempotent, not a re-key.
+    pub async fn encrypted_content(backend: Content, passphrase: &str) -> Result<Content> {
+        let salt = read_or_create_salt(&backend).await?;
+        Ok(Arc::new(EncryptedStore::from_passphrase(
+            backend, passphrase, &salt,
+        )?))
     }
 
     /// Wrap a remote content backend in a **bounded local read cache** (issue
@@ -304,7 +316,7 @@ impl Workspace {
     /// cached copy becomes a refetch instead of the hard `Corrupt` the outer layer
     /// would raise.
     #[cfg(feature = "object-store")]
-    async fn cached_remote(backend: Content, cache: &CacheConfig) -> Result<Content> {
+    pub async fn cached_content(backend: Content, cache: &CacheConfig) -> Result<Content> {
         let local: Content = Arc::new(LocalCasStore::open(&cache.dir).await?);
         let tier = TieredStore::with_limits(
             local,
@@ -326,7 +338,7 @@ impl Workspace {
     ) -> Result<Self> {
         let meta: Meta = Arc::new(SqliteMetadataStore::open(db_path)?);
         let backend: Content = Arc::new(ObjectContentStore::s3(cfg)?);
-        let content = Self::cached_remote(backend, &cache).await?;
+        let content = Self::cached_content(backend, &cache).await?;
         Self::open(meta, content).await
     }
 
@@ -335,7 +347,7 @@ impl Workspace {
     pub async fn open_pg_s3_cached(dsn: &str, cfg: S3Config, cache: CacheConfig) -> Result<Self> {
         let meta: Meta = Arc::new(PostgresMetadataStore::connect(dsn).await?);
         let backend: Content = Arc::new(ObjectContentStore::s3(cfg)?);
-        let content = Self::cached_remote(backend, &cache).await?;
+        let content = Self::cached_content(backend, &cache).await?;
         Self::open(meta, content).await
     }
 
@@ -348,7 +360,7 @@ impl Workspace {
     ) -> Result<Self> {
         let meta: Meta = Arc::new(SqliteMetadataStore::open(db_path)?);
         let backend: Content = Arc::new(ObjectContentStore::gcs(cfg)?);
-        let content = Self::cached_remote(backend, &cache).await?;
+        let content = Self::cached_content(backend, &cache).await?;
         Self::open(meta, content).await
     }
 
@@ -357,7 +369,7 @@ impl Workspace {
     pub async fn open_pg_gcs_cached(dsn: &str, cfg: GcsConfig, cache: CacheConfig) -> Result<Self> {
         let meta: Meta = Arc::new(PostgresMetadataStore::connect(dsn).await?);
         let backend: Content = Arc::new(ObjectContentStore::gcs(cfg)?);
-        let content = Self::cached_remote(backend, &cache).await?;
+        let content = Self::cached_content(backend, &cache).await?;
         Self::open(meta, content).await
     }
 
@@ -412,6 +424,23 @@ impl Workspace {
     /// Postgres metadata (multi-writer) over the given content backend.
     pub async fn open_pg(dsn: &str, content: Content) -> Result<Self> {
         let pg = Arc::new(PostgresMetadataStore::connect(dsn).await?);
+        Self::open_pg_store(pg, content).await
+    }
+
+    #[cfg(feature = "postgres")]
+    /// [`open_pg`](Self::open_pg) for a caller that already connected the store —
+    /// one assembling its own content stack, like the CLI's `--config`.
+    ///
+    /// This exists because [`open`](Self::open) takes `Meta` (an
+    /// `Arc<dyn MetadataStore>`) and so **cannot tell** that it was handed a
+    /// Postgres store. A caller that connected Postgres itself and went through
+    /// `open` got a workspace with `is_postgres() == false`: `subscribe` refused
+    /// with "requires the Postgres backend" on a workspace that *was* Postgres,
+    /// and the cross-worker co-edit relay silently fell back to single-worker
+    /// behaviour, which is a correctness problem in a cluster rather than a
+    /// missing optimization. `pg` must be the same store passed as the metadata
+    /// backend.
+    pub async fn open_pg_store(pg: Arc<PostgresMetadataStore>, content: Content) -> Result<Self> {
         let mut ws = Self::open(pg.clone(), content).await?;
         ws.pg = Some(pg);
         Ok(ws)
