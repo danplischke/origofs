@@ -1305,6 +1305,21 @@ class Workspace:
     # Raises PermissionError when the actor may not write at `path`. The denial
     # never says whether the path exists.
     async def ensure_may_write_at(self, ctx: WriteCtx, op: str, path: str) -> None: ...
+    # Checked ACL administration. `grant`/`revoke` above take no authorization at
+    # all — they exist for provisioning, which has no actor to check — so a service
+    # endpoint must use these, or any authenticated caller could grant itself
+    # `write` at `/`. The granter needs `write` at the prefix and may not hand on a
+    # permission it does not hold there; `granted_by` comes from `ctx`.
+    async def grant_as(
+        self, ctx: WriteCtx, actor_id: int, path_prefix: str, perms: str | Sequence[str]
+    ) -> None: ...
+    async def revoke_as(self, ctx: WriteCtx, actor_id: int, path_prefix: str) -> bool: ...
+    # The workspace switches reach every path, so they take the root check.
+    async def set_acl_default_deny_as(self, ctx: WriteCtx, deny: bool) -> None: ...
+    async def set_acl_enforce_reads_as(self, ctx: WriteCtx, on: bool) -> None: ...
+    async def set_write_policy_as(
+        self, ctx: WriteCtx, actor_id: int, policy: str
+    ) -> None: ...
     # Read enforcement (#124). Off by default: reads have never been checked, so
     # an existing workspace holds no read grants and enforcing without writing
     # them first stops every actor at once.

@@ -201,6 +201,14 @@ A `Scope` resolves *paths*, so an operation without one is outside it entirely:
   reader that should watch a document without editing it has no mode to do so
   today, and inventing one by allowing the socket and dropping its content frames
   would have to be built rather than assumed.
+- **Who may change a grant.** ACL administration goes through `grant_as` /
+  `revoke_as` and the `_as` forms of the workspace switches; the raw `grant` and
+  `revoke` are unauthorized primitives kept for provisioning, which has no actor to
+  check. A tenant admin needs `WRITE` at the prefix to delegate there and cannot
+  hand on a permission it does not itself hold, so a per-tenant admin granted
+  `WRITE` at `/tenant-a` can shape its own actors and cannot reach `/tenant-b` or
+  the workspace switches. Build the admin endpoint on the `_as` forms: the raw ones
+  would let any authenticated caller grant itself `WRITE` at `/`.
 - **Grants gate reads only where a workspace opts in** (`acl_enforce_reads`,
   default **off**). `ensure_may_read_at` checks `Perms::READ` at the path exactly
   as `ensure_may_write_at` checks `WRITE`, and the attributed reads on the engine

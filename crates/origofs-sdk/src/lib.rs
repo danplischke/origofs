@@ -1041,6 +1041,53 @@ impl Workspace {
         self.fs.revoke(actor_id, path_prefix, revoked_by).await
     }
 
+    /// [`grant`](Self::grant), performed **by** `ctx` and checked: the granter
+    /// needs `WRITE` at the prefix, and may not hand on a permission it does not
+    /// hold there. `granted_by` is `ctx`'s actor, not a caller-supplied claim.
+    ///
+    /// **This is the form a surface must use.** The raw `grant` takes no
+    /// authorization at all and exists for provisioning, which has no actor to
+    /// check — so an admin endpoint built on it would let any authenticated caller
+    /// grant itself `WRITE` at `/`.
+    pub async fn grant_as(
+        &self,
+        ctx: WriteCtx,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: Perms,
+    ) -> Result<()> {
+        self.fs.grant_as(ctx, actor_id, path_prefix, perms).await
+    }
+
+    /// [`revoke`](Self::revoke), performed **by** `ctx` and checked: `WRITE` at the
+    /// prefix, the same administrative gate as [`grant_as`](Self::grant_as).
+    pub async fn revoke_as(&self, ctx: WriteCtx, actor_id: i64, path_prefix: &str) -> Result<bool> {
+        self.fs.revoke_as(ctx, actor_id, path_prefix).await
+    }
+
+    /// [`set_acl_default_deny`](Self::set_acl_default_deny), checked at the root —
+    /// a workspace switch reaches every path.
+    pub async fn set_acl_default_deny_as(&self, ctx: WriteCtx, deny: bool) -> Result<()> {
+        self.fs.set_acl_default_deny_as(ctx, deny).await
+    }
+
+    /// [`set_acl_enforce_reads`](Self::set_acl_enforce_reads), checked at the root.
+    /// Ungated, an actor denied a read could switch enforcement off and retry.
+    pub async fn set_acl_enforce_reads_as(&self, ctx: WriteCtx, on: bool) -> Result<()> {
+        self.fs.set_acl_enforce_reads_as(ctx, on).await
+    }
+
+    /// [`set_write_policy`](Self::set_write_policy), checked at the root — the
+    /// policy is the fallback wherever no grant applies, so it reaches every path.
+    pub async fn set_write_policy_as(
+        &self,
+        ctx: WriteCtx,
+        actor_id: i64,
+        policy: WritePolicy,
+    ) -> Result<()> {
+        self.fs.set_write_policy_as(ctx, actor_id, policy).await
+    }
+
     /// Every grant in this workspace, or just one actor's.
     pub async fn list_grants(&self, actor_id: Option<i64>) -> Result<Vec<AclGrant>> {
         self.fs.list_grants(actor_id).await

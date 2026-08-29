@@ -1010,6 +1010,62 @@ async def test_the_longest_matching_prefix_wins():
         )
 
 
+# --- checked ACL administration --------------------------------------------
+
+
+@asyncio_test
+async def test_an_agent_cannot_grant_itself_through_the_bindings():
+    # `grant`/`revoke` take no authorization at all -- they exist for provisioning,
+    # which has no actor to check. A service endpoint built on them would let any
+    # authenticated caller grant itself write at `/`, so `grant_as` is the form a
+    # surface must use.
+    ws = await workspace()
+    alice = await ws.create_human("alice", None)
+    agent = await ws.create_agent("claude", "opus", alice)
+    await ws.set_acl_default_deny(True)
+    await ws.grant(alice, "/proj", "read+write", None)
+
+    # Alice narrows her agent: propose-only inside her subtree.
+    await ws.grant_as(origofs.WriteCtx.actor(alice), agent, "/proj", "read+propose")
+    assert await ws.effective_perms(agent, "/proj/f") == ["read", "propose"]
+
+    ctx = origofs.WriteCtx.actor(agent)
+    # It proposes rather than writing...
+    outcome = await ws.write_or_propose(ctx, "/proj/f.md", b"x", None)
+    assert not outcome.wrote and outcome.suggestion_id is not None
+
+    # ...and cannot promote itself, nor escape the subtree, nor turn the
+    # workspace switches off to get around the refusal.
+    for call in (
+        ws.grant_as(ctx, agent, "/proj", "read+write"),
+        ws.grant_as(ctx, agent, "/", "read+write"),
+        ws.revoke_as(ctx, alice, "/proj"),
+        ws.set_acl_default_deny_as(ctx, False),
+        ws.set_acl_enforce_reads_as(ctx, False),
+        ws.set_write_policy_as(ctx, agent, "direct"),
+    ):
+        with pytest.raises(PermissionError):
+            await call
+
+    assert await ws.effective_perms(agent, "/proj/f") == ["read", "propose"]
+    assert await ws.effective_perms(agent, "/elsewhere") == []
+
+
+@asyncio_test
+async def test_the_granter_is_taken_from_the_context():
+    # `granted_by` stops being a caller-supplied claim and becomes who the engine
+    # authorized -- the difference between an audit trail and an assertion.
+    ws = await workspace()
+    alice = await ws.create_human("alice", None)
+    agent = await ws.create_agent("claude", "opus", alice)
+    await ws.grant(alice, "/proj", "read+write", None)
+
+    await ws.grant_as(origofs.WriteCtx.actor(alice), agent, "/proj", "read")
+    grants = await ws.list_grants(agent)
+    row = next(g for g in grants if g["path_prefix"] == "/proj")
+    assert row["granted_by"] == alice
+
+
 # --- read enforcement (#124, phase 1) --------------------------------------
 
 
