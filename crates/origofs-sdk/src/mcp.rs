@@ -430,6 +430,55 @@ impl McpServer {
                 self.ws.reject_suggestion(id, self.ctx()).await?;
                 Ok(format!("rejected suggestion #{id}"))
             }
+            "origofs_trash" => {
+                let entries = self.ws.list_trash().await?;
+                // Scoped like every other listing: unscoped, a scoped agent would
+                // be told which of a neighbour's paths were deleted and when
+                // (issue #125).
+                let visible = self.scope.filter(entries, |e| Some(e.path.as_str()));
+                if visible.is_empty() {
+                    return Ok(match self.ws.trash_retention().await? {
+                        Some(_) => "nothing in the trash".to_string(),
+                        None => "trash is disabled for this workspace: deletes are \
+                                 immediate and nothing can be restored"
+                            .to_string(),
+                    });
+                }
+                Ok(visible
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "#{}\t{}\t{}\tdeleted by actor {}",
+                            e.id,
+                            e.kind.as_str(),
+                            e.path,
+                            e.actor_id
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            "origofs_restore" => {
+                let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
+                // Scope-checked by *path* before restoring: a trash id is a
+                // workspace-global handle, so without this a scoped agent could
+                // materialize a neighbour's deleted file by guessing an integer.
+                // Not-found rather than denied, for the reason the suggestion
+                // routes give: a refusal would confirm the id exists.
+                let entry = self
+                    .ws
+                    .list_trash()
+                    .await?
+                    .into_iter()
+                    .find(|e| e.id == id)
+                    .filter(|e| self.scope.contains(Some(e.path.as_str())))
+                    .ok_or_else(|| OrigoFSError::NotFound(format!("trash entry #{id}")))?;
+                let _ = &entry;
+                let path = self.ws.restore_trash(id, self.ctx()).await?;
+                Ok(format!("restored {path}"))
+            }
             "origofs_ls" => {
                 let entries = self.ws.ls_as(self.ctx(), &path()?).await?;
                 Ok(entries
@@ -681,6 +730,29 @@ fn tool_defs() -> Vec<Value> {
             &["message"],
         ),
         tool("origofs_log", "Show commit history.", json!({}), &[]),
+        // The recovery path for the failure this agent is most likely to cause.
+        // The engine has had a trash since #115 and no tool exposed it, so an
+        // agent that deleted the wrong file had nothing to reach for — and the
+        // deletion it needs to undo is one *it* is recorded as having made.
+        tool(
+            "origofs_trash",
+            "List deleted files that can still be restored, newest first. Each entry \
+             shows an id, the path it was deleted from, and who deleted it. Trash is \
+             off unless the workspace enabled it; when it is off this says so rather \
+             than reporting an empty list, because 'nothing was deleted' and 'nothing \
+             is being kept' are different answers.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "origofs_restore",
+            "Put a deleted file back at the path it was deleted from. Take the `id` \
+             from origofs_trash. This is the undo for a delete that should not have \
+             happened — including your own; the restore is credited to you and the \
+             original deletion stays in the record.",
+            json!({ "id": { "type": "integer" } }),
+            &["id"],
+        ),
     ];
     // Only offered when the server was built with `coedit` — advertising a tool
     // whose dispatch arm isn't compiled in would be a promise the server can't keep.

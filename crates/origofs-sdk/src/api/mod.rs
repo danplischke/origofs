@@ -37,7 +37,7 @@ use axum::{
     http::{HeaderMap, StatusCode, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -333,6 +333,19 @@ impl ReadAuth {
         })
     }
 
+    /// Whether this reader may read `path` — the filter form of
+    /// [`ensure_may_read`](Self::ensure_may_read), for a listing that drops an
+    /// entry rather than refusing the request.
+    async fn may_read(&self, ws: &Workspace, path: &str) -> ApiResult<bool> {
+        Ok(match self.0 {
+            Some(p) => ws
+                .ensure_may_read_at(p.write_ctx(), "read", path)
+                .await
+                .is_ok(),
+            None => true,
+        })
+    }
+
     async fn blame(&self, ws: &Workspace, path: &str) -> ApiResult<Vec<crate::BlameRange>> {
         Ok(match self.0 {
             Some(p) => ws.blame_as(p.write_ctx(), path).await?,
@@ -527,6 +540,9 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
         .route("/suggestions/{id}/accept", post(accept_suggestion))
         .route("/suggestions/{id}/reject", post(reject_suggestion))
         .route("/actors", post(create_actor))
+        .route("/trash", get(list_trash))
+        .route("/trash/{id}/restore", post(restore_trash))
+        .route("/trash/{id}", delete(purge_trash))
         .route("/revert-session", post(revert_session))
         .route("/sessions", post(create_session));
     if options.gate_reads {
@@ -1835,6 +1851,99 @@ struct BlameDto {
     actor: String,
     session: Option<i64>,
     kind: String,
+}
+
+// --- trash (issue #115) -----------------------------------------------------
+
+#[derive(Serialize)]
+struct TrashDto {
+    id: i64,
+    path: String,
+    kind: String,
+    size: u64,
+    actor_id: Option<i64>,
+    deleted_at: i64,
+}
+
+/// `GET /v1/trash` — what is still recoverable, newest deletion first.
+///
+/// Scope-filtered like every other listing, and read-gated like every other
+/// read: a trash entry names a path and when it was deleted, which is the same
+/// thing a `stat` would say about it.
+async fn list_trash(
+    State(ws): State<Shared>,
+    State(scope): State<Scope>,
+    who: ReadAuth,
+) -> ApiResult<Json<Vec<TrashDto>>> {
+    let rows = scope.filter(ws.list_trash().await?, |e| Some(e.path.as_str()));
+    let mut out = Vec::with_capacity(rows.len());
+    for e in rows {
+        // Per entry, because a trash listing is a listing: the same rule `ls_as`
+        // holds, so what this shows is what a `stat` on the restored path would
+        // have shown.
+        if who.may_read(&ws, &e.path).await? {
+            out.push(TrashDto {
+                id: e.id,
+                path: e.path,
+                kind: e.kind.as_str().to_string(),
+                size: e.size,
+                actor_id: e.actor_id,
+                deleted_at: e.deleted_at,
+            });
+        }
+    }
+    Ok(Json(out))
+}
+
+/// Resolve a trash id to its entry inside `scope`, or a 404.
+///
+/// A trash id is a workspace-global integer, so without this a scoped caller
+/// could materialize a neighbour's deleted file by guessing one. **404, never
+/// 403**, for the reason the suggestion routes give: a refusal would confirm the
+/// id exists.
+async fn trash_entry_in_scope(
+    ws: &Workspace,
+    scope: &Scope,
+    id: i64,
+) -> ApiResult<crate::TrashEntry> {
+    ws.list_trash()
+        .await?
+        .into_iter()
+        .find(|e| e.id == id)
+        .filter(|e| scope.contains(Some(e.path.as_str())))
+        .ok_or_else(|| crate::OrigoFSError::NotFound(format!("trash entry #{id}")).into())
+}
+
+/// `POST /v1/trash/{id}/restore` — put a deleted file back, attributed.
+///
+/// A restore writes into the working tree, so it takes the authenticated
+/// principal and goes through `restore_trash`, which checks the path like any
+/// other attributed mutation.
+async fn restore_trash(
+    State(ws): State<Shared>,
+    State(scope): State<Scope>,
+    Auth(principal): Auth,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    trash_entry_in_scope(&ws, &scope, id).await?;
+    let path = ws.restore_trash(id, principal.write_ctx()).await?;
+    Ok(Json(json!({ "restored": path })))
+}
+
+/// `DELETE /v1/trash/{id}` — drop one entry permanently.
+async fn purge_trash(
+    State(ws): State<Shared>,
+    State(scope): State<Scope>,
+    Auth(principal): Auth,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let entry = trash_entry_in_scope(&ws, &scope, id).await?;
+    // Purging destroys the only remaining copy of an uncommitted file, so it
+    // takes the same right as writing where it used to live — not merely a valid
+    // credential.
+    ws.ensure_may_write_at(principal.write_ctx(), "purge the trash for", &entry.path)
+        .await?;
+    Ok(Json(json!({ "purged": ws.purge_trash(id).await? })))
 }
 
 async fn blame(

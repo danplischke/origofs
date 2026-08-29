@@ -260,6 +260,26 @@ write path enforces this and you must not weaken it:
   then refused at acceptance with a `Denied` naming the author — the review queue
   was unusable for exactly the population it exists for. The approver's right is
   established before that point; re-checking as the author asks the wrong actor.
+- **The trash is a recovery path, so it has to be reachable.** A committed file
+  can be read back out of history; an **uncommitted** one could not be recovered
+  at all, which matters more here than for an ordinary filesystem because the
+  users are agents and `rm -rf` on a bad path is a routine failure mode. `#115`
+  built the engine half — retention config, GC root 5, an entry carrying *the
+  actor and session that deleted it*, so a restore is attributed and the deletion
+  is already in the op-log beside it — and nothing exposed it: no subcommand, no
+  route, no tool. `origofs trash list/restore/purge/retention`, `origofs_trash` +
+  `origofs_restore`, `GET /v1/trash` + `POST /v1/trash/{id}/restore` +
+  `DELETE /v1/trash/{id}`, and the matching FastAPI routes.
+  Retention stays **off by default**: turning it on silently would change when
+  space is reclaimed for every existing deployment, and the first anyone would
+  learn of it is a storage bill. An empty listing therefore distinguishes
+  "nothing deleted" from "not collecting" — only one of those is a configuration
+  answer. Three rules the surfaces share: a **restore is a write**, so it takes
+  the attributed `restore_trash`; a **purge takes `WRITE` at the entry's path**,
+  because it destroys the only remaining copy of an uncommitted file; and a
+  **trash id is a workspace-global integer**, so every id-addressed route
+  resolves it to a path and checks the scope first, answering *not found* rather
+  than *denied* for the same reason the suggestion routes do.
 - **Changing an ACL is itself a gated operation — use the `_as` form.** `grant`,
   `revoke`, `set_acl_default_deny`, `set_acl_enforce_reads` and `set_write_policy`
   take **no** authorization: `granted_by` is an audit field the caller fills in,

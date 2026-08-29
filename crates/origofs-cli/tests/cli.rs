@@ -2182,16 +2182,13 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         ),
         // `acl` mutates the ACLs, and delegating is administrative: `--by` runs
         // the gated `grant_as`/`revoke_as`, which need WRITE at the prefix and
-        // refuse to hand out a bit the granter does not hold. Attributed rather
-        // than Exempt, so rule 4 below checks the flag actually exists — except
-        // it names the granter `--by`, not `--actor`, because `--actor` on this
-        // command is the actor being granted *to*.
-        (
-            "acl",
-            Exempt(
-                "takes `--by` for the granter; `--actor` here names the grantee, not the caller",
-            ),
-        ),
+        // refuse to hand out a bit the granter does not hold. The flag is `--by`
+        // rather than `--actor` because on this command `--actor` would name the
+        // grantee, not the caller.
+        ("acl", Attributed),
+        // `trash restore` puts a file back in the working tree, which is a write
+        // like any other and is blamed like one.
+        ("trash", Attributed),
         (
             "require-attribution",
             Exempt("administrative: sets whether attribution is mandatory"),
@@ -2340,16 +2337,60 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         }
     }
 
-    // 4. Every attributed mutation actually offers `--actor`.
+    // 4. Every attributed mutation actually offers a way to name the caller.
+    //
+    //    `--actor` on most commands; `--by` where `--actor` already names a
+    //    different party (`acl grant <actor> …` grants *to* an actor, so the
+    //    caller is `--by`). Either satisfies this — what matters is that some
+    //    flag carries the acting identity, not which word it uses.
+    //
+    //    A subcommand *group* is checked through its children. `origofs trash
+    //    --help` lists `list`/`restore`/`purge` and none of their flags, so
+    //    scanning only the parent would pass a group whose mutating child took
+    //    nothing at all — the exact hole this rule exists to close.
+    fn names_the_caller(help: &str) -> bool {
+        help.contains("--actor") || help.contains("--by")
+    }
+    fn child_commands(help: &str) -> Vec<String> {
+        help.lines()
+            .skip_while(|l| !l.starts_with("Commands:"))
+            .skip(1)
+            .take_while(|l| !l.trim().is_empty())
+            .filter_map(|l| {
+                let t = l.strip_prefix("  ")?;
+                if t.starts_with(' ') {
+                    return None;
+                }
+                t.split_whitespace().next().map(str::to_string)
+            })
+            .filter(|c| c != "help")
+            .collect()
+    }
+
     for (name, kind) in table {
         if let Attributed = kind {
             let sub_help = raw(None, &[name, "--help"], None).expect_ok(name);
+            if names_the_caller(&sub_help.stdout) {
+                continue;
+            }
+            let children = child_commands(&sub_help.stdout);
             assert!(
-                sub_help.stdout.contains("--actor"),
+                !children.is_empty(),
                 "`{name}` is classified as an attributed mutation but its --help does not \
-                 offer `--actor`, so a caller cannot attribute it and it necessarily calls \
-                 a raw unattributed engine op. This is exactly issue #128.\n--- help ---\n{}",
+                 offer `--actor` (or `--by`), so a caller cannot attribute it and it \
+                 necessarily calls a raw unattributed engine op. This is exactly issue \
+                 #128.\n--- help ---\n{}",
                 sub_help.stdout
+            );
+            let named = children.iter().any(|c| {
+                let h = raw(None, &[name, c, "--help"], None).expect_ok(c);
+                names_the_caller(&h.stdout)
+            });
+            assert!(
+                named,
+                "`{name}` is a subcommand group classified as an attributed mutation, \
+                 but not one of its subcommands ({children:?}) offers `--actor` or \
+                 `--by`, so nothing under it can be attributed."
             );
         }
     }
@@ -2814,4 +2855,119 @@ fn acl_grants_gate_reads_end_to_end() {
     // identity once (the #128 ergonomics, applied to #124).
     ws.run_env(&["read", "/secret.md"], "ORIGOFS_ACTOR", &b)
         .expect_err("the env fallback carries into reads");
+}
+
+/// The trash, end to end through the binary (issue #115).
+///
+/// The engine and the SDK have had a recoverable delete since #115 — with the
+/// deleting actor recorded on the entry, which is the part an ordinary `.trash`
+/// directory cannot express. Nothing exposed it: no subcommand, no route, no
+/// tool. A recovery path nobody can reach does not recover anything, and the
+/// population it is for — an agent that shelled out to `rm -rf` on a bad path —
+/// is the population least likely to be holding a Rust compiler.
+#[test]
+fn trash_recovers_an_uncommitted_delete_end_to_end() {
+    let ws = Ws::init();
+    let alice = ws.actor(&["alice"]);
+    let a = alice.to_string();
+    ws.write_as("/keep.txt", alice, "precious\n")
+        .expect_ok("write");
+
+    // Off by default, and the empty listing says which kind of empty it is —
+    // "nothing deleted" and "not collecting" are different answers, and only one
+    // of them is a configuration problem.
+    ws.run(&["trash", "retention"])
+        .expect_ok("retention")
+        .stdout_has("disabled");
+    ws.run(&["trash", "list"])
+        .expect_ok("list")
+        .stdout_has("disabled");
+
+    // Deleted while trash is off: genuinely gone, which is the pre-#115 world
+    // and stays the default.
+    ws.run(&["rm", "/keep.txt", "--actor", &a]).expect_ok("rm");
+    ws.run(&["trash", "list"])
+        .expect_ok("list")
+        .stdout_lacks("keep.txt");
+
+    ws.run(&["trash", "retention", "7d"])
+        .expect_ok("enable")
+        .stdout_has("7d");
+    ws.run(&["trash", "retention"])
+        .expect_ok("show")
+        .stdout_has("7d");
+
+    ws.write_as("/keep.txt", alice, "precious\n")
+        .expect_ok("rewrite");
+    ws.run(&["rm", "/keep.txt", "--actor", &a])
+        .expect_ok("rm with trash on");
+    assert!(
+        ws.run(&["read", "/keep.txt"]).code == Some(1),
+        "the file must really be gone from the working tree"
+    );
+
+    // …and recoverable, with the actor that deleted it on the entry.
+    let listed = ws.run(&["trash", "list"]).expect_ok("list");
+    listed
+        .stdout_has("keep.txt")
+        .stdout_has(&format!("actor={alice}"));
+    let id = listed
+        .stdout
+        .lines()
+        .find(|l| l.contains("keep.txt"))
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|t| t.trim_start_matches('#').parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("could not parse an id out of:\n{}", listed.stdout));
+
+    ws.run(&["trash", "restore", &id.to_string(), "--actor", &a])
+        .expect_ok("restore")
+        .stdout_has("/keep.txt");
+    ws.run(&["read", "/keep.txt"])
+        .expect_ok("read after restore")
+        .stdout_has("precious");
+
+    // Purging is separate from disabling: "stop collecting" and "throw away what
+    // I have" are different decisions and the CLI keeps them apart.
+    ws.run(&["rm", "/keep.txt", "--actor", &a])
+        .expect_ok("rm again");
+    ws.run(&["trash", "retention", "off"])
+        .expect_ok("disable")
+        .stdout_has("kept");
+    ws.run(&["trash", "list"])
+        .expect_ok("list after disable")
+        .stdout_has("keep.txt");
+    ws.run(&["trash", "purge", "--all"])
+        .expect_ok("purge all")
+        .stdout_has("purged");
+    ws.run(&["trash", "list"])
+        .expect_ok("list after purge")
+        .stdout_lacks("keep.txt");
+}
+
+/// `trash purge` takes an id or `--all`, never both and never neither.
+#[test]
+fn trash_purge_refuses_an_ambiguous_invocation() {
+    let ws = Ws::init();
+    ws.run(&["trash", "purge"]).expect_err("neither");
+    ws.run(&["trash", "purge", "1", "--all"]).expect_err("both");
+}
+
+/// Retention accepts the durations a person would type, and refuses the rest.
+#[test]
+fn trash_retention_parses_human_durations() {
+    let ws = Ws::init();
+    for (input, shown) in [
+        ("48h", "2d"),
+        ("30m", "30m"),
+        ("3600", "1h"),
+        ("90s", "90s"),
+    ] {
+        ws.run(&["trash", "retention", input])
+            .expect_ok(input)
+            .stdout_has(shown);
+    }
+    ws.run(&["trash", "retention", "soon"])
+        .expect_err("nonsense");
+    // clap eats a leading `-`, so a zero window is the reachable "not positive".
+    ws.run(&["trash", "retention", "0h"]).expect_err("zero");
 }

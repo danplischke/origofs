@@ -1608,6 +1608,67 @@ def build_router(
         await _run(rooms.checkpoint_tree(_tree_key(p, xml_root), ctx, body, spans))
         return {"path": p, "bytes": len(body), "spans": len(spans)}
 
+    # --- trash (issue #115) -------------------------------------------------
+
+    @router.get("/trash", dependencies=[Depends(_read_gate)])
+    async def list_trash(root: str = Depends(_root), who: Any = Depends(_read_ctx)):
+        """What is still recoverable, newest deletion first.
+
+        A committed file can be read back out of history; an **uncommitted** one
+        could not be recovered at all, which matters more here than it would for
+        an ordinary filesystem because the users are agents. Off unless the
+        workspace enabled retention.
+        """
+        rows = await _run(ws.list_trash())
+        rows = [r for r in rows if _under(root, r.get("path"))]
+        if who is None:
+            return rows
+        # Per entry, like `ls`: a trash entry names a path and when it was
+        # deleted, which is what a `stat` on the restored path would say.
+        keep = []
+        for r in rows:
+            try:
+                await ws.ensure_may_read_at(who, "read", r["path"])
+            except PermissionError:
+                continue
+            keep.append(r)
+        return keep
+
+    async def _trash_entry_in_scope(sid: int, root: str) -> dict:
+        """Resolve a trash id inside `root`, or 404.
+
+        A trash id is a workspace-global integer, so without this a scoped caller
+        could materialize a neighbour's deleted file by guessing one. 404 rather
+        than 403, for the reason the suggestion routes give: a refusal would
+        confirm the id exists.
+        """
+        for r in await _run(ws.list_trash()):
+            if r["id"] == sid and _under(root, r.get("path")):
+                return r
+        raise HTTPException(status_code=404, detail=f"no trash entry {sid}")
+
+    @router.post("/trash/{sid}/restore")
+    async def restore_trash(
+        sid: int, ctx: Any = Depends(authn), root: str = Depends(_root)
+    ) -> dict:
+        """Put a deleted file back where it was, attributed to the caller."""
+        await _trash_entry_in_scope(sid, root)
+        return {"restored": await _run(ws.restore_trash(sid, ctx))}
+
+    @router.delete("/trash/{sid}")
+    async def purge_trash(
+        sid: int, ctx: Any = Depends(authn), root: str = Depends(_root)
+    ) -> dict:
+        """Drop one entry permanently.
+
+        Takes the same right as writing where the file used to live, not merely a
+        valid credential: this destroys the only remaining copy of an uncommitted
+        file.
+        """
+        entry = await _trash_entry_in_scope(sid, root)
+        await _run(ws.ensure_may_write_at(ctx, "purge the trash for", entry["path"]))
+        return {"purged": await _run(ws.purge_trash(sid))}
+
     @router.post("/coedit-tree-suggest/{path:path}")
     async def coedit_tree_suggest(
         path: str,

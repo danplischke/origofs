@@ -248,3 +248,62 @@ async def test_a_propose_only_agent_proposes_and_a_reviewer_accepts_over_http():
     assert (await ws.get_suggestion(sid))["status"] == "accepted"
     # Attributed to the proposer, not the approver.
     assert any(b["actor"]["id"] == agent for b in await ws.blame("/doc.md"))
+
+
+# --- trash over the router (#115) --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_trash_is_reachable_and_scoped_over_http():
+    """The engine has had a recoverable delete since #115 and no surface exposed
+    it — no route, no tool, no subcommand. A recovery path nobody can reach does
+    not recover anything."""
+    ws, owner, bob = await _fixture()
+    octx = origofs.WriteCtx.actor(owner)
+    await ws.set_trash_retention(3600)
+    await ws.remove_or_propose(octx, "/secret.md", None)
+    assert await ws.acl_enforce_reads() is False
+
+    c = _app(ws, owner, bob)
+    rows = c.get("/trash", headers={"X-Actor": str(owner)}).json()
+    assert [r["path"] for r in rows] == ["/secret.md"]
+    assert rows[0]["actor_id"] == owner
+    sid = rows[0]["id"]
+
+    # Restoring writes into the working tree, so it is attributed like any write.
+    r = c.post(f"/trash/{sid}/restore", headers={"X-Actor": str(owner)})
+    assert r.status_code == 200, r.text
+    assert bytes(await ws.read("/secret.md")) == b"private v2\n"
+
+
+@pytest.mark.asyncio
+async def test_a_trash_listing_hides_what_the_reader_may_not_stat():
+    # A trash entry names a path and when it was deleted, which is what a `stat`
+    # on the restored path would say — so the same per-entry rule applies.
+    ws, owner, bob = await _fixture()
+    octx = origofs.WriteCtx.actor(owner)
+    await ws.set_trash_retention(3600)
+    await ws.remove_or_propose(octx, "/secret.md", None)
+    await ws.set_acl_default_deny(True)
+    await ws.set_acl_enforce_reads(True)
+
+    c = _app(ws, owner, bob)
+    assert c.get("/trash", headers={"X-Actor": str(owner)}).json() != []
+    assert c.get("/trash", headers={"X-Actor": str(bob)}).json() == []
+
+
+@pytest.mark.asyncio
+async def test_purging_takes_the_write_right_not_merely_a_credential():
+    # Purging destroys the only remaining copy of an uncommitted file, so it
+    # takes the same right as writing where that file used to live.
+    ws, owner, bob = await _fixture()
+    octx = origofs.WriteCtx.actor(owner)
+    await ws.set_trash_retention(3600)
+    await ws.remove_or_propose(octx, "/secret.md", None)
+    await ws.set_acl_default_deny(True)
+
+    c = _app(ws, owner, bob)
+    sid = c.get("/trash", headers={"X-Actor": str(owner)}).json()[0]["id"]
+    assert c.delete(f"/trash/{sid}", headers={"X-Actor": str(bob)}).status_code == 403
+    assert c.delete(f"/trash/{sid}", headers={"X-Actor": str(owner)}).status_code == 200
+    assert c.get("/trash", headers={"X-Actor": str(owner)}).json() == []
