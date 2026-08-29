@@ -1000,6 +1000,42 @@ class Workspace:
     # Persist the CRDT alone, with no body -- durability for a shape only the host
     # can serialize. Deliberately does not stamp "last saved": the file has not moved.
     async def persist_coedit_tree(self, path: str, doc: CoeditTreeDoc) -> None: ...
+    # Resume to *propose* against: the propose check, no live marker. The
+    # asymmetry with `load_coedit_tree_as` is deliberate -- gating this on write
+    # would refuse exactly the propose-only agents it exists for.
+    async def load_coedit_tree_to_propose(
+        self, ctx: WriteCtx, path: str, root: Optional[str] = None
+    ) -> CoeditTreeDoc: ...
+    async def suggest_coedit_tree(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        doc: CoeditTreeDoc,
+        summary: Optional[str] = None,
+    ) -> int: ...
+    async def suggest_coedit_tree_update(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        base_sv: bytes,
+        update: bytes,
+        summary: Optional[str] = None,
+    ) -> int: ...
+    async def coedit_tree_suggestion_update(self, id: int) -> bytes: ...
+    async def merge_coedit_tree_suggestion(
+        self, id: int, root: Optional[str] = None
+    ) -> CoeditTreeDoc: ...
+    async def coedit_tree_root(self, path: str) -> Optional[str]: ...
+    # `accept_suggestion` refuses a tree proposal: landing one means writing the
+    # document back out as bytes, and only the host knows the schema for that.
+    async def accept_coedit_tree_suggestion(
+        self,
+        ctx: WriteCtx,
+        id: int,
+        doc: CoeditTreeDoc,
+        body: bytes,
+        spans: List[Tuple[int, int, str]],
+    ) -> None: ...
     async def end_coedit(self, path: str) -> None: ...
     # Propose against a co-edited path as a CRDT merge rather than a whole file
     # body: base = the document's Yjs state vector, proposal = an

@@ -312,3 +312,75 @@ def test_a_socketless_tree_checkpoint_leaves_no_live_marker():
     assert _run(lambda: ws.read("/solo.md")) == b"drafted offline\n"
     assert _run(lambda: ws.live_doc("/solo.md")) is None
     assert _run(lambda: ws.live_paths()) == []
+
+
+# --- tree-shaped proposals (issues #75 §3.2, #92) ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_propose_only_agent_can_propose_against_a_tree_document():
+    """The gap this closes: on the shape a rich-text editor uses, a propose-only
+    agent could not reach the review queue at all. Its options were a byte
+    suggestion — whose base goes stale on every keystroke elsewhere in the file
+    and whose acceptance discards concurrent work — or nothing."""
+    d = tempfile.mkdtemp()
+    ws = await origofs.Workspace.open_local(
+        os.path.join(d, "meta.db"), os.path.join(d, "cas")
+    )
+    owner = await ws.create_human("owner", None)
+    agent = await ws.create_agent("agent", "opus", owner)
+    octx, actx = origofs.WriteCtx.actor(owner), origofs.WriteCtx.actor(agent)
+    await ws.grant(owner, "/", "read+write", None)
+    await ws.grant(agent, "/", "read+propose", owner)
+    await ws.set_acl_default_deny(True)
+
+    doc = await ws.open_coedit_tree(octx, "/doc.md")
+    doc.append_text(octx, "p", "hello\n")
+    await ws.checkpoint_coedit_tree(octx, "/doc.md", doc, b"hello\n", [])
+    await ws.end_coedit("/doc.md")
+
+    # The write-shaped doors are shut…
+    with pytest.raises(PermissionError):
+        await ws.open_coedit_tree(actx, "/doc.md")
+    # …and the propose-shaped one is open.
+    replica = await ws.load_coedit_tree_to_propose(actx, "/doc.md")
+    replica.append_text(actx, "p", "proposed\n")
+    sid = await ws.suggest_coedit_tree(actx, "/doc.md", replica, "add a line")
+
+    row = await ws.get_suggestion(sid)
+    assert row["kind"] == "crdt-tree" and row["actor_id"] == agent
+    assert bytes(await ws.read("/doc.md")) == b"hello\n", "a proposal lands nothing"
+
+    # The reviewer sees the effect of the merge, not the opaque blobs.
+    assert "proposed" in await ws.suggestion_diff(sid)
+
+    # origofs cannot serialize a tree, so the ordinary accept refuses and names
+    # the call that works.
+    with pytest.raises(ValueError, match="accept_coedit_tree_suggestion"):
+        await ws.accept_suggestion(sid, octx)
+
+    # The host merges, serializes, and lands it — attributed to the author.
+    merged = await ws.merge_coedit_tree_suggestion(sid)
+    assert "proposed" in await merged.plain_text()
+    await ws.accept_coedit_tree_suggestion(
+        octx, sid, merged, b"hello\nproposed\n", []
+    )
+    assert bytes(await ws.read("/doc.md")) == b"hello\nproposed\n"
+    assert (await ws.get_suggestion(sid))["status"] == "accepted"
+    assert any(r["actor"]["id"] == agent for r in await ws.blame("/doc.md"))
+
+
+@pytest.mark.asyncio
+async def test_the_sidecar_reports_its_root_so_a_reviewer_need_not_know_it():
+    d = tempfile.mkdtemp()
+    ws = await origofs.Workspace.open_local(
+        os.path.join(d, "meta.db"), os.path.join(d, "cas")
+    )
+    owner = await ws.create_human("owner", None)
+    octx = origofs.WriteCtx.actor(owner)
+    doc = await ws.open_coedit_tree(octx, "/doc.md", "prose")
+    doc.append_text(octx, "p", "hi\n")
+    await ws.checkpoint_coedit_tree(octx, "/doc.md", doc, b"hi\n", [])
+
+    assert await ws.coedit_tree_root("/doc.md") == "prose"
+    assert await ws.coedit_tree_root("/nothing.md") is None

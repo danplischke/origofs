@@ -229,6 +229,37 @@ write path enforces this and you must not weaken it:
   without a session, use `load_coedit_as` — propose right, no live marker; that
   is what the `origofs_suggest_coedit` MCP tool does, and gating it on write
   would have broken the propose-only agents the tool exists for.
+- **Both document shapes have a proposal path, and they accept differently.**
+  The tree shape had no counterpart to `suggest_coedit`, so on the shape a
+  rich-text editor actually binds to (`Y.XmlFragment`), a propose-only actor
+  could not reach the review queue at all — its options were a byte suggestion,
+  whose base goes stale on every keystroke elsewhere in the file and whose
+  acceptance discards concurrent work, or nothing. `suggest_coedit_tree` (and
+  `suggest_coedit_tree_update` for a browser holding the blobs) records one, and
+  `load_coedit_tree_to_propose` resumes the replica to build it against —
+  *propose* right, no live marker. Note the asymmetry with `load_coedit_tree_as`
+  beside it, which serves a host's socket-less **checkpoint** and so takes the
+  write check: on this shape `_as` is not the propose form.
+
+  It is a separate `SuggestionKind` (`crdt-tree`) rather than a flag on `Crdt`
+  because **acceptance differs**. Landing a flat proposal is `applyUpdate` then
+  serialize the `Y.Text`, which origofs can do; landing a tree one needs the
+  document written back out as bytes, and only the host knows the schema — the
+  same reason `checkpoint_coedit_tree` takes a body. So `accept_suggestion`
+  *refuses* a tree proposal and names `accept_coedit_tree_suggestion`, which
+  takes the host's `body` and `spans` and resolves the row in one call. One kind
+  for both would have applied a tree update to a flat document and produced a
+  file nobody can read.
+
+  Acceptance carries the review rules itself — approver holds `WRITE` at the
+  path, approver ≠ author — because it does not route through
+  `accept_suggestion`. It lands the bytes as the **author** through
+  `checkpoint_coedit_tree_unchecked`, and that split is load-bearing on both
+  shapes: `apply_coedit_suggestion` used to call the *checked* `checkpoint_coedit`
+  as the author, so a propose-only actor's CRDT proposal was recorded happily and
+  then refused at acceptance with a `Denied` naming the author — the review queue
+  was unusable for exactly the population it exists for. The approver's right is
+  established before that point; re-checking as the author asks the wrong actor.
 - **Changing an ACL is itself a gated operation — use the `_as` form.** `grant`,
   `revoke`, `set_acl_default_deny`, `set_acl_enforce_reads` and `set_write_policy`
   take **no** authorization: `granted_by` is an audit field the caller fills in,

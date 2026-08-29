@@ -172,6 +172,29 @@ def _origofs_exc() -> tuple:
     return _ORIGOFS_EXC
 
 
+def _as_bytes(v: Any) -> bytes:
+    """A Yjs blob as it survives JSON: raw bytes, a list of ints, or base64.
+
+    A browser sends a `Uint8Array`, which `JSON.stringify` turns into an object
+    of index→byte or an array depending on how the client serializes it; a
+    Python client sends bytes directly. Accepting all three keeps the route
+    usable from either side without a second, binary-only endpoint.
+    """
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return bytes(v)
+    if isinstance(v, list):
+        return bytes(int(b) & 0xFF for b in v)
+    if isinstance(v, dict):  # {"0": 1, "1": 2, ...} from JSON.stringify
+        return bytes(int(v[k]) & 0xFF for k in sorted(v, key=int))
+    if isinstance(v, str):
+        import base64
+
+        return base64.b64decode(v)
+    raise HTTPException(
+        status_code=400, detail="expected bytes, a list of byte values, or base64"
+    )
+
+
 async def _run(awaitable: Awaitable[Any]) -> Any:
     """Await a workspace call, mapping origofs errors to HTTP status codes."""
     conflict_error, origofs_error = _origofs_exc()
@@ -1585,7 +1608,86 @@ def build_router(
         await _run(rooms.checkpoint_tree(_tree_key(p, xml_root), ctx, body, spans))
         return {"path": p, "bytes": len(body), "spans": len(spans)}
 
-    # --- liveness and readiness ---------------------------------------------
+    @router.post("/coedit-tree-suggest/{path:path}")
+    async def coedit_tree_suggest(
+        path: str,
+        payload: dict,
+        ctx: Any = Depends(authn),
+        root: str = Depends(_root),
+    ) -> dict:
+        """Propose a change to a tree document as a CRDT merge (#92, #75 §3.2).
+
+        The `XmlFragment` counterpart of the flat shape's CRDT suggestion, and the
+        route a **propose-only** agent needs: without it, the only ways to suggest
+        a change to a rich-text document were a whole-file byte suggestion — whose
+        base goes stale on every keystroke elsewhere in the file, and whose
+        acceptance discards concurrent work — or nothing.
+
+        Takes the *propose* right, not write. That is the whole point: gating it
+        on write would refuse exactly the callers it exists for.
+
+        Body: ``{"base_sv": <bytes|list[int]>, "update": <bytes|list[int]>,
+        "summary": "..."}`` — a browser sends ``encodeStateVector(doc)`` and
+        ``encodeStateAsUpdate(doc)``. Returns the suggestion id.
+        """
+        p = _scoped(root, path)
+        base_sv = _as_bytes(payload.get("base_sv", b""))
+        update = _as_bytes(payload.get("update", b""))
+        sid = await _run(
+            ws.suggest_coedit_tree_update(
+                ctx, p, base_sv, update, payload.get("summary")
+            )
+        )
+        return {"id": sid, "path": p}
+
+    @router.get("/coedit-tree-suggestions/{sid}/update")
+    async def coedit_tree_suggestion_update(
+        sid: int, root: str = Depends(_root), who: Any = Depends(_read_ctx)
+    ) -> Response:
+        """The proposed Yjs update behind a tree suggestion, as raw bytes.
+
+        For a host that wants to merge it into a document it already holds — the
+        live room, rather than a replica origofs resumes for it.
+        """
+        await _in_scope_suggestion(sid, root)
+        if who is not None and await _run(ws.get_suggestion_as(who, sid)) is None:
+            # Not found rather than denied, for the same reason the engine says
+            # so: a suggestion id is a guessable global handle.
+            raise HTTPException(status_code=404, detail=f"no suggestion {sid}")
+        return Response(
+            content=bytes(await _run(ws.coedit_tree_suggestion_update(sid))),
+            media_type="application/octet-stream",
+        )
+
+    @router.post("/coedit-tree-suggestions/{sid}/accept")
+    async def coedit_tree_accept(
+        sid: int,
+        payload: dict,
+        ctx: Any = Depends(authn),
+        root: str = Depends(_root),
+    ) -> dict:
+        """Accept a tree suggestion: land your serialized body, resolve the row.
+
+        origofs cannot turn an `XmlFragment` back into a file — it does not own
+        your schema — so the ordinary ``/suggestions/{id}/accept`` route refuses a
+        tree proposal and this one takes the bytes, exactly as
+        ``/coedit-tree-checkpoint`` does. The bytes land attributed to the
+        proposal's **author**; you are recorded as the approver.
+
+        Body: ``{"body": "...", "spans": [[start, end, node], ...],
+        "root": "..."}``.
+        """
+        await _in_scope_suggestion(sid, root)
+        body = payload.get("body", "")
+        body = body.encode() if isinstance(body, str) else bytes(body)
+        spans = [(int(a), int(b), str(node)) for a, b, node in payload.get("spans", [])]
+        xml_root = payload.get("root") or _DEFAULT_TREE_ROOT
+        ctx = await _session_bound(ws, ctx)
+        merged = await _run(ws.merge_coedit_tree_suggestion(sid, xml_root))
+        await _run(ws.accept_coedit_tree_suggestion(ctx, sid, merged, body, spans))
+        return {"accepted": sid, "bytes": len(body)}
+
+    # --- liveness and readiness ---------------------------------------------    # --- liveness and readiness ---------------------------------------------
     #
     # Deliberately **ungated**, matching the Rust API where these sit outside
     # `/v1`: a load balancer and a Kubernetes probe have no bearer token, and a

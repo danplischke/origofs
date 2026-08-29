@@ -2669,6 +2669,172 @@ impl Workspace {
         })
     }
 
+    /// Resume a tree document to **propose against**: the *propose* check, and no
+    /// live marker.
+    ///
+    /// Note the asymmetry with `load_coedit_tree_as` above, which serves a
+    /// socket-less checkpoint and so takes the write check. Gating this on write
+    /// would refuse exactly the propose-only agents it exists for.
+    #[pyo3(signature = (ctx, path, root=None))]
+    fn load_coedit_tree_to_propose<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        root: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let root = root.unwrap_or_else(|| origofs_core::DEFAULT_TREE_ROOT.to_string());
+            let doc = ws
+                .load_coedit_tree_to_propose(c, &path, &root)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    CoeditTreeDoc {
+                        inner: Arc::new(tokio::sync::Mutex::new(doc)),
+                    },
+                )
+            })
+        })
+    }
+
+    /// Propose a change to a **tree-shaped** co-edited path as a CRDT merge, the
+    /// `XmlFragment` counterpart of `suggest_coedit` — and the shape a rich-text
+    /// editor actually uses. Without it a propose-only agent had no way to
+    /// propose against such a document at all.
+    #[pyo3(signature = (ctx, path, doc, summary=None))]
+    fn suggest_coedit_tree<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        doc: Py<CoeditTreeDoc>,
+        summary: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        let inner = doc.borrow(py).inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            ws.suggest_coedit_tree(c, &path, &guard, summary.as_deref())
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// The primitive behind `suggest_coedit_tree`, for a client that already
+    /// holds the two Yjs blobs (a browser editor sends `encodeStateVector` +
+    /// `encodeStateAsUpdate`).
+    #[pyo3(signature = (ctx, path, base_sv, update, summary=None))]
+    fn suggest_coedit_tree_update<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        base_sv: Vec<u8>,
+        update: Vec<u8>,
+        summary: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.suggest_coedit_tree_update(c, &path, &base_sv, &update, summary.as_deref())
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// The proposed Yjs update behind a tree suggestion, for merging into a
+    /// document you already hold (the live room, rather than a fresh replica).
+    fn coedit_tree_suggestion_update<'py>(
+        &self,
+        py: Python<'py>,
+        id: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let bytes = ws
+                .coedit_tree_suggestion_update(id)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
+        })
+    }
+
+    /// Merge a tree suggestion into a resumed replica and hand it back. Persists
+    /// nothing: serialize the result and pass the bytes to
+    /// `accept_coedit_tree_suggestion`.
+    #[pyo3(signature = (id, root=None))]
+    fn merge_coedit_tree_suggestion<'py>(
+        &self,
+        py: Python<'py>,
+        id: i64,
+        root: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let root = root.unwrap_or_else(|| origofs_core::DEFAULT_TREE_ROOT.to_string());
+            let doc = ws
+                .merge_coedit_tree_suggestion(id, &root)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    CoeditTreeDoc {
+                        inner: Arc::new(tokio::sync::Mutex::new(doc)),
+                    },
+                )
+            })
+        })
+    }
+
+    /// The ``XmlFragment`` name a path's tree sidecar was written under, or
+    /// ``None`` when there is no readable sidecar. A reviewer has no schema, so
+    /// this is how it learns which root to resume under.
+    fn coedit_tree_root<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.coedit_tree_root(&path).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Accept a tree suggestion: land your serialized ``body`` attributed to the
+    /// proposal's **author**, and resolve the row, in one call.
+    ///
+    /// ``accept_suggestion`` refuses a tree proposal, because landing one means
+    /// writing the document back out as bytes and only you know the schema for
+    /// that — the same reason ``checkpoint_coedit_tree`` takes a body. The
+    /// approver must hold write at the path and must differ from the author.
+    fn accept_coedit_tree_suggestion<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        id: i64,
+        doc: Py<CoeditTreeDoc>,
+        body: Vec<u8>,
+        spans: Vec<(u64, u64, String)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        let inner = doc.borrow(py).inner.clone();
+        let spans: Vec<origofs_sdk::TreeSpan> = spans
+            .into_iter()
+            .map(|(start, end, node)| origofs_sdk::TreeSpan::new(start, end, node))
+            .collect();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            ws.accept_coedit_tree_suggestion(c, id, &guard, &body, &spans)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
     /// Open a live co-editing document for `path` (roadmap M8): resume the CRDT
     /// from its persisted sidecar if one exists, else promote the file's current
     /// text into a fresh document attributed to `ctx`. Returns a [`CoeditDoc`] to

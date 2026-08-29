@@ -2028,6 +2028,101 @@ impl Workspace {
         self.fs.persist_coedit_tree(path, doc).await
     }
 
+    /// Resume a tree document to **propose against**: the propose check, and no
+    /// live marker.
+    ///
+    /// Note the asymmetry with [`load_coedit_tree_as`](Self::load_coedit_tree_as)
+    /// beside it — that one serves a host's socket-less *checkpoint* and so takes
+    /// the write check. Gating this on `WRITE` would refuse exactly the
+    /// propose-only actors it exists for. Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn load_coedit_tree_to_propose(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        root: &str,
+    ) -> Result<CoeditTreeDoc> {
+        self.fs.load_coedit_tree_to_propose(ctx, path, root).await
+    }
+
+    /// Propose a change to a **tree-shaped** co-edited path as a CRDT merge —
+    /// the `XmlFragment` counterpart of [`suggest_coedit`](Self::suggest_coedit),
+    /// and the shape a rich-text editor actually uses. Without it a propose-only
+    /// actor had no way to propose against such a document at all. Requires the
+    /// `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn suggest_coedit_tree(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditTreeDoc,
+        summary: Option<&str>,
+    ) -> Result<i64> {
+        self.fs.suggest_coedit_tree(ctx, path, doc, summary).await
+    }
+
+    /// The primitive behind [`suggest_coedit_tree`](Self::suggest_coedit_tree),
+    /// for a client that already holds the Yjs blobs. Requires the `coedit`
+    /// feature.
+    #[cfg(feature = "coedit")]
+    pub async fn suggest_coedit_tree_update(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        base_sv: &[u8],
+        update: &[u8],
+        summary: Option<&str>,
+    ) -> Result<i64> {
+        self.fs
+            .suggest_coedit_tree_update(ctx, path, base_sv, update, summary)
+            .await
+    }
+
+    /// The proposed Yjs update behind a tree suggestion, for a host merging it
+    /// into a document it already holds. Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn coedit_tree_suggestion_update(&self, id: i64) -> Result<Bytes> {
+        self.fs.coedit_tree_suggestion_update(id).await
+    }
+
+    /// Merge a tree suggestion into a resumed replica and hand it back. Persists
+    /// nothing: serialize the result and pass the bytes to
+    /// [`accept_coedit_tree_suggestion`](Self::accept_coedit_tree_suggestion).
+    /// Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn merge_coedit_tree_suggestion(&self, id: i64, root: &str) -> Result<CoeditTreeDoc> {
+        self.fs.merge_coedit_tree_suggestion(id, root).await
+    }
+
+    /// The `XmlFragment` name a path's tree sidecar was written under, or `None`
+    /// when there is no readable sidecar. Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn coedit_tree_root(&self, path: &str) -> Result<Option<String>> {
+        self.fs.coedit_tree_root(path).await
+    }
+
+    /// Accept a tree suggestion: land the host's serialized `body` attributed to
+    /// the proposal's **author**, and resolve the row, in one call.
+    ///
+    /// `accept_suggestion` refuses a tree proposal, because landing one means
+    /// writing the document back out as bytes and only the host knows the schema
+    /// for that — the same reason `checkpoint_coedit_tree` takes a body. The
+    /// approver must differ from the author, exactly as on the flat path.
+    /// Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn accept_coedit_tree_suggestion(
+        &self,
+        ctx: WriteCtx,
+        id: i64,
+        doc: &CoeditTreeDoc,
+        body: &[u8],
+        spans: &[TreeSpan],
+    ) -> Result<()> {
+        self.fs
+            .accept_coedit_tree_suggestion(ctx, id, doc, body, spans)
+            .await
+    }
+
     /// End a live co-editing session for `path`: clear its live marker so byte
     /// readers stop being told the durable blob may lag. Checkpoint *first* — this
     /// only drops the flag. Requires the `coedit` feature.
