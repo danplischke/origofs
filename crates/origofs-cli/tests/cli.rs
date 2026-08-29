@@ -2180,6 +2180,18 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
             "write-policy",
             Exempt("administrative: sets the very policy an actor is judged by"),
         ),
+        // `acl` mutates the ACLs, and delegating is administrative: `--by` runs
+        // the gated `grant_as`/`revoke_as`, which need WRITE at the prefix and
+        // refuse to hand out a bit the granter does not hold. Attributed rather
+        // than Exempt, so rule 4 below checks the flag actually exists — except
+        // it names the granter `--by`, not `--actor`, because `--actor` on this
+        // command is the actor being granted *to*.
+        (
+            "acl",
+            Exempt(
+                "takes `--by` for the granter; `--actor` here names the grantee, not the caller",
+            ),
+        ),
         (
             "require-attribution",
             Exempt("administrative: sets whether attribution is mandatory"),
@@ -2340,6 +2352,88 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
                 sub_help.stdout
             );
         }
+    }
+
+    // 5. Every read that can reveal a path offers `--actor` too (issue #124).
+    //
+    //    `ReadOnly` used to end the analysis: a read mutates nothing, so there
+    //    was nothing to attribute. Read enforcement changes that — `Perms::READ`
+    //    is consulted where a workspace opts in, and a subcommand with no way to
+    //    say who is asking can only call the unattributed engine method, which is
+    //    exempt by construction. The result is a binary that cannot show what an
+    //    ACL actually does, on the tool `CLAUDE.md` calls the best index of what
+    //    the system can do.
+    //
+    //    The split is the same discipline as `Exempt`: a read that reveals no
+    //    path needs no actor, and saying which it is forces the thought.
+    const READS_A_PATH: &[&str] = &[
+        "read",
+        "ls",
+        "stat",
+        "blame",
+        "diff",
+        "suggestions",
+        "suggestion-diff",
+        "presence",
+    ];
+    const READS_NO_PATH: &[(&str, &str)] = &[
+        (
+            "log",
+            "commit metadata: hash, author, message, time. `diff` is what turns a commit into paths",
+        ),
+        (
+            "status",
+            "the working tree against HEAD; whoever runs it already holds the workspace directory",
+        ),
+        (
+            "info",
+            "chunk layout for a path the caller named; reports no path it was not given",
+        ),
+        (
+            "conflicts",
+            "unresolved merge state, which belongs to the merge rather than to a reader",
+        ),
+        (
+            "locks",
+            "LFS-style lock ownership is a free-form `--owner` string, not an actor",
+        ),
+        (
+            "watch",
+            "the change feed: filtering it needs a cursor the feed does not carry — see api_read_acl.rs",
+        ),
+        (
+            "schema-version",
+            "one integer about the metadata store; no paths at all",
+        ),
+        ("help", "clap's own help output"),
+    ];
+
+    for (name, kind) in table {
+        let ReadOnly = kind else { continue };
+        let scoped = READS_A_PATH.contains(name);
+        let unscoped = READS_NO_PATH.iter().any(|(n, _)| n == name);
+        assert!(
+            scoped ^ unscoped,
+            "`{name}` is read-only but is not classified as revealing a path or \
+             not. Add it to READS_A_PATH (and give it `--actor`), or to \
+             READS_NO_PATH with the reason it can reveal nothing an ACL covers."
+        );
+        if scoped {
+            let sub_help = raw(None, &[name, "--help"], None).expect_ok(name);
+            assert!(
+                sub_help.stdout.contains("--actor"),
+                "`{name}` reveals a path but offers no `--actor`, so it can only \
+                 call the unattributed engine read and `acl_enforce_reads` does \
+                 not apply to it.\n--- help ---\n{}",
+                sub_help.stdout
+            );
+        }
+    }
+    for (name, why) in READS_NO_PATH {
+        assert!(
+            why.len() > 20,
+            "`{name}` is exempt from read attribution but gives no real reason ({why:?})"
+        );
     }
 }
 
@@ -2623,4 +2717,101 @@ fn serve_reads_auth_tokens_from_the_environment() {
         anon.contains("401"),
         "and reads must still be gated, got {anon:?}"
     );
+}
+
+/// The ACL surface, end to end through the binary (issues #123, #124).
+///
+/// Until now the engine's ACLs were reachable from Rust and Python and from no
+/// surface at all — no HTTP route, no MCP tool, no subcommand. That is the shape
+/// `CLAUDE.md` warns about: a workspace could not be configured without writing
+/// code, and "no route exists" was the only thing standing between a propose-only
+/// agent and a self-granted `WRITE` at `/`.
+///
+/// This drives the whole loop the way an operator would: provision, grant,
+/// enforce, verify, and confirm the enforcement actually bites on a read.
+#[test]
+fn acl_grants_gate_reads_end_to_end() {
+    let ws = Ws::init();
+    let owner = ws.actor(&["owner"]);
+    let bob = ws.actor(&["bob"]);
+    let (o, b) = (owner.to_string(), bob.to_string());
+
+    ws.write_as("/proj/open.md", owner, "shared\n")
+        .expect_ok("write open");
+    ws.write_as("/secret.md", owner, "private\n")
+        .expect_ok("write secret");
+
+    // Provisioning: the first grant in a fresh workspace has no granter, and the
+    // command says so rather than pretending something checked it.
+    ws.run(&["acl", "grant", &o, "/", "read+write"])
+        .expect_ok("provision owner")
+        .stdout_has("unchecked");
+
+    // Delegation, checked: owner holds WRITE at `/`, so it may hand bob READ
+    // under a subtree.
+    ws.run(&["acl", "grant", &b, "/proj", "read", "--by", &o])
+        .expect_ok("owner grants bob")
+        .stdout_has("by actor");
+
+    // …and cannot hand out a bit it does not hold. Nobody holds anything at
+    // `/nowhere` under default-deny, so this is the amplification refusal.
+    ws.run(&["acl", "default-deny", "on", "--by", &o])
+        .expect_ok("default deny on");
+    ws.run(&["acl", "grant", &b, "/proj", "write", "--by", &b])
+        .expect_err("bob may not grant himself write");
+
+    // `acl check` answers the question an ACL bug is actually asking, and does
+    // it before enforcement is switched on — which is the whole point of being
+    // able to check first.
+    ws.run(&["acl", "check", &b, "/proj/open.md"])
+        .expect_ok("check granted")
+        .stdout_has("read");
+    ws.run(&["acl", "check", &b, "/secret.md"])
+        .expect_ok("check denied")
+        .stdout_lacks("read");
+
+    // Off by default: bob reads everything until someone opts in.
+    ws.run(&["acl", "enforce-reads"])
+        .expect_ok("show")
+        .stdout_has("off");
+    ws.run(&["read", "/secret.md", "--actor", &b])
+        .expect_ok("read before enforcement")
+        .stdout_has("private");
+
+    ws.run(&["acl", "enforce-reads", "on", "--by", &o])
+        .expect_ok("enforce reads");
+
+    // Now it bites — and only for the actor it should.
+    ws.run(&["read", "/secret.md", "--actor", &b])
+        .expect_err("bob may not read the secret");
+    ws.run(&["read", "/proj/open.md", "--actor", &b])
+        .expect_ok("bob may read his own subtree")
+        .stdout_has("shared");
+    ws.run(&["read", "/secret.md", "--actor", &o])
+        .expect_ok("owner still reads everything")
+        .stdout_has("private");
+
+    // The listing and the stat agree: what `ls` hides, `stat` refuses.
+    ws.run(&["acl", "grant", &b, "/", "read", "--by", &o])
+        .expect_ok("bob may list the root");
+    ws.run(&["acl", "grant", &b, "/secret.md", "none", "--by", &o])
+        .expect_ok("…but not that one file");
+    ws.run(&["ls", "/", "--actor", &b])
+        .expect_ok("bob lists the root")
+        .stdout_lacks("secret.md")
+        .stdout_has("proj");
+    ws.run(&["stat", "/secret.md", "--actor", &b])
+        .expect_err("and stat must refuse the same path");
+
+    // An unattributed read is still open, because the CLI is not a boundary and
+    // never claimed to be: whoever writes the argv has `meta.db` on disk anyway.
+    // The flag is how you see what an actor would be served, not a gate.
+    ws.run(&["read", "/secret.md"])
+        .expect_ok("unattributed read stays open")
+        .stdout_has("private");
+
+    // `ORIGOFS_ACTOR` works on reads too, so a shell or agent harness sets
+    // identity once (the #128 ergonomics, applied to #124).
+    ws.run_env(&["read", "/secret.md"], "ORIGOFS_ACTOR", &b)
+        .expect_err("the env fallback carries into reads");
 }

@@ -4816,12 +4816,11 @@ impl Workspace {
         })
     }
 
-    /// `ls`, checked against `read` at the directory.
+    /// `ls`, checked against `read` at the directory **and at every entry**.
     ///
-    /// Checks the directory, not its entries: an actor that may read `/a` gets all
-    /// of `/a`'s entries. Per-entry filtering has to be designed together with
-    /// `stat_as` so the two agree about a denied path, or the difference between
-    /// them is an existence oracle.
+    /// An entry the actor may not read is absent rather than refused, so the
+    /// listing and `stat_as` agree about it — if they disagreed, the difference
+    /// between them would be an existence oracle.
     fn ls_as<'py>(
         &self,
         py: Python<'py>,
@@ -4835,6 +4834,170 @@ impl Workspace {
             Python::attach(|py| {
                 let out: PyResult<Vec<_>> = entries.iter().map(|e| dir_entry_dict(py, e)).collect();
                 Ok(out?.into_pyobject(py)?.unbind().into_any())
+            })
+        })
+    }
+
+    /// `diff`, with entries at unreadable paths removed.
+    fn diff_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        from_: String,
+        to: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let changes = ws.diff_as(c, &from_, &to).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                changes
+                    .iter()
+                    .map(|d| diff_dict(py, d))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// `diff_file`, checked against `read` at the path — a unified diff of a file
+    /// is that file's content in another arrangement.
+    fn diff_file_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        from_: String,
+        to: String,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.diff_file_as(c, &from_, &to, &path)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// `presence`, with sessions at unreadable paths removed — and sessions
+    /// naming no path removed too, because a row with no path still says a
+    /// neighbour is connected.
+    fn presence_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        window_secs: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let list = ws.presence_as(c, window_secs).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                list.iter()
+                    .map(|p| presence_dict(py, p))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// `list_suggestions`, with proposals against unreadable paths removed.
+    #[pyo3(signature = (ctx, status=None, path=None))]
+    fn list_suggestions_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        status: Option<String>,
+        path: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let st = match status.as_deref() {
+                Some(s) => Some(
+                    SuggestionStatus::parse(s)
+                        .ok_or_else(|| PyValueError::new_err(format!("unknown status {s:?}")))?,
+                ),
+                None => None,
+            };
+            let list = ws
+                .list_suggestions_as(c, st, path.as_deref())
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| {
+                list.iter()
+                    .map(|s| suggestion_dict(py, s))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// `get_suggestion`, answering ``None`` for a proposal against a path the
+    /// actor may not read.
+    ///
+    /// Not found rather than denied: a suggestion id is a guessable,
+    /// workspace-global handle, so a refusal would confirm one exists at that id
+    /// — the existence answer the check is there to withhold.
+    fn get_suggestion_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        id: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let s = ws.get_suggestion_as(c, id).await.map_err(to_pyerr)?;
+            Python::attach(|py| match s {
+                Some(s) => suggestion_dict(py, &s).map(Some),
+                None => Ok(None),
+            })
+        })
+    }
+
+    /// `suggestion_diff`, raising the ordinary not-found for a proposal against a
+    /// path the actor may not read.
+    fn suggestion_diff_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        id: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.suggestion_diff_as(c, id).await.map_err(to_pyerr)
+        })
+    }
+
+    /// `live_doc`, answering ``None`` for a path the actor may not read — a
+    /// filter, because "is this path live" is an existence question.
+    fn live_doc_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let live = ws.live_doc_as(c, &path).await.map_err(to_pyerr)?;
+            Python::attach(|py| match live {
+                Some(l) => live_doc_dict(py, &l).map(Some),
+                None => Ok(None),
+            })
+        })
+    }
+
+    /// `live_paths`, with unreadable paths removed. Unfiltered it is a
+    /// workspace-wide list of exactly which files someone is editing right now.
+    fn live_paths_as<'py>(&self, py: Python<'py>, ctx: WriteCtx) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let list = ws.live_paths_as(c).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                list.iter()
+                    .map(|l| live_doc_dict(py, l))
+                    .collect::<PyResult<Vec<_>>>()
             })
         })
     }

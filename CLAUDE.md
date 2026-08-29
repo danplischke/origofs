@@ -259,9 +259,59 @@ write path enforces this and you must not weaken it:
   because checkout, merge, gc and the CRDT coordinator are built from them. Like
   the write checks it runs **before** any lookup, so a denial cannot leak
   existence — which matters more here, since probing for existence is the point of
-  an unauthorized read. `ls_as` checks the directory, not its entries; per-entry
-  filtering must land together with `stat_as` or the two disagree and become an
-  oracle. Issue #124.
+  an unauthorized read.
+
+  **`ls_as` filters per entry, and had to.** It checks the directory (a refusal —
+  an empty listing would say "this directory is here and holds nothing") and then
+  drops the entries the actor may not read (an absence — an entry it may not read
+  looks exactly like one that is not there). The pair `ls_as`/`stat_as` has to
+  agree, because a listing that hides what a stat serves is the oracle; both ask
+  the same resolver whether the actor holds `READ` at the entry's own full path,
+  so neither can drift.
+
+  **The collection reads filter the same way** — `diff_as`, `presence_as`,
+  `list_suggestions_as`, `live_paths_as` — and the id-addressed ones
+  (`get_suggestion_as`, `suggestion_diff_as`, `live_doc_as`) answer *not found*
+  rather than *denied*: a suggestion id is a guessable, workspace-global handle,
+  so a refusal would confirm one exists at it. A row with **no** path is dropped
+  too (an idle `Presence`), matching the ruling `Scope::contains(None)` already
+  makes for tenancy. Two collections stay ungated with reasons in the exempt
+  lists: `log` (commit metadata, no paths) and the **change feed** — filtering
+  `watch(after_seq)` would leave a client that can see none of the rows polling
+  the same cursor forever, so it needs a high-water mark in the response shape
+  first.
+
+  **Every surface threads the actor, and each has its own answer for "no actor".**
+  The engine half shipped first and no surface called it, which made the switch
+  decoration on the only place it is for. Now: the HTTP API's `ReadAuth`
+  extractor resolves a principal when there is one and, when there is not, serves
+  the read anonymously while enforcement is off and answers **401** once it is on
+  — so turning the switch on closes the anonymous door by itself, without also
+  setting `gate_reads`. MCP always has an agent, so its read tools simply pass
+  `self.ctx()`. The CLI takes `--actor`/`ORIGOFS_ACTOR` on every read that
+  reveals a path, which is not an identity check (nothing on the CLI is) but is
+  how you see what an actor would actually be served. `build_router`'s `reader`
+  dependency may now return a `WriteCtx`, and reads run as it; returning `None`
+  keeps the older gate-only shape.
+
+  Three structural guards keep it that way, one per surface, because a new route
+  or tool is invisible to behavioural tests:
+  `api_read_acl.rs::every_read_route_binds_its_read_auth`,
+  `mcp.rs::no_mcp_tool_reads_through_an_unattributed_method`, and rule 5 of the
+  CLI's `every_mutating_subcommand_is_classified_and_attributable`. Each takes an
+  exempt list where every entry carries a reason — the same discipline the write
+  side already had, and for the same reason: "exempt" with no reason is how #78
+  and #128 both happened.
+
+  **`origofs acl` is the surface the ACLs never had.** No HTTP route, no MCP
+  tool, and until now no subcommand — so a workspace could not be configured
+  without writing Rust or Python, and "no route exists" was the only thing
+  standing between a propose-only agent and a self-granted `WRITE` at `/`.
+  `acl grant/revoke/default-deny/enforce-reads` take `--by` and go through the
+  gated `_as` forms; omitting `--by` uses the ungated provisioning form and says
+  so in its output, because the raw forms exist for the first grant in a fresh
+  workspace and not for a caller who forgot the flag. `acl show` and `acl check`
+  answer the question an ACL bug is actually asking. Issue #124.
 - **`effective_perms` is cached, and the cache is exact rather than fresh-ish.**
   It was up to three round trips — `list_acl` returns *every* grant the actor
   holds — with a linear prefix match over the result: 16% of a read at one grant,

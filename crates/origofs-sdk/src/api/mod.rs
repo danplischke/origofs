@@ -265,6 +265,139 @@ impl FromRequestParts<AppState> for Auth {
     }
 }
 
+/// The identity behind a **read**, which may legitimately be absent.
+///
+/// Reads are open by default on this surface (parity with the Python
+/// `build_router`), so a read handler cannot simply take [`Auth`] the way a
+/// mutation does — that would turn every anonymous `GET` into a `401` for every
+/// deployment. It cannot ignore identity either: the six per-path reads and the
+/// collection reads all have `_as` forms that consult `Perms::READ`, and a
+/// handler calling the unattributed twin makes `acl_enforce_reads` decoration on
+/// the one surface that faces a network.
+///
+/// So the extractor resolves the principal when there is one and, when there is
+/// not, decides by the workspace's own switch:
+///
+/// * enforcement **off** — `ReadAuth(None)`, an anonymous read, exactly as before.
+/// * enforcement **on** — `401`, because an unauthenticated read is a read that
+///   cannot be checked, and serving it would be the whole hole. Turning the
+///   switch on therefore closes the anonymous door by itself; an operator does
+///   not have to remember to set `gate_reads` as well.
+///
+/// It sits in an extractor for the reason [`ScopedPath`] does: a rule each
+/// handler has to remember is one a new route will eventually skip.
+struct ReadAuth(Option<Principal>);
+
+impl FromRequestParts<AppState> for ReadAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        match state.auth.authenticate(&parts.headers).await {
+            Some(p) => Ok(ReadAuth(Some(p))),
+            None if state.ws.acl_enforce_reads().await? => Err(ApiError::status(
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated: this workspace enforces read permissions, so a \
+                 read needs a credential to check them against",
+            )),
+            None => Ok(ReadAuth(None)),
+        }
+    }
+}
+
+/// Every read this surface performs, dispatched on whether the request carried an
+/// identity.
+///
+/// The anonymous arm calls the unattributed engine method, which is correct
+/// precisely because the extractor above has already established that the
+/// workspace does not enforce read permissions — `_as` with no actor is not a
+/// thing that could be written here.
+impl ReadAuth {
+    async fn ensure_may_read(&self, ws: &Workspace, op: &str, path: &str) -> ApiResult<()> {
+        if let Some(p) = self.0 {
+            ws.ensure_may_read_at(p.write_ctx(), op, path).await?;
+        }
+        Ok(())
+    }
+
+    async fn ls(&self, ws: &Workspace, path: &str) -> ApiResult<Vec<crate::DirEntry>> {
+        Ok(match self.0 {
+            Some(p) => ws.ls_as(p.write_ctx(), path).await?,
+            None => ws.ls(path).await?,
+        })
+    }
+
+    async fn stat(&self, ws: &Workspace, path: &str) -> ApiResult<crate::Inode> {
+        Ok(match self.0 {
+            Some(p) => ws.stat_as(p.write_ctx(), path).await?,
+            None => ws.stat(path).await?,
+        })
+    }
+
+    async fn blame(&self, ws: &Workspace, path: &str) -> ApiResult<Vec<crate::BlameRange>> {
+        Ok(match self.0 {
+            Some(p) => ws.blame_as(p.write_ctx(), path).await?,
+            None => ws.blame(path).await?,
+        })
+    }
+
+    async fn diff(&self, ws: &Workspace, from: &str, to: &str) -> ApiResult<Vec<crate::DiffEntry>> {
+        Ok(match self.0 {
+            Some(p) => ws.diff_as(p.write_ctx(), from, to).await?,
+            None => ws.diff(from, to).await?,
+        })
+    }
+
+    async fn diff_file(
+        &self,
+        ws: &Workspace,
+        from: &str,
+        to: &str,
+        path: &str,
+    ) -> ApiResult<String> {
+        Ok(match self.0 {
+            Some(p) => ws.diff_file_as(p.write_ctx(), from, to, path).await?,
+            None => ws.diff_file(from, to, path).await?,
+        })
+    }
+
+    async fn presence(&self, ws: &Workspace, window_secs: i64) -> ApiResult<Vec<crate::Presence>> {
+        Ok(match self.0 {
+            Some(p) => ws.presence_as(p.write_ctx(), window_secs).await?,
+            None => ws.presence(window_secs).await?,
+        })
+    }
+
+    async fn list_suggestions(
+        &self,
+        ws: &Workspace,
+        status: Option<crate::SuggestionStatus>,
+        path: Option<&str>,
+    ) -> ApiResult<Vec<crate::Suggestion>> {
+        Ok(match self.0 {
+            Some(p) => ws.list_suggestions_as(p.write_ctx(), status, path).await?,
+            None => ws.list_suggestions(status, path).await?,
+        })
+    }
+
+    async fn get_suggestion(
+        &self,
+        ws: &Workspace,
+        id: i64,
+    ) -> ApiResult<Option<crate::Suggestion>> {
+        Ok(match self.0 {
+            Some(p) => ws.get_suggestion_as(p.write_ctx(), id).await?,
+            None => ws.get_suggestion(id).await?,
+        })
+    }
+
+    async fn suggestion_diff(&self, ws: &Workspace, id: i64) -> ApiResult<String> {
+        Ok(match self.0 {
+            Some(p) => ws.suggestion_diff_as(p.write_ctx(), id).await?,
+            None => ws.suggestion_diff(id).await?,
+        })
+    }
+}
+
 /// Options for [`router_with`].
 #[derive(Clone)]
 pub struct ApiOptions {
@@ -940,6 +1073,7 @@ fn parse_range(headers: &HeaderMap, size: u64) -> Option<std::result::Result<(u6
 
 async fn read_file(
     State(ws): State<Shared>,
+    who: ReadAuth,
     ScopedPath(path): ScopedPath,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
@@ -949,6 +1083,11 @@ async fn read_file(
     // it yields the size, which `Content-Length`, `Content-Range` and `416` all
     // need before the first byte.
     let p = path;
+    // Before `open_for_range`, not after: the check has to precede the lookup or a
+    // refusal and a miss become distinguishable, which is the existence answer the
+    // check exists to withhold. `read_range_stream` takes a manifest rather than a
+    // path, so the gate belongs here rather than around the stream.
+    who.ensure_may_read(&ws, "read", &p).await?;
     let (manifest, size) = ws.open_for_range(&p).await?;
     let ctype = content_type_for(&p);
 
@@ -1114,9 +1253,9 @@ struct EntryDto {
     kind: String,
 }
 
-async fn list_path(ws: &Workspace, path: &str) -> ApiResult<Json<Vec<EntryDto>>> {
-    let entries = ws
-        .ls(path)
+async fn list_path(ws: &Workspace, who: &ReadAuth, path: &str) -> ApiResult<Json<Vec<EntryDto>>> {
+    let entries = who
+        .ls(ws, path)
         .await?
         .into_iter()
         .map(|e| EntryDto {
@@ -1137,15 +1276,17 @@ async fn list_path(ws: &Workspace, path: &str) -> ApiResult<Json<Vec<EntryDto>>>
 async fn list_root(
     State(ws): State<Shared>,
     State(scope): State<Scope>,
+    who: ReadAuth,
 ) -> ApiResult<Json<Vec<EntryDto>>> {
-    list_path(&ws, &scope.resolve("/").map_err(scope_error)?).await
+    list_path(&ws, &who, &scope.resolve("/").map_err(scope_error)?).await
 }
 
 async fn list_dir(
     State(ws): State<Shared>,
+    who: ReadAuth,
     ScopedPath(path): ScopedPath,
 ) -> ApiResult<Json<Vec<EntryDto>>> {
-    list_path(&ws, &path).await
+    list_path(&ws, &who, &path).await
 }
 
 /// `POST /v1/dirs` — the root directory.
@@ -1179,8 +1320,12 @@ struct InodeDto {
     ctime: i64,
 }
 
-async fn stat(State(ws): State<Shared>, ScopedPath(path): ScopedPath) -> ApiResult<Json<InodeDto>> {
-    let i = ws.stat(&path).await?;
+async fn stat(
+    State(ws): State<Shared>,
+    who: ReadAuth,
+    ScopedPath(path): ScopedPath,
+) -> ApiResult<Json<InodeDto>> {
+    let i = who.stat(&ws, &path).await?;
     Ok(Json(InodeDto {
         ino: i.ino,
         kind: i.kind.as_str().to_string(),
@@ -1311,13 +1456,14 @@ struct DiffEntryDto {
 async fn diff(
     State(ws): State<Shared>,
     State(scope): State<Scope>,
+    who: ReadAuth,
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<Vec<DiffEntryDto>>> {
     if !scope.is_whole() {
         return Err(unscopable("a whole-tree diff"));
     }
-    let out = ws
-        .diff(&q.from, &q.to)
+    let out = who
+        .diff(&ws, &q.from, &q.to)
         .await?
         .into_iter()
         .map(|d| DiffEntryDto {
@@ -1350,10 +1496,11 @@ struct DiffFileDto {
 async fn diff_file(
     State(ws): State<Shared>,
     State(scope): State<Scope>,
+    who: ReadAuth,
     Query(q): Query<DiffFileQuery>,
 ) -> ApiResult<Json<DiffFileDto>> {
     let path = scope_path(&scope, &q.path)?;
-    let diff = ws.diff_file(&q.from, &q.to, &path).await?;
+    let diff = who.diff_file(&ws, &q.from, &q.to, &path).await?;
     Ok(Json(DiffFileDto { path, diff }))
 }
 
@@ -1435,6 +1582,7 @@ struct ListSuggestQuery {
 async fn list_suggestions(
     State(ws): State<Shared>,
     State(scope): State<Scope>,
+    who: ReadAuth,
     Query(q): Query<ListSuggestQuery>,
 ) -> ApiResult<Json<Vec<SuggestionDto>>> {
     let status = match q.status.as_deref() {
@@ -1449,7 +1597,7 @@ async fn list_suggestions(
     // one, since `None` means "no path filter" and would otherwise mean "every
     // tenant's".
     let filter = scope.resolve_opt(q.path.as_deref()).map_err(scope_error)?;
-    let rows = ws.list_suggestions(status, filter.as_deref()).await?;
+    let rows = who.list_suggestions(&ws, status, filter.as_deref()).await?;
     let out = scope
         .filter(rows, |r| Some(r.path.as_str()))
         .into_iter()
@@ -1461,10 +1609,14 @@ async fn list_suggestions(
 async fn get_suggestion(
     State(ws): State<Shared>,
     State(scope): State<Scope>,
+    who: ReadAuth,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<SuggestionDto>> {
-    let s = ws
-        .get_suggestion(id)
+    // `ReadAuth::get_suggestion` already answers `None` for a proposal at a path
+    // the actor may not read, so the miss below covers a denial as well as an
+    // absence — the same 404 the scope check makes below, for the same reason.
+    let s = who
+        .get_suggestion(&ws, id)
         .await?
         .ok_or_else(|| crate::OrigoFSError::NotFound(format!("suggestion #{id}")))?;
     // Suggestion ids are workspace-global, so knowing an id was enough to read a
@@ -1491,10 +1643,11 @@ async fn suggestion_in_scope(ws: &Shared, scope: &Scope, id: i64) -> Result<(), 
 async fn suggestion_diff(
     State(ws): State<Shared>,
     State(scope): State<Scope>,
+    who: ReadAuth,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     suggestion_in_scope(&ws, &scope, id).await?;
-    let diff = ws.suggestion_diff(id).await?;
+    let diff = who.suggestion_diff(&ws, id).await?;
     Ok(Json(json!({ "id": id, "diff": diff })))
 }
 
@@ -1686,10 +1839,11 @@ struct BlameDto {
 
 async fn blame(
     State(ws): State<Shared>,
+    who: ReadAuth,
     ScopedPath(path): ScopedPath,
 ) -> ApiResult<Json<Vec<BlameDto>>> {
-    let out = ws
-        .blame(&path)
+    let out = who
+        .blame(&ws, &path)
         .await?
         .into_iter()
         .map(|r| BlameDto {
@@ -1781,9 +1935,10 @@ struct PresenceQuery {
 async fn presence(
     State(ws): State<Shared>,
     State(scope): State<Scope>,
+    who: ReadAuth,
     Query(q): Query<PresenceQuery>,
 ) -> ApiResult<Json<Vec<PresenceDto>>> {
-    let rows = ws.presence(q.window.unwrap_or(60)).await?;
+    let rows = who.presence(&ws, q.window.unwrap_or(60)).await?;
     // Presence is workspace-wide. Note what this drops: a row with **no** path --
     // an idle session -- is filtered out too, because a record naming no path still
     // tells a scoped reader that a neighbour is connected. `Scope::contains(None)`

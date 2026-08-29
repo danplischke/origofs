@@ -1166,11 +1166,71 @@ impl Workspace {
         self.fs.blame_as(ctx, path).await
     }
 
-    /// [`ls`](Self::ls), checked against `READ` at the directory. Checks the
-    /// directory, not its entries — see `Fs::ls_as` on why per-entry filtering is
-    /// not here yet.
+    /// [`ls`](Self::ls), checked against `READ` at the directory **and at every
+    /// entry it returns** — an entry the actor may not read is absent rather than
+    /// refused, so the listing and [`stat_as`](Self::stat_as) agree about it.
     pub async fn ls_as(&self, ctx: WriteCtx, path: &str) -> Result<Vec<DirEntry>> {
         self.fs.ls_as(ctx, path).await
+    }
+
+    /// [`diff`](Self::diff), with entries at unreadable paths removed.
+    pub async fn diff_as(&self, ctx: WriteCtx, from: &str, to: &str) -> Result<Vec<DiffEntry>> {
+        self.fs.diff_as(ctx, from, to).await
+    }
+
+    /// [`diff_file`](Self::diff_file), checked against `READ` at the path — a
+    /// unified diff of a file is that file's content in another arrangement.
+    pub async fn diff_file_as(
+        &self,
+        ctx: WriteCtx,
+        from: &str,
+        to: &str,
+        path: &str,
+    ) -> Result<String> {
+        self.fs.diff_file_as(ctx, from, to, path).await
+    }
+
+    /// [`presence`](Self::presence), with sessions at unreadable paths removed —
+    /// and a session that names no path removed too, because it still says a
+    /// neighbour is connected. Same ruling `Scope` already makes for tenancy.
+    pub async fn presence_as(&self, ctx: WriteCtx, window_secs: i64) -> Result<Vec<Presence>> {
+        self.fs.presence_as(ctx, window_secs).await
+    }
+
+    /// [`list_suggestions`](Self::list_suggestions), with proposals against
+    /// unreadable paths removed.
+    pub async fn list_suggestions_as(
+        &self,
+        ctx: WriteCtx,
+        status: Option<SuggestionStatus>,
+        path: Option<&str>,
+    ) -> Result<Vec<Suggestion>> {
+        self.fs.list_suggestions_as(ctx, status, path).await
+    }
+
+    /// [`get_suggestion`](Self::get_suggestion), answering `None` for a proposal
+    /// against a path the actor may not read — not found rather than denied,
+    /// because a suggestion id is a guessable global handle and a refusal would
+    /// confirm one exists.
+    pub async fn get_suggestion_as(&self, ctx: WriteCtx, id: i64) -> Result<Option<Suggestion>> {
+        self.fs.get_suggestion_as(ctx, id).await
+    }
+
+    /// [`live_doc`](Self::live_doc), answering `None` for a path the actor may
+    /// not read — a filter, because "is this path live" is an existence question.
+    pub async fn live_doc_as(&self, ctx: WriteCtx, path: &str) -> Result<Option<LiveDoc>> {
+        self.fs.live_doc_as(ctx, path).await
+    }
+
+    /// [`live_paths`](Self::live_paths), with unreadable paths removed.
+    pub async fn live_paths_as(&self, ctx: WriteCtx) -> Result<Vec<LiveDoc>> {
+        self.fs.live_paths_as(ctx).await
+    }
+
+    /// [`suggestion_diff`](Self::suggestion_diff), raising the ordinary
+    /// `NotFound` for a proposal against a path the actor may not read.
+    pub async fn suggestion_diff_as(&self, ctx: WriteCtx, id: i64) -> Result<String> {
+        self.fs.suggestion_diff_as(ctx, id).await
     }
 
     // --- portable dump/load (issue #117) ------------------------------------

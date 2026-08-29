@@ -162,7 +162,7 @@ impl McpServer {
         };
         match name {
             "origofs_read" => {
-                let bytes = self.ws.read(&path()?).await?;
+                let bytes = self.ws.read_as(self.ctx(), &path()?).await?;
                 Ok(String::from_utf8_lossy(&bytes).into_owned())
             }
             "origofs_write" => {
@@ -221,7 +221,7 @@ impl McpServer {
                         "edit: `old` and `new` are identical — nothing to change".into(),
                     ));
                 }
-                let bytes = self.ws.read(p).await?;
+                let bytes = self.ws.read_as(self.ctx(), p).await?;
                 let text = std::str::from_utf8(&bytes).map_err(|_| {
                     OrigoFSError::InvalidArgument(format!(
                         "{p}: not a UTF-8 text file; edit works on text"
@@ -343,25 +343,29 @@ impl McpServer {
                 ))
             }
             "origofs_live" => match args.get("path").and_then(Value::as_str) {
-                Some(p) if !p.is_empty() => match self.ws.live_doc(&path()?).await? {
-                    Some(l) => Ok(format!(
-                        "{p} is LIVE (open since {} by actor {}): its durable bytes are a \
+                Some(p) if !p.is_empty() => {
+                    match self.ws.live_doc_as(self.ctx(), &path()?).await? {
+                        Some(l) => Ok(format!(
+                            "{p} is LIVE (open since {} by actor {}): its durable bytes are a \
                              checkpoint and may lag the open document — origofs_read still \
                              answers, it just may be behind. Propose with \
                              origofs_suggest_coedit rather than origofs_write.",
-                        l.since, l.actor_id
-                    )),
-                    None => Ok(format!(
-                        "{p} is not live: its stored bytes are the whole truth"
-                    )),
-                },
+                            l.since, l.actor_id
+                        )),
+                        None => Ok(format!(
+                            "{p} is not live: its stored bytes are the whole truth"
+                        )),
+                    }
+                }
                 _ => {
                     // The live-document list is workspace-wide, so unscoped it
                     // reports which of a neighbour's paths are being edited right
                     // now — a side door around the path tools (issue #125).
                     let live = self
                         .scope
-                        .filter(self.ws.live_paths().await?, |l| Some(l.path.as_str()));
+                        .filter(self.ws.live_paths_as(self.ctx()).await?, |l| {
+                            Some(l.path.as_str())
+                        });
                     if live.is_empty() {
                         return Ok("no live documents".to_string());
                     }
@@ -388,7 +392,11 @@ impl McpServer {
                 };
                 let list = self
                     .ws
-                    .list_suggestions(Some(SuggestionStatus::Pending), path_filter.as_deref())
+                    .list_suggestions_as(
+                        self.ctx(),
+                        Some(SuggestionStatus::Pending),
+                        path_filter.as_deref(),
+                    )
                     .await?;
                 let list = self.scope.filter(list, |s| Some(s.path.as_str()));
                 if list.is_empty() {
@@ -410,7 +418,7 @@ impl McpServer {
             }
             "origofs_suggestion_diff" => {
                 let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
-                self.ws.suggestion_diff(id).await
+                self.ws.suggestion_diff_as(self.ctx(), id).await
             }
             "origofs_accept" => {
                 let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
@@ -423,7 +431,7 @@ impl McpServer {
                 Ok(format!("rejected suggestion #{id}"))
             }
             "origofs_ls" => {
-                let entries = self.ws.ls(&path()?).await?;
+                let entries = self.ws.ls_as(self.ctx(), &path()?).await?;
                 Ok(entries
                     .iter()
                     .map(|e| format!("{}\t{}", e.kind.as_str(), e.name))
@@ -452,7 +460,7 @@ impl McpServer {
                 }
             }
             "origofs_blame" => {
-                let ranges = self.ws.blame(&path()?).await?;
+                let ranges = self.ws.blame_as(self.ctx(), &path()?).await?;
                 Ok(ranges
                     .iter()
                     .map(|r| {

@@ -458,6 +458,61 @@ async fn every_mutating_mcp_tool_is_policy_classified() {
     }
 }
 
+/// No MCP tool reads through an **unattributed** engine method.
+///
+/// The read counterpart of the classification test above, and the guard on issue
+/// #124's phase 2. Every read tool has an agent — the MCP server resolves one at
+/// startup and attributes every mutation to it — so unlike the HTTP surface there
+/// is no anonymous case to accommodate: a read tool calling `ws.read` rather than
+/// `ws.read_as` is simply dropping an identity it already holds, and
+/// `acl_enforce_reads` becomes decoration for every agent on the server.
+///
+/// Scanned from source rather than exercised, for the same reason the sibling is:
+/// a new tool is invisible to behavioural tests until someone writes one.
+#[test]
+fn no_mcp_tool_reads_through_an_unattributed_method() {
+    // The unattributed reads. Each has an `_as` twin that consults `Perms::READ`;
+    // these exist for checkout, merge, gc and the CRDT coordinator, none of which
+    // is an MCP tool.
+    const UNATTRIBUTED: &[&str] = &[
+        "read(",
+        "read_range(",
+        "ls(",
+        "stat(",
+        "readlink(",
+        "blame(",
+        "diff(",
+        "diff_file(",
+        "presence(",
+        "live_doc(",
+        "live_paths(",
+        "list_suggestions(",
+        "get_suggestion(",
+        "suggestion_diff(",
+    ];
+
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp.rs"),
+    )
+    .unwrap();
+
+    let mut offenders = Vec::new();
+    for m in UNATTRIBUTED {
+        let needle = format!("ws.{m}");
+        if src.contains(&needle) {
+            offenders.push(needle);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these unattributed reads are called from the MCP server, so the tools \
+         using them answer without consulting `Perms::READ`:\n  {}\n\nThe MCP \
+         server always has an agent — call the `_as` twin with `self.ctx()`.",
+        offenders.join("\n  ")
+    );
+}
+
 /// Every tool that takes a `path` resolves it through the server's [`Scope`], and
 /// no tool leaks a path outside it (issue #125).
 ///
