@@ -11,7 +11,7 @@ version = "0.1.0"
 # edition behind the three crates that set `2024` explicitly.
 edition = "2024"
 rust-version = "1.88"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/danplischke/origofs"
 description = "origofs — an agent-and-human filesystem: content-addressed storage, pluggable metadata DB, opt-in Git-style versioning, and per-actor edit attribution"
 keywords = ["filesystem", "content-addressed", "versioning", "attribution", "agents"]

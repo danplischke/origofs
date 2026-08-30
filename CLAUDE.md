@@ -521,4 +521,4 @@ compiling at all until #107.
 
 ## License
 
-MIT OR Apache-2.0
+MIT

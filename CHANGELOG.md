@@ -7,6 +7,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
+### Changed
+
+- **License consolidated to MIT only.** The project was dual-licensed
+  `MIT OR Apache-2.0`; it is now MIT alone. `LICENSE-MIT` became `LICENSE`,
+  `LICENSE-APACHE` is gone, and every declaration (`[workspace.package]`,
+  `pyproject.toml`, README, CONTRIBUTING) says `MIT`. Under the old `OR` terms
+  every user already had the right to take the code as MIT, so nothing anyone
+  holds is narrowed.
+
 ### Added
 
 - **A structured (`Y.XmlFragment`) co-editing shape, so rich-text editors bind
