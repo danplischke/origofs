@@ -291,6 +291,7 @@ impl Workspace {
     ///
     /// Reads or creates the key-derivation salt sidecar as a side effect, so
     /// calling it twice against one backend is idempotent, not a re-key.
+    #[cfg(feature = "encryption")]
     pub async fn encrypted_content(backend: Content, passphrase: &str) -> Result<Content> {
         let salt = read_or_create_salt(&backend).await?;
         Ok(Arc::new(EncryptedStore::from_passphrase(
