@@ -8,7 +8,7 @@
 and every byte knows who wrote it.**
 
 [![CI](https://github.com/danplischke/origofs/actions/workflows/ci.yml/badge.svg)](https://github.com/danplischke/origofs/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![license](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.88%2B-dea584)](#install)
 [![design](https://img.shields.io/badge/docs-DESIGN.md-informational)](docs/DESIGN.md)
 
@@ -1065,4 +1065,4 @@ attribution, and the failure-surface work — live in
 
 ## License
 
-MIT OR Apache-2.0
+MIT — see [`LICENSE`](LICENSE).

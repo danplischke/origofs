@@ -101,4 +101,4 @@ design doc section or issue where relevant.
 ## License
 
 By contributing you agree that your contributions are licensed under the same
-terms as the project: MIT OR Apache-2.0.
+terms as the project: MIT.
