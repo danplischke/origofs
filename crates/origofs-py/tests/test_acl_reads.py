@@ -9,6 +9,8 @@ a Python caller:
 * the router runs reads *as* the actor its `reader` dependency resolves, and
   refuses an anonymous read once the workspace enforces.
 """
+import asyncio
+import functools
 import os
 import tempfile
 
@@ -42,10 +44,21 @@ async def _fixture():
     return ws, owner, bob
 
 
+def _sync(coro_fn):
+    """CI runs pytest without pytest-asyncio; the repo convention is a sync
+    test that drives its coroutine itself (see test_fastapi_tenant_scope.py)."""
+
+    @functools.wraps(coro_fn)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(coro_fn(*args, **kwargs))
+
+    return wrapper
+
+
 # --- the bindings ------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_attributed_reads_are_open_until_the_workspace_opts_in():
     ws, _owner, bob = await _fixture()
     ctx = origofs.WriteCtx.actor(bob)
@@ -57,7 +70,7 @@ async def test_attributed_reads_are_open_until_the_workspace_opts_in():
     assert await ws.blame_as(ctx, "/secret.md") is not None
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_every_attributed_read_is_gated_once_enforced():
     ws, _owner, bob = await _fixture()
     ctx = origofs.WriteCtx.actor(bob)
@@ -79,7 +92,7 @@ async def test_every_attributed_read_is_gated_once_enforced():
     assert bytes(await ws.read_as(ctx, "/proj/open.md")) == b"shared\n"
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_a_listing_hides_exactly_what_a_stat_refuses():
     # The pair property. A listing that promises more than a stat delivers is
     # useless; one that hides what a stat serves is an existence oracle. Both
@@ -98,7 +111,7 @@ async def test_a_listing_hides_exactly_what_a_stat_refuses():
         await ws.stat_as(ctx, "/secret.md")
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_the_collection_reads_filter_rather_than_refuse():
     ws, owner, bob = await _fixture()
     octx, bctx = origofs.WriteCtx.actor(owner), origofs.WriteCtx.actor(bob)
@@ -149,7 +162,7 @@ def _app(ws, owner, bob, *, reader_returns_ctx=True):
     return TestClient(app)
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_router_reads_run_as_the_reader_context():
     ws, owner, bob = await _fixture()
     await ws.set_acl_default_deny(True)
@@ -163,7 +176,7 @@ async def test_router_reads_run_as_the_reader_context():
     )
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_router_refuses_an_anonymous_read_once_enforced():
     # The hole this closes. Reads are open by default, so a read route cannot
     # demand a credential unconditionally — it has to demand one exactly when
@@ -176,7 +189,7 @@ async def test_router_refuses_an_anonymous_read_once_enforced():
     assert c.get("/files/secret.md").status_code == 401
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_a_gate_only_reader_still_works():
     # Backwards compatibility: a `reader` returning None is the documented
     # older shape, and it keeps behaving as a gate whose value is ignored.
@@ -189,7 +202,7 @@ async def test_a_gate_only_reader_still_works():
 # --- tree proposals over the router (#92) ------------------------------------
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_a_propose_only_agent_proposes_and_a_reviewer_accepts_over_http():
     """The route a Plate/y-prosemirror app needs: an agent with `propose` and no
     `write` suggests a change to a rich-text document, and a human lands it.
@@ -253,7 +266,7 @@ async def test_a_propose_only_agent_proposes_and_a_reviewer_accepts_over_http():
 # --- trash over the router (#115) --------------------------------------------
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_the_trash_is_reachable_and_scoped_over_http():
     """The engine has had a recoverable delete since #115 and no surface exposed
     it — no route, no tool, no subcommand. A recovery path nobody can reach does
@@ -276,7 +289,7 @@ async def test_the_trash_is_reachable_and_scoped_over_http():
     assert bytes(await ws.read("/secret.md")) == b"private v2\n"
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_a_trash_listing_hides_what_the_reader_may_not_stat():
     # A trash entry names a path and when it was deleted, which is what a `stat`
     # on the restored path would say — so the same per-entry rule applies.
@@ -292,7 +305,7 @@ async def test_a_trash_listing_hides_what_the_reader_may_not_stat():
     assert c.get("/trash", headers={"X-Actor": str(bob)}).json() == []
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_purging_takes_the_write_right_not_merely_a_credential():
     # Purging destroys the only remaining copy of an uncommitted file, so it
     # takes the same right as writing where that file used to live.

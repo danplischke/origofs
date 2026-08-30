@@ -14,6 +14,7 @@ Build + run (from crates/origofs-py, in a venv):
     pytest tests/test_coedit_tree.py
 """
 import asyncio
+import functools
 import os
 import tempfile
 import time
@@ -34,6 +35,18 @@ def _run(make):
         return await make()
 
     return _LOOP.run_until_complete(_go())
+
+
+def _sync(coro_fn):
+    """CI runs pytest without pytest-asyncio; drive the coroutine on the
+    module loop, matching `_run` above."""
+
+    @functools.wraps(coro_fn)
+    def wrapper(*args, **kwargs):
+        return _LOOP.run_until_complete(coro_fn(*args, **kwargs))
+
+    return wrapper
+
 
 
 def _app(policy=None):
@@ -317,7 +330,7 @@ def test_a_socketless_tree_checkpoint_leaves_no_live_marker():
 # --- tree-shaped proposals (issues #75 §3.2, #92) ---------------------------
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_a_propose_only_agent_can_propose_against_a_tree_document():
     """The gap this closes: on the shape a rich-text editor uses, a propose-only
     agent could not reach the review queue at all. Its options were a byte
@@ -370,7 +383,7 @@ async def test_a_propose_only_agent_can_propose_against_a_tree_document():
     assert any(r["actor"]["id"] == agent for r in await ws.blame("/doc.md"))
 
 
-@pytest.mark.asyncio
+@_sync
 async def test_the_sidecar_reports_its_root_so_a_reviewer_need_not_know_it():
     d = tempfile.mkdtemp()
     ws = await origofs.Workspace.open_local(
