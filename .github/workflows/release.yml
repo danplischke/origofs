@@ -25,11 +25,18 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  # Dry runs: build every wheel without tagging or publishing anything.
+  # Manual runs build every wheel. They publish only when `tag` names an
+  # existing v* tag — `github.ref` is a branch here, so it can't stand in for one.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to release. Leave empty for a wheels-only dry run."
+        type: string
+        required: false
+        default: ""
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -48,33 +55,57 @@ jobs:
     name: Tag is on main
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Every downstream job reads its release decision from here, so "is this a
+    # release?" is answered once, for both triggers, in the job that can check it.
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      tag: ${{ steps.check.outputs.tag }}
+      ref: ${{ steps.check.outputs.ref }}
     steps:
       # Full history: `merge-base --is-ancestor` needs both the tagged commit and
       # main's, and a tag push checks out at depth 1 by default.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Require the tagged commit to be on main
+        id: check
         shell: bash
         # Via env, not `${{ }}` interpolation — a tag name is attacker-shaped
         # input and must never be pasted into the script body.
         env:
           EVENT: ${{ github.event_name }}
-          TAG: ${{ github.ref_name }}
+          PUSHED_TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" != "push" ]; then
+          if [ "$EVENT" = "push" ]; then
+            TAG="$PUSHED_TAG"
+            SHA="$GITHUB_SHA"
+          elif [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+            if ! SHA=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+              echo "::error::No tag '$TAG' in this repository. Push the tag first, then re-run."
+              exit 1
+            fi
+          else
             echo "Dry run ($EVENT, $GITHUB_REF) — wheels only, nothing is published."
+            printf 'publish=false\ntag=\nref=%s\n' "$GITHUB_REF" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::'$TAG' is not a v* tag."; exit 1 ;;
+          esac
           git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Tag '$TAG' points at $GITHUB_SHA, which is not on main." \
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::Tag '$TAG' points at $SHA, which is not on main." \
                  "Releases are only cut from v* tags on main — merge to main first, then tag."
             exit 1
           fi
-          echo "Tag '$TAG' ($GITHUB_SHA) is on main."
+          echo "Tag '$TAG' ($SHA) is on main."
+          printf 'publish=true\ntag=%s\nref=refs/tags/%s\n' "$TAG" "$TAG" >> "$GITHUB_OUTPUT"
 
   wheels:
     name: ${{ matrix.name }}
@@ -108,7 +139,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             args: --release --out dist
     steps:
+      # The guard's ref, not the run's: a manual release is dispatched from a
+      # branch, so the default checkout would build main's HEAD, not the tag's.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -154,6 +189,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.ref }}
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
@@ -171,7 +208,7 @@ jobs:
   github-release:
     name: Attach to GitHub Release
     needs: [guard, wheels, sdist]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.guard.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -185,10 +222,13 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # Explicit: on a manual release `github.ref` is the branch it was
+          # dispatched from, not the tag being released.
+          tag_name: ${{ needs.guard.outputs.tag }}
           # A tag with a pre-release suffix (`v0.1.0-rc.1`) is marked as such, so
           # it doesn't show as the repository's latest release and `pip` won't
           # install it without `--pre`. GitHub does not infer this from semver.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(needs.guard.outputs.tag, '-') }}
 
   # Publish to PyPI via Trusted Publishing (OIDC — no API token in secrets).
   #
@@ -202,7 +242,7 @@ jobs:
   pypi:
     name: Publish to PyPI
     needs: [guard, wheels, sdist]
-    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_TO_PYPI == 'true'
+    if: needs.guard.outputs.publish == 'true' && vars.PUBLISH_TO_PYPI == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
