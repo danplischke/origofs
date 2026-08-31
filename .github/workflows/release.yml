@@ -236,7 +236,9 @@ jobs:
   # missing publisher. To enable:
   #   1. On PyPI, add a trusted publisher for the `origofs` project:
   #      owner `danplischke`, repo `origofs`, workflow `release.yml`,
-  #      environment `pypi`.
+  #      environment `pypi`. While the project does not exist on PyPI yet this
+  #      is a *pending* publisher — all five fields must match exactly, or the
+  #      OIDC exchange is rejected and no token is minted.
   #   2. Create a `pypi` environment in the repo's settings.
   #   3. Set the repository variable PUBLISH_TO_PYPI to `true`.
   pypi:
@@ -252,7 +254,10 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - uses: PyO3/maturin-action@v1
+      # Not `maturin upload`: it is deprecated (PyO3/maturin#2334), and it
+      # reports a rejected OIDC claim as `missing field "token"` rather than
+      # naming the publisher mismatch that caused it.
+      - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          command: upload
-          args: --non-interactive --skip-existing dist/*
+          packages-dir: dist
+          skip-existing: true
