@@ -64,7 +64,7 @@ jobs:
     steps:
       # Full history: `merge-base --is-ancestor` needs both the tagged commit and
       # main's, and a tag push checks out at depth 1 by default.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -141,11 +141,11 @@ jobs:
     steps:
       # The guard's ref, not the run's: a manual release is dispatched from a
       # branch, so the default checkout would build main's HEAD, not the tag's.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.guard.outputs.ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -177,7 +177,7 @@ jobs:
           pip install --no-index --find-links dist origofs
           python ../../.github/scripts/wheel_smoke.py
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.name }}
           path: crates/origofs-py/dist/*.whl
@@ -188,7 +188,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.guard.outputs.ref }}
       - name: Build sdist
@@ -197,7 +197,7 @@ jobs:
           command: sdist
           args: --out dist
           working-directory: crates/origofs-py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: crates/origofs-py/dist/*.tar.gz
@@ -213,7 +213,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -248,7 +248,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

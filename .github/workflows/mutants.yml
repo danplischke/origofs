@@ -39,7 +39,7 @@ jobs:
         # is the complete, disjoint partition of the ~1700 mutants.
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -70,7 +70,7 @@ jobs:
       # exits non-zero.
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mutants-shard-${{ matrix.shard }}
           path: mutants.out/
@@ -93,7 +93,7 @@ jobs:
         # Same 0-based k/N partition as the core sweep.
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -123,7 +123,7 @@ jobs:
       # two sweeps' reports don't collide.
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mutants-sdk-shard-${{ matrix.shard }}
           path: mutants.out/
