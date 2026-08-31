@@ -7,6 +7,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
+## [0.0.3] — 2026-08-30
+
+The 0.1.0 section below announced a tagged release, but the `v0.1.0` tag was
+never pushed, so the release workflow never ran and no 0.1.0 wheels shipped.
+`v0.0.3` is therefore the first release actually cut through `release.yml`,
+and it carries everything since `v0.0.2`.
+
 ### Changed
 
 - **License consolidated to MIT only.** The project was dual-licensed
@@ -477,5 +484,6 @@ The `#[non_exhaustive]` markings above exist so that the changes most likely
 during hardening — a new error variant, a new counter on a report — are additive
 rather than breaking.
 
-[Unreleased]: https://github.com/danplischke/origofs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/danplischke/origofs/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/danplischke/origofs/compare/v0.0.2...v0.0.3
 [0.1.0]: https://github.com/danplischke/origofs/releases/tag/v0.1.0

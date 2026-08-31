@@ -22,7 +22,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # below, so a consumer can build a SQLite-only workspace without linking the
 # Postgres, object-store, and encryption trees. `full` and the default feature
 # set keep all three on, so nothing changes unless you ask.
-origofs-core = { version = "0.1.0", path = "../origofs-core", default-features = false }
+origofs-core = { version = "0.0.3", path = "../origofs-core", default-features = false }
 bytes = "1.12.1"
 futures = "0.3.33"
 getrandom = "0.2"

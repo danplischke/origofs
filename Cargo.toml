@@ -6,7 +6,7 @@ members = ["crates/origofs-core", "crates/origofs-sdk", "crates/origofs-cli", "c
 # One version for the whole workspace. It was `0.0.0` here while origofs-core/-sdk/
 # -cli each hardcoded `0.1.0` — so `origofs-py`, the only crate that inherited it,
 # built a wheel that `pip` saw as version 0.0.0.
-version = "0.1.0"
+version = "0.0.3"
 # `2021` here was likewise inherited only by origofs-py, leaving it a language
 # edition behind the three crates that set `2024` explicitly.
 edition = "2024"
