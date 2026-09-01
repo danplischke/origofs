@@ -10,7 +10,7 @@
 # Must be >= the workspace MSRV enforced by the `msrv` CI job (edition 2024 sets a
 # 1.85 *language* floor, but the code uses let-chains, stabilized in 1.88). Keep
 # this in step with .github/workflows/ci.yml's `msrv` job.
-FROM rust:1.88-slim AS build
+FROM rust:1.98-slim AS build
 # The CLI enables origofs-sdk's `full` features, including FUSE — but `fuser`'s
 # `libfuse`/`libfuse3` features are off by default (see release.yml), so on Linux
 # it takes the pure-Rust mount path and links no C library at build time. The
