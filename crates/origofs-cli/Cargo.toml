@@ -29,7 +29,7 @@ path = "src/bin/git-remote-origofs.rs"
 # `metrics` is enabled explicitly rather than folded into `full` (same treatment
 # as `coedit`): the library stays emit-only, and this binary is the one that
 # installs an exporter — see `init_metrics` below.
-origofs-sdk = { version = "0.0.3", path = "../origofs-sdk", features = ["full", "metrics"] }
+origofs-sdk = { version = "0.0.4", path = "../origofs-sdk", features = ["full", "metrics"] }
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
 # Config-file backend selection (`--config`): pick Postgres/S3/GCS for the
