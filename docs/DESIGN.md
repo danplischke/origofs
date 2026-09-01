@@ -166,8 +166,7 @@ A version above what a build can read surfaces as `UnsupportedVersion` (machine 
 deliberately **not** `Corrupt`: the bytes are fine and the fix is to upgrade origofs, not to restore a backup.
 
 **Store descriptor.** Per-object versions only help a caller that reaches the object, and several paths treat
-bytes they can't parse as *absent* (recovery classification, the co-edit sidecar's rebuild-on-unparseable
-fallback). So `Fs::init` — which every `Workspace::open_*` funnels through — stamps a tiny descriptor
+bytes they can't parse as *absent* (recovery classification). So `Fs::init` — which every `Workspace::open_*` funnels through — stamps a tiny descriptor
 (`ORGS | version | format_version | min_reader_version`) into a **named slot** on the content store and checks it
 on every open: one loud, actionable failure at open instead of N confusing ones later. `min_reader_version` is
 what gates, so a future additive change can leave older readers working. Named slots
@@ -176,6 +175,17 @@ namespace — `<root>/meta/<name>` on a local CAS, `<prefix>.meta/<name>` on an 
 returns them and GC can never sweep them. A store with no descriptor is a fresh one and is stamped on open.
 `EncryptedStore` passes slots through in plaintext (like the Argon2id salt) so "needs a newer origofs" stays
 distinguishable from "wrong passphrase".
+
+**The co-edit sidecars carry the header too, and are deliberately outside the descriptor.** A sidecar is not a
+content-store object — it is an ordinary working-tree *file body* — but it is the sharpest case of the
+"unparseable reads as absent" hazard above: an unrecognized flat sidecar rebuilds from the file (losing the
+editing history), and an unrecognized tree one opens **empty**, which a host that ignores `resumed()` then
+checkpoints over the real file. So both are framed `ORGY | version | …` (flat) and `ORGX | version | …` (tree),
+with the pre-versioning single-byte framings (`1`/`2`) still read forever — unambiguous, since neither byte is
+`O`. A version above what the build reads is `UnsupportedVersion`, never the fallback. They stay out of
+`GRAPH_KINDS`, and so out of the store descriptor's `format_version`, because a store-level bump locks an older
+build out of the *whole* store at open, and co-editing is an opt-in feature (`coedit`) most workspaces never
+write a byte of; the loud per-document error is the proportionate replacement.
 
 **Packs are versioned at the end, not the start.** A pack object *begins* with raw user bytes: a chunk whose
 contents start with `ORGP` would be indistinguishable from a header, so byte 0 cannot carry a trustworthy tag

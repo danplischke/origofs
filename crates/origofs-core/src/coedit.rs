@@ -16,6 +16,7 @@ use crate::attribution::{BlameRange, WriteCtx};
 use crate::content::ContentStore;
 use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
+use crate::format;
 use crate::metadata::MetadataStore;
 use similar::{ChangeTag, TextDiff};
 use std::sync::Arc;
@@ -1062,23 +1063,60 @@ pub fn coedit_sidecar_path(path: &str) -> String {
     format!("{COEDIT_SIDECAR_DIR}/{}", hex::encode(path.as_bytes()))
 }
 
-/// Framing tag for the sidecar blob: `[SIDECAR_MAGIC][32-byte BLAKE3 of the flat
-/// text it crystallized][ydoc state update]`. The embedded hash is the coherence
-/// marker — [`open_coedit`](Fs::open_coedit) resumes the CRDT only if the file
-/// still hashes to it, else rebuilds from the file.
-const SIDECAR_MAGIC: u8 = 1;
+/// Length of the coherence hash a sidecar embeds (BLAKE3).
+const SIDECAR_HASH_LEN: usize = 32;
 
-/// Split a framed sidecar blob into `(flat_hash, ydoc_state)`, or `None` if it
-/// isn't in the current format (a truncated or corrupt blob — the caller then
-/// rebuilds from the flat file, which is always safe). Unlike the content-store
-/// objects in [`crate::format`], the sidecar is a resumable *cache*, so an
-/// unreadable one costs a rebuild rather than data: falling back is correct here.
-fn parse_sidecar(blob: &[u8]) -> Option<(&[u8], &[u8])> {
-    if blob.len() >= 33 && blob[0] == SIDECAR_MAGIC {
-        Some((&blob[1..33], &blob[33..]))
+/// The **pre-versioning** framing: `[1][32-byte hash][ydoc state]`, written by
+/// every origofs up to 0.0.4. Kept readable forever — it is the one format a
+/// bucket in the wild is guaranteed to hold, and re-framing an existing sidecar
+/// would need a migration pass over the working tree to buy nothing.
+///
+/// It is unambiguous against the versioned framing because that one opens with an
+/// ASCII tag (`O` = 0x4f), which `1` is not.
+const LEGACY_SIDECAR_MAGIC: u8 = 1;
+
+/// Frame a sidecar blob:
+/// `ORGY | version | [32-byte BLAKE3 of the flat text it crystallized] | [ydoc state]`.
+///
+/// The embedded hash is the coherence marker — [`open_coedit`](Fs::open_coedit)
+/// resumes the CRDT only if the file still hashes to it, else rebuilds from the
+/// file.
+fn frame_sidecar(text: &[u8], state: &[u8]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(format::HEADER_LEN + SIDECAR_HASH_LEN + state.len());
+    blob.extend_from_slice(&format::COEDIT_SIDECAR.header());
+    blob.extend_from_slice(blake3::hash(text).as_bytes());
+    blob.extend_from_slice(state);
+    blob
+}
+
+/// Split a framed sidecar blob into `(flat_hash, ydoc_state)`.
+///
+/// Three outcomes, and the difference between the last two is the whole point of
+/// the version byte:
+///
+/// - `Ok(Some(..))` — a v1 or legacy sidecar, resumable.
+/// - `Ok(None)` — not a sidecar this build recognizes *at all* (truncated, or
+///   foreign bytes). The sidecar is a resumable **cache**, so the caller falls
+///   back: the flat shape rebuilds from the file, which is always safe.
+/// - `Err(UnsupportedVersion)` — a sidecar written by a **newer** origofs. That
+///   is emphatically not a cache miss: the bytes are fine and the fix is to
+///   upgrade, so folding it into the fallback above would report a document with
+///   history as one without, and quietly drop the history on the next checkpoint.
+///   See `check_store_format` in `engine.rs`, which names this exact path.
+fn parse_sidecar(blob: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+    let body = if format::COEDIT_SIDECAR.tagged(blob) {
+        match format::COEDIT_SIDECAR.version_of(blob)? {
+            1 => &blob[format::HEADER_LEN..],
+            // Unreachable while `max_read_version` matches the arms above;
+            // `version_of` has already refused anything higher.
+            v => return Err(format::COEDIT_SIDECAR.unsupported(v)),
+        }
+    } else if blob.first() == Some(&LEGACY_SIDECAR_MAGIC) {
+        &blob[1..]
     } else {
-        None
-    }
+        return Ok(None);
+    };
+    Ok((body.len() >= SIDECAR_HASH_LEN).then(|| body.split_at(SIDECAR_HASH_LEN)))
 }
 
 /// Tile `text` into consecutive `(actor, session, byte_len)` spans from its blame
@@ -1168,11 +1206,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // underneath (an accepted suggestion, a merge, a plain write) and rebuild
         // instead of resuming a stale CRDT.
         self.mkdir_p(COEDIT_SIDECAR_DIR).await?;
-        let state = doc.state_update();
-        let mut blob = Vec::with_capacity(1 + 32 + state.len());
-        blob.push(SIDECAR_MAGIC);
-        blob.extend_from_slice(blake3::hash(text.as_bytes()).as_bytes());
-        blob.extend_from_slice(&state);
+        let blob = frame_sidecar(text.as_bytes(), &doc.state_update());
         self.write(&coedit_sidecar_path(path), &blob).await?;
         // Refresh the live marker's coherence hash to what we just wrote, so the
         // *next* checkpoint can again tell an out-of-band write from our own. Only
@@ -1266,7 +1300,9 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
             Err(e) => return Err(e),
         };
-        let Some((_, ydoc)) = parse_sidecar(&sidecar) else {
+        // `?`, not a `refuse`: a sidecar from a newer origofs is an upgrade
+        // problem, not an unreconcilable document.
+        let Some((_, ydoc)) = parse_sidecar(&sidecar)? else {
             return refuse("its CRDT sidecar is unreadable");
         };
         let replica = CoeditDoc::load(ydoc)?;
@@ -1287,7 +1323,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub(crate) async fn load_coedit(&self, ctx: WriteCtx, path: &str) -> Result<CoeditDoc> {
         match self.read(&coedit_sidecar_path(path)).await {
             Ok(blob) => {
-                if let Some((flat_hash, ydoc)) = parse_sidecar(&blob) {
+                if let Some((flat_hash, ydoc)) = parse_sidecar(&blob)? {
                     let current = match self.read(path).await {
                         Ok(b) => b,
                         Err(OrigoFSError::NotFound(_)) => bytes::Bytes::new(),

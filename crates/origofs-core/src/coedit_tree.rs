@@ -80,6 +80,7 @@ use crate::coedit::{
 use crate::content::ContentStore;
 use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
+use crate::format;
 use crate::metadata::MetadataStore;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -651,13 +652,12 @@ fn raw_text<T: ReadTxn>(text: &XmlTextRef, txn: &T) -> String {
     out
 }
 
-/// Framing tag for a tree sidecar blob:
-/// `[TREE_SIDECAR_MAGIC][root len][root][32-byte BLAKE3 of the body it crystallized][ydoc state]`.
-///
-/// Distinct from the flat sidecar's tag so neither can ever be read as the other,
-/// and carrying the root name because a tree opened under a different root would
-/// silently be a different (empty) document.
-const TREE_SIDECAR_MAGIC: u8 = 2;
+/// The **pre-versioning** tree framing:
+/// `[2][root len][root][32-byte hash][ydoc state]`, written by every origofs up
+/// to 0.0.4 and readable forever. The tag was distinct from the flat sidecar's so
+/// neither could ever be read as the other; the versioned framing keeps that
+/// property with a distinct four-byte tag instead.
+const LEGACY_TREE_SIDECAR_MAGIC: u8 = 2;
 
 /// The sidecar path for a tree-co-edited `path`. The `t` prefix keeps it clear of
 /// the flat sidecar's hex-encoded name, so one path can have both without collision.
@@ -665,14 +665,20 @@ pub fn coedit_tree_sidecar_path(path: &str) -> String {
     format!("{COEDIT_SIDECAR_DIR}/t{}", hex::encode(path.as_bytes()))
 }
 
-/// Frame a tree sidecar blob.
+/// Frame a tree sidecar blob:
+/// `ORGX | version | [root len][root] | [32-byte BLAKE3 of the body it crystallized] | [ydoc state]`.
+///
+/// It carries the root name because a tree resumed under a different root would
+/// silently be a different (empty) document.
 fn frame_tree_sidecar(root: &str, body: &[u8], state: &[u8]) -> Result<Vec<u8>> {
     let root = root.as_bytes();
     let len = u8::try_from(root.len()).map_err(|_| {
         OrigoFSError::InvalidArgument("co-edit tree root name must be at most 255 bytes".into())
     })?;
-    let mut blob = Vec::with_capacity(2 + root.len() + 32 + state.len());
-    blob.push(TREE_SIDECAR_MAGIC);
+    let mut blob = Vec::with_capacity(
+        format::HEADER_LEN + 1 + root.len() + TREE_SIDECAR_HASH_LEN + state.len(),
+    );
+    blob.extend_from_slice(&format::COEDIT_TREE_SIDECAR.header());
     blob.push(len);
     blob.extend_from_slice(root);
     blob.extend_from_slice(blake3::hash(body).as_bytes());
@@ -680,20 +686,57 @@ fn frame_tree_sidecar(root: &str, body: &[u8], state: &[u8]) -> Result<Vec<u8>> 
     Ok(blob)
 }
 
-/// Split a framed tree sidecar into `(root, body_hash, ydoc_state)`, or `None` if
-/// it is not in the current format. As with the flat sidecar, an unreadable one is
-/// a cache miss rather than data loss — the caller opens an empty document and the
-/// host reseeds.
-fn parse_tree_sidecar(blob: &[u8]) -> Option<(&str, &[u8], &[u8])> {
-    if blob.len() < 2 || blob[0] != TREE_SIDECAR_MAGIC {
-        return None;
-    }
-    let root_len = blob[1] as usize;
-    let rest = blob.get(2..)?;
+/// Length of the coherence hash a tree sidecar embeds (BLAKE3).
+const TREE_SIDECAR_HASH_LEN: usize = 32;
+
+/// Split a framed tree sidecar into its root, coherence hash and ydoc state.
+///
+/// The three outcomes are `coedit::parse_sidecar`'s, and the middle one
+/// costs more here. `Ok(None)` — unrecognized bytes — opens an **empty**
+/// document, because origofs cannot rebuild a tree from a flat file the way the
+/// flat shape can. So a sidecar from a newer origofs must not land there: it is
+/// `Err(UnsupportedVersion)`, or a host that never checks
+/// [`resumed`](CoeditTreeDoc::resumed) checkpoints an empty body over a file whose
+/// history this build simply failed to recognize.
+fn parse_tree_sidecar(blob: &[u8]) -> Result<Option<TreeSidecar<'_>>> {
+    let body = if format::COEDIT_TREE_SIDECAR.tagged(blob) {
+        match format::COEDIT_TREE_SIDECAR.version_of(blob)? {
+            1 => &blob[format::HEADER_LEN..],
+            // Unreachable while `max_read_version` matches the arms above.
+            v => return Err(format::COEDIT_TREE_SIDECAR.unsupported(v)),
+        }
+    } else if blob.first() == Some(&LEGACY_TREE_SIDECAR_MAGIC) {
+        &blob[1..]
+    } else {
+        return Ok(None);
+    };
+    Ok(split_tree_sidecar(body))
+}
+
+/// A parsed tree sidecar.
+struct TreeSidecar<'a> {
+    /// The `XmlFragment` root the document was written under. A tree resumed under
+    /// a different root is a different (empty) document, so this is checked.
+    root: &'a str,
+    /// BLAKE3 of the body this sidecar last crystallized — the coherence marker.
+    body_hash: &'a [u8],
+    /// The ydoc state update.
+    state: &'a [u8],
+}
+
+/// The version-independent tail shared by both tree framings:
+/// `[root len][root][32-byte hash][ydoc state]`.
+fn split_tree_sidecar(body: &[u8]) -> Option<TreeSidecar<'_>> {
+    let root_len = *body.first()? as usize;
+    let rest = body.get(1..)?;
     let root = std::str::from_utf8(rest.get(..root_len)?).ok()?;
     let rest = rest.get(root_len..)?;
-    let hash = rest.get(..32)?;
-    Some((root, hash, &rest[32..]))
+    let body_hash = rest.get(..TREE_SIDECAR_HASH_LEN)?;
+    Some(TreeSidecar {
+        root,
+        body_hash,
+        state: &rest[TREE_SIDECAR_HASH_LEN..],
+    })
 }
 
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
@@ -749,10 +792,12 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             Err(OrigoFSError::NotFound(_)) => return Ok(CoeditTreeDoc::new(root)),
             Err(e) => return Err(e),
         };
-        let Some((sidecar_root, body_hash, state)) = parse_tree_sidecar(&blob) else {
+        // `?`, not a fallthrough to the empty document: a sidecar written by a
+        // newer origofs has history this build must not report as absent.
+        let Some(sidecar) = parse_tree_sidecar(&blob)? else {
             return Ok(CoeditTreeDoc::new(root));
         };
-        if sidecar_root != root {
+        if sidecar.root != root {
             return Ok(CoeditTreeDoc::new(root));
         }
         let current = match self.read(path).await {
@@ -760,10 +805,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             Err(OrigoFSError::NotFound(_)) => bytes::Bytes::new(),
             Err(e) => return Err(e),
         };
-        if blake3::hash(&current).as_bytes().as_slice() != body_hash {
+        if blake3::hash(&current).as_bytes().as_slice() != sidecar.body_hash {
             return Ok(CoeditTreeDoc::new(root)); // the file moved under us
         }
-        CoeditTreeDoc::load(root, state)
+        CoeditTreeDoc::load(root, sidecar.state)
     }
 
     /// Checkpoint a tree-shaped co-edited document into `path`: land the host's
@@ -1016,7 +1061,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             Err(OrigoFSError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        Ok(parse_tree_sidecar(&blob).map(|(root, _, _)| root.to_string()))
+        Ok(parse_tree_sidecar(&blob)?.map(|s| s.root.to_string()))
     }
 
     /// Accept a tree suggestion: land the host's serialized `body` **attributed to
@@ -1249,13 +1294,17 @@ mod tests {
     #[test]
     fn a_sidecar_round_trips_its_root_and_coherence_hash() {
         let framed = frame_tree_sidecar("content", b"body", b"state").unwrap();
-        let (root, hash, state) = parse_tree_sidecar(&framed).unwrap();
-        assert_eq!(root, "content");
-        assert_eq!(hash, blake3::hash(b"body").as_bytes());
-        assert_eq!(state, b"state");
-        // A flat sidecar must never parse as a tree one.
-        assert!(parse_tree_sidecar(&[1, 0, 0, 0]).is_none());
-        assert!(parse_tree_sidecar(&[]).is_none());
-        assert!(parse_tree_sidecar(&[TREE_SIDECAR_MAGIC, 200, 1, 2]).is_none());
+        let parsed = parse_tree_sidecar(&framed).unwrap().unwrap();
+        assert_eq!(parsed.root, "content");
+        assert_eq!(parsed.body_hash, blake3::hash(b"body").as_bytes());
+        assert_eq!(parsed.state, b"state");
+        // A flat sidecar must never parse as a tree one — in either framing.
+        assert!(parse_tree_sidecar(&[1, 0, 0, 0]).unwrap().is_none());
+        assert!(parse_tree_sidecar(&[]).unwrap().is_none());
+        assert!(
+            parse_tree_sidecar(&[LEGACY_TREE_SIDECAR_MAGIC, 200, 1, 2])
+                .unwrap()
+                .is_none()
+        );
     }
 }
