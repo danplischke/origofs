@@ -107,6 +107,38 @@ jobs:
           echo "Tag '$TAG' ($SHA) is on main."
           printf 'publish=true\ntag=%s\nref=refs/tags/%s\n' "$TAG" "$TAG" >> "$GITHUB_OUTPUT"
 
+      # `cargo metadata` only — nothing is compiled. The runner image ships Rust,
+      # but every other workflow here installs it explicitly rather than rely on
+      # that.
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # A tag is an assertion *about* the committed version, never an input to
+      # it. Cargo cannot read a git tag, and `crates/origofs-py/pyproject.toml`
+      # declares `dynamic = ["version"]`, so maturin stamps the wheel from
+      # Cargo.toml as well — meaning a tag that disagrees with the manifests does
+      # not produce a differently-versioned build, it produces a correctly-built
+      # artifact under a version that appears nowhere in git. Asserting it here
+      # costs one five-minute job; a 0.0.0 wheel already shipped once for want of
+      # this check.
+      - name: Require the crate versions to match the tag
+        shell: bash
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TAG" ]; then
+            # Same reason the build jobs check out `guard.outputs.ref`: a manual
+            # release is dispatched from a branch, so the tree here is that
+            # branch's, and the version that ships is the one at the tag.
+            git checkout --quiet --detach "refs/tags/$TAG"
+            python3 .github/scripts/check_versions.py "${TAG#v}"
+          else
+            # A dry run has no tag to assert against; the workspace still has to
+            # agree with itself.
+            python3 .github/scripts/check_versions.py
+          fi
+
   wheels:
     name: ${{ matrix.name }}
     needs: [guard]

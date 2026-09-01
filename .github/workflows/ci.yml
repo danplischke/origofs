@@ -65,6 +65,13 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      # One authoritative version in `[workspace.package]` and six intra-workspace
+      # requirements that restate it, so a hand-edited bump is a seven-place edit.
+      # Caught on the PR that drifts rather than at the tag — release.yml's `guard`
+      # job runs the same script with the tag's version.
+      - name: Version consistency
+        run: python3 .github/scripts/check_versions.py
+
       - name: Clippy (deny warnings)
         run: |
           cargo clippy --workspace --all-targets -- -D warnings

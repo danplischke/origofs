@@ -36,6 +36,15 @@ from ._origofs import (
     fuse_mountable,
 )
 
+# Set by the extension from `CARGO_PKG_VERSION` (see the `m.add` in src/lib.rs),
+# so it is the crate version the wheel was actually built from rather than a
+# second copy to keep in step. The redundant-looking `as __version__` is the
+# explicit re-export form type checkers require.
+#
+# Deliberately *not* in `__all__`: a caller's `from origofs import *` would then
+# overwrite their own module's `__version__`.
+from ._origofs import __version__ as __version__
+
 __all__ = [
     "OrigoFSError",
     "ConflictError",

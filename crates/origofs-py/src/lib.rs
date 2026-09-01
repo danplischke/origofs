@@ -5474,5 +5474,11 @@ fn _origofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(content_hash, m)?)?;
     m.add("OrigoFSError", m.py().get_type::<OrigoFSError>())?;
     m.add("ConflictError", m.py().get_type::<ConflictError>())?;
+    // `origofs.__version__`, single-sourced from `[workspace.package].version`:
+    // `CARGO_PKG_VERSION` is the same value maturin stamps the wheel with, so the
+    // string a caller reads and the version `pip` resolved cannot disagree.
+    // Compiled in rather than read back through `importlib.metadata`, which finds
+    // no distribution for an extension imported out of a build tree.
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

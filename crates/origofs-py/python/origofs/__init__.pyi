@@ -26,6 +26,9 @@ from typing import (
     TypedDict,
 )
 
+#: The version of the ``origofs`` distribution this extension was built from.
+__version__: str
+
 # --- record shapes ----------------------------------------------------------
 #
 # One TypedDict per dict the extension returns, mirroring the builders in

@@ -25,6 +25,7 @@ wheel alone, on a runner where nothing else is installed.
 """
 
 import asyncio
+import importlib.metadata
 import os
 import sys
 import tempfile
@@ -74,7 +75,18 @@ async def main() -> None:
     got_actor = spans[0]["actor"]["id"]
     assert got_actor == actor, f"blame names actor {got_actor}, expected {actor}"
 
-    version = getattr(origofs, "__version__", "")
+    # Both versions trace back to `[workspace.package].version` — the wheel's
+    # through maturin, the extension's through `CARGO_PKG_VERSION` — so they can
+    # only disagree if the artifact was assembled from mismatched parts. That is
+    # precisely what a smoke test of a *publishable* wheel should refuse to pass,
+    # and `getattr(..., "")` used to hide it: `__version__` did not exist at all,
+    # so this line printed a blank version on every wheel it ever cleared.
+    version = origofs.__version__
+    declared = importlib.metadata.version("origofs")
+    assert version == declared, (
+        f"extension was built as {version}, but the wheel declares {declared}"
+    )
+
     print(f"origofs {version} ok on {sys.platform} (python {sys.version.split()[0]})")
 
 
