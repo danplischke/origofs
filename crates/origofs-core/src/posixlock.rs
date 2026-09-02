@@ -219,6 +219,70 @@ pub fn resolve(existing: &[PosixLock], req: &LockRequest) -> Resolution {
     }
 }
 
+/// Apply a [`Resolution`] to an in-memory lock set — the reference model.
+///
+/// The backends do exactly this in SQL. Having it here as well is what lets the
+/// property, fuzz and simulation tiers state "the database agrees with the model"
+/// as an assertion rather than as a hope, and it is the only definition of what
+/// the SQL is *supposed* to do.
+#[doc(hidden)]
+pub fn apply(locks: &mut Vec<PosixLock>, res: &Resolution) {
+    if res.conflict.is_some() {
+        return;
+    }
+    locks.retain(|l| {
+        !res.delete
+            .iter()
+            .any(|(owner, start)| *owner == l.owner && *start == l.start)
+    });
+    locks.extend(res.insert.iter().cloned());
+    locks.sort_by(|a, b| (&a.owner, a.start).cmp(&(&b.owner, b.start)));
+}
+
+/// The invariants a lock set must satisfy at rest, or a description of the first
+/// violation.
+///
+/// The non-overlap rule is not cosmetic: `(workspace, ino, owner, start_off)` is
+/// the table's primary key, and two overlapping ranges for one owner are how that
+/// key stops identifying a row. A violation here is a constraint error at runtime
+/// on a `setlk` somebody's editor issued, so it is worth asserting everywhere the
+/// resolver is exercised rather than waiting to meet it in production.
+#[doc(hidden)]
+pub fn check_state(locks: &[PosixLock]) -> Result<(), String> {
+    for l in locks {
+        if l.start > l.end {
+            return Err(format!(
+                "inverted range {}..={} ({})",
+                l.start, l.end, l.owner
+            ));
+        }
+        if l.start < 0 {
+            return Err(format!("negative start {} ({})", l.start, l.owner));
+        }
+    }
+    for (i, a) in locks.iter().enumerate() {
+        for b in &locks[i + 1..] {
+            if a.owner == b.owner && overlaps(a, b.start, b.end) {
+                return Err(format!(
+                    "owner {} holds overlapping ranges {}..={} and {}..={}",
+                    a.owner, a.start, a.end, b.start, b.end
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `owner` holds `byte`, and exclusively if so — the observable state a
+/// caller actually cares about, independent of how ranges happen to be split.
+#[doc(hidden)]
+pub fn held_at(locks: &[PosixLock], owner: &str, byte: i64) -> Option<bool> {
+    locks
+        .iter()
+        .find(|l| l.owner == owner && l.start <= byte && byte <= l.end)
+        .map(|l| l.exclusive)
+}
+
 /// The lock that would block `req`, or `None` if it would be granted — `getlk`.
 pub fn test(existing: &[PosixLock], req: &LockRequest) -> Option<PosixLock> {
     resolve(existing, req).conflict

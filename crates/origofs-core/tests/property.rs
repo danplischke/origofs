@@ -18,6 +18,7 @@
 //!   is likewise a no-op when re-merged.
 
 use origofs_core::chunk::chunk_bounds;
+use origofs_core::posixlock::{self, LOCK_EOF, LockKind, LockRequest, PosixLock};
 use origofs_core::{
     ChunkRef, Commit, Fs, Hash, MAX_CHUNK, MIN_CHUNK, Manifest, MemStore, MergeOutcome,
     SqliteMetadataStore, Tree, TreeEntry, TreeKind,
@@ -292,4 +293,192 @@ fn disjoint_three_way_merge_is_clean_and_idempotent() {
             })?;
         }
     );
+}
+
+// --- POSIX advisory lock semantics (issue #119) -----------------------------
+//
+// `posixlock::resolve` is pure, total, and the only place the range arithmetic
+// lives, which makes it the natural property target: the example tests beside it
+// pin the cases somebody thought of, and these assert the invariants over
+// sequences nobody did.
+//
+// States are built by *folding a random request sequence*, never generated
+// directly. A hand-generated `Vec<PosixLock>` would mostly be states the resolver
+// can never produce (one owner holding overlapping ranges), so the properties
+// would be tested against inputs that cannot occur and would miss the ones that
+// can. Folding also means the sequence itself is under test, which is where the
+// interesting bugs are — a split followed by a coalesce followed by an unlock.
+
+fn arb_kind() -> impl Strategy<Value = LockKind> {
+    prop_oneof![
+        4 => Just(LockKind::Shared),
+        4 => Just(LockKind::Exclusive),
+        2 => Just(LockKind::Unlock),
+    ]
+}
+
+/// Deliberately cramped: a handful of owners over a couple of hundred bytes, so
+/// overlap, adjacency and contention are the common case rather than a rarity.
+/// `LOCK_EOF` is mixed in because the open-ended range is where the arithmetic
+/// can overflow.
+fn arb_request() -> impl Strategy<Value = LockRequest> {
+    (0usize..3, 0i64..200, 0i64..200, arb_kind(), 0u8..4).prop_map(|(owner, a, b, kind, eof)| {
+        let (start, mut end) = if a <= b { (a, b) } else { (b, a) };
+        if eof == 0 {
+            end = LOCK_EOF;
+        }
+        LockRequest {
+            owner: ["a", "b", "c"][owner].to_string(),
+            holder: "h".to_string(),
+            pid: 1,
+            start,
+            end,
+            kind,
+        }
+    })
+}
+
+fn fold(reqs: &[LockRequest]) -> Result<Vec<PosixLock>, TestCaseError> {
+    let mut state: Vec<PosixLock> = Vec::new();
+    for r in reqs {
+        let res = posixlock::resolve(&state, r);
+        let before = state.clone();
+        posixlock::apply(&mut state, &res);
+
+        posixlock::check_state(&state).map_err(|e| {
+            TestCaseError::fail(format!(
+                "invariant broken after {r:?}: {e}\nstate: {state:?}"
+            ))
+        })?;
+
+        if res.conflict.is_some() {
+            prop_assert_eq!(&state, &before, "a refused request must change nothing");
+            continue;
+        }
+        // Other owners are never touched by somebody else's request.
+        for owner in ["a", "b", "c"] {
+            if owner == r.owner {
+                continue;
+            }
+            let was: Vec<&PosixLock> = before.iter().filter(|l| l.owner == owner).collect();
+            let now: Vec<&PosixLock> = state.iter().filter(|l| l.owner == owner).collect();
+            prop_assert_eq!(was, now, "request for {} disturbed {}", r.owner, owner);
+        }
+    }
+    Ok(state)
+}
+
+proptest! {
+    /// The invariant the primary key depends on, over arbitrary op sequences: one
+    /// owner never ends up holding two overlapping ranges. Checked after every
+    /// step inside `fold`, so a violation names the request that caused it.
+    #[test]
+    fn lock_sequences_preserve_the_state_invariants(reqs in prop::collection::vec(arb_request(), 0..40)) {
+        fold(&reqs)?;
+    }
+
+    /// A granted request is *observably* in force afterwards: every byte it named
+    /// is held by that owner, with the type asked for. This is what makes range
+    /// splitting safe — however the rows are carved up, the bytes agree.
+    #[test]
+    fn a_granted_lock_covers_exactly_what_it_asked_for(
+        reqs in prop::collection::vec(arb_request(), 0..30),
+        last in arb_request(),
+    ) {
+        let mut state = fold(&reqs)?;
+        let res = posixlock::resolve(&state, &last);
+        prop_assume!(res.conflict.is_none());
+        posixlock::apply(&mut state, &res);
+
+        // Sample the range rather than walking it: `LOCK_EOF` makes it unbounded.
+        let end = last.end.min(last.start.saturating_add(300));
+        for byte in [last.start, (last.start + end) / 2, end] {
+            let held = posixlock::held_at(&state, &last.owner, byte);
+            match last.kind {
+                LockKind::Unlock => prop_assert!(
+                    held.is_none(),
+                    "byte {} still held after unlocking {}..={}", byte, last.start, last.end
+                ),
+                LockKind::Shared => prop_assert_eq!(
+                    held, Some(false),
+                    "byte {} not shared-held after locking {}..={}", byte, last.start, last.end
+                ),
+                LockKind::Exclusive => prop_assert_eq!(
+                    held, Some(true),
+                    "byte {} not exclusively held after locking {}..={}", byte, last.start, last.end
+                ),
+            }
+        }
+    }
+
+    /// A request touches only the bytes it names: whatever the owner held outside
+    /// the range it holds identically afterwards.
+    ///
+    /// This is the property the splitting logic exists for, and the one the other
+    /// three miss — dropping the split entirely still satisfies "the range I asked
+    /// for is held" and "no overlaps", because destroying the ends violates
+    /// neither. Locking the middle of your own range must not silently release
+    /// its edges.
+    #[test]
+    fn a_request_leaves_bytes_outside_its_range_alone(
+        reqs in prop::collection::vec(arb_request(), 0..30),
+        last in arb_request(),
+    ) {
+        let mut state = fold(&reqs)?;
+        let before = state.clone();
+        let res = posixlock::resolve(&state, &last);
+        prop_assume!(res.conflict.is_none());
+        posixlock::apply(&mut state, &res);
+
+        for byte in 0..250i64 {
+            if byte >= last.start && byte <= last.end {
+                continue;
+            }
+            prop_assert_eq!(
+                posixlock::held_at(&before, &last.owner, byte),
+                posixlock::held_at(&state, &last.owner, byte),
+                "byte {} outside {}..={} changed", byte, last.start, last.end
+            );
+        }
+    }
+
+    /// Re-issuing a request that was granted changes nothing further. A resolver
+    /// that failed this would grow rows on every repeat — which is what an editor
+    /// re-taking its own lock actually does.
+    #[test]
+    fn re_applying_a_granted_request_is_a_no_op(
+        reqs in prop::collection::vec(arb_request(), 0..30),
+        last in arb_request(),
+    ) {
+        let mut state = fold(&reqs)?;
+        let first = posixlock::resolve(&state, &last);
+        prop_assume!(first.conflict.is_none());
+        posixlock::apply(&mut state, &first);
+        let once = state.clone();
+
+        let again = posixlock::resolve(&state, &last);
+        prop_assert!(again.conflict.is_none(), "own request blocked by its own effect");
+        posixlock::apply(&mut state, &again);
+        prop_assert_eq!(state, once, "re-applying the same request moved the state");
+    }
+
+    /// Unlocking everything returns to empty, whatever route the state took.
+    /// Catches a split that loses or strands a fragment.
+    #[test]
+    fn unlocking_the_whole_file_empties_the_set(reqs in prop::collection::vec(arb_request(), 0..40)) {
+        let mut state = fold(&reqs)?;
+        for owner in ["a", "b", "c"] {
+            let r = LockRequest {
+                owner: owner.to_string(),
+                holder: "h".to_string(),
+                pid: 1,
+                start: 0,
+                end: LOCK_EOF,
+                kind: LockKind::Unlock,
+            };
+            let res = posixlock::resolve(&state, &r);
+            posixlock::apply(&mut state, &res);
+        }
+        prop_assert!(state.is_empty(), "fragments survived a full unlock: {:?}", state);
+    }
 }

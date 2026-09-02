@@ -560,6 +560,19 @@ compiling at all until #107.
   - **NFS has none of this**, and not by choice: `nfsserve` exposes no NLM hooks,
     and NFSv3 locking is a separate protocol. `fallocate`/`copy_file_range` from
     the same issue also remain absent.
+  - **Four test tiers, because each one misses what the next catches.**
+    `property.rs` asserts the resolver's invariants over arbitrary op sequences —
+    states are built by *folding* random requests, never generated directly, since
+    a hand-made lock set is mostly states the resolver cannot emit.
+    `posix_lock_sim.rs` is the seeded DST: it drives the **real store** and
+    compares the rows against the reference model (`posixlock::apply`) after every
+    step, because `resolve` can be perfect while the SQL translation is not — a
+    `DELETE` that misses its row, an expiry filter off by one. It carries a
+    negative control that deliberately breaks the model and requires the
+    comparison to notice. `concurrency.rs` covers contention. The
+    `posix_lock_resolve` fuzz target is the deeper search of the same invariants;
+    note CI only `cargo check`s the fuzz crate, which is exactly why the
+    properties also run in-crate.
 - **Path traversal is rejected at every metadata boundary.** `validate_component`
   (`engine.rs`) refuses `.`/`..`/`/`/NUL in a single name so a poisoned name can
   never be *stored* — which is what stops it escaping during host materialization
