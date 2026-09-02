@@ -129,6 +129,7 @@ pub(crate) const PACK_INDEX: ObjectKind = ObjectKind {
 /// out: a sidecar this build cannot parse is treated as **absent**, and an absent
 /// sidecar is a silent fallback rather than an error. Without a version byte, the
 /// first symptom of a format change is lost editing history.
+#[cfg(feature = "coedit")]
 pub(crate) const COEDIT_SIDECAR: ObjectKind = ObjectKind {
     tag: b"ORGY",
     name: "co-edit sidecar",
@@ -144,6 +145,7 @@ pub(crate) const COEDIT_SIDECAR: ObjectKind = ObjectKind {
 /// sidecar therefore opens an **empty** document, so a format change that this
 /// build silently declined to recognize would discard every live document's
 /// history and let a host checkpoint an empty body over the file.
+#[cfg(feature = "coedit")]
 pub(crate) const COEDIT_TREE_SIDECAR: ObjectKind = ObjectKind {
     tag: b"ORGX",
     name: "co-edit tree sidecar",
@@ -313,22 +315,25 @@ impl StoreDescriptor {
 mod tests {
     use super::*;
 
-    const ALL: [&ObjectKind; 9] = [
-        &MANIFEST,
-        &TREE,
-        &COMMIT,
-        &REFS,
-        &STORE,
-        &PACK,
-        &PACK_INDEX,
-        &COEDIT_SIDECAR,
-        &COEDIT_TREE_SIDECAR,
-    ];
+    const ALL: [&ObjectKind; 7] = [&MANIFEST, &TREE, &COMMIT, &REFS, &STORE, &PACK, &PACK_INDEX];
+
+    /// The kinds that exist only with `coedit` on. Gated like the consts they
+    /// name, so a `--no-default-features` build of this crate still compiles its
+    /// tests — CI runs clippy on exactly that shape.
+    #[cfg(feature = "coedit")]
+    const COEDIT_KINDS: [&ObjectKind; 2] = [&COEDIT_SIDECAR, &COEDIT_TREE_SIDECAR];
+    #[cfg(not(feature = "coedit"))]
+    const COEDIT_KINDS: [&ObjectKind; 0] = [];
+
+    /// Every kind this build knows.
+    fn all() -> Vec<&'static ObjectKind> {
+        ALL.iter().chain(COEDIT_KINDS.iter()).copied().collect()
+    }
 
     #[test]
     fn readers_are_never_behind_writers() {
         // Rule 3: support for reading a version ships before anything writes it.
-        for k in ALL {
+        for k in all() {
             assert!(
                 k.write_version <= k.max_read_version,
                 "{}: writes v{} but only reads up to v{}",
@@ -348,8 +353,9 @@ mod tests {
     fn type_tags_are_distinct() {
         // Recovery classifies objects by tag alone, so a collision would make two
         // kinds indistinguishable in the store.
-        for (i, a) in ALL.iter().enumerate() {
-            for b in &ALL[i + 1..] {
+        let all = all();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
                 assert_ne!(a.tag, b.tag, "{} and {} share a type tag", a.name, b.name);
             }
         }
