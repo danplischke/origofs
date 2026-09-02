@@ -5,6 +5,7 @@
 use crate::attribution::{Actor, ActorInit, EditOp, EditOpInit, ToolCallInit, WritePolicy};
 use crate::collab::{Event, EventInit, LiveDoc, Presence};
 use crate::error::{OrigoFSError, Result};
+use crate::posixlock::{LockRequest, PosixLock};
 use crate::suggest::{Suggestion, SuggestionInit, SuggestionStatus};
 use crate::types::{DirEntry, Hash, Ino, Inode, InodeInit};
 use async_trait::async_trait;
@@ -383,6 +384,37 @@ pub trait MetadataStore: Send + Sync {
 
     /// List held locks as `(path, owner, acquired_at)`.
     async fn list_locks(&self) -> Result<Vec<(String, String, i64)>>;
+
+    // --- POSIX advisory locks (issue #119) -------------------------------
+    //
+    // Distinct from the git-LFS-style `lock` above in every way but the word: that
+    // one is a durable claim on a *path* taken by a person, this one is a
+    // byte-ranged, per-open-file-description claim on an *inode* that dies with the
+    // process. See `crate::posixlock`.
+
+    /// Live locks on `ino`. Rows whose lease has expired are not returned — a
+    /// crashed mount must not keep blocking a range forever.
+    async fn posix_locks(&self, ino: Ino, now: i64) -> Result<Vec<PosixLock>>;
+
+    /// Apply `req` to `ino` atomically, returning the lock that refused it.
+    ///
+    /// Read-decide-write must be one serialized step or two mounts both read "no
+    /// conflict" and both insert, which is the entire bug this table exists to
+    /// prevent. Expired rows are dropped in the same transaction, so reaping needs
+    /// no background task.
+    async fn apply_posix_lock(
+        &self,
+        ino: Ino,
+        req: &LockRequest,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<Option<PosixLock>>;
+
+    /// Drop every lock held by one mount instance — a clean unmount.
+    async fn release_posix_locks_for_holder(&self, holder: &str) -> Result<u64>;
+
+    /// Push out the lease on every lock a mount instance holds.
+    async fn renew_posix_lease(&self, holder: &str, expires_at: i64) -> Result<u64>;
 
     // --- attribution -----------------------------------------------------
 
@@ -843,6 +875,24 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn list_locks(&self) -> Result<Vec<(String, String, i64)>> {
         (**self).list_locks().await
+    }
+    async fn posix_locks(&self, ino: Ino, now: i64) -> Result<Vec<PosixLock>> {
+        (**self).posix_locks(ino, now).await
+    }
+    async fn apply_posix_lock(
+        &self,
+        ino: Ino,
+        req: &LockRequest,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<Option<PosixLock>> {
+        (**self).apply_posix_lock(ino, req, expires_at, now).await
+    }
+    async fn release_posix_locks_for_holder(&self, holder: &str) -> Result<u64> {
+        (**self).release_posix_locks_for_holder(holder).await
+    }
+    async fn renew_posix_lease(&self, holder: &str, expires_at: i64) -> Result<u64> {
+        (**self).renew_posix_lease(holder, expires_at).await
     }
     async fn create_actor(&self, init: ActorInit) -> Result<i64> {
         (**self).create_actor(init).await

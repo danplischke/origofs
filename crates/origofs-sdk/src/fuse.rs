@@ -29,9 +29,10 @@ use crate::{Event, FileKind, Inode, OrigoFSError, Owner, Workspace, WriteCtx};
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, Notifier, OpenFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
+use origofs_core::posixlock::{LOCK_EOF, LockAnswer, LockKind, LockRequest};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
@@ -127,6 +128,74 @@ const READDIR_CURSOR_CAP: usize = 4096;
 /// hundred concurrent writers still fit in a normal process.
 const HANDLE_BUFFER_CAP: usize = 4 * 1024 * 1024;
 
+/// How long a blocked `F_SETLKW` waits before giving up.
+///
+/// A wait needs an end because nothing can cancel it: `fuser` exposes no
+/// `FUSE_INTERRUPT` hook at this layer, so if the waiting process is killed the
+/// reply is still owed. Generous enough to cover the lock handoffs real programs
+/// do, short enough that a forgotten waiter frees its slot the same minute.
+const BLOCKING_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a blocked waiter re-tries. There is no cross-process wakeup to wait
+/// on — the holder may be on another machine — so this polls. Short enough to feel
+/// immediate, long enough not to hammer the store while a lock is held.
+const BLOCKING_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// Translate a FUSE lock range onto a stored one.
+///
+/// FUSE ranges are `u64` and inclusive, with `u64::MAX` for end-of-file; stored
+/// ranges are `i64` for the database's sake. Both ends saturate rather than wrap,
+/// so an open-ended lock stays open-ended instead of becoming a negative offset.
+fn lock_range(start: u64, end: u64) -> (i64, i64) {
+    let s = start.min(i64::MAX as u64) as i64;
+    let e = if end >= i64::MAX as u64 {
+        LOCK_EOF
+    } else {
+        end as i64
+    };
+    (s, e)
+}
+
+/// `F_RDLCK`/`F_WRLCK`/`F_UNLCK` onto the engine's kinds; `None` for anything else,
+/// which the kernel should never send and which becomes `EINVAL` rather than a guess.
+///
+/// The conversions look pointless here and are not: these constants are `c_int` on
+/// Linux but `c_short` on macOS, and this module is `cfg(unix)` rather than
+/// `cfg(linux)`, so it does build against macFUSE. Clippy only ever sees the Linux
+/// width, where the widening is a no-op — hence the allow rather than a "fix" that
+/// would stop compiling on the other platform.
+/// The `F_*LCK` constants widened to what `ReplyLock` takes. See [`lock_kind`] for
+/// why the conversion is not redundant.
+#[allow(clippy::useless_conversion)]
+fn read_type() -> i32 {
+    libc::F_RDLCK.into()
+}
+
+#[allow(clippy::useless_conversion)]
+fn write_type() -> i32 {
+    libc::F_WRLCK.into()
+}
+
+#[allow(clippy::useless_conversion)]
+fn unlock_type() -> i32 {
+    libc::F_UNLCK.into()
+}
+
+#[allow(clippy::useless_conversion)]
+fn lock_kind(typ: i32) -> Option<LockKind> {
+    let (rd, wr, un): (i32, i32, i32) = (
+        libc::F_RDLCK.into(),
+        libc::F_WRLCK.into(),
+        libc::F_UNLCK.into(),
+    );
+    match typ {
+        t if t == rd => Some(LockKind::Shared),
+        t if t == wr => Some(LockKind::Exclusive),
+        t if t == un => Some(LockKind::Unlock),
+        _ => None,
+    }
+}
+
 /// A FUSE filesystem backed by an origofs [`Workspace`].
 pub struct OrigoFSFuse {
     ws: Workspace,
@@ -171,6 +240,14 @@ pub struct OrigoFSFuse {
     /// per-handle actor would be an actor read long after the process that
     /// supplied it is gone. The mount's identity is a property of the mount.
     ctx: Option<WriteCtx>,
+    /// Identity of *this mount instance* for POSIX advisory locks (issue #119).
+    ///
+    /// The lock table is shared between mounts, so rows need to say which mount
+    /// put them there: a clean unmount deletes this holder's rows outright, and a
+    /// crashed one is cleaned up when its lease expires. It also namespaces the
+    /// kernel's lock owner, which is only unique within one kernel — two mounts on
+    /// two machines can hand out the same owner id for unrelated files.
+    holder: String,
 }
 
 impl OrigoFSFuse {
@@ -183,14 +260,121 @@ impl OrigoFSFuse {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        Ok(Self {
+        let holder = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let me = Self {
             ws,
             watcher: Arc::new(Watcher::new()),
             rt,
             cursors: Mutex::new(HashMap::new()),
             handles: Mutex::new(HandleTable::default()),
             ctx,
-        })
+            holder,
+        };
+        me.spawn_lease_renewer();
+        Ok(me)
+    }
+
+    /// Keep this mount's advisory-lock leases alive while it runs.
+    ///
+    /// A durable lock table cannot be tidied by a process that has died, so rows
+    /// expire unless renewed. Renewing only when a lock op happens would not do:
+    /// a process that takes a lock and then works for five minutes would have it
+    /// expire underneath it and another mount could take the range.
+    ///
+    /// Read once, at mount time. Turning the workspace switch on does not reach a
+    /// mount that is already running — remount to pick it up — which is stated
+    /// here because the alternative is polling the setting forever on every mount
+    /// that will never use it.
+    fn spawn_lease_renewer(&self) {
+        let enabled = self
+            .blk(self.ws.fs().posix_locks_enabled())
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let ws = self.ws.clone();
+        let holder = self.holder.clone();
+        // Spawned on the mount's own runtime, which is dropped with the mount, so
+        // the task cannot outlive the filesystem it renews for.
+        self.rt.spawn(async move {
+            let every = std::time::Duration::from_secs(
+                (origofs_core::posixlock::LEASE_SECS as u64 / 3).max(1),
+            );
+            loop {
+                tokio::time::sleep(every).await;
+                if ws.fs().renew_posix_lease(&holder).await.is_err() {
+                    // A failed renewal is not fatal: the lease still has time on
+                    // it and the next tick tries again. Losing the store entirely
+                    // is reported by the operations the user actually issued.
+                    continue;
+                }
+            }
+        });
+    }
+
+    /// Build a lock request from what the kernel handed us.
+    ///
+    /// The owner is the kernel's lock owner — the open file description, not the
+    /// process, which is what POSIX says ownership follows — prefixed with this
+    /// mount so two mounts cannot collide on the same number.
+    fn lock_request(
+        &self,
+        lock_owner: LockOwner,
+        pid: u32,
+        start: i64,
+        end: i64,
+        kind: LockKind,
+    ) -> LockRequest {
+        LockRequest {
+            owner: format!("{}:{}", self.holder, lock_owner),
+            holder: self.holder.clone(),
+            pid: i64::from(pid),
+            start,
+            end,
+            kind,
+        }
+    }
+
+    /// Wait for a blocked `F_SETLKW` **off the session thread**, then reply.
+    ///
+    /// This is the part that cannot be done inline. `fuser`'s dispatch loop is
+    /// single-threaded unless configured otherwise (`Config::n_threads` defaults
+    /// to 1, and this mount does not raise it), so sleeping inside the callback
+    /// would freeze every other operation on the mountpoint for the duration —
+    /// a blocking lock on one file would stall reads of every other. Moving the
+    /// reply onto the mount's runtime keeps the session thread free, which is
+    /// also what lets the wait be generous rather than a token retry.
+    ///
+    /// Bounded rather than indefinite: `fuser` surfaces no `FUSE_INTERRUPT` hook
+    /// here, so a wait with no deadline could not be cancelled when the waiting
+    /// process is killed, and the reply would be owed forever. On timeout the
+    /// caller gets `EAGAIN`, which is a lie POSIX does not sanction for
+    /// `F_SETLKW` but is the honest end of a wait nobody can cancel.
+    fn wait_for_lock(&self, ino: i64, req: LockRequest, reply: ReplyEmpty) {
+        let ws = self.ws.clone();
+        let ctx = self.ctx;
+        self.rt.spawn(async move {
+            let deadline = std::time::Instant::now() + BLOCKING_LOCK_TIMEOUT;
+            loop {
+                tokio::time::sleep(BLOCKING_LOCK_POLL).await;
+                match ws.fs().vfs_setlk_as(ctx, ino, &req).await {
+                    Ok(LockAnswer::Free) => return reply.ok(),
+                    Ok(LockAnswer::NotEnabled) => return reply.error(Errno::ENOSYS),
+                    Err(e) => return reply.error(errno(&e)),
+                    Ok(LockAnswer::Held(_)) => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    return reply.error(Errno::EAGAIN);
+                }
+            }
+        });
     }
 
     fn blk<F: Future>(&self, f: F) -> F::Output {
@@ -1170,7 +1354,86 @@ impl Filesystem for OrigoFSFuse {
     /// watcher here rather than waiting for [`Drop`] shortens the window in which
     /// a notification can be issued at a mount that can no longer answer the
     /// syscall that notification has to wait behind (see [`Watcher`]).
+    /// `fcntl(F_GETLK)` — report what would block this range, if anything.
+    fn getlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: ReplyLock,
+    ) {
+        let Some(kind) = lock_kind(typ) else {
+            return reply.error(Errno::EINVAL);
+        };
+        let (s, e) = lock_range(start, end);
+        let req = self.lock_request(lock_owner, pid, s, e, kind);
+        match self.blk(self.ws.fs().vfs_getlk_as(self.ctx, ino.0 as i64, &req)) {
+            // `ENOSYS` is not a failure here: it is how the kernel is told to go
+            // back to handling advisory locks locally, which is what every mount
+            // did before this feature and what one with the switch off still does.
+            Ok(LockAnswer::NotEnabled) => reply.error(Errno::ENOSYS),
+            Ok(LockAnswer::Free) => reply.locked(start, end, unlock_type(), pid),
+            Ok(LockAnswer::Held(l)) => reply.locked(
+                l.start as u64,
+                l.end as u64,
+                if l.exclusive {
+                    write_type()
+                } else {
+                    read_type()
+                },
+                l.pid as u32,
+            ),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// `fcntl(F_SETLK)` / `F_SETLKW` — take, downgrade or release a range.
+    fn setlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        let Some(kind) = lock_kind(typ) else {
+            return reply.error(Errno::EINVAL);
+        };
+        let (s, e) = lock_range(start, end);
+        let req = self.lock_request(lock_owner, pid, s, e, kind);
+        let ino = ino.0 as i64;
+        match self.blk(self.ws.fs().vfs_setlk_as(self.ctx, ino, &req)) {
+            Ok(LockAnswer::NotEnabled) => reply.error(Errno::ENOSYS),
+            Ok(LockAnswer::Free) => reply.ok(),
+            // `F_SETLK` says "fail rather than wait", and `EAGAIN` is what that
+            // failure is spelled as.
+            Ok(LockAnswer::Held(_)) if !sleep => reply.error(Errno::EAGAIN),
+            Ok(LockAnswer::Held(_)) => self.wait_for_lock(ino, req, reply),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
     fn destroy(&mut self) {
+        // Drop this mount's advisory locks. They are rows in a shared table, so
+        // leaving them would block other mounts until the lease ran out — the
+        // lease is the safety net for a crash, not the ordinary path.
+        if let Err(e) = self.blk(
+            self.ws
+                .fs()
+                .release_posix_locks_for_holder(&self.holder.clone()),
+        ) {
+            tracing::warn!(error = %e, "fuse: could not release advisory locks at unmount");
+        }
         // Last chance for anything still buffered: after this the session is gone
         // and nobody will call `release`. Nothing here can be reported to a
         // caller, so a failure is logged rather than swallowed silently.

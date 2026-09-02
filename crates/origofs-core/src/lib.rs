@@ -36,6 +36,7 @@ pub mod objectstore;
 pub mod pack;
 pub mod perf;
 pub mod portable;
+pub mod posixlock;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod recover;

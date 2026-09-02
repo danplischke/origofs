@@ -16,6 +16,8 @@ pub use futures::stream::BoxStream;
 /// [`api::set_metrics_renderer`], exactly as it installs a tracing subscriber.
 #[cfg(feature = "metrics")]
 pub use origofs_core::metrics;
+/// POSIX advisory locking types (issue #119), for callers that read held locks.
+pub use origofs_core::posixlock;
 // The building blocks a caller needs to assemble a backend stack by hand, which
 // `Workspace::open_encrypted` takes. Previously private, so an embedder could not
 // compose one.
@@ -1038,6 +1040,27 @@ impl Workspace {
     /// Turn the attribution requirement on or off.
     pub async fn set_require_attribution(&self, required: bool) -> Result<()> {
         self.fs.set_require_attribution(required).await
+    }
+
+    /// Whether this workspace answers POSIX advisory locks itself (issue #119).
+    ///
+    /// See [`Fs::posix_locks_enabled`](origofs_core::Fs::posix_locks_enabled) for
+    /// why this is off by default: a mount that does not answer `setlk` still has
+    /// working advisory locks, served locally by the kernel, so turning this on
+    /// trades that for coordination *between* mounts.
+    pub async fn posix_locks_enabled(&self) -> Result<bool> {
+        self.fs.posix_locks_enabled().await
+    }
+
+    /// Turn cross-mount advisory locking on or off.
+    pub async fn set_posix_locks_enabled(&self, on: bool) -> Result<()> {
+        self.fs.set_posix_locks_enabled(on).await
+    }
+
+    /// The advisory locks currently held on `path`, live leases only.
+    pub async fn posix_locks(&self, path: &str) -> Result<Vec<origofs_core::posixlock::PosixLock>> {
+        let ino = self.fs.stat(path).await?.ino;
+        self.fs.posix_locks(ino).await
     }
 
     /// Refuse an unattributed mutation when this workspace requires attribution.
