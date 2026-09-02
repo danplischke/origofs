@@ -7,6 +7,12 @@
 //! resolved back to their stashed bytes so an export/import round-trip is
 //! lossless. Packed objects are out of scope for this milestone — freshly
 //! committed and freshly exported repos keep their objects loose.
+//!
+//! Deliberately asymmetric with the exporter, which skips `/.origofs` (#143): a
+//! git repository that happens to carry a `.origofs` directory is somebody else's
+//! content, and dropping it on the way in would lose a user's files to a name
+//! collision. Do not "fix" the asymmetry — the export filter exists to keep
+//! origofs's own state out of repos it publishes, not to reserve the name.
 
 use super::object::{ObjectFormat, ParsedCommit, parse_commit, parse_tree, read_loose};
 use crate::Workspace;

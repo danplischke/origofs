@@ -489,8 +489,16 @@ compiling at all until #107.
   `is_internal_path` (`engine.rs`, deliberately **not** in `coedit.rs` — a
   workspace written by a co-editing build gets merged and exported by builds
   without the feature). Match on the **directory boundary**, never a bare
-  `starts_with`: `/.origofs-bench` is a real path. `git export` has the same gap
-  and is tracked separately (#143).
+  `starts_with`: `/.origofs-bench` is a real path. **`git export` had the same gap
+  (#143)** and now skips `/.origofs` at the root of every commit tree, so a
+  published repo carries no sidecars and none of the `(actor, session)` stamps and
+  node ids inside them. It filters by *position*, not by tree identity: the same
+  origofs tree can be a filtered root in one commit and an ordinary `/sub`
+  directory in another, so the exporter's memo is keyed on `(hash, is_root)` — the
+  hash alone hands the second encoding to the first commit. **Import is
+  deliberately asymmetric** and keeps a `.origofs` it finds: an incoming repo's
+  directory of that name is somebody else's content, and the export filter exists
+  to keep origofs's state out of what it publishes, not to reserve the name.
 - **Path traversal is rejected at every metadata boundary.** `validate_component`
   (`engine.rs`) refuses `.`/`..`/`/`/NUL in a single name so a poisoned name can
   never be *stored* — which is what stops it escaping during host materialization

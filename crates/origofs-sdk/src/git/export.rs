@@ -15,6 +15,7 @@ use super::object::{
 use crate::Workspace;
 use async_recursion::async_recursion;
 use origofs_core::error::{OrigoFSError, Result};
+use origofs_core::is_internal_path;
 use origofs_core::objectgraph::TreeKind;
 use origofs_core::types::Hash;
 use std::collections::HashMap;
@@ -158,7 +159,7 @@ struct Exporter<'a> {
     fmt: ObjectFormat,
     lfs_threshold: Option<u64>,
     /// origofs tree hash -> git tree oid hex.
-    trees: HashMap<Hash, String>,
+    trees: HashMap<(Hash, bool), String>,
     /// origofs commit hash -> git commit oid hex.
     commits: HashMap<Hash, String>,
     lfs_objects: usize,
@@ -177,7 +178,7 @@ impl Exporter<'_> {
         for p in &commit.parents {
             parent_oids.push(self.export_commit(*p).await?);
         }
-        let tree_oid = self.export_tree(commit.tree).await?;
+        let tree_oid = self.export_tree(commit.tree, true).await?;
 
         let ident = git_ident(&commit.author);
         let mut payload = format!("tree {tree_oid}\n");
@@ -196,15 +197,33 @@ impl Exporter<'_> {
     }
 
     #[async_recursion]
-    async fn export_tree(&mut self, origofs_hash: Hash) -> Result<String> {
-        if let Some(oid) = self.trees.get(&origofs_hash) {
+    /// Re-encode one origofs tree as a git tree.
+    ///
+    /// `root` marks a commit's top-level tree, where `/.origofs` is skipped. It is
+    /// origofs's own state — the co-edit CRDT sidecars are committed working-tree
+    /// files under `/.origofs/ydoc/`, one opaque blob per co-edited path per
+    /// commit. No git consumer can read them, they churn on every checkpoint, and
+    /// the Yjs state carries the `(actor, session)` stamps and node ids origofs
+    /// issued, so exporting them leaks internal identifiers into a repository
+    /// somebody publishes.
+    ///
+    /// Skipped at the **root only**, and by the same predicate the rest of the
+    /// engine uses: `/.origofs` is internal because of where it sits, so a user
+    /// directory named `.origofs` nested deeper is an ordinary path and stays.
+    /// Asking `is_internal_path` rather than matching the name also keeps the
+    /// directory-boundary rule — `/.origofs-bench` is a real path and is exported.
+    async fn export_tree(&mut self, origofs_hash: Hash, root: bool) -> Result<String> {
+        if let Some(oid) = self.trees.get(&(origofs_hash, root)) {
             return Ok(oid.clone());
         }
         let tree = self.ws.fs().tree_object(&origofs_hash).await?;
         let mut entries = Vec::with_capacity(tree.entries.len());
         for e in &tree.entries {
+            if root && is_internal_path(&format!("/{}", e.name)) {
+                continue;
+            }
             let (mode, oid_hex): (&'static str, String) = match e.kind {
-                TreeKind::Dir => ("40000", self.export_tree(e.hash).await?),
+                TreeKind::Dir => ("40000", self.export_tree(e.hash, false).await?),
                 TreeKind::File => {
                     let bytes = self.ws.fs().read_blob_bytes(&e.hash).await?;
                     let mode = if e.mode & 0o111 != 0 {
@@ -229,7 +248,7 @@ impl Exporter<'_> {
         }
         let obj = make_object(self.fmt, "tree", &tree_payload(entries));
         write_loose(&self.git_dir, &obj)?;
-        self.trees.insert(origofs_hash, obj.oid_hex.clone());
+        self.trees.insert((origofs_hash, root), obj.oid_hex.clone());
         Ok(obj.oid_hex)
     }
 
