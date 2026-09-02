@@ -59,6 +59,38 @@ pub use chunk::{AVG_CHUNK, ChunkRef, MAX_CHUNK, MIN_CHUNK, Manifest};
 pub use clock::{Clock, SystemClock};
 #[cfg(feature = "coedit")]
 pub use coedit::{COEDIT_SIDECAR_DIR, CoeditDoc, SyncReply, coedit_sidecar_path};
+
+/// Decoder entry points exposed for `cargo fuzz` only (`crates/origofs-core/fuzz`).
+///
+/// The framing parsers are private because nothing outside the co-editing code
+/// should frame or unframe a sidecar. They are still `&[u8] -> Result<_>`
+/// decoders of bytes read back from the content store, which the fuzz crate calls
+/// "the ideal fuzz surface" — and a decoder nothing fuzzes is exactly how a
+/// panic-on-malformed-input ships. This module is the narrowest way to give the
+/// targets a handle without widening the real API.
+///
+/// Not a supported interface: hidden from the docs, and free to change or vanish.
+#[cfg(feature = "coedit")]
+#[doc(hidden)]
+pub mod fuzz_support {
+    use crate::error::Result;
+
+    /// [`crate::coedit`]'s flat-sidecar framing, as owned bytes.
+    pub fn parse_flat_sidecar(blob: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        Ok(crate::coedit::parse_sidecar(blob)?.map(|(h, s)| (h.to_vec(), s.to_vec())))
+    }
+
+    /// A parsed tree sidecar: the `XmlFragment` root, the 32-byte coherence hash
+    /// of the body it crystallized, and the ydoc state.
+    pub type TreeSidecarParts = (String, Vec<u8>, Vec<u8>);
+
+    /// [`crate::coedit_tree`]'s tree-sidecar framing, as owned parts.
+    pub fn parse_tree_sidecar(blob: &[u8]) -> Result<Option<TreeSidecarParts>> {
+        Ok(crate::coedit_tree::parse_tree_sidecar(blob)?
+            .map(|s| (s.root.to_string(), s.body_hash.to_vec(), s.state.to_vec())))
+    }
+}
+
 #[cfg(feature = "coedit")]
 pub use coedit_tree::{
     CoeditTreeDoc, DEFAULT_TREE_ROOT, NODE_KEY, TreeRun, TreeSpan, coedit_tree_sidecar_path,

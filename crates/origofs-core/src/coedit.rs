@@ -1103,7 +1103,7 @@ fn frame_sidecar(text: &[u8], state: &[u8]) -> Vec<u8> {
 ///   upgrade, so folding it into the fallback above would report a document with
 ///   history as one without, and quietly drop the history on the next checkpoint.
 ///   See `check_store_format` in `engine.rs`, which names this exact path.
-fn parse_sidecar(blob: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+pub(crate) fn parse_sidecar(blob: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
     let body = if format::COEDIT_SIDECAR.tagged(blob) {
         match format::COEDIT_SIDECAR.version_of(blob)? {
             1 => &blob[format::HEADER_LEN..],

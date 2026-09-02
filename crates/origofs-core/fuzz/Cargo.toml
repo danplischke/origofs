@@ -20,6 +20,9 @@ libfuzzer-sys = "0.4"
 
 [dependencies.origofs-core]
 path = ".."
+# The sidecar decoders live behind this feature, and a decoder nothing fuzzes is
+# how a panic-on-malformed-input ships.
+features = ["coedit"]
 
 [profile.release]
 debug = 1
@@ -51,6 +54,27 @@ bench = false
 [[bin]]
 name = "refsnapshot_decode"
 path = "fuzz_targets/refsnapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sidecar_decode"
+path = "fuzz_targets/sidecar_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree_sidecar_decode"
+path = "fuzz_targets/tree_sidecar_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coedit_state_decode"
+path = "fuzz_targets/coedit_state_decode.rs"
 test = false
 doc = false
 bench = false
