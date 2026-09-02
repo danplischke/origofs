@@ -121,9 +121,50 @@ pub(crate) const PACK_INDEX: ObjectKind = ObjectKind {
     max_read_version: 2,
 };
 
+/// Co-edit CRDT sidecar, flat (`Y.Text`) shape (`crate::coedit`, `coedit` feature).
+///
+/// Unlike every other kind here the sidecar is not a content-store object — it is
+/// an ordinary working-tree *file body*, chunked and committed like any other. It
+/// carries a header anyway, for the reason `coedit::parse_sidecar` spells
+/// out: a sidecar this build cannot parse is treated as **absent**, and an absent
+/// sidecar is a silent fallback rather than an error. Without a version byte, the
+/// first symptom of a format change is lost editing history.
+#[cfg(feature = "coedit")]
+pub(crate) const COEDIT_SIDECAR: ObjectKind = ObjectKind {
+    tag: b"ORGY",
+    name: "co-edit sidecar",
+    write_version: 1,
+    max_read_version: 1,
+};
+
+/// Co-edit CRDT sidecar, tree (`Y.XmlFragment`) shape (`crate::coedit_tree`, `coedit` feature).
+///
+/// The same framing argument as [`COEDIT_SIDECAR`], with more at stake: the flat
+/// shape can rebuild a document from the file's text, and this one cannot —
+/// parsing bytes back into nodes needs the host's schema. An unreadable tree
+/// sidecar therefore opens an **empty** document, so a format change that this
+/// build silently declined to recognize would discard every live document's
+/// history and let a host checkpoint an empty body over the file.
+#[cfg(feature = "coedit")]
+pub(crate) const COEDIT_TREE_SIDECAR: ObjectKind = ObjectKind {
+    tag: b"ORGX",
+    name: "co-edit tree sidecar",
+    write_version: 1,
+    max_read_version: 1,
+};
+
 /// Every object kind whose version a *store* has to account for. Excludes the
 /// store descriptor itself (it describes them; it cannot describe itself) and the
 /// pack encoding (a private detail of one backend, not of the object graph).
+///
+/// The co-edit sidecars are excluded too, and that is a judgement rather than an
+/// oversight. A store-level bump locks an older build out of the **whole** store
+/// at open — every ordinary file read included — and co-editing is an opt-in
+/// feature (`coedit`) most workspaces never write a byte of. Paying a store-wide
+/// lockout for it is disproportionate. What replaces it is that a sidecar written
+/// by a newer origofs is a loud `UnsupportedVersion` at the one document that
+/// meets it, never the "unparseable, so absent" fallback the version byte exists
+/// to prevent.
 const GRAPH_KINDS: [&ObjectKind; 4] = [&MANIFEST, &TREE, &COMMIT, &REFS];
 
 /// The highest object-graph format version this build ever writes.
@@ -276,10 +317,23 @@ mod tests {
 
     const ALL: [&ObjectKind; 7] = [&MANIFEST, &TREE, &COMMIT, &REFS, &STORE, &PACK, &PACK_INDEX];
 
+    /// The kinds that exist only with `coedit` on. Gated like the consts they
+    /// name, so a `--no-default-features` build of this crate still compiles its
+    /// tests — CI runs clippy on exactly that shape.
+    #[cfg(feature = "coedit")]
+    const COEDIT_KINDS: [&ObjectKind; 2] = [&COEDIT_SIDECAR, &COEDIT_TREE_SIDECAR];
+    #[cfg(not(feature = "coedit"))]
+    const COEDIT_KINDS: [&ObjectKind; 0] = [];
+
+    /// Every kind this build knows.
+    fn all() -> Vec<&'static ObjectKind> {
+        ALL.iter().chain(COEDIT_KINDS.iter()).copied().collect()
+    }
+
     #[test]
     fn readers_are_never_behind_writers() {
         // Rule 3: support for reading a version ships before anything writes it.
-        for k in ALL {
+        for k in all() {
             assert!(
                 k.write_version <= k.max_read_version,
                 "{}: writes v{} but only reads up to v{}",
@@ -299,8 +353,9 @@ mod tests {
     fn type_tags_are_distinct() {
         // Recovery classifies objects by tag alone, so a collision would make two
         // kinds indistinguishable in the store.
-        for (i, a) in ALL.iter().enumerate() {
-            for b in &ALL[i + 1..] {
+        let all = all();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
                 assert_ne!(a.tag, b.tag, "{} and {} share a type tag", a.name, b.name);
             }
         }

@@ -7,6 +7,36 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
+### Changed
+
+- **The co-edit CRDT sidecars are versioned, so their framing can be evolved
+  without reading as "this document has no history".** Both shapes treated a
+  sidecar they could not parse as an *absent* one — the flat shape rebuilds from
+  the file, the tree shape opens an **empty** document, which a host that ignores
+  `CoeditTreeDoc::resumed()` then checkpoints over the real file. The framings
+  carried a single magic byte (`1` flat, `2` tree) that named the shape and not
+  the layout, so any future change to either would have taken that silent
+  fallback: no file corrupted, but every live document's editing history and
+  per-node author stamps dropped, quietly.
+
+  They now carry the same 5-byte header every structured object has —
+  `ORGY | version | …` (flat) and `ORGX | version | …` (tree), added to
+  `format.rs` under its existing rules (never re-encode a shipped version, add a
+  decoder arm, ship the reader before the writer). **Sidecars written by earlier
+  origofs still resume**, history intact: the old single-byte framings are read
+  forever and are unambiguous against the new ones, since neither `1` nor `2` is
+  `O`. A sidecar from a *newer* origofs is now `UnsupportedVersion` — an upgrade
+  problem the reader reports — instead of the "absent, so rebuild" fallback;
+  genuinely unrecognizable bytes still take that fallback, which is what it is
+  for.
+
+  The two kinds stay out of `GRAPH_KINDS`, and so out of the store descriptor's
+  `format_version`. That is a judgement, not an oversight: a store-level bump
+  locks an older build out of the *whole* store at open — every ordinary file
+  read included — and co-editing is an opt-in feature (`coedit`) most workspaces
+  never write a byte of. The loud per-document error is the proportionate
+  replacement, and it is what the descriptor was covering for.
+
 ## [0.0.3] — 2026-08-30
 
 The 0.1.0 section below announced a tagged release, but the `v0.1.0` tag was
