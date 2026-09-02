@@ -19,6 +19,7 @@
 use crate::collab::LiveDoc;
 use crate::content::ContentStore;
 use crate::engine::Fs;
+use crate::engine::is_internal_path;
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
 use crate::objectgraph::{Commit, Tree, TreeEntry, TreeKind};
@@ -476,6 +477,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             let o = omap.get(n).copied();
             let t = tmap.get(n).copied();
             let path = format!("{prefix}/{name}");
+            // origofs's own state under `/.origofs` is machine-generated, and a
+            // conflict on it is never actionable by the person who has to resolve
+            // it. See the three arms below that consult this.
+            let internal = is_internal_path(&path);
             match (o, t) {
                 (None, None) => {}
                 (Some(oe), None) => {
@@ -487,6 +492,11 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                         merged.push(oe.clone());
                     } else if b == Some(oe) {
                         // ours unchanged, theirs deleted -> delete
+                    } else if internal {
+                        // We changed it, they deleted it. Keeping ours is what the
+                        // conflict arm below would do anyway; the only difference
+                        // is that nobody is asked to adjudicate it.
+                        merged.push(oe.clone());
                     } else {
                         merged.push(oe.clone());
                         conflicts.push(Conflict {
@@ -501,6 +511,8 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                         merged.push(te.clone());
                     } else if b == Some(te) {
                         // theirs unchanged, ours deleted -> delete
+                    } else if internal {
+                        merged.push(te.clone());
                     } else {
                         merged.push(te.clone());
                         conflicts.push(Conflict {
@@ -544,6 +556,27 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                             kind: TreeKind::Dir,
                             hash: sub,
                         });
+                    } else if internal {
+                        // Both sides changed origofs's own state at this path.
+                        //
+                        // Keep ours and say nothing. Every alternative is worse:
+                        // a conflict asks a person to adjudicate bytes they cannot
+                        // read; a `.theirs` sibling leaves an unreachable blob in a
+                        // hidden directory; and letting `merge_file` run risks the
+                        // quieter bug — a sidecar that happens to be valid UTF-8
+                        // would go through *diff3*, splicing two CRDT states (or a
+                        // pair of `<<<<<<<` markers) into a structurally invalid
+                        // one, with `conflict: false`.
+                        //
+                        // Keeping a stale sidecar is safe by construction: it is
+                        // framed with the BLAKE3 of the body it crystallized, and
+                        // the merged file matches neither side, so the next open
+                        // rejects it and rebuilds (flat) or opens empty (tree) —
+                        // exactly what it does for any other stale sidecar. This
+                        // arm sits after the dir/dir arm above so `/.origofs`
+                        // itself still recurses and a document only edited on one
+                        // side keeps its sidecar.
+                        merged.push(oe.clone());
                     } else if oe.kind == TreeKind::File && te.kind == TreeKind::File {
                         let base_h = b.filter(|e| e.kind == TreeKind::File).map(|e| e.hash);
                         let fm = self.merge_file(oe.hash, te.hash, base_h).await?;

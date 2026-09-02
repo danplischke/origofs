@@ -71,7 +71,7 @@ pub use content::{
 pub use corpus::{Passage, PassageOptions, Segmentation};
 #[cfg(feature = "encryption")]
 pub use encrypt::EncryptedStore;
-pub use engine::{Fs, validate_ref_name};
+pub use engine::{Fs, INTERNAL_DIR, is_internal_path, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
 pub use portable::{Cell, DUMP_FORMAT, DUMP_TABLES, LoadReport, Row};
 pub use scope::{Scope, ScopeError};

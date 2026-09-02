@@ -130,6 +130,37 @@ fn covering_chunks(manifest: &Manifest, off: u64, end: u64) -> Vec<(Hash, u64, u
     plan
 }
 
+/// The reserved directory origofs keeps its **own** working-tree state under.
+///
+/// It holds machine-generated state, not user content — today the co-edit CRDT
+/// sidecars ([`crate::COEDIT_SIDECAR_DIR`], `/.origofs/ydoc`). Keeping that state
+/// in the working tree rather than the metadata DB is deliberate: it is then
+/// versioned, garbage-collected, deduplicated and encrypted like any other file,
+/// and it rides with its branch. The cost is that machinery written for user
+/// files reaches it too, and that machinery has to know not to treat it as user
+/// content — see [`is_internal_path`].
+///
+/// Declared here, not in [`crate::coedit`], precisely because it must be visible
+/// to builds **without** the `coedit` feature: a workspace written by a
+/// co-editing build can be merged or exported by one without it, and the files
+/// are there either way.
+pub const INTERNAL_DIR: &str = "/.origofs";
+
+/// Whether `path` is [`INTERNAL_DIR`] itself or something inside it.
+///
+/// Matches on the **directory boundary**, never a bare `starts_with` — the same
+/// rule the multi-tenant prefix matching takes, and not a hypothetical concern
+/// here: `/.origofs-bench` is a real path (the `perf` bench directory) that a
+/// prefix test would swallow along with every user path that merely begins with
+/// those characters.
+pub fn is_internal_path(path: &str) -> bool {
+    match path.strip_prefix(INTERNAL_DIR) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
 /// Reject a single path component that could escape the workspace tree or
 /// corrupt the dentry graph: the traversal names `.`/`..`, an empty name, or a
 /// name embedding a path separator or NUL. Enforced at every metadata boundary
