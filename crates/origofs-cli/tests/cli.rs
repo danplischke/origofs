@@ -2273,11 +2273,21 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         ),
         (
             "mount",
-            Surface("a kernel mount has no caller identity; the documented bypass in CLAUDE.md"),
+            Surface(
+                "a kernel mount has no *caller* identity — the kernel never says which \
+                 process issued a request — so it cannot attribute per operation. Since \
+                 #141 it can be bound to one actor with `--actor`, which makes the \
+                 path ACLs apply to everything through the mountpoint; that bounds the \
+                 mount, it does not identify anyone",
+            ),
         ),
         (
             "nfs",
-            Surface("an NFS export has no per-caller identity either; the same documented bypass"),
+            Surface(
+                "the same, and weaker: NFSv3 authenticates nobody, so `--actor` bounds \
+                 what the export can reach while every client on the socket shares that \
+                 one identity",
+            ),
         ),
         (
             "git",

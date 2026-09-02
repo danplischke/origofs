@@ -197,8 +197,35 @@ write path enforces this and you must not weaken it:
   `origofs-cli/tests/cli.rs::every_mutating_subcommand_is_classified_and_attributable`
   does the same for the CLI — every subcommand must be classified, every exemption
   must carry a *reason*, and every attributed one must actually offer `--actor`.
-  The FUSE/NFS mounts remain a deliberate bypass (a mount has no actor context).
   Issues #78, #128.
+- **A mount is bound to one actor, or to none — and `none` is the only bypass
+  left.** The FUSE/NFS surfaces address everything by inode through the `vfs_*`
+  layer, which took no actor at all, so path-scoped ACLs did not reach them: an
+  agent refused `WRITE` under `/src` over MCP took the identical action through a
+  mount. Since #141 every mutating inode op has an ACL-checked `vfs_*_as`
+  counterpart taking `Option<WriteCtx>`, and both mounts hold one for their
+  lifetime (`fuse::spawn_as`/`mount_as`, `nfs::serve_as`, `origofs mount --actor`,
+  `origofs nfs --actor`, and `ws.mount(..., ctx=)` / `ws.serve_nfs(..., ctx=)` from
+  Python). `None` is the historical anonymous mount and still bypasses, which is
+  why it is a *visible argument* rather than an absent one.
+  - **Checked in the engine, as always.** The guard is inside the `_as` method, so
+    a caller cannot forget it; what a surface *can* do is call the unchecked op
+    instead, and that is source text rather than behaviour. Two structural tests
+    close it: `origofs-core/tests/vfs_acl.rs::every_inode_op_has_a_checked_counterpart`
+    (a new `vfs_thing` must gain a `vfs_thing_as` or an exemption with a reason)
+    and `origofs-sdk/tests/mount_acl.rs` (no mount may call an unchecked op). The
+    latter is deliberately not feature-gated, so it runs on the Windows leg too.
+  - **It authorizes; it does not attribute.** A write through a mount still
+    records no `edit_op` and no blame. The mount's actor bounds what the mount can
+    reach — do not read it as attribution, and do not read `--actor` as
+    authentication: the kernel never says which process issued a request, and
+    NFSv3 authenticates nobody, so one actor covers everything on that mountpoint
+    or socket.
+  - **Reads follow the same opt-in as everywhere else.** Gated only under
+    `acl_enforce_reads`, and `readdir` filters per entry like `ls_as` — a listing
+    that names what a `stat` would refuse is the existence oracle the refusal
+    exists to prevent. The filtered listing pages internally, because a page that
+    filters to empty would otherwise read as end-of-directory and truncate.
 - **A checkpoint never overwrites a file that changed underneath it.** Both shapes
   compare the file against the live marker's coherence hash. The tree shape
   refuses (`refuse_out_of_band`) — origofs cannot parse bytes back into nodes. The
@@ -450,6 +477,20 @@ compiling at all until #107.
 
 - **Never put large bytes in the metadata DB.** The whole design rests on the
   metadata/content split; the DB references content by hash only.
+- **`/.origofs` is origofs's own state, and machinery for user files must not
+  treat it as user content.** The co-edit CRDT sidecars live in the working tree
+  (`/.origofs/ydoc`) so they are versioned, collected, deduplicated and encrypted
+  like any other file and ride with their branch — a deliberate trade whose price
+  is that code written for user files reaches them. `merge` was where that showed
+  (#142): two branches that had both checkpointed one document produced an
+  unresolvable binary conflict on a hidden file, plus a `.theirs` sibling nobody
+  would find, and a sidecar that happened to be valid UTF-8 would have been
+  *diff3-merged* into a structurally invalid CRDT state. Use `INTERNAL_DIR` /
+  `is_internal_path` (`engine.rs`, deliberately **not** in `coedit.rs` — a
+  workspace written by a co-editing build gets merged and exported by builds
+  without the feature). Match on the **directory boundary**, never a bare
+  `starts_with`: `/.origofs-bench` is a real path. `git export` has the same gap
+  and is tracked separately (#143).
 - **Path traversal is rejected at every metadata boundary.** `validate_component`
   (`engine.rs`) refuses `.`/`..`/`/`/NUL in a single name so a poisoned name can
   never be *stored* — which is what stops it escaping during host materialization

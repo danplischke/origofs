@@ -15,7 +15,7 @@
 //! `mount -t nfs -o vers=3,tcp,port=11111,mountport=11111,nolock host:/ /mnt`
 //! (needs the OS NFS client / `nfs-utils`).
 
-use crate::{FileKind, Inode, OrigoFSError, Owner, Workspace};
+use crate::{FileKind, Inode, OrigoFSError, Owner, Workspace, WriteCtx};
 use async_trait::async_trait;
 use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_gid3,
@@ -30,11 +30,25 @@ const ROOT: fileid3 = 1;
 /// An NFSv3 view of a workspace.
 pub struct OrigoFSNfs {
     ws: Workspace,
+    /// The actor this export was started for, or `None` for an anonymous one
+    /// (issue #141). See [`crate::fuse`]'s field of the same name.
+    ///
+    /// Binding an actor here is worth strictly less than on FUSE, and the reason
+    /// is in the `serve` docs below: NFSv3 authenticates nobody, so the identity
+    /// is the *export's*, not the caller's. It bounds what anyone reaching the
+    /// socket can do — useful for exporting a subtree read-only, or as one actor
+    /// among many — and it is not a substitute for the network boundary.
+    ctx: Option<WriteCtx>,
 }
 
 impl OrigoFSNfs {
     pub fn new(ws: Workspace) -> Self {
-        Self { ws }
+        Self::new_as(ws, None)
+    }
+
+    /// [`new`](Self::new) for an export bound to an actor (issue #141).
+    pub fn new_as(ws: Workspace, ctx: Option<WriteCtx>) -> Self {
+        Self { ws, ctx }
     }
 }
 
@@ -51,6 +65,17 @@ pub async fn serve(ws: Workspace, addr: &str) -> std::io::Result<()> {
     serve_until(ws, addr, crate::shutdown_signal()).await
 }
 
+/// [`serve`], with every operation checked against `ctx`'s grants (issue #141).
+///
+/// Read the security note on [`serve`] first: this bounds what the export can
+/// reach, not who reached it. NFSv3 supplies no caller identity, so one actor
+/// covers every client on the socket. It is the difference between "anyone who
+/// reaches this port gets the whole workspace" and "…gets what this actor may
+/// touch", which is worth having and is not authentication.
+pub async fn serve_as(ws: Workspace, addr: &str, ctx: Option<WriteCtx>) -> std::io::Result<()> {
+    serve_until_as(ws, addr, ctx, crate::shutdown_signal()).await
+}
+
 /// [`serve`], returning when `shutdown` resolves.
 ///
 /// `nfsserve`'s listener has no drain hook, so this stops accepting and returns
@@ -65,7 +90,17 @@ pub async fn serve_until(
     addr: &str,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> std::io::Result<()> {
-    let listener = NFSTcpListener::bind(addr, OrigoFSNfs::new(ws)).await?;
+    serve_until_as(ws, addr, None, shutdown).await
+}
+
+/// [`serve_until`], bound to an actor (issue #141).
+pub async fn serve_until_as(
+    ws: Workspace,
+    addr: &str,
+    ctx: Option<WriteCtx>,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> std::io::Result<()> {
+    let listener = NFSTcpListener::bind(addr, OrigoFSNfs::new_as(ws, ctx)).await?;
     tokio::select! {
         r = listener.handle_forever() => r,
         _ = shutdown => {
@@ -160,7 +195,7 @@ impl NFSFileSystem for OrigoFSNfs {
         match self
             .ws
             .fs()
-            .vfs_lookup(dirid as i64, name(filename)?)
+            .vfs_lookup_as(self.ctx, dirid as i64, name(filename)?)
             .await
             .map_err(stat)?
         {
@@ -171,7 +206,12 @@ impl NFSFileSystem for OrigoFSNfs {
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         Ok(attr(
-            &self.ws.fs().vfs_getattr(id as i64).await.map_err(stat)?,
+            &self
+                .ws
+                .fs()
+                .vfs_getattr_as(self.ctx, id as i64)
+                .await
+                .map_err(stat)?,
         ))
     }
 
@@ -179,7 +219,7 @@ impl NFSFileSystem for OrigoFSNfs {
         if let set_size3::size(sz) = setattr.size {
             self.ws
                 .fs()
-                .vfs_truncate(id as i64, sz)
+                .vfs_truncate_as(self.ctx, id as i64, sz)
                 .await
                 .map_err(stat)?;
         }
@@ -188,7 +228,11 @@ impl NFSFileSystem for OrigoFSNfs {
         // nothing. atime/mtime are still not persisted (the inode carries a single
         // mtime the engine maintains), so those remain accepted-and-ignored.
         if let set_mode3::mode(m) = setattr.mode {
-            self.ws.fs().vfs_chmod(id as i64, m).await.map_err(stat)?;
+            self.ws
+                .fs()
+                .vfs_chmod_as(self.ctx, id as i64, m)
+                .await
+                .map_err(stat)?;
         }
         let uid = match setattr.uid {
             set_uid3::uid(u) => Some(u),
@@ -201,12 +245,17 @@ impl NFSFileSystem for OrigoFSNfs {
         if uid.is_some() || gid.is_some() {
             self.ws
                 .fs()
-                .vfs_chown(id as i64, uid, gid)
+                .vfs_chown_as(self.ctx, id as i64, uid, gid)
                 .await
                 .map_err(stat)?;
         }
         Ok(attr(
-            &self.ws.fs().vfs_getattr(id as i64).await.map_err(stat)?,
+            &self
+                .ws
+                .fs()
+                .vfs_getattr_as(self.ctx, id as i64)
+                .await
+                .map_err(stat)?,
         ))
     }
 
@@ -219,14 +268,14 @@ impl NFSFileSystem for OrigoFSNfs {
         let size = self
             .ws
             .fs()
-            .vfs_getattr(id as i64)
+            .vfs_getattr_as(self.ctx, id as i64)
             .await
             .map_err(stat)?
             .size;
         let bytes = self
             .ws
             .fs()
-            .vfs_read(id as i64, offset, count)
+            .vfs_read_as(self.ctx, id as i64, offset, count)
             .await
             .map_err(stat)?;
         let eof = offset.saturating_add(bytes.len() as u64) >= size;
@@ -236,11 +285,16 @@ impl NFSFileSystem for OrigoFSNfs {
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         self.ws
             .fs()
-            .vfs_write(id as i64, offset, data)
+            .vfs_write_as(self.ctx, id as i64, offset, data)
             .await
             .map_err(stat)?;
         Ok(attr(
-            &self.ws.fs().vfs_getattr(id as i64).await.map_err(stat)?,
+            &self
+                .ws
+                .fs()
+                .vfs_getattr_as(self.ctx, id as i64)
+                .await
+                .map_err(stat)?,
         ))
     }
 
@@ -260,17 +314,28 @@ impl NFSFileSystem for OrigoFSNfs {
         let inode = self
             .ws
             .fs()
-            .vfs_create(dirid as i64, name(filename)?, mode, owner_of(&attr_in))
+            .vfs_create_as(
+                self.ctx,
+                dirid as i64,
+                name(filename)?,
+                mode,
+                owner_of(&attr_in),
+            )
             .await
             .map_err(stat)?;
         if let set_size3::size(sz) = attr_in.size {
             self.ws
                 .fs()
-                .vfs_truncate(inode.ino, sz)
+                .vfs_truncate_as(self.ctx, inode.ino, sz)
                 .await
                 .map_err(stat)?;
         }
-        let inode = self.ws.fs().vfs_getattr(inode.ino).await.map_err(stat)?;
+        let inode = self
+            .ws
+            .fs()
+            .vfs_getattr_as(self.ctx, inode.ino)
+            .await
+            .map_err(stat)?;
         Ok((inode.ino as fileid3, attr(&inode)))
     }
 
@@ -282,7 +347,7 @@ impl NFSFileSystem for OrigoFSNfs {
         let inode = self
             .ws
             .fs()
-            .vfs_create(dirid as i64, name(filename)?, 0o644, Owner::ROOT)
+            .vfs_create_as(self.ctx, dirid as i64, name(filename)?, 0o644, Owner::ROOT)
             .await
             .map_err(stat)?;
         Ok(inode.ino as fileid3)
@@ -296,7 +361,7 @@ impl NFSFileSystem for OrigoFSNfs {
         let inode = self
             .ws
             .fs()
-            .vfs_mkdir(dirid as i64, name(dirname)?, 0o755, Owner::ROOT)
+            .vfs_mkdir_as(self.ctx, dirid as i64, name(dirname)?, 0o755, Owner::ROOT)
             .await
             .map_err(stat)?;
         Ok((inode.ino as fileid3, attr(&inode)))
@@ -307,14 +372,22 @@ impl NFSFileSystem for OrigoFSNfs {
         match self
             .ws
             .fs()
-            .vfs_lookup(dirid as i64, n)
+            .vfs_lookup_as(self.ctx, dirid as i64, n)
             .await
             .map_err(stat)?
         {
-            Some(inode) if inode.kind == FileKind::Dir => {
-                self.ws.fs().vfs_rmdir(dirid as i64, n).await.map_err(stat)
-            }
-            Some(_) => self.ws.fs().vfs_unlink(dirid as i64, n).await.map_err(stat),
+            Some(inode) if inode.kind == FileKind::Dir => self
+                .ws
+                .fs()
+                .vfs_rmdir_as(self.ctx, dirid as i64, n)
+                .await
+                .map_err(stat),
+            Some(_) => self
+                .ws
+                .fs()
+                .vfs_unlink_as(self.ctx, dirid as i64, n)
+                .await
+                .map_err(stat),
             None => Err(nfsstat3::NFS3ERR_NOENT),
         }
     }
@@ -328,7 +401,8 @@ impl NFSFileSystem for OrigoFSNfs {
     ) -> Result<(), nfsstat3> {
         self.ws
             .fs()
-            .vfs_rename(
+            .vfs_rename_as(
+                self.ctx,
                 from_dirid as i64,
                 name(from_filename)?,
                 to_dirid as i64,
@@ -390,7 +464,7 @@ impl NFSFileSystem for OrigoFSNfs {
         let page = self
             .ws
             .fs()
-            .vfs_readdir_page_with_attrs(dirid, after.as_deref(), max_entries.max(1))
+            .vfs_readdir_page_with_attrs_as(self.ctx, dirid, after.as_deref(), max_entries.max(1))
             .await
             .map_err(stat)?;
         let entries = if max_entries == 0 {
@@ -422,14 +496,19 @@ impl NFSFileSystem for OrigoFSNfs {
         let inode = self
             .ws
             .fs()
-            .vfs_symlink(dirid as i64, name(linkname)?, target, Owner::ROOT)
+            .vfs_symlink_as(self.ctx, dirid as i64, name(linkname)?, target, Owner::ROOT)
             .await
             .map_err(stat)?;
         Ok((inode.ino as fileid3, attr(&inode)))
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
-        let target = self.ws.fs().vfs_readlink(id as i64).await.map_err(stat)?;
+        let target = self
+            .ws
+            .fs()
+            .vfs_readlink_as(self.ctx, id as i64)
+            .await
+            .map_err(stat)?;
         Ok(nfsstring::from(target.into_bytes()))
     }
 }
