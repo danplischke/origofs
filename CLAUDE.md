@@ -499,6 +499,22 @@ compiling at all until #107.
   deliberately asymmetric** and keeps a `.origofs` it finds: an incoming repo's
   directory of that name is somebody else's content, and the export filter exists
   to keep origofs's state out of what it publishes, not to reserve the name.
+- **`yrs` is pinned at 0.23.5 on purpose, and the co-editing socket is exposed
+  because of it (#144).** A malformed y-sync update reaches
+  `from_utf8_unchecked` (`encoding/read.rs`, `updates/decoder.rs`) and is then
+  iterated in `block::utf16_len` — undefined behaviour, aborting under the debug
+  UB checks and **silent in release**. 51 bytes are enough, through the public
+  `CoeditDoc::load`, and `handle_sync` feeds it bytes from clients `coedit.rs`
+  explicitly does not trust. **Do not "just upgrade"**: measured, 0.24/0.25/0.26
+  reproduce it identically, and 0.27.4 (the latest) has the same two unsafe sites
+  *and* does not compile on stable Rust, since it uses `if let` guards. Nothing
+  local contains it either — the abort is non-unwinding, so `catch_unwind` is no
+  help, and validating the bytes first would mean reimplementing the decoder.
+  `tests/coedit_malformed_update.rs` holds the reproducer, `#[ignore]`d because it
+  would take the suite down rather than fail it; run it with `--ignored` when
+  trying a candidate yrs, and drop the `#[ignore]`s in the change that moves the
+  pin. `fuzz_targets/coedit_state_decode.rs` drives the same path and is expected
+  to abort.
 - **Path traversal is rejected at every metadata boundary.** `validate_component`
   (`engine.rs`) refuses `.`/`..`/`/`/NUL in a single name so a poisoned name can
   never be *stored* — which is what stops it escaping during host materialization

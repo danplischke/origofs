@@ -19,9 +19,15 @@
 //! is undefined behaviour: it aborts under the debug UB checks and is silent in
 //! release. A 51-byte input is enough. That is reachable from the y-sync
 //! WebSocket, whose clients this codebase explicitly does not trust, so it is a
-//! real exposure rather than a corrupt-file curiosity. Tracked in the issue
-//! tracker; the fix is upstream (0.27.x), not here. Expect this target to abort
-//! until that lands — that is it working.
+//! real exposure rather than a corrupt-file curiosity.
+//!
+//! **There is no version to upgrade to.** Checked, rather than assumed: the
+//! reproducer aborts identically on 0.24.0, 0.25.0 and 0.26.0, and the two
+//! `from_utf8_unchecked` sites behind it (`encoding/read.rs`,
+//! `updates/decoder.rs`) are unchanged in 0.27.4, the latest release — which
+//! additionally does not build on stable Rust at all, as it uses `if let` guards.
+//! So expect this target to abort. That is it working, and it will keep working
+//! until upstream validates those bytes.
 
 use libfuzzer_sys::fuzz_target;
 use origofs_core::{CoeditDoc, CoeditTreeDoc};
