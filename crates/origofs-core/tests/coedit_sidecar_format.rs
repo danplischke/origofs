@@ -213,3 +213,55 @@ async fn junk_is_still_a_cache_miss_on_both_shapes() {
     let empty = fs.load_coedit_tree("/notes.md", ROOT).await.unwrap();
     assert!(!empty.resumed(), "the tree shape opens empty and says so");
 }
+
+/// A bounded randomized sweep over both framings: arbitrary bytes must be
+/// *reported*, never fatal.
+///
+/// The real coverage is `cargo fuzz run sidecar_decode` / `tree_sidecar_decode`,
+/// which CI only `cargo check`s — so without something like this the totality
+/// claim is only ever argued, never executed, on an ordinary test run. This is
+/// the cheap standing version of that argument: deterministic, seeded, and it
+/// leans on the shapes a purely random generator would almost never produce (a
+/// valid tag, a plausible length prefix) because those are the inputs that reach
+/// past the first guard.
+///
+/// # Why this stops at the framing
+///
+/// It deliberately does **not** drive `CoeditDoc::load` / `CoeditTreeDoc::load`
+/// on the same bytes, which is the obvious next step and is what the
+/// `coedit_state_decode` fuzz target does instead. Those reach `yrs`'s
+/// `Update::decode_v1`, and on malformed input `yrs 0.23.5` builds a `str` from
+/// unvalidated bytes and then iterates it — undefined behaviour, which aborts the
+/// process rather than unwinding, so a test cannot contain it. Writing this sweep
+/// is what found that; it is tracked separately and is not origofs's bug to fix
+/// here. The framing parsers below are origofs's own, and they are total.
+#[test]
+fn arbitrary_bytes_are_reported_rather_than_fatal() {
+    fn xorshift(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    let prefixes: [&[u8]; 6] = [b"ORGY", b"ORGX", &[1], &[2], &[0], b"ORG"];
+    let mut seed = 0x5eed_1234_u64;
+    for case in 0..4000u32 {
+        let mut blob: Vec<u8> = Vec::new();
+        // Half the cases start with something the parsers will actually accept as
+        // a tag, so the sweep gets past the cheap rejection and into the length
+        // and UTF-8 handling.
+        if case % 2 == 0 {
+            blob.extend_from_slice(prefixes[(case as usize / 2) % prefixes.len()]);
+        }
+        let len = (xorshift(&mut seed) % 80) as usize;
+        while blob.len() < len {
+            blob.extend_from_slice(&xorshift(&mut seed).to_le_bytes());
+        }
+        blob.truncate(len.max(blob.len().min(len)));
+
+        // The contract is only "no panic"; either outcome is fine.
+        let _ = origofs_core::fuzz_support::parse_flat_sidecar(&blob);
+        let _ = origofs_core::fuzz_support::parse_tree_sidecar(&blob);
+    }
+}

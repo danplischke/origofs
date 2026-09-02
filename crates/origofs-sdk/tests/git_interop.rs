@@ -273,3 +273,163 @@ async fn lfs_pointer_roundtrip() {
     assert_eq!(dst.read("/big.bin").await.unwrap().len(), 4096);
     assert_eq!(&dst.read("/big.bin").await.unwrap()[..], &big[..]);
 }
+
+// --- `/.origofs` never leaves the workspace (#143) --------------------------
+
+/// The exporter drops origofs's own state from the root of every commit tree.
+///
+/// The co-edit sidecars are committed working-tree files under `/.origofs/ydoc/`,
+/// so an unfiltered walk shipped one opaque blob per co-edited path per commit
+/// into any repo somebody cloned — carrying the `(actor, session)` stamps and node
+/// ids the CRDT issued. Written here as plain files rather than through the
+/// co-editing API on purpose: the exporter sees a path and some bytes, the feature
+/// that produced them is not part of the question, and this suite is gated on
+/// `git`, not `coedit`.
+///
+/// The two lookalikes are the point of the test as much as the sidecar is. A bare
+/// `starts_with` would eat `/.origofs-bench`, and a name match at every level
+/// would eat a user's own nested `.origofs` directory; only the root path is
+/// internal.
+async fn export_omits_internal_state_for(fmt: ObjectFormat) {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = workspace(tmp.path(), "src").await;
+
+    src.write("/notes.md", b"# notes\n").await.unwrap();
+    src.mkdir_p("/.origofs/ydoc").await.unwrap();
+    src.write("/.origofs/ydoc/2f6e6f7465732e6d64", b"\x01ydoc-state")
+        .await
+        .unwrap();
+    src.mkdir_p("/.origofs-bench").await.unwrap();
+    src.write("/.origofs-bench/keep.txt", b"bench\n")
+        .await
+        .unwrap();
+    src.mkdir_p("/src/.origofs").await.unwrap();
+    src.write("/src/.origofs/user.txt", b"mine\n")
+        .await
+        .unwrap();
+    src.commit("Dev <dev@example.com>", "with a sidecar")
+        .await
+        .unwrap();
+
+    let repo = tmp.path().join("exported");
+    let opts = ExportOptions {
+        format: fmt,
+        ..Default::default()
+    };
+    export_git(&src, &repo, &opts).await.unwrap();
+
+    let (ok, out, err) = git(&repo, &["ls-tree", "-r", "--name-only", "main"]);
+    assert!(ok, "ls-tree failed: {err}");
+    let paths: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    assert!(
+        !paths
+            .iter()
+            .any(|p| *p == ".origofs" || p.starts_with(".origofs/")),
+        "exported repo carries origofs internal state: {paths:?}"
+    );
+    for expected in [
+        "notes.md",
+        ".origofs-bench/keep.txt",
+        "src/.origofs/user.txt",
+    ] {
+        assert!(
+            paths.contains(&expected),
+            "exporter dropped a user path {expected:?}: {paths:?}"
+        );
+    }
+
+    // Exporting is a read: the workspace keeps its own state.
+    assert_eq!(
+        &src.read("/.origofs/ydoc/2f6e6f7465732e6d64").await.unwrap()[..],
+        b"\x01ydoc-state"
+    );
+}
+
+#[tokio::test]
+async fn export_omits_internal_state_sha1() {
+    export_omits_internal_state_for(ObjectFormat::Sha1).await;
+}
+
+#[tokio::test]
+async fn export_omits_internal_state_sha256() {
+    export_omits_internal_state_for(ObjectFormat::Sha256).await;
+}
+
+/// `/.origofs` is internal because of *where it sits*, so the same origofs tree can
+/// need exporting two different ways — and the exporter memoizes by tree hash.
+///
+/// Moving the whole root under `/sub` makes that concrete: the tree that was the
+/// first commit's root (where `.origofs` is origofs's own state, filtered) is the
+/// second commit's `/sub` (where it is an ordinary user directory, kept). Both
+/// commits are exported in one walk, head first, so a memo keyed on the hash alone
+/// hands the older commit the `/sub` encoding and ships the sidecar after all.
+#[tokio::test]
+async fn export_filters_by_position_not_by_tree_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = workspace(tmp.path(), "src").await;
+
+    src.mkdir_p("/.origofs/ydoc").await.unwrap();
+    src.write("/.origofs/ydoc/a", b"\x01state").await.unwrap();
+    src.write("/notes.md", b"# notes\n").await.unwrap();
+    src.commit("Dev <dev@example.com>", "internal at the root")
+        .await
+        .unwrap();
+
+    src.mkdir_p("/sub").await.unwrap();
+    src.rename("/.origofs", "/sub/.origofs").await.unwrap();
+    src.rename("/notes.md", "/sub/notes.md").await.unwrap();
+    src.commit("Dev <dev@example.com>", "moved under /sub")
+        .await
+        .unwrap();
+
+    // The aliasing is the premise of the test, so assert it rather than assume it:
+    // if a future change stops the two trees colliding, this must fail loudly
+    // instead of quietly testing nothing.
+    let log = src.log().await.unwrap();
+    let head_root = src.fs().tree_object(&log[0].commit.tree).await.unwrap();
+    let sub = head_root
+        .entries
+        .iter()
+        .find(|e| e.name == "sub")
+        .expect("/sub must be in the head tree");
+    assert_eq!(
+        sub.hash, log[1].commit.tree,
+        "premise: /sub must be the very same origofs tree as the older commit's root"
+    );
+
+    let repo = tmp.path().join("exported");
+    export_git(&src, &repo, &ExportOptions::default())
+        .await
+        .unwrap();
+
+    let listing = |rev: &str| {
+        let (ok, out, err) = git(&repo, &["ls-tree", "-r", "--name-only", rev]);
+        assert!(ok, "ls-tree {rev} failed: {err}");
+        out.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    // Head: `.origofs` sits under `/sub`, which makes it a user path — it stays.
+    let head = listing("main");
+    assert!(
+        head.iter().any(|p| p == "sub/.origofs/ydoc/a"),
+        "a user directory named .origofs was dropped: {head:?}"
+    );
+    assert!(head.iter().any(|p| p == "sub/notes.md"), "{head:?}");
+
+    // Parent: the identical tree was the root there, so it is internal and goes.
+    let parent = listing("main~1");
+    assert!(
+        !parent.iter().any(|p| p.starts_with(".origofs/")),
+        "the memoized tree leaked internal state into the older commit: {parent:?}"
+    );
+    assert!(parent.iter().any(|p| p == "notes.md"), "{parent:?}");
+}

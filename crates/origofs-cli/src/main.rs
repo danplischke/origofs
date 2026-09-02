@@ -464,7 +464,21 @@ enum Cmd {
     },
     /// Mount the workspace as a POSIX filesystem via FUSE (blocks until
     /// unmounted; needs root + /dev/fuse).
-    Mount { mountpoint: PathBuf },
+    Mount {
+        mountpoint: PathBuf,
+        /// Bind the mount to this actor, so every operation through it is checked
+        /// against that actor's path grants (issue #141).
+        ///
+        /// Falls back to `ORIGOFS_ACTOR`. Unset, the mount is anonymous and the
+        /// ACLs do not apply to it — the historical behaviour.
+        ///
+        /// This is the *mount's* identity, not the caller's: the kernel does not
+        /// tell origofs which process issued a request, so one actor covers
+        /// everything that goes through this mountpoint. It bounds what the mount
+        /// can reach; it does not authenticate anyone.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Serve the workspace to agents over MCP (JSON-RPC on stdio). Every write
     /// is attributed to the given agent.
     Mcp {
@@ -629,6 +643,16 @@ enum Cmd {
         /// Address to bind, e.g. `127.0.0.1:11111`.
         #[arg(long, default_value = "127.0.0.1:11111")]
         addr: String,
+        /// Bind the export to this actor, so every operation through it is checked
+        /// against that actor's path grants (issue #141).
+        ///
+        /// Falls back to `ORIGOFS_ACTOR`. Read the warning above first: NFSv3
+        /// authenticates nobody, so this bounds what the export can reach, not who
+        /// reached it. It is the difference between "anyone on this port gets the
+        /// whole workspace" and "…gets what this actor may touch" — worth having,
+        /// and not a substitute for the network boundary.
+        #[arg(long)]
+        actor: Option<i64>,
     },
 }
 
@@ -2216,10 +2240,10 @@ async fn main() -> Result<()> {
                 std::process::exit(outcome.exit_code);
             }
         }
-        Cmd::Mount { mountpoint } => {
+        Cmd::Mount { mountpoint, actor } => {
             #[cfg(not(unix))]
             {
-                let _ = mountpoint;
+                let _ = (mountpoint, actor);
                 return Err(unix_only("mount", "FUSE (`/dev/fuse`)"));
             }
             #[cfg(unix)]
@@ -2233,7 +2257,14 @@ async fn main() -> Result<()> {
                     mountpoint.display()
                 );
                 // The mount drives its own runtime, so run it off the async main thread.
-                let handle = std::thread::spawn(move || origofs_sdk::fuse::mount(ws, &mountpoint));
+                let ctx = read_ctx(actor)?;
+                if ctx.is_none() {
+                    println!(
+                        "  (anonymous mount: path ACLs do not apply — pass --actor to bind one)"
+                    );
+                }
+                let handle =
+                    std::thread::spawn(move || origofs_sdk::fuse::mount_as(ws, &mountpoint, ctx));
                 handle
                     .join()
                     .map_err(|_| anyhow::anyhow!("mount thread panicked"))??;
@@ -2510,10 +2541,10 @@ async fn main() -> Result<()> {
             janitor.abort();
             result?;
         }
-        Cmd::Nfs { addr } => {
+        Cmd::Nfs { addr, actor } => {
             #[cfg(not(unix))]
             {
-                let _ = addr;
+                let _ = (addr, actor);
                 return Err(unix_only("nfs", "the NFSv3 server surface"));
             }
             #[cfg(unix)]
@@ -2531,7 +2562,7 @@ async fn main() -> Result<()> {
                 println!(
                     "serving origofs over NFSv3 at {addr} (SIGTERM/Ctrl-C to stop)\n  mount with: mount -t nfs -o vers=3,tcp,port=<port>,mountport=<port>,nolock <host>:/ /mnt"
                 );
-                origofs_sdk::nfs::serve(ws, &addr).await?;
+                origofs_sdk::nfs::serve_as(ws, &addr, read_ctx(actor)?).await?;
             }
         }
     }

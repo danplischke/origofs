@@ -25,7 +25,7 @@
 //! it buys a large constant factor off a write path that rewrites the whole file
 //! per request (see [`HANDLE_BUFFER_CAP`] for the arithmetic).
 
-use crate::{Event, FileKind, Inode, OrigoFSError, Owner, Workspace};
+use crate::{Event, FileKind, Inode, OrigoFSError, Owner, Workspace, WriteCtx};
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, Notifier, OpenFlags, ReplyAttr,
@@ -158,10 +158,28 @@ pub struct OrigoFSFuse {
     /// or a `block_on` (see `OrigoFSFuse::handles_of` for the lock order that
     /// keeps that true).
     handles: Mutex<HandleTable>,
+    /// The actor this mount was started for, or `None` for an anonymous mount
+    /// (issue #141).
+    ///
+    /// Held for the life of the mount and passed to every engine call, so the
+    /// path-scoped ACLs apply to what comes through the kernel exactly as they do
+    /// to MCP and HTTP. `None` preserves the historical behaviour — no identity,
+    /// no check — for `origofs mount`'s single-user case.
+    ///
+    /// It is deliberately *not* captured per open file handle. A handle outlives
+    /// the call that opened it, and buffered writes flush from `release`, so a
+    /// per-handle actor would be an actor read long after the process that
+    /// supplied it is gone. The mount's identity is a property of the mount.
+    ctx: Option<WriteCtx>,
 }
 
 impl OrigoFSFuse {
     pub fn new(ws: Workspace) -> std::io::Result<Self> {
+        Self::new_as(ws, None)
+    }
+
+    /// [`new`](Self::new) for a mount bound to an actor (issue #141).
+    pub fn new_as(ws: Workspace, ctx: Option<WriteCtx>) -> std::io::Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -171,6 +189,7 @@ impl OrigoFSFuse {
             rt,
             cursors: Mutex::new(HashMap::new()),
             handles: Mutex::new(HandleTable::default()),
+            ctx,
         })
     }
 
@@ -213,7 +232,8 @@ impl OrigoFSFuse {
         let mut cursor: Option<String> = None;
         let mut skipped: u64 = 0;
         loop {
-            let page = self.blk(self.ws.fs().vfs_readdir_page(
+            let page = self.blk(self.ws.fs().vfs_readdir_page_as(
+                self.ctx,
                 ino,
                 cursor.as_deref(),
                 READDIR_PAGE,
@@ -524,7 +544,11 @@ impl OrigoFSFuse {
     fn flush_buf(&self, ino: i64, buf: &mut DirtyBuffer) -> Result<(), OrigoFSError> {
         let runs = buf.take();
         for (i, run) in runs.iter().enumerate() {
-            if let Err(e) = self.blk(self.ws.fs().vfs_write(ino, run.offset, &run.data)) {
+            if let Err(e) = self.blk(
+                self.ws
+                    .fs()
+                    .vfs_write_as(self.ctx, ino, run.offset, &run.data),
+            ) {
                 buf.restore(runs.into_iter().skip(i).collect());
                 return Err(e);
             }
@@ -980,7 +1004,12 @@ fn config() -> Config {
 /// among the fields left behind by the partial move), so the join can't unmount
 /// itself out from under the thread it is waiting on.
 pub fn mount(ws: Workspace, mountpoint: &Path) -> std::io::Result<()> {
-    spawn(ws, mountpoint)?.join()
+    mount_as(ws, mountpoint, None)
+}
+
+/// [`mount`], for a mount bound to an actor (issue #141).
+pub fn mount_as(ws: Workspace, mountpoint: &Path, ctx: Option<WriteCtx>) -> std::io::Result<()> {
+    spawn_as(ws, mountpoint, ctx)?.join()
 }
 
 /// A live background mount, which unmounts when dropped (issue #75).
@@ -1050,7 +1079,20 @@ impl Drop for Mount {
 /// feed. The returned guard stops it **before** the unmount — see [`Mount`] for
 /// why that ordering is load-bearing rather than tidy.
 pub fn spawn(ws: Workspace, mountpoint: &Path) -> std::io::Result<Mount> {
-    let fs = OrigoFSFuse::new(ws.clone())?;
+    spawn_as(ws, mountpoint, None)
+}
+
+/// [`spawn`], for a mount bound to an actor (issue #141).
+///
+/// Every operation the kernel sends is then checked against the grants covering
+/// the path it touches, so a mount stops being the way around the ACLs that
+/// govern every other surface. Passing `None` is the anonymous mount [`spawn`]
+/// gives you.
+///
+/// This authorizes; it does not attribute. Writes through the mount still record
+/// no `edit_op` and no blame.
+pub fn spawn_as(ws: Workspace, mountpoint: &Path, ctx: Option<WriteCtx>) -> std::io::Result<Mount> {
+    let fs = OrigoFSFuse::new_as(ws.clone(), ctx)?;
     // Grabbed before `fs` is handed to the session, which is what gives us the
     // notifier to hand back to it.
     let watcher = Arc::clone(&fs.watcher);
@@ -1147,7 +1189,7 @@ impl Filesystem for OrigoFSFuse {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy().to_string();
-        match self.blk(self.ws.fs().vfs_lookup(parent.0 as i64, &name)) {
+        match self.blk(self.ws.fs().vfs_lookup_as(self.ctx, parent.0 as i64, &name)) {
             Ok(Some(i)) => reply.entry(&TTL, &self.attr_of(&i), Generation(0)),
             Ok(None) => reply.error(Errno::ENOENT),
             Err(e) => reply.error(errno(&e)),
@@ -1155,7 +1197,7 @@ impl Filesystem for OrigoFSFuse {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.blk(self.ws.fs().vfs_getattr(ino.0 as i64)) {
+        match self.blk(self.ws.fs().vfs_getattr_as(self.ctx, ino.0 as i64)) {
             Ok(i) => reply.attr(&TTL, &self.attr_of(&i)),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1189,7 +1231,7 @@ impl Filesystem for OrigoFSFuse {
                 reply.error(errno(&e));
                 return;
             }
-            if let Err(e) = self.blk(self.ws.fs().vfs_truncate(ino, sz)) {
+            if let Err(e) = self.blk(self.ws.fs().vfs_truncate_as(self.ctx, ino, sz)) {
                 reply.error(errno(&e));
                 return;
             }
@@ -1198,7 +1240,7 @@ impl Filesystem for OrigoFSFuse {
         // after which this replied with freshly-read (unchanged) attributes — so a
         // `chmod` reported success and moved nothing (#121, #122). Apply them.
         if let Some(m) = mode
-            && let Err(e) = self.blk(self.ws.fs().vfs_chmod(ino, m))
+            && let Err(e) = self.blk(self.ws.fs().vfs_chmod_as(self.ctx, ino, m))
         {
             reply.error(errno(&e));
             return;
@@ -1206,19 +1248,19 @@ impl Filesystem for OrigoFSFuse {
         // One call for both halves: `chown` and `chgrp` each send only their own,
         // and `vfs_chown` treats `None` as chown(2)'s -1 ("leave alone").
         if (uid.is_some() || gid.is_some())
-            && let Err(e) = self.blk(self.ws.fs().vfs_chown(ino, uid, gid))
+            && let Err(e) = self.blk(self.ws.fs().vfs_chown_as(self.ctx, ino, uid, gid))
         {
             reply.error(errno(&e));
             return;
         }
-        match self.blk(self.ws.fs().vfs_getattr(ino)) {
+        match self.blk(self.ws.fs().vfs_getattr_as(self.ctx, ino)) {
             Ok(i) => reply.attr(&TTL, &self.attr_of(&i)),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        match self.blk(self.ws.fs().vfs_readlink(ino.0 as i64)) {
+        match self.blk(self.ws.fs().vfs_readlink_as(self.ctx, ino.0 as i64)) {
             Ok(t) => reply.data(t.as_bytes()),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1283,7 +1325,7 @@ impl Filesystem for OrigoFSFuse {
             reply.error(errno(&e));
             return;
         }
-        match self.blk(self.ws.fs().vfs_read(ino, offset, size)) {
+        match self.blk(self.ws.fs().vfs_read_as(self.ctx, ino, offset, size)) {
             Ok(b) => reply.data(&b),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1353,7 +1395,7 @@ impl Filesystem for OrigoFSFuse {
             reply.error(errno(&e));
             return;
         }
-        match self.blk(self.ws.fs().vfs_write(ino, offset, data)) {
+        match self.blk(self.ws.fs().vfs_write_as(self.ctx, ino, offset, data)) {
             Ok(n) => reply.written(n),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1414,7 +1456,8 @@ impl Filesystem for OrigoFSFuse {
             }
         };
         'fill: loop {
-            let page = match self.blk(self.ws.fs().vfs_readdir_page(
+            let page = match self.blk(self.ws.fs().vfs_readdir_page_as(
+                self.ctx,
                 ino,
                 cursor.as_deref(),
                 READDIR_PAGE,
@@ -1461,11 +1504,13 @@ impl Filesystem for OrigoFSFuse {
         reply: ReplyCreate,
     ) {
         let name = name.to_string_lossy().to_string();
-        match self.blk(
-            self.ws
-                .fs()
-                .vfs_create(parent.0 as i64, &name, mode, caller_owner(req)),
-        ) {
+        match self.blk(self.ws.fs().vfs_create_as(
+            self.ctx,
+            parent.0 as i64,
+            &name,
+            mode,
+            caller_owner(req),
+        )) {
             Ok(i) => {
                 let fh = self.open_handle(i.ino);
                 reply.created(&TTL, &to_attr(&i), Generation(0), fh, FopenFlags::empty());
@@ -1484,11 +1529,13 @@ impl Filesystem for OrigoFSFuse {
         reply: ReplyEntry,
     ) {
         let name = name.to_string_lossy().to_string();
-        match self.blk(
-            self.ws
-                .fs()
-                .vfs_mkdir(parent.0 as i64, &name, mode, caller_owner(req)),
-        ) {
+        match self.blk(self.ws.fs().vfs_mkdir_as(
+            self.ctx,
+            parent.0 as i64,
+            &name,
+            mode,
+            caller_owner(req),
+        )) {
             Ok(i) => reply.entry(&TTL, &to_attr(&i), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1504,7 +1551,7 @@ impl Filesystem for OrigoFSFuse {
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_string_lossy().to_string();
         if self.any_open() {
-            match self.blk(self.ws.fs().vfs_lookup(parent.0 as i64, &name)) {
+            match self.blk(self.ws.fs().vfs_lookup_as(self.ctx, parent.0 as i64, &name)) {
                 Ok(Some(i)) => {
                     if let Err(e) = self.flush_ino(i.ino) {
                         reply.error(errno(&e));
@@ -1518,7 +1565,7 @@ impl Filesystem for OrigoFSFuse {
                 }
             }
         }
-        match self.blk(self.ws.fs().vfs_unlink(parent.0 as i64, &name)) {
+        match self.blk(self.ws.fs().vfs_unlink_as(self.ctx, parent.0 as i64, &name)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1526,7 +1573,7 @@ impl Filesystem for OrigoFSFuse {
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_string_lossy().to_string();
-        match self.blk(self.ws.fs().vfs_rmdir(parent.0 as i64, &name)) {
+        match self.blk(self.ws.fs().vfs_rmdir_as(self.ctx, parent.0 as i64, &name)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1544,7 +1591,8 @@ impl Filesystem for OrigoFSFuse {
     ) {
         let name = name.to_string_lossy().to_string();
         let newname = newname.to_string_lossy().to_string();
-        match self.blk(self.ws.fs().vfs_rename(
+        match self.blk(self.ws.fs().vfs_rename_as(
+            self.ctx,
             parent.0 as i64,
             &name,
             newparent.0 as i64,
@@ -1565,11 +1613,13 @@ impl Filesystem for OrigoFSFuse {
     ) {
         let name = link_name.to_string_lossy().to_string();
         let target = target.to_string_lossy().to_string();
-        match self.blk(
-            self.ws
-                .fs()
-                .vfs_symlink(parent.0 as i64, &name, &target, caller_owner(req)),
-        ) {
+        match self.blk(self.ws.fs().vfs_symlink_as(
+            self.ctx,
+            parent.0 as i64,
+            &name,
+            &target,
+            caller_owner(req),
+        )) {
             Ok(i) => reply.entry(&TTL, &to_attr(&i), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1587,11 +1637,12 @@ impl Filesystem for OrigoFSFuse {
         reply: ReplyEntry,
     ) {
         let newname = newname.to_string_lossy().to_string();
-        match self.blk(
-            self.ws
-                .fs()
-                .vfs_link(ino.0 as i64, newparent.0 as i64, &newname),
-        ) {
+        match self.blk(self.ws.fs().vfs_link_as(
+            self.ctx,
+            ino.0 as i64,
+            newparent.0 as i64,
+            &newname,
+        )) {
             Ok(i) => reply.entry(&TTL, &self.attr_of(&i), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1638,7 +1689,11 @@ impl Filesystem for OrigoFSFuse {
             return;
         }
         let name = name.to_string_lossy().to_string();
-        match self.blk(self.ws.fs().vfs_setxattr(ino.0 as i64, &name, value)) {
+        match self.blk(
+            self.ws
+                .fs()
+                .vfs_setxattr_as(self.ctx, ino.0 as i64, &name, value),
+        ) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1651,7 +1706,7 @@ impl Filesystem for OrigoFSFuse {
     /// first form and would otherwise silently get a truncated value.
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let name = name.to_string_lossy().to_string();
-        match self.blk(self.ws.fs().vfs_getxattr(ino.0 as i64, &name)) {
+        match self.blk(self.ws.fs().vfs_getxattr_as(self.ctx, ino.0 as i64, &name)) {
             Ok(Some(v)) => {
                 if size == 0 {
                     reply.size(v.len() as u32);
@@ -1670,7 +1725,7 @@ impl Filesystem for OrigoFSFuse {
     /// List extended attribute names (issue #119). The reply is the
     /// NUL-separated, NUL-terminated form `listxattr(2)` specifies.
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        match self.blk(self.ws.fs().vfs_listxattr(ino.0 as i64)) {
+        match self.blk(self.ws.fs().vfs_listxattr_as(self.ctx, ino.0 as i64)) {
             Ok(names) => {
                 let mut buf = Vec::new();
                 for n in names {
@@ -1693,7 +1748,11 @@ impl Filesystem for OrigoFSFuse {
     /// set is `ENODATA`, not success.
     fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name = name.to_string_lossy().to_string();
-        match self.blk(self.ws.fs().vfs_removexattr(ino.0 as i64, &name)) {
+        match self.blk(
+            self.ws
+                .fs()
+                .vfs_removexattr_as(self.ctx, ino.0 as i64, &name),
+        ) {
             Ok(true) => reply.ok(),
             Ok(false) => reply.error(Errno::ENODATA),
             Err(e) => reply.error(errno(&e)),

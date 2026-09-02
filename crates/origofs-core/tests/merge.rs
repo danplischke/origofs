@@ -1,7 +1,9 @@
 //! Three-way merge: fast-forward, clean text merge, text conflict + resolve,
 //! chunk-granular binary merge, binary conflict, modify/delete, and locks.
 
-use origofs_core::{Fs, Hash, MemStore, MergeOutcome, SqliteMetadataStore};
+use origofs_core::{
+    Fs, Hash, INTERNAL_DIR, MemStore, MergeOutcome, SqliteMetadataStore, is_internal_path,
+};
 use std::sync::Arc;
 
 async fn fixture() -> Fs<SqliteMetadataStore, Arc<MemStore>> {
@@ -388,4 +390,193 @@ async fn locks_are_exclusive() {
     assert!(!fs.unlock("/f", "bob").await.unwrap(), "not bob's lock");
     assert!(fs.unlock("/f", "alice").await.unwrap());
     assert!(fs.locks().await.unwrap().is_empty());
+}
+
+// --- origofs's own state under `/.origofs` (issue #142) ---------------------
+//
+// The sidecars live in the working tree so they are versioned, collected and
+// deduplicated like any other file. The price is that machinery written for user
+// content reaches them, and `merge` was the case where that showed: a co-edited
+// document checkpointed on two branches produced a *binary conflict* on a hidden
+// file nobody can read or resolve, plus a `.theirs` sibling nobody will ever
+// find.
+
+/// The boundary rule, tested directly because `/.origofs-bench` is a real path
+/// (the `perf` bench directory) and a `starts_with` would swallow it.
+#[test]
+fn internal_paths_match_on_the_directory_boundary() {
+    assert!(is_internal_path(INTERNAL_DIR));
+    assert!(is_internal_path("/.origofs/ydoc"));
+    assert!(is_internal_path("/.origofs/ydoc/2f6e6f7465732e6d64"));
+
+    assert!(!is_internal_path("/.origofs-bench"));
+    assert!(!is_internal_path("/.origofs-bench/bin"));
+    assert!(!is_internal_path("/.origofsX"));
+    assert!(!is_internal_path("/"));
+    assert!(
+        !is_internal_path("/docs/.origofs"),
+        "only the tree root's copy"
+    );
+}
+
+// The headline property: two branches that both checkpointed a co-edited document
+// merge without asking anyone to adjudicate the CRDT state, while the *document*
+// conflicts normally.
+#[tokio::test]
+async fn diverging_internal_state_never_conflicts_and_leaves_no_theirs_sibling() {
+    let fs = fixture().await;
+    fs.mkdir_p("/.origofs/ydoc").await.unwrap();
+    // Distinct seeds: `binary` masks `seed | 1`, so e.g. 2 and 3 collide — which
+    // would leave the sidecar identical on both sides and pass this test on a
+    // merge that never diverged. The assertion below pins that.
+    let (base, theirs, ours) = (binary(4_000, 11), binary(4_000, 21), binary(4_000, 31));
+    assert!(
+        base != theirs && theirs != ours && base != ours,
+        "the three sides must genuinely differ or this test proves nothing"
+    );
+    fs.write("/.origofs/ydoc/aa", &base).await.unwrap();
+    fs.write("/doc.md", b"base\n").await.unwrap();
+    fs.commit("a", "base").await.unwrap();
+    fs.create_branch("dev").await.unwrap();
+
+    fs.checkout("dev").await.unwrap();
+    fs.write("/.origofs/ydoc/aa", &theirs).await.unwrap();
+    fs.write("/doc.md", b"theirs\n").await.unwrap();
+    let dev = fs.commit("a", "theirs").await.unwrap();
+
+    fs.checkout("main").await.unwrap();
+    fs.write("/.origofs/ydoc/aa", &ours).await.unwrap();
+    fs.write("/doc.md", b"ours\n").await.unwrap();
+    fs.commit("a", "ours").await.unwrap();
+
+    // The document itself must still conflict — otherwise this test would pass on
+    // a merge that never diverged at all.
+    match fs.merge(dev, "a", "merge").await.unwrap() {
+        MergeOutcome::Conflicts(cs) => {
+            assert!(
+                cs.iter().any(|c| c.path == "/doc.md"),
+                "the user's document must still conflict: {cs:?}"
+            );
+            assert!(
+                !cs.iter().any(|c| is_internal_path(&c.path)),
+                "origofs's own state must never be reported as a conflict: {cs:?}"
+            );
+        }
+        other => panic!("expected a conflict on /doc.md, got {other:?}"),
+    }
+
+    // Ours is kept verbatim — never a diff3-spliced blob — and no unreachable
+    // sibling is left behind in the hidden directory.
+    assert_eq!(fs.read("/.origofs/ydoc/aa").await.unwrap()[..], ours[..]);
+    assert!(
+        fs.read("/.origofs/ydoc/aa.theirs").await.is_err(),
+        "a `.theirs` sibling under {INTERNAL_DIR} is unreachable junk"
+    );
+    assert!(
+        !fs.ls("/.origofs/ydoc")
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.name.ends_with(".theirs")),
+        "no `.theirs` entry may be listed under {INTERNAL_DIR}"
+    );
+}
+
+// The suppression is scoped by path, not by "hidden-looking": a user directory
+// whose name merely begins with the reserved one conflicts like any other.
+#[tokio::test]
+async fn a_lookalike_of_the_internal_dir_still_conflicts() {
+    let fs = fixture().await;
+    fs.mkdir_p("/.origofs-bench").await.unwrap();
+    fs.write("/.origofs-bench/bin", &binary(4_000, 11))
+        .await
+        .unwrap();
+    fs.commit("a", "base").await.unwrap();
+    fs.create_branch("dev").await.unwrap();
+
+    fs.checkout("dev").await.unwrap();
+    fs.write("/.origofs-bench/bin", &binary(4_000, 21))
+        .await
+        .unwrap();
+    let dev = fs.commit("a", "theirs").await.unwrap();
+
+    fs.checkout("main").await.unwrap();
+    fs.write("/.origofs-bench/bin", &binary(4_000, 31))
+        .await
+        .unwrap();
+    fs.commit("a", "ours").await.unwrap();
+
+    match fs.merge(dev, "a", "merge").await.unwrap() {
+        MergeOutcome::Conflicts(cs) => assert!(
+            cs.iter().any(|c| c.path == "/.origofs-bench/bin"),
+            "a lookalike path must conflict normally: {cs:?}"
+        ),
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+}
+
+// The suppression must not swallow the other side's entries: `/.origofs` is a
+// directory and still recurses, so a document checkpointed only on their branch
+// keeps its sidecar through the merge.
+#[tokio::test]
+async fn internal_state_added_on_one_side_survives_the_merge() {
+    let fs = fixture().await;
+    fs.mkdir_p("/.origofs/ydoc").await.unwrap();
+    fs.write("/.origofs/ydoc/ours", &binary(1_000, 1))
+        .await
+        .unwrap();
+    fs.write("/a.md", b"base\n").await.unwrap();
+    fs.commit("a", "base").await.unwrap();
+    fs.create_branch("dev").await.unwrap();
+
+    fs.checkout("dev").await.unwrap();
+    let theirs = binary(1_000, 9);
+    fs.write("/.origofs/ydoc/theirs", &theirs).await.unwrap();
+    let dev = fs.commit("a", "theirs").await.unwrap();
+
+    fs.checkout("main").await.unwrap();
+    fs.write("/a.md", b"ours\n").await.unwrap();
+    fs.commit("a", "ours").await.unwrap();
+
+    let out = fs.merge(dev, "a", "merge").await.unwrap();
+    assert!(
+        !matches!(out, MergeOutcome::Conflicts(_)),
+        "nothing here conflicts: {out:?}"
+    );
+    assert_eq!(
+        fs.read("/.origofs/ydoc/theirs").await.unwrap()[..],
+        theirs[..]
+    );
+    assert!(fs.read("/.origofs/ydoc/ours").await.is_ok());
+}
+
+// modify/delete on internal state is the same non-question: resolve it, silently.
+#[tokio::test]
+async fn internal_state_modify_delete_does_not_conflict() {
+    let fs = fixture().await;
+    fs.mkdir_p("/.origofs/ydoc").await.unwrap();
+    fs.write("/.origofs/ydoc/aa", &binary(1_000, 1))
+        .await
+        .unwrap();
+    fs.write("/keep.md", b"base\n").await.unwrap();
+    fs.commit("a", "base").await.unwrap();
+    fs.create_branch("dev").await.unwrap();
+
+    // They delete the sidecar (a `checkout` on their side would do this too).
+    fs.checkout("dev").await.unwrap();
+    fs.remove("/.origofs/ydoc/aa").await.unwrap();
+    let dev = fs.commit("a", "dropped it").await.unwrap();
+
+    // We re-checkpointed it.
+    fs.checkout("main").await.unwrap();
+    let ours = binary(1_000, 4);
+    fs.write("/.origofs/ydoc/aa", &ours).await.unwrap();
+    fs.commit("a", "rewrote it").await.unwrap();
+
+    let out = fs.merge(dev, "a", "merge").await.unwrap();
+    assert!(
+        !matches!(out, MergeOutcome::Conflicts(_)),
+        "a modify/delete on origofs's own state is not the user's to resolve: {out:?}"
+    );
+    assert_eq!(fs.read("/.origofs/ydoc/aa").await.unwrap()[..], ours[..]);
 }

@@ -1041,7 +1041,11 @@ struct NfsServer {
 impl NfsServer {
     /// Start serving `ws` at `addr` on a private runtime. Binding happens inside
     /// the accept-loop task, so a bind failure surfaces from [`Self::joined`].
-    fn start(ws: CoreWorkspace, addr: String) -> std::io::Result<Self> {
+    fn start(
+        ws: CoreWorkspace,
+        addr: String,
+        ctx: Option<origofs_sdk::WriteCtx>,
+    ) -> std::io::Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("origofs-nfs")
@@ -1051,7 +1055,7 @@ impl NfsServer {
         tasks.spawn_on(
             async move {
                 tokio::select! {
-                    r = origofs_sdk::nfs::serve(ws, &addr) => r,
+                    r = origofs_sdk::nfs::serve_as(ws, &addr, ctx) => r,
                     // Returning here drops the accept loop, and with it the
                     // listener — its fd (and port) is released right now.
                     _ = stop_rx.changed() => Ok(()),
@@ -3460,12 +3464,21 @@ impl Workspace {
     /// background. Returns a `Mount` handle; unmount by calling `.unmount()`,
     /// exiting its `with` block, or dropping it. Requires FUSE (`/dev/fuse`).
     /// Unix only.
+    ///
+    /// Pass `ctx` to bind the mount to an actor, so every operation through it is
+    /// checked against that actor's path grants (issue #141). Without it the mount
+    /// is anonymous and the ACLs do not apply to it. The identity is the
+    /// *mount's*, not the caller's — the kernel does not say which process issued
+    /// a request — and it authorizes without attributing: writes through a mount
+    /// still record no blame.
     #[cfg(target_os = "linux")]
-    fn mount(&self, py: Python<'_>, mountpoint: String) -> PyResult<Mount> {
+    #[pyo3(signature = (mountpoint, ctx = None))]
+    fn mount(&self, py: Python<'_>, mountpoint: String, ctx: Option<WriteCtx>) -> PyResult<Mount> {
         let ws = self.inner.clone();
         let mp = mountpoint.clone();
+        let c = ctx.map(|c| c.inner);
         let session = py
-            .detach(move || origofs_sdk::fuse::spawn(ws, Path::new(&mp)))
+            .detach(move || origofs_sdk::fuse::spawn_as(ws, Path::new(&mp), c))
             .map_err(io_err)?;
         Ok(Mount {
             session: Some(session),
@@ -3476,7 +3489,8 @@ impl Workspace {
     /// FUSE mounting is not available on this platform (Unix/FUSE only). Use the
     /// HTTP API (`origofs.fastapi`) or embed the SDK directly.
     #[cfg(not(target_os = "linux"))]
-    fn mount(&self, _mountpoint: String) -> PyResult<()> {
+    #[pyo3(signature = (_mountpoint, _ctx = None))]
+    fn mount(&self, _mountpoint: String, _ctx: Option<WriteCtx>) -> PyResult<()> {
         Err(unsupported("FUSE mounting"))
     }
 
@@ -3509,14 +3523,16 @@ impl Workspace {
     /// caller that cancels and immediately blocks the loop delays the teardown
     /// it asked for — ordinary asyncio semantics). Unix only.
     #[cfg(unix)]
-    #[pyo3(signature = (addr, shutdown = None))]
+    #[pyo3(signature = (addr, shutdown = None, ctx = None))]
     fn serve_nfs<'py>(
         &self,
         py: Python<'py>,
         addr: String,
         shutdown: Option<Bound<'py, PyAny>>,
+        ctx: Option<WriteCtx>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
+        let c = ctx.map(|c| c.inner);
         // Converted while we hold the GIL; the resulting future is plain Rust.
         let stopper = shutdown
             .map(pyo3_async_runtimes::tokio::into_future)
@@ -3524,7 +3540,7 @@ impl Workspace {
         future_into_py(py, async move {
             // Dropping `server` (which is what a cancelled Python task does to
             // this future) is itself a full teardown — see `NfsServer::drop`.
-            let mut server = NfsServer::start(ws, addr).map_err(io_err)?;
+            let mut server = NfsServer::start(ws, addr, c).map_err(io_err)?;
             let Some(stopper) = stopper else {
                 // No explicit handle: run until the caller cancels us.
                 return server.joined().await.map_err(io_err);
@@ -3545,8 +3561,13 @@ impl Workspace {
     /// NFS serving is not available on this platform (Unix only). Use the HTTP
     /// API (`origofs.fastapi`) or embed the SDK directly.
     #[cfg(not(unix))]
-    #[pyo3(signature = (_addr, _shutdown = None))]
-    fn serve_nfs(&self, _addr: String, _shutdown: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+    #[pyo3(signature = (_addr, _shutdown = None, _ctx = None))]
+    fn serve_nfs(
+        &self,
+        _addr: String,
+        _shutdown: Option<Bound<'_, PyAny>>,
+        _ctx: Option<WriteCtx>,
+    ) -> PyResult<()> {
         Err(unsupported("NFS serving"))
     }
 

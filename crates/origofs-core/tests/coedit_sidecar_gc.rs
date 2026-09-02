@@ -19,8 +19,8 @@
 #![cfg(feature = "coedit")]
 
 use origofs_core::{
-    ContentStore, Fs, Hash, MemStore, MetadataStore, SqliteMetadataStore, WriteCtx,
-    coedit_sidecar_path,
+    COEDIT_SIDECAR_DIR, ContentStore, Fs, Hash, MemStore, MetadataStore, SqliteMetadataStore,
+    WriteCtx, coedit_sidecar_path, coedit_tree_sidecar_path, is_internal_path,
 };
 use std::sync::Arc;
 
@@ -186,4 +186,28 @@ async fn an_orphaned_sidecar_is_reclaimable_and_reopening_is_clean() {
     // Reopening the vanished path is clean: an empty document, no error.
     let reopened = fs.open_coedit(a, "/gone.md").await.unwrap();
     assert_eq!(reopened.text(), "");
+}
+
+/// Both sidecar shapes must live under the reserved directory, because that
+/// prefix is what `merge` keys the "origofs's own state, never a user conflict"
+/// rule on (issue #142) — and what `git export` will key its skip on.
+///
+/// The two constants are declared in different modules (`INTERNAL_DIR` in the
+/// engine, so it is visible without the `coedit` feature; `COEDIT_SIDECAR_DIR`
+/// beside the code that writes it), so nothing but this test stops them drifting
+/// apart. Drift would be silent: the sidecars would simply start conflicting
+/// again.
+#[test]
+fn every_sidecar_path_is_inside_the_reserved_directory() {
+    assert!(is_internal_path(COEDIT_SIDECAR_DIR));
+    for path in ["/notes.md", "/deep/nested/doc.md", "/a b/c.txt"] {
+        assert!(
+            is_internal_path(&coedit_sidecar_path(path)),
+            "flat sidecar for {path} escaped the reserved directory"
+        );
+        assert!(
+            is_internal_path(&coedit_tree_sidecar_path(path)),
+            "tree sidecar for {path} escaped the reserved directory"
+        );
+    }
 }

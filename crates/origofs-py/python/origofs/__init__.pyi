@@ -1438,13 +1438,22 @@ class Workspace:
         ...
 
     if sys.platform == "linux":
-        def mount(self, mountpoint: str) -> Mount: ...
+        def mount(self, mountpoint: str, ctx: Optional[WriteCtx] = None) -> Mount:
+            """Mount at ``mountpoint``. Pass ``ctx`` to bind the mount to an actor,
+            so every operation through it is checked against that actor's path
+            grants; without it the mount is anonymous and the ACLs do not apply.
+            The identity is the mount's, not the caller's, and it authorizes
+            without attributing."""
+
     else:
-        def mount(self, mountpoint: str) -> NoReturn: ...
+        def mount(self, mountpoint: str, ctx: Optional[WriteCtx] = None) -> NoReturn: ...
 
     if sys.platform != "win32":
         async def serve_nfs(
-            self, addr: str, shutdown: Optional[Awaitable[Any]] = None
+            self,
+            addr: str,
+            shutdown: Optional[Awaitable[Any]] = None,
+            ctx: Optional[WriteCtx] = None,
         ) -> None:
             """Serve NFSv3 at ``addr`` until cancelled, until ``shutdown`` (any
             awaitable, e.g. ``asyncio.Event().wait()``) resolves, or until the
@@ -1454,7 +1463,10 @@ class Workspace:
             ...
     else:
         def serve_nfs(
-            self, addr: str, shutdown: Optional[Awaitable[Any]] = None
+            self,
+            addr: str,
+            shutdown: Optional[Awaitable[Any]] = None,
+            ctx: Optional[WriteCtx] = None,
         ) -> NoReturn: ...
 
 def content_hash(data: bytes) -> str:

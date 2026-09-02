@@ -79,6 +79,11 @@ tokio-postgres = { version = "0.7", optional = true }
 # Opt-in CRDT co-editing (roadmap M8): a Yjs-in-Rust document whose per-span
 # authorship checkpoints through `write_as_blamed`. Gated so non-collab builds
 # don't pull it in.
+# Pinned deliberately: a malformed update reaches unvalidated-UTF-8 handling and
+# causes UB (#144). Upgrading does not fix it — 0.24/0.25/0.26 reproduce it
+# identically and 0.27.4 (latest) has the same `from_utf8_unchecked` sites and
+# does not build on stable Rust. Before moving this, run the ignored reproducer:
+# `cargo test -p origofs-core --features coedit --test coedit_malformed_update -- --ignored`
 yrs = { version = "0.23", optional = true }
 
 [features]

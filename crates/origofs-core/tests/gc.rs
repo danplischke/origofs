@@ -400,8 +400,30 @@ async fn touch_refreshes_only_stale_objects() {
     }
 
     // Young: nothing to do, and the stamp is left alone.
+    //
+    // Backdated to *inside* the refresh threshold first, for two reasons. A
+    // freshly-`put` object reads as age 0 whether or not `touch` reset its stamp,
+    // so asserting `age == 0` could not fail for the bug it names — the refresh
+    // firing on a young object would have produced age 0 too. And it was a
+    // wall-clock race: `put` and the read either side of a second boundary made
+    // the age 1 and failed the test, which is what it did under load.
+    //
+    // Half the threshold leaves 30s of headroom before `touch` would legitimately
+    // refresh, and the assertion now has somewhere to fall: a stamp left alone
+    // stays at least this old, while one wrongly refreshed drops to ~0.
+    let young = origofs_core::DEDUP_REFRESH_AFTER_SECS / 2;
+    backdate_objects(dir.path(), young);
+    assert!(
+        age_of(&store, &hash).await >= young,
+        "backdating did not take"
+    );
     store.touch(&hash).await.unwrap();
-    assert_eq!(age_of(&store, &hash).await, 0);
+    let after = age_of(&store, &hash).await;
+    assert!(
+        after >= young,
+        "touch refreshed an object inside the refresh threshold: age fell from \
+         {young} to {after}"
+    );
 
     // Stale: the refresh brings it back inside any valid grace period.
     let stale = origofs_core::DEDUP_REFRESH_AFTER_SECS * 10;

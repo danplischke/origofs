@@ -698,7 +698,7 @@ const TREE_SIDECAR_HASH_LEN: usize = 32;
 /// `Err(UnsupportedVersion)`, or a host that never checks
 /// [`resumed`](CoeditTreeDoc::resumed) checkpoints an empty body over a file whose
 /// history this build simply failed to recognize.
-fn parse_tree_sidecar(blob: &[u8]) -> Result<Option<TreeSidecar<'_>>> {
+pub(crate) fn parse_tree_sidecar(blob: &[u8]) -> Result<Option<TreeSidecar<'_>>> {
     let body = if format::COEDIT_TREE_SIDECAR.tagged(blob) {
         match format::COEDIT_TREE_SIDECAR.version_of(blob)? {
             1 => &blob[format::HEADER_LEN..],
@@ -714,14 +714,14 @@ fn parse_tree_sidecar(blob: &[u8]) -> Result<Option<TreeSidecar<'_>>> {
 }
 
 /// A parsed tree sidecar.
-struct TreeSidecar<'a> {
+pub(crate) struct TreeSidecar<'a> {
     /// The `XmlFragment` root the document was written under. A tree resumed under
     /// a different root is a different (empty) document, so this is checked.
-    root: &'a str,
+    pub(crate) root: &'a str,
     /// BLAKE3 of the body this sidecar last crystallized — the coherence marker.
-    body_hash: &'a [u8],
+    pub(crate) body_hash: &'a [u8],
     /// The ydoc state update.
-    state: &'a [u8],
+    pub(crate) state: &'a [u8],
 }
 
 /// The version-independent tail shared by both tree framings:

@@ -609,3 +609,440 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .ok_or_else(|| OrigoFSError::InvalidArgument(format!("ino {ino} is not a symlink")))
     }
 }
+
+// --- the ACL-checked inode ops a mount calls (issue #141) --------------------
+//
+// The ops above take no actor, and for most of their history nothing could give
+// them one: a mount had no identity, which `CLAUDE.md` documented as a
+// deliberate bypass. That was survivable while the only authorization was a
+// per-actor write policy — a mount was all-or-nothing anyway. Path-scoped ACLs
+// (#123) made it false containment: an agent refused `WRITE` under `/src` over
+// MCP or HTTP took the identical action through a mount, and no check ran.
+//
+// # Why the checks live here and not in the mount
+//
+// `CLAUDE.md`'s standing rule — enforce in the engine, never per surface. A
+// guard the surface calls is a guard the next surface, or the next op on this
+// one, can forget; a guard *inside* the method cannot be forgotten by anything
+// that calls the method. What remains is a surface calling the unchecked op
+// instead, which is a question about source text rather than about runtime
+// behaviour, and `origofs-sdk/tests/mount_acl.rs` answers it the way `tests/mcp.rs`
+// answers it for MCP tools.
+//
+// # `None` is an anonymous mount, and still bypasses
+//
+// Every one of these takes `Option<WriteCtx>`, not `WriteCtx`. `None` means a
+// mount started without an identity, and behaves exactly as the mounts always
+// have. That keeps `origofs mount` working unchanged for the single-user case it
+// was built for, and it makes the bypass a visible argument at the call site
+// rather than an absent one. `Some(ctx)` is a mount bound to an actor: every op
+// is checked against the grants covering the path it touches.
+//
+// # What this does *not* do
+//
+// It does not attribute. A write through a mount still records no `edit_op` and
+// no blame, exactly as before — the ACL question is "may this actor", and the
+// attribution question is "what did they change", which for an offset write is
+// a different and larger problem than authorizing it. Do not read a mount having
+// an actor as its writes being attributed to one.
+//
+// # Denials still do not leak existence
+//
+// `#123`'s invariant 4. The `(parent, name)` guards resolve only the *parent*'s
+// path and append the name, so no lookup of the target precedes the check —
+// a create, unlink or rename is refused identically whether or not the name is
+// there. The `ino` guards must resolve the inode to know its path, but an `ino`
+// only ever reaches a mount through a `lookup` that this same layer already
+// gated, so nothing is revealed that the caller had not already been allowed to
+// learn.
+impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
+    /// The absolute path of `ino`, for a guard that must name it in a check.
+    ///
+    /// An inode unreachable from the root has no path for a grant to cover, so it
+    /// is refused rather than allowed: a prefix ACL cannot express permission for
+    /// something outside the tree, and defaulting to "allow" would make an orphan
+    /// the way around every grant.
+    async fn guard_path_of(&self, ino: Ino) -> Result<String> {
+        self.vfs_path_of(ino).await?.ok_or_else(|| {
+            OrigoFSError::Denied(format!(
+                "ino {ino} is not reachable from the workspace root"
+            ))
+        })
+    }
+
+    /// The path `name` would have inside directory `parent`.
+    async fn guard_path_in(&self, parent: Ino, name: &str) -> Result<String> {
+        let dir = self.guard_path_of(parent).await?;
+        Ok(format!("{}/{name}", dir.trim_end_matches('/')))
+    }
+
+    /// Refuse a mount-initiated write at `ino` unless `ctx` may write there.
+    async fn guard_write(&self, ctx: Option<crate::WriteCtx>, op: &str, ino: Ino) -> Result<()> {
+        let Some(ctx) = ctx else { return Ok(()) };
+        let path = self.guard_path_of(ino).await?;
+        self.ensure_may_write_at(ctx, op, &path).await
+    }
+
+    /// Refuse a mount-initiated write at `parent`/`name` unless `ctx` may write there.
+    async fn guard_write_in(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        op: &str,
+        parent: Ino,
+        name: &str,
+    ) -> Result<()> {
+        let Some(ctx) = ctx else { return Ok(()) };
+        let path = self.guard_path_in(parent, name).await?;
+        self.ensure_may_write_at(ctx, op, &path).await
+    }
+
+    /// Refuse a mount-initiated read of `ino` unless `ctx` may read there.
+    ///
+    /// A no-op unless the workspace has `acl_enforce_reads` on, like every other
+    /// read check.
+    async fn guard_read(&self, ctx: Option<crate::WriteCtx>, op: &str, ino: Ino) -> Result<()> {
+        let Some(ctx) = ctx else { return Ok(()) };
+        if !self.acl_enforce_reads().await? {
+            return Ok(());
+        }
+        let path = self.guard_path_of(ino).await?;
+        self.ensure_may_read_at(ctx, op, &path).await
+    }
+
+    /// Whether `ctx` may read `parent`/`name`, for filtering a listing.
+    async fn guard_may_read_in(
+        &self,
+        ctx: crate::WriteCtx,
+        parent_path: &str,
+        name: &str,
+    ) -> Result<bool> {
+        let child = format!("{}/{name}", parent_path.trim_end_matches('/'));
+        Ok(self
+            .effective_perms(ctx.actor, &child)
+            .await?
+            .contains(crate::acl::Perms::READ))
+    }
+
+    // --- mutations ---------------------------------------------------------
+
+    /// [`vfs_write`](Self::vfs_write), checked.
+    pub async fn vfs_write_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32> {
+        self.guard_write(ctx, "write", ino).await?;
+        self.vfs_write(ino, offset, data).await
+    }
+
+    /// [`vfs_truncate`](Self::vfs_truncate), checked.
+    pub async fn vfs_truncate_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        size: u64,
+    ) -> Result<()> {
+        self.guard_write(ctx, "truncate", ino).await?;
+        self.vfs_truncate(ino, size).await
+    }
+
+    /// [`vfs_create`](Self::vfs_create), checked.
+    pub async fn vfs_create_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        owner: Owner,
+    ) -> Result<Inode> {
+        self.guard_write_in(ctx, "create", parent, name).await?;
+        self.vfs_create(parent, name, mode, owner).await
+    }
+
+    /// [`vfs_mkdir`](Self::vfs_mkdir), checked.
+    pub async fn vfs_mkdir_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        owner: Owner,
+    ) -> Result<Inode> {
+        self.guard_write_in(ctx, "create a directory at", parent, name)
+            .await?;
+        self.vfs_mkdir(parent, name, mode, owner).await
+    }
+
+    /// [`vfs_unlink`](Self::vfs_unlink), checked.
+    pub async fn vfs_unlink_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        parent: Ino,
+        name: &str,
+    ) -> Result<()> {
+        self.guard_write_in(ctx, "remove", parent, name).await?;
+        self.vfs_unlink(parent, name).await
+    }
+
+    /// [`vfs_rmdir`](Self::vfs_rmdir), checked.
+    pub async fn vfs_rmdir_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        parent: Ino,
+        name: &str,
+    ) -> Result<()> {
+        self.guard_write_in(ctx, "remove the directory", parent, name)
+            .await?;
+        self.vfs_rmdir(parent, name).await
+    }
+
+    /// [`vfs_link`](Self::vfs_link), checked at the **new** name.
+    ///
+    /// The destination is where the change lands; the source inode is not
+    /// modified, and its content is already reachable to anyone holding the
+    /// inode.
+    pub async fn vfs_link_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        newparent: Ino,
+        newname: &str,
+    ) -> Result<Inode> {
+        self.guard_write_in(ctx, "hard-link into", newparent, newname)
+            .await?;
+        self.vfs_link(ino, newparent, newname).await
+    }
+
+    /// [`vfs_rename`](Self::vfs_rename), checked at **both** ends.
+    ///
+    /// Source *and* destination, per `#123`: checking only the source lets an
+    /// actor move a file it controls into a tree it does not, and checking only
+    /// the destination lets it move one out of a tree it may not touch.
+    pub async fn vfs_rename_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        parent: Ino,
+        name: &str,
+        newparent: Ino,
+        newname: &str,
+    ) -> Result<()> {
+        self.guard_write_in(ctx, "rename out of", parent, name)
+            .await?;
+        self.guard_write_in(ctx, "rename into", newparent, newname)
+            .await?;
+        self.vfs_rename(parent, name, newparent, newname).await
+    }
+
+    /// [`vfs_symlink`](Self::vfs_symlink), checked.
+    pub async fn vfs_symlink_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        parent: Ino,
+        name: &str,
+        target: &str,
+        owner: Owner,
+    ) -> Result<Inode> {
+        self.guard_write_in(ctx, "create a symlink at", parent, name)
+            .await?;
+        self.vfs_symlink(parent, name, target, owner).await
+    }
+
+    /// [`vfs_chmod`](Self::vfs_chmod), checked.
+    pub async fn vfs_chmod_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        mode: u32,
+    ) -> Result<Inode> {
+        self.guard_write(ctx, "change the mode of", ino).await?;
+        self.vfs_chmod(ino, mode).await
+    }
+
+    /// [`vfs_chown`](Self::vfs_chown), checked.
+    pub async fn vfs_chown_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode> {
+        self.guard_write(ctx, "change the owner of", ino).await?;
+        self.vfs_chown(ino, uid, gid).await
+    }
+
+    /// [`vfs_setxattr`](Self::vfs_setxattr), checked.
+    pub async fn vfs_setxattr_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        self.guard_write(ctx, "set an extended attribute on", ino)
+            .await?;
+        self.vfs_setxattr(ino, name, value).await
+    }
+
+    /// [`vfs_removexattr`](Self::vfs_removexattr), checked.
+    pub async fn vfs_removexattr_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        name: &str,
+    ) -> Result<bool> {
+        self.guard_write(ctx, "remove an extended attribute from", ino)
+            .await?;
+        self.vfs_removexattr(ino, name).await
+    }
+
+    // --- reads -------------------------------------------------------------
+
+    /// [`vfs_lookup`](Self::vfs_lookup), checked at the child.
+    ///
+    /// Checked at `parent`/`name` rather than at `parent`, so a grant that opens
+    /// one child of a directory does not open its siblings.
+    pub async fn vfs_lookup_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        parent: Ino,
+        name: &str,
+    ) -> Result<Option<Inode>> {
+        if let Some(ctx) = ctx
+            && self.acl_enforce_reads().await?
+        {
+            let path = self.guard_path_in(parent, name).await?;
+            self.ensure_may_read_at(ctx, "look up", &path).await?;
+        }
+        self.vfs_lookup(parent, name).await
+    }
+
+    /// [`vfs_getattr`](Self::vfs_getattr), checked.
+    pub async fn vfs_getattr_as(&self, ctx: Option<crate::WriteCtx>, ino: Ino) -> Result<Inode> {
+        self.guard_read(ctx, "stat", ino).await?;
+        self.vfs_getattr(ino).await
+    }
+
+    /// [`vfs_read`](Self::vfs_read), checked.
+    pub async fn vfs_read_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        offset: u64,
+        size: u32,
+    ) -> Result<Bytes> {
+        self.guard_read(ctx, "read", ino).await?;
+        self.vfs_read(ino, offset, size).await
+    }
+
+    /// [`vfs_readlink`](Self::vfs_readlink), checked.
+    pub async fn vfs_readlink_as(&self, ctx: Option<crate::WriteCtx>, ino: Ino) -> Result<String> {
+        self.guard_read(ctx, "read the symlink", ino).await?;
+        self.vfs_readlink(ino).await
+    }
+
+    /// [`vfs_getxattr`](Self::vfs_getxattr), checked.
+    pub async fn vfs_getxattr_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.guard_read(ctx, "read an extended attribute of", ino)
+            .await?;
+        self.vfs_getxattr(ino, name).await
+    }
+
+    /// [`vfs_listxattr`](Self::vfs_listxattr), checked.
+    pub async fn vfs_listxattr_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+    ) -> Result<Vec<String>> {
+        self.guard_read(ctx, "list the extended attributes of", ino)
+            .await?;
+        self.vfs_listxattr(ino).await
+    }
+
+    /// [`vfs_readdir_page`](Self::vfs_readdir_page), checked at the directory and
+    /// **filtered per entry** — the same pair of rules
+    /// [`ls_as`](Self::ls_as) takes, and for the same reason: a listing that names
+    /// an entry `stat` would refuse is the existence oracle the refusal exists to
+    /// prevent.
+    ///
+    /// # Why this pages internally
+    ///
+    /// The caller resumes from the last name it was handed, so returning a page
+    /// that filtered to empty would read as end-of-directory and silently truncate
+    /// the listing. Instead this keeps scanning until it has something visible or
+    /// the directory is genuinely exhausted. Everything between the last visible
+    /// entry and where the scan stopped is invisible and simply gets re-filtered
+    /// on the next call — redundant, never wrong, and it always advances.
+    pub async fn vfs_readdir_page_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>> {
+        let Some(ctx) = ctx else {
+            return self.vfs_readdir_page(ino, after_name, limit).await;
+        };
+        if !self.acl_enforce_reads().await? {
+            return self.vfs_readdir_page(ino, after_name, limit).await;
+        }
+        let dir = self.guard_path_of(ino).await?;
+        self.ensure_may_read_at(ctx, "list", &dir).await?;
+
+        let mut cursor = after_name.map(|s| s.to_string());
+        loop {
+            let page = self.vfs_readdir_page(ino, cursor.as_deref(), limit).await?;
+            let exhausted = page.len() < limit;
+            let last = page.last().map(|e| e.name.clone());
+            let mut visible = Vec::with_capacity(page.len());
+            for entry in page {
+                if self.guard_may_read_in(ctx, &dir, &entry.name).await? {
+                    visible.push(entry);
+                }
+            }
+            if !visible.is_empty() || exhausted {
+                return Ok(visible);
+            }
+            // The whole page was invisible: keep scanning rather than reporting a
+            // premature end. `last` is `Some` whenever the page was non-empty, and
+            // an empty page sets `exhausted`, so this always advances.
+            cursor = last;
+        }
+    }
+
+    /// [`vfs_readdir_page_with_attrs`](Self::vfs_readdir_page_with_attrs), checked
+    /// and filtered like [`vfs_readdir_page_as`](Self::vfs_readdir_page_as).
+    ///
+    /// This form carries its own cursor (`next_after`/`end`), so a page that
+    /// filters to empty is not mistaken for the end and it needs no internal loop.
+    pub async fn vfs_readdir_page_with_attrs_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<DirPage> {
+        let page = self
+            .vfs_readdir_page_with_attrs(ino, after_name, limit)
+            .await?;
+        let Some(ctx) = ctx else { return Ok(page) };
+        if !self.acl_enforce_reads().await? {
+            return Ok(page);
+        }
+        let dir = self.guard_path_of(ino).await?;
+        self.ensure_may_read_at(ctx, "list", &dir).await?;
+        let mut entries = Vec::with_capacity(page.entries.len());
+        for e in page.entries {
+            if self.guard_may_read_in(ctx, &dir, &e.entry.name).await? {
+                entries.push(e);
+            }
+        }
+        Ok(DirPage { entries, ..page })
+    }
+}
