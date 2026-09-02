@@ -240,7 +240,27 @@ def test_the_sweeper_persists_a_tree_room_without_inventing_a_body():
     with TestClient(app) as tc:
         with tc.websocket_connect("/coedit-tree/doc.md?token=alice-token") as sock:
             _handshake(sock, client, ctx)
-            time.sleep(0.4)  # several sweeper ticks, socket still open
+
+            # The socket stays OPEN throughout -- that is the whole point, and it
+            # is what makes this the *sweeper's* persist rather than the last
+            # leave's: `leave()` persists the sidecar too, so a check made only
+            # after the socket closes would pass with the sweeper dead. Wait for
+            # the sidecar with a bound rather than a fixed sleep, as the flat
+            # sibling in test_coedit.py does: on a loaded runner the sweeper's
+            # tick is not a wall-clock promise. `load_coedit_tree_as` is the
+            # socket-less resume a host's "Save" route uses -- the write check,
+            # no live marker -- so probing with it claims nothing.
+            persisted = False
+            for _ in range(60):
+                time.sleep(0.05)
+                probe = _run(lambda: ws.load_coedit_tree_as(ctx, "/doc.md", "content"))
+                if _run(lambda: probe.resumed()):
+                    persisted = True
+                    break
+            assert persisted, (
+                "the sweeper never persisted the tree room's sidecar while its "
+                "socket stayed open"
+            )
 
             # The file was never invented...
             with pytest.raises(FileNotFoundError):
