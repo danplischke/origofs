@@ -515,6 +515,64 @@ compiling at all until #107.
   trying a candidate yrs, and drop the `#[ignore]`s in the change that moves the
   pin. `fuzz_targets/coedit_state_decode.rs` drives the same path and is expected
   to abort.
+- **There are two things called a lock, and they are unrelated (#119).**
+  `Fs::lock` is the durable, named, git-LFS-style claim on a **path**, taken by a
+  person so nobody else edits a binary; it outlives every process involved.
+  `vfs_setlk_as` is a POSIX **advisory byte-range** lock on an *inode*, owned by an
+  open file description and dead with the process. Neither can be expressed in the
+  other's table, which is why `posix_lock` is its own.
+  - **Why it is stored at all.** A FUSE filesystem that does not implement `setlk`
+    still has working advisory locks — the kernel serves them locally, per mount —
+    so an in-process table would reimplement what already works. The only thing
+    missing, and the only reason to answer `setlk`, is coordination *between*
+    mounts. That is why the table is durable rather than in-memory.
+  - **Off by default** (`origofs posix-locks on`), because answering `setlk` takes
+    locking *away* from the kernel's local handling: a bug here breaks what works
+    today. Same reasoning and same default as `acl_enforce_reads` and trash
+    retention. Mounts read it once, at mount time.
+  - **A durable table cannot be tidied by a process that has died**, so every row
+    carries a `holder` (the mount instance — a clean unmount deletes its rows) and
+    an `expires_at` lease that a live mount renews on a timer. Renewing only on
+    lock operations would not do: a process that takes a lock and then works for
+    five minutes would lose it. Expired rows are dropped inside the same
+    transaction that next touches the inode, so nothing needs a background reaper.
+  - **The semantics live in `posixlock.rs` and touch no database.** Splitting a
+    range somebody re-locks the middle of, downgrading half of an exclusive lock,
+    an unlock that punches a hole — that is where this gets subtle, and it is
+    unit-tested directly rather than through two backends. Each backend only runs
+    `resolve` inside a transaction. **That transaction is the correctness
+    boundary**: SQLite takes `BEGIN IMMEDIATE` and Postgres a per-inode
+    `pg_advisory_xact_lock`, because read-decide-write must be serialized or two
+    mounts both find no conflict and both insert. `SELECT … FOR UPDATE` is *not*
+    enough on Postgres — there are no gap locks, and the rows in question do not
+    exist yet.
+  - **`F_SETLKW` replies from off the session thread.** `fuser`'s dispatch loop is
+    single-threaded (`Config::n_threads` defaults to 1 and this mount does not
+    raise it), so waiting inline would freeze every operation on the mountpoint
+    for the duration. The waiter moves the `ReplyEmpty` onto the mount's runtime
+    and answers later. It is bounded (30s) because `fuser` exposes no
+    `FUSE_INTERRUPT` hook here, so an unbounded wait could never be cancelled.
+  - **Authorization follows what the lock claims**: exclusive takes the write
+    check, shared takes the read guard (inert unless `acl_enforce_reads`), and
+    **unlocking is never refused** — an actor whose grant was revoked mid-flight
+    must still be able to let go, or the range stays stuck until its lease runs
+    out.
+  - **NFS has none of this**, and not by choice: `nfsserve` exposes no NLM hooks,
+    and NFSv3 locking is a separate protocol. `fallocate`/`copy_file_range` from
+    the same issue also remain absent.
+  - **Four test tiers, because each one misses what the next catches.**
+    `property.rs` asserts the resolver's invariants over arbitrary op sequences —
+    states are built by *folding* random requests, never generated directly, since
+    a hand-made lock set is mostly states the resolver cannot emit.
+    `posix_lock_sim.rs` is the seeded DST: it drives the **real store** and
+    compares the rows against the reference model (`posixlock::apply`) after every
+    step, because `resolve` can be perfect while the SQL translation is not — a
+    `DELETE` that misses its row, an expiry filter off by one. It carries a
+    negative control that deliberately breaks the model and requires the
+    comparison to notice. `concurrency.rs` covers contention. The
+    `posix_lock_resolve` fuzz target is the deeper search of the same invariants;
+    note CI only `cargo check`s the fuzz crate, which is exactly why the
+    properties also run in-crate.
 - **Path traversal is rejected at every metadata boundary.** `validate_component`
   (`engine.rs`) refuses `.`/`..`/`/`/NUL in a single name so a poisoned name can
   never be *stored* — which is what stops it escaping during host materialization

@@ -2194,6 +2194,15 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
             Exempt("administrative: sets whether attribution is mandatory"),
         ),
         (
+            "posix-locks",
+            Exempt(
+                "administrative: sets whether this workspace answers `fcntl` \
+                 advisory locks, and lists the locks held. Touches no file content \
+                 — an advisory lock is coordination between cooperating processes, \
+                 not a change to the tree, so there is nothing to attribute.",
+            ),
+        ),
+        (
             "quota",
             Exempt("administrative: sets the workspace's capacity limits, not its contents"),
         ),
@@ -3046,4 +3055,49 @@ fn a_byte_quota_refuses_the_write_that_would_exceed_it() {
         .expect_ok("under the cap");
     ws.write_as("/big.txt", alice, "0123456789abcdef0123456789")
         .expect_err("over the cap");
+}
+
+/// The switch is reachable and reversible, and reads back what was set.
+///
+/// It exists at all because an engine feature with no surface cannot be turned on
+/// without writing Rust — the failure #115, #116 and #124 all shared.
+#[test]
+fn posix_locks_switch_round_trips() {
+    let ws = Ws::init();
+    ws.run(&["posix-locks"])
+        .expect_ok("read the default")
+        .stdout_has("off");
+    ws.run(&["posix-locks", "on"])
+        .expect_ok("turn it on")
+        .stdout_has("on");
+    ws.run(&["posix-locks"])
+        .expect_ok("read it back")
+        .stdout_has("on");
+    ws.run(&["posix-locks", "off"])
+        .expect_ok("and back off")
+        .stdout_has("off");
+}
+
+#[test]
+fn posix_locks_rejects_an_unknown_setting() {
+    let ws = Ws::init();
+    ws.run(&["posix-locks", "maybe"])
+        .expect_err("a bogus setting")
+        .stderr_has("expected `on` or `off`");
+}
+
+/// An empty listing has to say whether locking is even on: "nothing holds this"
+/// and "we are not answering locks" are different answers to the same command.
+#[test]
+fn listing_locks_on_a_path_distinguishes_off_from_empty() {
+    let ws = Ws::init();
+    ws.run_in(&["write", "/f.bin"], "data\n")
+        .expect_ok("a file to ask about");
+    ws.run(&["posix-locks", "--path", "/f.bin"])
+        .expect_ok("listing while off")
+        .stdout_has("locking is off");
+    ws.run(&["posix-locks", "on"]).expect_ok("turn it on");
+    ws.run(&["posix-locks", "--path", "/f.bin"])
+        .expect_ok("listing while on and unlocked")
+        .stdout_has("locking is on");
 }

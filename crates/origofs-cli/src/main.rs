@@ -390,6 +390,24 @@ enum Cmd {
         /// `on` or `off`. Omit to print the current setting.
         setting: Option<String>,
     },
+    /// Turn cross-mount POSIX advisory locking on (`on`) or off (`off`); with no
+    /// argument, print the current setting.
+    ///
+    /// **Off by default, and worth understanding before turning on.** A FUSE mount
+    /// that does not answer `fcntl` locks still has working advisory locks — the
+    /// kernel serves them locally, per mount — so this does not add locking to a
+    /// workspace that had none. What it adds is coordination *between* mounts: two
+    /// processes on two machines against one workspace. It also takes locking over
+    /// from the kernel for that mount, which is why it is a deliberate switch.
+    ///
+    /// Mounts read it once, at mount time; remount to pick up a change.
+    PosixLocks {
+        /// `on` or `off`. Omit to print the current setting.
+        setting: Option<String>,
+        /// Instead of the setting, list the locks held on this path.
+        #[arg(long)]
+        path: Option<String>,
+    },
     /// Show per-line authorship (blame) for a file.
     Blame {
         path: String,
@@ -2108,6 +2126,58 @@ async fn main() -> Result<()> {
                 );
             }
         },
+        Cmd::PosixLocks { setting, path } => {
+            if let Some(path) = path {
+                let held = ws.posix_locks(&path).await?;
+                if held.is_empty() {
+                    // Distinguishes "nothing holds this" from "not collecting",
+                    // the same way `trash list` has to.
+                    let on = ws.posix_locks_enabled().await?;
+                    println!(
+                        "no advisory locks on {path} (locking is {})",
+                        if on { "on" } else { "off" }
+                    );
+                } else {
+                    for l in held {
+                        let end = if l.end == origofs_sdk::posixlock::LOCK_EOF {
+                            "EOF".to_string()
+                        } else {
+                            l.end.to_string()
+                        };
+                        println!(
+                            "{}\t{}-{}\tpid {}\towner {}\tmount {}",
+                            if l.exclusive { "WRITE" } else { "READ " },
+                            l.start,
+                            end,
+                            l.pid,
+                            l.owner,
+                            l.holder
+                        );
+                    }
+                }
+            } else {
+                match setting.as_deref() {
+                    None => {
+                        let on = ws.posix_locks_enabled().await?;
+                        println!("posix-locks is {}", if on { "on" } else { "off" });
+                    }
+                    Some(v) => {
+                        let on = match v {
+                            "on" | "true" | "1" => true,
+                            "off" | "false" | "0" => false,
+                            other => {
+                                return Err(origofs_sdk::OrigoFSError::InvalidArgument(format!(
+                                    "unknown setting {other:?} (expected `on` or `off`)"
+                                ))
+                                .into());
+                            }
+                        };
+                        ws.set_posix_locks_enabled(on).await?;
+                        println!("posix-locks is {}", if on { "on" } else { "off" });
+                    }
+                }
+            }
+        }
         Cmd::Blame { path, actor } => {
             let ranges = match read_ctx(actor)? {
                 Some(ctx) => ws.blame_as(ctx, &path).await?,

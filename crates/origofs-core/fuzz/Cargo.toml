@@ -78,3 +78,13 @@ path = "fuzz_targets/coedit_state_decode.rs"
 test = false
 doc = false
 bench = false
+
+# Not a decoder like the rest: `resolve` parses nothing. It is here because it
+# maintains the non-overlap invariant that `posix_lock`'s primary key depends on,
+# and a violation is a constraint error on a real `setlk`.
+[[bin]]
+name = "posix_lock_resolve"
+path = "fuzz_targets/posix_lock_resolve.rs"
+test = false
+doc = false
+bench = false

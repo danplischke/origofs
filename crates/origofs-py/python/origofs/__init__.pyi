@@ -254,6 +254,23 @@ class LockRecord(TypedDict):
     acquired_at: int
 
 
+class PosixLockRecord(TypedDict):
+    """One POSIX advisory byte-range lock (``posix_locks``).
+
+    Unrelated to :class:`LockRecord` despite the word: that one is a durable,
+    named claim on a *path* taken by a person, this one is owned by an open file
+    description and dies with the process. ``end`` is inclusive; ``2**63 - 1``
+    means to end-of-file.
+    """
+
+    owner: str
+    holder: str
+    pid: int
+    start: int
+    end: int
+    exclusive: bool
+
+
 class MergeResult(TypedDict):
     """The outcome of ``merge``. ``commit`` is ``None`` unless a commit was made;
     ``conflicts`` is non-empty only when the merge stopped on them."""
@@ -1406,6 +1423,14 @@ class Workspace:
     # nothing about who may do what. Off by default.
     async def require_attribution(self) -> bool: ...
     async def set_require_attribution(self, required: bool) -> None: ...
+    # ── POSIX advisory locks (#119) ──────────────────────────────────────────
+    # Off by default: a mount that does not answer `setlk` still has advisory
+    # locks, served locally by the kernel, so this switch is about coordinating
+    # them *between* mounts. Listing is read-only — locks belong to a mount's
+    # lifetime and lease, neither of which a library call has.
+    async def posix_locks_enabled(self) -> bool: ...
+    async def set_posix_locks_enabled(self, on: bool) -> None: ...
+    async def posix_locks(self, path: str) -> list[PosixLockRecord]: ...
     async def ensure_attributed(self, op: str) -> None:
         """Raises ``PermissionError`` when this workspace requires attribution and
         no actor was named. Returns ``None`` when it does not.

@@ -5246,6 +5246,60 @@ impl Workspace {
         })
     }
 
+    /// Whether this workspace answers POSIX advisory locks itself (issue #119).
+    ///
+    /// Off by default. A FUSE mount that does not answer `setlk` still has
+    /// working advisory locks — the kernel serves them locally, per mount — so
+    /// this is not "locking on/off", it is whether locks are coordinated
+    /// *between* mounts.
+    fn posix_locks_enabled<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.posix_locks_enabled().await.map_err(to_pyerr)
+        })
+    }
+
+    /// Turn cross-mount advisory locking on or off.
+    fn set_posix_locks_enabled<'py>(
+        &self,
+        py: Python<'py>,
+        on: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.set_posix_locks_enabled(on).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// The advisory locks currently held on `path`, live leases only.
+    ///
+    /// Read-only on purpose. The locks are taken by *mounts*, whose lifetime is
+    /// what a lock is scoped to and whose renewal timer is what keeps its lease
+    /// alive; a lock taken by a library call would have neither and would quietly
+    /// expire under its holder. So Python can see who holds what — which is the
+    /// service-side question — and a mount is what takes them.
+    fn posix_locks<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let held = ws.posix_locks(&path).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                held.into_iter()
+                    .map(|l| {
+                        let d = PyDict::new(py);
+                        d.set_item("owner", l.owner)?;
+                        d.set_item("holder", l.holder)?;
+                        d.set_item("pid", l.pid)?;
+                        d.set_item("start", l.start)?;
+                        d.set_item("end", l.end)?;
+                        d.set_item("exclusive", l.exclusive)?;
+                        Ok(d.unbind())
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
     /// Refuse an unattributed mutation when this workspace requires attribution.
     ///
     /// **A surface calls this on the path where no actor was named** — it is what

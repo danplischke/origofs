@@ -21,12 +21,13 @@ use crate::collab::{Event, EventInit, LiveDoc, Presence};
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::{MetaTxn, MetadataStore};
 use crate::migrations::MIGRATIONS;
+use crate::posixlock::{LockRequest, PosixLock};
 use crate::suggest::{Suggestion, SuggestionInit, SuggestionKind, SuggestionStatus};
 use crate::types::{DirEntry, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit};
 use crate::util::{blocking_section, now_secs};
 use async_trait::async_trait;
 use parking_lot::{ArcMutexGuard, Mutex, MutexGuard, RawMutex};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -316,6 +317,19 @@ fn truncate_workspace_tree(conn: &Connection, ws: i64) -> rusqlite::Result<()> {
         params![ws],
     )?;
     Ok(())
+}
+
+/// Decode one `posix_lock` row. Shared by the plain listing and the transactional
+/// apply so the two cannot drift in column order.
+fn row_to_lock(r: &rusqlite::Row<'_>) -> rusqlite::Result<PosixLock> {
+    Ok(PosixLock {
+        owner: r.get(0)?,
+        holder: r.get(1)?,
+        pid: r.get(2)?,
+        start: r.get(3)?,
+        end: r.get(4)?,
+        exclusive: r.get::<_, i64>(5)? != 0,
+    })
 }
 
 #[async_trait]
@@ -1407,6 +1421,113 @@ impl MetadataStore for SqliteMetadataStore {
                 out.push(row?);
             }
             Ok(out)
+        })
+    }
+
+    async fn posix_locks(&self, ino: Ino, now: i64) -> Result<Vec<PosixLock>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT owner, holder, pid, start_off, end_off, exclusive FROM posix_lock
+                 WHERE workspace_id = ?1 AND ino = ?2 AND expires_at > ?3 ORDER BY start_off",
+            )?;
+            let rows = stmt.query_map(params![self.workspace_id, ino, now], row_to_lock)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    async fn apply_posix_lock(
+        &self,
+        ino: Ino,
+        req: &LockRequest,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<Option<PosixLock>> {
+        let req = req.clone();
+        blocking_section(move || {
+            let mut conn = self.lock();
+            // `Immediate` takes the write lock before the SELECT. A deferred
+            // transaction would read, decide, and only then discover another
+            // process had written — with the decision already made from stale
+            // rows, which is exactly the race this table exists to close.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // An expired lease is not a blocker, so drop those rows here rather
+            // than needing a background reaper to make progress possible.
+            tx.execute(
+                "DELETE FROM posix_lock WHERE workspace_id = ?1 AND ino = ?2 AND expires_at <= ?3",
+                params![self.workspace_id, ino, now],
+            )?;
+            let existing = {
+                let mut stmt = tx.prepare(
+                    "SELECT owner, holder, pid, start_off, end_off, exclusive FROM posix_lock
+                     WHERE workspace_id = ?1 AND ino = ?2 ORDER BY start_off",
+                )?;
+                let rows = stmt.query_map(params![self.workspace_id, ino], row_to_lock)?;
+                let mut v = Vec::new();
+                for row in rows {
+                    v.push(row?);
+                }
+                v
+            };
+            let res = crate::posixlock::resolve(&existing, &req);
+            for (owner, start) in &res.delete {
+                tx.execute(
+                    "DELETE FROM posix_lock
+                     WHERE workspace_id = ?1 AND ino = ?2 AND owner = ?3 AND start_off = ?4",
+                    params![self.workspace_id, ino, owner, start],
+                )?;
+            }
+            for l in &res.insert {
+                tx.execute(
+                    "INSERT INTO posix_lock(workspace_id, ino, owner, holder, pid, start_off,
+                                            end_off, exclusive, acquired_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        self.workspace_id,
+                        ino,
+                        l.owner,
+                        l.holder,
+                        l.pid,
+                        l.start,
+                        l.end,
+                        i64::from(l.exclusive),
+                        now,
+                        expires_at
+                    ],
+                )?;
+            }
+            // Committed even when refused: the request wrote nothing, but the
+            // expired rows it cleared should stay cleared.
+            tx.commit()?;
+            Ok(res.conflict)
+        })
+    }
+
+    async fn release_posix_locks_for_holder(&self, holder: &str) -> Result<u64> {
+        let holder = holder.to_string();
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM posix_lock WHERE workspace_id = ?1 AND holder = ?2",
+                params![self.workspace_id, holder],
+            )?;
+            Ok(n as u64)
+        })
+    }
+
+    async fn renew_posix_lease(&self, holder: &str, expires_at: i64) -> Result<u64> {
+        let holder = holder.to_string();
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "UPDATE posix_lock SET expires_at = ?3 WHERE workspace_id = ?1 AND holder = ?2",
+                params![self.workspace_id, holder, expires_at],
+            )?;
+            Ok(n as u64)
         })
     }
 

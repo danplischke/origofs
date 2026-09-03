@@ -11,6 +11,7 @@
 //! runs many rounds to shake out interleavings; a violation prints its round and
 //! the observed state.
 
+use origofs_core::posixlock::{self, LockAnswer, LockKind, LockRequest};
 use origofs_core::{
     EventInit, FileKind, Fs, MemStore, MetadataStore, OrigoFSError, SqliteMetadataStore, WriteCtx,
 };
@@ -556,5 +557,130 @@ async fn rmdir_racing_mkdir_never_orphans_a_dentry() {
             "round {round}: /dir deleted with {children} orphaned child dentr(ies) \
              (remove: {removed:?}, mkdir: {created:?})"
         );
+    }
+}
+
+// --- POSIX advisory locks under contention (issue #119) ---------------------
+//
+// Honest scope, because this tier is easy to over-claim. The correctness
+// argument for `apply_posix_lock` is that read-decide-write is *serialized* —
+// SQLite by `BEGIN IMMEDIATE`, Postgres by a per-inode advisory lock — or two
+// callers both find no conflict and both insert. What follows exercises that
+// under genuinely concurrent tasks, but `SqliteMetadataStore` also holds a single
+// process-wide connection mutex, which would mask a missing `BEGIN IMMEDIATE` in
+// this process. So a pass here is evidence the *invariant* survives contention,
+// not proof that the transaction is correctly scoped across processes. The
+// cross-process claim is only really exercised by the Postgres path, which
+// self-skips unless `ORIGOFS_PG_TEST_URL` is set.
+
+async fn lockable() -> (Arc<CFs>, i64) {
+    let fs = shared().await;
+    fs.write("/f", b"0123456789").await.unwrap();
+    fs.set_posix_locks_enabled(true).await.unwrap();
+    let ino = fs.stat("/f").await.unwrap().ino;
+    (fs, ino)
+}
+
+fn excl(owner: usize, start: i64, end: i64, kind: LockKind) -> LockRequest {
+    LockRequest {
+        owner: format!("owner-{owner}"),
+        holder: format!("mount-{owner}"),
+        pid: 1,
+        start,
+        end,
+        kind,
+    }
+}
+
+/// Many owners race for the *same* exclusive range: **exactly one** may win.
+///
+/// Two winners is the failure the whole design is arranged to prevent — it means
+/// two processes each believe they hold the bytes exclusively, which is precisely
+/// the guarantee an advisory lock exists to provide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_exclusive_locks_have_exactly_one_winner() {
+    for round in 0..60u64 {
+        let (fs, ino) = lockable().await;
+        let mut tasks = Vec::new();
+        for i in 0..8usize {
+            let fs = fs.clone();
+            tasks.push(tokio::spawn(async move {
+                fs.vfs_setlk_as(None, ino, &excl(i, 0, 99, LockKind::Exclusive))
+                    .await
+            }));
+        }
+        let mut winners = 0;
+        for t in tasks {
+            if matches!(t.await.unwrap().unwrap(), LockAnswer::Free) {
+                winners += 1;
+            }
+        }
+        assert_eq!(
+            winners, 1,
+            "round {round}: {winners} owners each took the same exclusive range"
+        );
+        let held = fs.posix_locks(ino).await.unwrap();
+        assert_eq!(held.len(), 1, "round {round}: stored {held:?}");
+        posixlock::check_state(&held).unwrap_or_else(|e| panic!("round {round}: {e}"));
+    }
+}
+
+/// Shared readers racing the same range must *all* win — the mirror of the test
+/// above, and what stops "exactly one winner" being satisfied by a lock that is
+/// simply always exclusive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_shared_locks_all_succeed() {
+    for round in 0..40u64 {
+        let (fs, ino) = lockable().await;
+        let mut tasks = Vec::new();
+        for i in 0..8usize {
+            let fs = fs.clone();
+            tasks.push(tokio::spawn(async move {
+                fs.vfs_setlk_as(None, ino, &excl(i, 0, 99, LockKind::Shared))
+                    .await
+            }));
+        }
+        for t in tasks {
+            assert_eq!(
+                t.await.unwrap().unwrap(),
+                LockAnswer::Free,
+                "round {round}: a shared lock was refused by another shared lock"
+            );
+        }
+        assert_eq!(fs.posix_locks(ino).await.unwrap().len(), 8);
+    }
+}
+
+/// Mixed traffic: many owners taking, splitting and dropping overlapping ranges
+/// at once. The assertion is the schema's invariant — one owner never ends up
+/// holding two overlapping ranges, which is what its primary key requires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn mixed_lock_traffic_preserves_the_state_invariant() {
+    for round in 0..30u64 {
+        let (fs, ino) = lockable().await;
+        let mut tasks = Vec::new();
+        for i in 0..6usize {
+            let fs = fs.clone();
+            tasks.push(tokio::spawn(async move {
+                for step in 0..12i64 {
+                    let start = (step * 7 + i as i64 * 5) % 60;
+                    let kind = match (step + i as i64) % 3 {
+                        0 => LockKind::Shared,
+                        1 => LockKind::Exclusive,
+                        _ => LockKind::Unlock,
+                    };
+                    // Refusals are expected and fine; an *error* is not.
+                    fs.vfs_setlk_as(None, ino, &excl(i, start, start + 20, kind))
+                        .await
+                        .expect("a contended lock op must not error");
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let held = fs.posix_locks(ino).await.unwrap();
+        posixlock::check_state(&held)
+            .unwrap_or_else(|e| panic!("round {round}: {e}\nstate: {held:?}"));
     }
 }

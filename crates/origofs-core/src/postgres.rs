@@ -15,6 +15,7 @@ use crate::collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, Presence};
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::{MetaTxn, MetadataStore};
 use crate::migrations::MIGRATIONS;
+use crate::posixlock::{LockRequest, PosixLock};
 use crate::suggest::{Suggestion, SuggestionInit, SuggestionKind, SuggestionStatus};
 use crate::types::{DirEntry, FileKind, Hash, Ino, Inode, InodeInit};
 use crate::util::now_secs;
@@ -801,6 +802,27 @@ async fn truncate_workspace_tree_pg(c: &tokio_postgres::Client, ws: i64) -> Resu
     )
     .await?;
     Ok(())
+}
+
+/// Decode one `posix_lock` row, shared by the listing and the transactional apply
+/// so the two cannot drift in column order.
+fn row_to_lock(r: &tokio_postgres::Row) -> PosixLock {
+    PosixLock {
+        owner: r.get(0),
+        holder: r.get(1),
+        pid: r.get(2),
+        start: r.get(3),
+        end: r.get(4),
+        exclusive: r.get::<_, i64>(5) != 0,
+    }
+}
+
+/// Advisory-lock key for one inode. Mixed rather than concatenated because the
+/// key is a single `bigint` and both inputs use the full range.
+fn posix_lock_key(workspace_id: i64, ino: Ino) -> i64 {
+    (workspace_id as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(ino as u64) as i64
 }
 
 #[async_trait]
@@ -1775,6 +1797,109 @@ impl MetadataStore for PostgresMetadataStore {
             .into_iter()
             .map(|r| (r.get(0), r.get(1), r.get(2)))
             .collect())
+    }
+
+    async fn posix_locks(&self, ino: Ino, now: i64) -> Result<Vec<PosixLock>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT owner, holder, pid, start_off, end_off, exclusive FROM posix_lock
+                 WHERE workspace_id = $1 AND ino = $2 AND expires_at > $3 ORDER BY start_off",
+                &[&self.workspace_id, &ino, &now],
+            )
+            .await?;
+        Ok(rows.iter().map(row_to_lock).collect())
+    }
+
+    async fn apply_posix_lock(
+        &self,
+        ino: Ino,
+        req: &LockRequest,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<Option<PosixLock>> {
+        let mut c = self.client().await?;
+        let tx = c.transaction().await?;
+        // Serialize every request against this one inode for the life of the
+        // transaction. `SELECT … FOR UPDATE` is not enough: Postgres takes no gap
+        // locks, so two transactions both find *no* conflicting row and both
+        // insert. The advisory lock covers the absent rows too. A hash collision
+        // between inodes costs a little serialization and no correctness.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&posix_lock_key(self.workspace_id, ino)],
+        )
+        .await?;
+        // An expired lease is not a blocker; clearing it here means progress needs
+        // no background reaper.
+        tx.execute(
+            "DELETE FROM posix_lock WHERE workspace_id = $1 AND ino = $2 AND expires_at <= $3",
+            &[&self.workspace_id, &ino, &now],
+        )
+        .await?;
+        let rows = tx
+            .query(
+                "SELECT owner, holder, pid, start_off, end_off, exclusive FROM posix_lock
+                 WHERE workspace_id = $1 AND ino = $2 ORDER BY start_off",
+                &[&self.workspace_id, &ino],
+            )
+            .await?;
+        let existing: Vec<PosixLock> = rows.iter().map(row_to_lock).collect();
+        let res = crate::posixlock::resolve(&existing, req);
+        for (owner, start) in &res.delete {
+            tx.execute(
+                "DELETE FROM posix_lock
+                 WHERE workspace_id = $1 AND ino = $2 AND owner = $3 AND start_off = $4",
+                &[&self.workspace_id, &ino, owner, start],
+            )
+            .await?;
+        }
+        for l in &res.insert {
+            tx.execute(
+                "INSERT INTO posix_lock(workspace_id, ino, owner, holder, pid, start_off,
+                                        end_off, exclusive, acquired_at, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                &[
+                    &self.workspace_id,
+                    &ino,
+                    &l.owner,
+                    &l.holder,
+                    &l.pid,
+                    &l.start,
+                    &l.end,
+                    &i64::from(l.exclusive),
+                    &now,
+                    &expires_at,
+                ],
+            )
+            .await?;
+        }
+        // Committed even when refused: the request wrote nothing, but the expired
+        // rows it cleared should stay cleared.
+        tx.commit().await?;
+        Ok(res.conflict)
+    }
+
+    async fn release_posix_locks_for_holder(&self, holder: &str) -> Result<u64> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM posix_lock WHERE workspace_id = $1 AND holder = $2",
+                &[&self.workspace_id, &holder],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    async fn renew_posix_lease(&self, holder: &str, expires_at: i64) -> Result<u64> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "UPDATE posix_lock SET expires_at = $3 WHERE workspace_id = $1 AND holder = $2",
+                &[&self.workspace_id, &holder, &expires_at],
+            )
+            .await?;
+        Ok(n)
     }
 
     async fn create_actor(&self, init: ActorInit) -> Result<i64> {
