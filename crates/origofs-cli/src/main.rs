@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use origofs_sdk::{MergeOutcome, SuggestionStatus, Workspace, WriteCtx};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod config;
 
@@ -559,7 +559,30 @@ enum Cmd {
     ///
     /// Opening a workspace already migrates, so this is for running the upgrade
     /// deliberately — as a deploy step, before starting the new binaries.
-    Migrate,
+    ///
+    /// Migrations are **forward-only**: there are no down-migrations, because one
+    /// that dropped a column a newer build had been filling would destroy every
+    /// row written since the upgrade. The way back is a backup taken *before* the
+    /// migration, which is what `--backup` is for; a build too old for the
+    /// database it meets refuses to open it rather than working against a schema
+    /// it does not know.
+    Migrate {
+        /// Report what would be applied and exit, changing nothing.
+        ///
+        /// This is the one way to see a pending migration at all: opening a
+        /// workspace runs the runner, so by the time any other subcommand can look,
+        /// the answer is always "already current".
+        #[arg(long)]
+        check: bool,
+        /// Snapshot the metadata database to this path first, and apply nothing if
+        /// the snapshot fails.
+        ///
+        /// The whole rollback plan for an upgrade, in one flag. SQLite uses its
+        /// online backup API (not a file copy); Postgres has no in-process
+        /// equivalent and says so, pointing at `pg_dump`.
+        #[arg(long, value_name = "PATH")]
+        backup: Option<PathBuf>,
+    },
     /// Show the workspace's schema version and the newest this binary knows.
     SchemaVersion,
     /// Back up the **metadata** store — the half that cannot be rebuilt.
@@ -1433,16 +1456,97 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
-/// Open the workspace the CLI operates on. With `--config` this selects the
-/// Postgres/S3/GCS backends the file names; without it, the default local
-/// SQLite/local-CAS workspace under `--workspace` (honoring `ORIGOFS_ENCRYPTION_KEY`
-/// for encryption at rest), exactly as before.
-async fn open_workspace(cli: &Cli) -> Result<Workspace> {
-    let cfg = match &cli.config {
-        Some(path) => config::Config::load(path)?,
-        None => config::Config::default(),
-    };
-    cfg.open(&cli.workspace).await
+/// The configuration describing the workspace the CLI operates on. With
+/// `--config` this selects the Postgres/S3/GCS backends the file names; without
+/// it, the default local SQLite/local-CAS workspace under `--workspace` (honoring
+/// `ORIGOFS_ENCRYPTION_KEY` for encryption at rest), exactly as before.
+///
+/// Loaded once and handed to `Config::open` — or, for the two schema subcommands,
+/// to `Config::open_metadata_unmigrated`, which must see the store before opening
+/// migrates it.
+fn load_config(cli: &Cli) -> Result<config::Config> {
+    match &cli.config {
+        Some(path) => config::Config::load(path),
+        None => Ok(config::Config::default()),
+    }
+}
+
+/// `origofs schema-version` — report the metadata schema without changing it.
+///
+/// Reads the store *unmigrated*, because opening a workspace applies every
+/// pending step: asked through a normal open, this question can only ever answer
+/// "current", including on the store you were about to upgrade.
+async fn run_schema_version(cfg: &config::Config, workspace: &Path) -> Result<()> {
+    let store = cfg.open_metadata_unmigrated(workspace).await?;
+    let current = store.schema_version().await?;
+    let latest = origofs_sdk::latest_schema_version();
+    println!("schema version: v{current} (this binary knows up to v{latest})");
+    match current.cmp(&latest) {
+        std::cmp::Ordering::Less => println!(
+            "  {} step(s) pending — opening this workspace will apply them; \n  run `origofs migrate --backup <path>` to snapshot the database first",
+            latest - current
+        ),
+        std::cmp::Ordering::Equal => {}
+        std::cmp::Ordering::Greater => println!(
+            "  this database was written by a NEWER origofs and this build refuses to \n  open it (migrations are forward-only, so proceeding would work against a \n  schema it does not know). Upgrade origofs, or restore the backup taken \n  before the upgrade."
+        ),
+    }
+    Ok(())
+}
+
+/// `origofs migrate` — the deliberate schema step, and the last point at which an
+/// upgrade is still reversible.
+///
+/// Runs the metadata half only: the migration runner is `MetadataStore::init`, and
+/// a schema step has no business requiring the content backend to be reachable.
+/// The forward-compatibility guard `Fs::init` applies is re-applied here, because
+/// this path does not go through it.
+async fn run_migrate(
+    cfg: &config::Config,
+    workspace: &Path,
+    check: bool,
+    backup: Option<&Path>,
+) -> Result<()> {
+    let store = cfg.open_metadata_unmigrated(workspace).await?;
+    let before = store.schema_version().await?;
+    let latest = origofs_sdk::latest_schema_version();
+
+    if before > latest {
+        anyhow::bail!(
+            "this database is at schema v{before} and this build understands at most \n\
+             v{latest} — it was written by a newer origofs. Migrations are forward-only, \n\
+             so there is nothing to roll back to here: upgrade origofs, or restore the \n\
+             metadata backup taken before the upgrade."
+        );
+    }
+    if before == latest {
+        println!("schema already at v{latest}; nothing to apply");
+        return Ok(());
+    }
+
+    let pending = latest - before;
+    if check {
+        println!("schema v{before} -> v{latest}: {pending} step(s) pending (nothing applied)");
+        return Ok(());
+    }
+
+    // Before, not after: the snapshot is worthless once the step it protects
+    // against has run, and a failed snapshot must stop the upgrade rather than
+    // leave one that silently never happened.
+    if let Some(dest) = backup {
+        let what = store.backup_to(dest).await?;
+        println!("{what}");
+    }
+
+    store.init().await?;
+    let after = store.schema_version().await?;
+    println!("migrated schema v{before} -> v{after} ({pending} step(s))");
+    if backup.is_none() {
+        println!(
+            "  note: migrations are forward-only. To go back, restore a metadata \n  backup taken before this ran (`--backup <path>` takes one)."
+        );
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -1450,7 +1554,20 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.log_format);
     std::fs::create_dir_all(&cli.workspace)?;
-    let ws = open_workspace(&cli).await?;
+    let cfg = load_config(&cli)?;
+
+    // Schema inspection happens *before* the workspace is opened, because opening
+    // is what migrates. Both of these have to be able to observe — and in
+    // `migrate`'s case, snapshot — a database that has not been touched yet.
+    match &cli.cmd {
+        Cmd::SchemaVersion => return run_schema_version(&cfg, &cli.workspace).await,
+        Cmd::Migrate { check, backup } => {
+            return run_migrate(&cfg, &cli.workspace, *check, backup.as_deref()).await;
+        }
+        _ => {}
+    }
+
+    let ws = cfg.open(&cli.workspace).await?;
 
     match cli.cmd {
         Cmd::Init => {
@@ -2405,29 +2522,11 @@ async fn main() -> Result<()> {
             ws.flush().await?;
             println!("flushed buffered writes to durable storage");
         }
-        Cmd::Migrate => {
-            let (before, after) = ws.migrate().await?;
-            if before == after {
-                println!("schema already at v{after}; nothing to apply");
-            } else {
-                println!("migrated schema v{before} -> v{after}");
-            }
-        }
-        Cmd::SchemaVersion => {
-            let current = ws.schema_version().await?;
-            let latest = ws.latest_schema_version();
-            println!("schema version: v{current} (this binary knows up to v{latest})");
-            if current < latest {
-                println!(
-                    "  run `origofs migrate` to apply {} step(s)",
-                    latest - current
-                );
-            } else if current > latest {
-                println!(
-                    "  warning: the store is NEWER than this binary; a newer origofs wrote it \n  and this one may not understand every column. Upgrade before writing."
-                );
-            }
-        }
+        // `Migrate` and `SchemaVersion` are handled before the workspace is
+        // opened — see `run_schema_cmd`. Opening is what migrates, so a report
+        // produced from `ws` could only ever describe the state this process just
+        // created.
+        Cmd::Migrate { .. } | Cmd::SchemaVersion => unreachable!("handled before open"),
         Cmd::Backup { dest } => {
             let what = ws.backup_metadata(&dest).await?;
             println!("{what}");

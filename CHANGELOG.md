@@ -9,6 +9,53 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ### Changed
 
+- **Encrypted objects are versioned, and the Argon2id cost belongs to the store
+  rather than to a dependency.** Everything else in a bucket could be evolved
+  without rewriting it; the ciphertext could not. `EncryptedStore` wrote the bare
+  AEAD output, so nothing recorded which cipher, nonce derivation or KDF had
+  produced an object — and the failure that implies is the least legible one in
+  the system: a changed scheme decrypts to nothing and reports
+  `Corrupt("wrong key or corrupt data")`, which is exactly what a mistyped
+  passphrase looks like, on data that is perfectly intact.
+
+  Objects are now framed `ORGE | version | AEAD(…)` under `format.rs`'s existing
+  rules. It costs five bytes and changes no address — the address is the
+  *plaintext* hash (convergent encryption), never the stored bytes. **Objects
+  written by earlier origofs carry no header and are read forever.** Ciphertext is
+  indistinguishable from random, so roughly one legacy object in 2^32 begins with
+  `ORGE` by chance; the header therefore only chooses which interpretation to try
+  first and the **AEAD tag decides**, making a coincidence cost one extra open
+  instead of a false corruption report. A ciphertext from a newer origofs is
+  `UnsupportedVersion` ("upgrade"), not `Corrupt` ("restore a backup").
+
+  The key-derivation parameters were `argon2::Params::default()` — a constant the
+  dependency owns, and one it has already moved once (0.4 → 0.5 raised `m_cost`
+  from 4096 to 19456). A second such change would have re-derived a different key
+  for every existing store on a routine `cargo update`, reported as a wrong
+  passphrase, with nothing in the store recording what the real cost had been.
+  They are now pinned as `KdfParams::LEGACY` and **recorded per store**, in a `kdf`
+  sidecar beside the salt (same namespace, same reasoning: outside the
+  content-addressed space so GC cannot sweep it, beside the content so it survives
+  a metadata-DB loss). A store holding a salt but no descriptor predates this and
+  is legacy by definition — the distinction matters the day `KdfParams::current()`
+  is raised, which is now a safe thing to do. `tests/encryption.rs` pins the
+  ciphertext of a fixed `(passphrase, salt, plaintext)`, which pins the whole chain
+  — Argon2id, BLAKE3's keyed nonce derivation, XChaCha20-Poly1305 and the framing —
+  so a dependency bump that moves any of it fails in CI rather than in a bucket.
+
+- **The store descriptor's two fields move independently, so a fleet survives its
+  own rollout.** `min_reader_version` is the field that gates: raising it locks
+  every older build out of the *whole* store at open. It was stamped equal to
+  `format_version`, and stamped on **open** — so the day `write_version` went to 2,
+  the first node to upgrade would have taken the bucket away from every node that
+  had not, before a single v2 object existed anywhere. That is the exact inversion
+  of rule 3 ("ship the reader before the writer"), in the mechanism meant to
+  enforce it. `format_version` is advisory now and still rises on open;
+  `min_reader_version` comes from its own `MIN_READER_VERSION` constant, raised
+  deliberately in the release that starts writing genuinely non-additive objects.
+  Neither field is ever lowered, so an older build re-opening a store cannot erase
+  a newer one's warning.
+
 - **The co-edit CRDT sidecars are versioned, so their framing can be evolved
   without reading as "this document has no history".** Both shapes treated a
   sidecar they could not parse as an *absent* one — the flat shape rebuilds from
@@ -36,6 +83,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
   read included — and co-editing is an opt-in feature (`coedit`) most workspaces
   never write a byte of. The loud per-document error is the proportionate
   replacement, and it is what the descriptor was covering for.
+
+### Added
+
+- **`origofs migrate --check` and `--backup <path>`, and a schema report that
+  precedes the migration it reports on.** Opening a workspace *is* the migration
+  runner, and both of these subcommands ran after the open — so `origofs migrate`,
+  documented as the deliberate deploy step, could only ever answer "already
+  current", and `schema-version` reported the version the same process had just
+  created. A pending migration was therefore unobservable, which made "should I
+  take a backup first?" unanswerable in practice.
+
+  Both now read the metadata store *unmigrated*, ahead of the open. `--check`
+  reports what would be applied and exits; `--backup` snapshots the database
+  before the first step and applies nothing if the snapshot fails, because a
+  backup taken after the step protects against nothing. Migrations are forward-only
+  and there are deliberately no down-migrations — one that dropped a column a newer
+  build had been filling would destroy every row written since the upgrade — so
+  that snapshot is the whole rollback plan, and the command says so when you
+  migrate without one.
+
+  The guard on the other side already existed and is now covered: an older binary
+  meeting a newer database refuses it as `UnsupportedVersion` **before** touching
+  it, leaving the database byte-for-byte as found, so rolling the binaries forward
+  again is a recovery rather than a repair
+  (`origofs-core/tests/schema_rollback.rs`).
 
 ## [0.0.3] — 2026-08-30
 

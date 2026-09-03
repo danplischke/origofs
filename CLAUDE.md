@@ -604,6 +604,39 @@ compiling at all until #107.
   (`touch`), and the sweep re-checks an object's age at the moment it deletes it
   (`delete_if_older_than`) so a long pass cannot act on an age it read minutes
   earlier. A backend that cannot date its objects collects nothing.
+- **Upgrading origofs must never require rewriting a bucket, and the two stores
+  get opposite treatments because they fail in opposite directions.** Content is
+  immutable and hash-addressed, so a format change mints *new* objects and leaves
+  every old one valid — the rules live in `format.rs` (never re-encode a shipped
+  version; add a decoder arm; raise `max_read_version` a release before
+  `write_version`), and `tests/format.rs` pins the v1 bytes *and* their hashes so a
+  silent re-address fails in CI rather than in a bucket. It also pins the FastCDC
+  boundaries, because re-chunking is not a correctness break but is a total dedup
+  break. The metadata DB is the opposite: rewritten in place, forward-only, no
+  down-migrations by design.
+  - **Anything a dependency owns is pinned in *data*, not left to the crate.** The
+    encrypted-at-rest layout is the sharp case: `EncryptedStore` frames objects
+    `ORGE | version | AEAD(…)` (bare pre-envelope objects read forever — the AEAD
+    tag, not the header, is what finally decides between the two shapes), and the
+    Argon2id cost is `KdfParams::LEGACY` recorded per store in a `kdf` sidecar
+    rather than `argon2::Params::default()`, a constant the crate has already moved
+    once. Both failures would have surfaced as `Corrupt("wrong key or corrupt
+    data")` — the wrong-passphrase message — on intact data.
+    `tests/encryption.rs` pins the ciphertext of a fixed `(passphrase, salt,
+    plaintext)`, which pins Argon2id, the BLAKE3 nonce derivation, the cipher and
+    the framing at once.
+  - **`min_reader_version` is the field that locks a fleet out; `format_version` is
+    advisory.** They are separate constants deliberately: stamping them together on
+    *open* meant the first node to upgrade took the store away from every node that
+    had not, before writing a single new-version object. Raise `MIN_READER_VERSION`
+    only in the release that starts writing objects older readers genuinely cannot
+    use.
+  - **The rollback path is a backup, not a down-migration.** An older binary meeting
+    a newer DB refuses it (`UnsupportedVersion`) *before* touching it, so the DB is
+    left exactly as found; `origofs migrate --check` shows a pending step and
+    `--backup` snapshots before applying. Both read the store **unmigrated, ahead of
+    the workspace open** — opening is the migration runner, so anything asking after
+    the open can only describe what it just did.
 - **The content store can rebuild the DB, but not attribution.** It is a
   self-describing Merkle DAG with a mirrored ref table, so `origofs fsck --rebuild`
   (SDK `rebuild`/`scan`) restores committed files, dirs, symlinks, and branches

@@ -188,3 +188,50 @@ async fn put_keyed_rejects_a_non_content_addressed_key() {
         "a non-content-addressed key must be rejected (nonce reuse)"
     );
 }
+
+// --- golden vectors: the stored bytes must not move under us ------------------
+
+/// A store's ciphertext is produced by four things origofs does not own outright —
+/// the Argon2id parameters, `argon2` itself, BLAKE3's keyed nonce derivation, and
+/// XChaCha20-Poly1305 — plus one it does, the envelope framing. If any of them
+/// changes, every object already in every encrypted store becomes undecryptable,
+/// and the symptom is `Corrupt("wrong key or corrupt data")`: indistinguishable
+/// from an operator typing the wrong passphrase, on data that is in fact intact.
+///
+/// That is not a failure anyone would diagnose as "the dependency moved", so it is
+/// pinned here rather than discovered in a bucket. Encryption is convergent — the
+/// nonce is derived, not random — so the bytes are fully deterministic.
+///
+/// **If this fails, do not update the constant.** Work out which input changed; if
+/// it is a dependency, the fix is to pin the dependency, not to accept new bytes.
+/// A deliberate scheme change gets a new envelope version and keeps decoding v1
+/// (`origofs_core::format`).
+#[tokio::test]
+async fn passphrase_store_ciphertext_is_pinned() {
+    const PASSPHRASE: &str = "correct horse battery staple";
+    const SALT: &[u8] = b"origofs-fixture!";
+    const PLAINTEXT: &[u8] = b"the quick brown fox";
+    const CIPHERTEXT: &str =
+        "4f524745019f6a5eb2c97cea9395002959bf6f03f762f8bfed00a3341f47b99f55ec1296a51f97e7";
+
+    let backend = Arc::new(MemStore::new());
+    let store =
+        EncryptedStore::from_passphrase(backend.clone(), PASSPHRASE, SALT).expect("derive key");
+
+    let hash = store.put(PLAINTEXT).await.unwrap();
+    // The address is the plaintext hash, so it is fixed by BLAKE3 alone.
+    assert_eq!(hash, Hash::of(PLAINTEXT));
+
+    let stored = backend.get(&hash).await.unwrap();
+    assert_eq!(
+        hex(&stored),
+        CIPHERTEXT,
+        "the encrypted-at-rest byte layout changed — every existing encrypted \
+         store would fail to decrypt, reporting a wrong passphrase"
+    );
+    assert_eq!(&store.get(&hash).await.unwrap()[..], PLAINTEXT);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}

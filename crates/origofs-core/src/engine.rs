@@ -389,6 +389,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// A store with no descriptor is a fresh one — stamp it. A backend that doesn't
     /// implement named slots reports "never written" forever and is simply never
     /// checked — see [`ContentStore::put_meta`].
+    ///
+    /// **Opening is not writing, and the stamp reflects that.** This runs on every
+    /// open, including a read-only one, so what it records has to be true of a
+    /// build that goes on to read one object and exit. It raises the advisory
+    /// `format_version` (this build *may* write objects that new, and a reader
+    /// arriving between the bump and the first such object is better off warned)
+    /// and leaves `min_reader_version` alone unless this build's
+    /// `MIN_READER_VERSION` is genuinely higher — see
+    /// [`StoreDescriptor::raised_over`] for why coupling the two locked a fleet out
+    /// of its own bucket on the first upgrade.
     async fn check_store_format(&self) -> Result<()> {
         use crate::format::{STORE_DESCRIPTOR_SLOT, StoreDescriptor};
         let current = StoreDescriptor::current();
@@ -396,12 +406,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             Some(bytes) => {
                 let found = StoreDescriptor::decode(&bytes)?;
                 found.check_readable()?;
-                // We are about to write objects newer than the store advertises;
-                // record that before any of them lands, so a reader that arrives
-                // between the bump and the first v2 object is still warned.
-                if current.format_version > found.format_version {
+                let raised = found.raised_over(current);
+                if raised != found {
                     self.content
-                        .put_meta(STORE_DESCRIPTOR_SLOT, &current.encode())
+                        .put_meta(STORE_DESCRIPTOR_SLOT, &raised.encode())
                         .await?;
                 }
             }
