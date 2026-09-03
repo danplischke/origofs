@@ -920,6 +920,99 @@ under failure is a first-class concern:
   file, directory, and branch — chunking and all. (Blame and the audit log live
   only in the DB — see [Backing up](#backing-up).)
 
+## Operating a workspace
+
+Four things you configure rather than call: what may be recovered, who may reach
+what, how much space is used, and whether file locks coordinate between mounts.
+All four are **off or unlimited by default** — turning one on changes behaviour
+for everyone using that workspace, so none of them arrives with an upgrade.
+
+### Undo a delete — `origofs trash`
+
+A committed file can always be read back out of history. An **uncommitted** one
+could not be recovered at all, which matters more here than on an ordinary
+filesystem: the users are agents, and `rm -rf` on a bad path is a routine failure
+mode.
+
+```bash
+origofs trash retention          # "trash is disabled" — the default
+origofs trash retention 7d       # start collecting, keep entries a week
+
+origofs rm /draft.md --actor 2
+origofs trash list               # #1  file  5  actor=2  /draft.md
+origofs trash restore 1 --actor 2
+```
+
+Entries record **who deleted them**, so a restore is attributed and the deletion
+is already in the op-log beside it. Retention is off by default because turning
+it on silently would change when space is reclaimed for every existing
+deployment, and the first anyone would learn of it is a storage bill. An empty
+listing therefore tells you *which* empty it is — nothing deleted, or not
+collecting.
+
+### Scope what an agent can reach — `origofs acl`
+
+Grants are `(actor, path prefix) → permissions`, longest prefix wins, matched on
+directory boundaries so `/tenant-a` never covers `/tenant-abc`.
+
+```bash
+origofs acl grant 1 /src read+write
+origofs acl check 1 /src/main.rs      # actor 1 at /src/main.rs: read+write
+origofs acl show
+```
+
+**A grant on its own restricts nothing.** With `default-deny` off — the default —
+an actor with no matching grant falls back to its write policy, which for an
+ordinary actor is full access:
+
+```bash
+origofs acl check 1 /secrets.txt      # actor 1 at /secrets.txt: read+write+propose
+origofs acl default-deny on
+origofs acl check 1 /secrets.txt      # actor 1 at /secrets.txt: none
+```
+
+That is what `acl check` is for: it answers the question an ACL bug is actually
+asking, after prefix matching *and* the fallback. Reads are a separate switch
+(`origofs acl enforce-reads on`) because reads have never been checked — turning
+it on without writing read grants first stops every actor at once.
+
+Grants are enforced in the engine, so they apply the same over MCP, the HTTP API
+and a mount. Pass `--by` to grant *as* an actor: that requires `WRITE` at the
+prefix and refuses to hand out a bit the granter does not hold there. Omitting it
+provisions as the workspace owner and says so.
+
+### Measure and cap — `origofs du` / `origofs quota`
+
+```bash
+origofs du /                     # /   2 inodes   6 bytes
+origofs quota                    # bytes:  6 / unlimited
+                                 # inodes: 2 / unlimited
+```
+
+Both count an inode with several names once, and sum **logical** size — never
+deduplicated bytes. A quota measured in physical bytes would move under a user
+who changed nothing, because someone else's write can dedup against theirs.
+
+### Share file locks between mounts — `origofs posix-locks`
+
+```bash
+origofs posix-locks              # posix-locks is off
+origofs posix-locks on
+origofs posix-locks --path /notes.md
+```
+
+This is **not** "locking on/off". A FUSE mount that does not answer `fcntl` locks
+still has working advisory locks — the kernel serves them locally, per mount — so
+a single mount already coordinates its own processes. What this adds is
+coordination *between* mounts: two processes, on two machines, against one
+workspace. It also takes locking over from the kernel for that mount, which is
+why it is a deliberate switch rather than a default.
+
+Locks are taken by mounts, not by the CLI, and they carry a lease so a mount that
+dies does not hold a byte range forever. Mounts read the setting once, at mount
+time — remount to pick up a change. NFS exports do not support this: NFSv3
+locking is a separate protocol (NLM) that origofs does not speak.
+
 ## Backing up
 
 Two stores, two very different jobs.
