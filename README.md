@@ -1054,6 +1054,35 @@ bounds how much you can lose. The restore procedure is the same shape: restore t
 database, keep the content store as it is, then check `origofs schema-version`
 before starting the new binaries.
 
+### Upgrading origofs
+
+**Nothing in the content store is ever migrated.** Objects are immutable and
+addressed by the hash of their own bytes, so a format change adds new objects and
+leaves every existing one valid and readable. That includes encrypted stores:
+objects carry a version header, the Argon2id parameters are recorded next to the
+salt, and both are read back exactly as written no matter which build wrote them.
+Upgrading origofs never means rewriting a bucket.
+
+**The metadata database is migrated in place, forward only.** There are no
+down-migrations, deliberately: a step that dropped a column the newer build had
+been filling would destroy everything written since the upgrade. So the way back
+is a snapshot taken before the step, which is what `--backup` is for:
+
+```bash
+origofs --workspace ./ws migrate --check                   # what would be applied?
+origofs --workspace ./ws migrate --backup ./pre-upgrade.db # snapshot, then apply
+```
+
+Both read the database *before* migrating it — opening a workspace applies pending
+steps, so anything asked afterwards can only describe what it just did.
+
+**Rolling back the binaries is safe.** A build that meets a database from a newer
+origofs refuses to open it (`unsupported_version`, "upgrade origofs") rather than
+working against a schema it does not know, and the refusal leaves the database
+untouched — so rolling forward again is a recovery, not a repair. To actually run
+the older build, restore the pre-upgrade snapshot; the content store needs no
+rollback.
+
 ## Storage backends
 
 Content addressing means a chunk's identity is its BLAKE3 hash, so dedup,

@@ -29,14 +29,15 @@ pub use origofs_core::{
     ResyncOutcome, ResyncReport, Scope, ScopeError, Segmentation, Suggestion, SuggestionContent,
     SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats,
     TrashEntry, Usage, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
+    latest_schema_version,
 };
 // Backend-specific re-exports, gated to match `origofs-core`'s own features.
-#[cfg(feature = "encryption")]
-pub use origofs_core::EncryptedStore;
 #[cfg(feature = "coedit")]
 pub use origofs_core::{
     COEDIT_SIDECAR_DIR, CoeditDoc, CoeditTreeDoc, DEFAULT_TREE_ROOT, SyncReply, TreeRun, TreeSpan,
 };
+#[cfg(feature = "encryption")]
+pub use origofs_core::{EncryptedStore, KdfParams};
 // The cross-worker co-editing relay rides on Postgres `LISTEN`/`NOTIFY`, so
 // these types exist only when both features are on.
 #[cfg(all(feature = "coedit", feature = "postgres"))]
@@ -291,13 +292,14 @@ impl Workspace {
     /// constructor cannot see the type of — a Postgres one, where
     /// [`open_pg_store`](Self::open_pg_store) is what must do the opening.
     ///
-    /// Reads or creates the key-derivation salt sidecar as a side effect, so
-    /// calling it twice against one backend is idempotent, not a re-key.
+    /// Reads or creates the key-derivation salt **and the Argon2id parameters** as
+    /// a side effect, so calling it twice against one backend is idempotent, not a
+    /// re-key.
     #[cfg(feature = "encryption")]
     pub async fn encrypted_content(backend: Content, passphrase: &str) -> Result<Content> {
-        let salt = read_or_create_salt(&backend).await?;
-        Ok(Arc::new(EncryptedStore::from_passphrase(
-            backend, passphrase, &salt,
+        let (salt, params) = read_or_create_key_material(&backend).await?;
+        Ok(Arc::new(EncryptedStore::from_passphrase_with_params(
+            backend, passphrase, &salt, params,
         )?))
     }
 
@@ -2331,9 +2333,64 @@ impl Workspace {
 #[cfg(feature = "encryption")]
 const KEYSALT: &str = "keysalt";
 
+/// The Argon2id cost this store derives its key with, recorded beside the salt.
+///
+/// The parameters used to come from `argon2::Params::default()` — a constant the
+/// dependency owns, which it has already changed once (0.4 → 0.5 raised `m_cost`
+/// from 4096 to 19456). A second such change would silently derive a *different*
+/// key for every existing store, and because a wrong key and a wrong passphrase
+/// are cryptographically indistinguishable, the whole store would report "wrong
+/// passphrase" after a routine `cargo update`. Nothing in the store recorded which
+/// cost its objects were keyed with, so there would have been no way to recover it
+/// beyond guessing at old crate defaults.
+///
+/// So it is written down, in the same sidecar namespace as the salt and for the
+/// same reasons: outside the content-addressed namespace, so GC cannot sweep it,
+/// and beside the content, so it survives a metadata-database loss. Losing this
+/// file is exactly as bad as losing the salt.
+///
+/// **A store with no `kdf` sidecar but with a salt predates this**, and its
+/// objects were keyed with [`KdfParams::LEGACY`] — the frozen copy of the old
+/// crate default — so that is what it gets, written down to make it explicit
+/// rather than changed. Only a store with *neither* is genuinely new, and only a
+/// new store may be created at [`KdfParams::current`]. Conflating the two is the
+/// bug this whole mechanism exists to prevent, one layer up: it would re-key every
+/// pre-existing store the day `current()` is raised.
 #[cfg(feature = "encryption")]
-async fn read_or_create_salt(content: &Content) -> Result<Vec<u8>> {
-    if let Some(salt) = content.get_sidecar(KEYSALT).await? {
+const KDF_PARAMS: &str = "kdf";
+
+/// The salt and Argon2id cost this store's key is derived from, created together
+/// on a fresh store and read as a pair afterwards.
+///
+/// They are read together because the *absence* of one is only meaningful next to
+/// the other — see [`KDF_PARAMS`] — and written parameters-first, so any process
+/// that can see a salt can also see the parameters that go with it. Two processes
+/// opening the same fresh store therefore agree: whichever loses the
+/// create-if-absent race adopts the winner's value rather than deriving its own.
+#[cfg(feature = "encryption")]
+async fn read_or_create_key_material(content: &Content) -> Result<(Vec<u8>, KdfParams)> {
+    let existing_salt = content.get_sidecar(KEYSALT).await?;
+    let params = match content.get_sidecar(KDF_PARAMS).await? {
+        Some(raw) => KdfParams::decode(&raw)?,
+        None => {
+            let assumed = if existing_salt.is_some() {
+                KdfParams::LEGACY
+            } else {
+                KdfParams::current()
+            };
+            KdfParams::decode(
+                &content
+                    .put_sidecar_if_absent(KDF_PARAMS, &assumed.encode())
+                    .await?,
+            )?
+        }
+    };
+    Ok((read_or_create_salt(content, existing_salt).await?, params))
+}
+
+#[cfg(feature = "encryption")]
+async fn read_or_create_salt(content: &Content, existing: Option<Vec<u8>>) -> Result<Vec<u8>> {
+    if let Some(salt) = existing {
         if salt.is_empty() {
             return Err(OrigoFSError::Content(
                 "the stored encryption salt is empty (refusing to derive a key from it)".into(),
