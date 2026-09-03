@@ -1908,7 +1908,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "origofs-cli"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "origofs-core"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "argon2",
  "async-recursion",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "origofs-py"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fuser",
  "origofs-core",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "origofs-sdk"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-recursion",
