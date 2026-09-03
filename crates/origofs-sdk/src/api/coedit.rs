@@ -106,14 +106,10 @@ impl RoomDoc {
     }
 
     /// Start tracking `ctx`'s edits for undo, at the moment a socket joins.
-    ///
-    /// A no-op on a tree room: undo is flat-only for now (see
-    /// [`undo`](Self::undo)), and tracking a stack nothing can pop would just
-    /// hold memory for the room's lifetime.
     fn track_undo(&self, ctx: WriteCtx) {
         match self {
             Self::Flat(d) => d.track_undo(ctx),
-            Self::Tree(_) => {}
+            Self::Tree(d) => d.track_undo(ctx),
         }
     }
 
@@ -121,25 +117,7 @@ impl RoomDoc {
     fn untrack_undo(&self, actor: i64) {
         match self {
             Self::Flat(d) => d.untrack_undo(actor),
-            Self::Tree(_) => {}
-        }
-    }
-
-    /// Undo (or redo) `ctx`'s actor's most recent action, returning the y-sync
-    /// update to fan out — empty when there was nothing to pop.
-    ///
-    /// **Flat rooms only.** The tree shape refuses rather than returning an empty
-    /// update, because the two are not the same answer and a client cannot tell
-    /// them apart: "you have nothing to undo" would be a lie told to an editor
-    /// whose user has been typing. Undo there needs its own `UndoManager` over
-    /// the `Y.XmlFragment`, which is the remaining half of #146.
-    fn undo(&self, ctx: WriteCtx, redo: bool) -> Result<Vec<u8>, OrigoFSError> {
-        match self {
-            Self::Flat(d) if redo => d.redo_as(ctx),
-            Self::Flat(d) => d.undo_as(ctx),
-            Self::Tree(_) => Err(OrigoFSError::InvalidArgument(
-                "undo is not available on a tree-shaped co-edit document yet (#146)".into(),
-            )),
+            Self::Tree(d) => d.untrack_undo(actor),
         }
     }
 
@@ -453,7 +431,7 @@ impl Coordinator {
     }
 
     /// Undo (or, with `redo`, redo) `ctx`'s actor's most recent action on the
-    /// live flat document at `path`, fanning the result out to the room.
+    /// live document at `path`, fanning the result out to the room.
     ///
     /// Returns whether anything was actually popped, so a caller can tell "undone"
     /// from "nothing to undo" — the two are different answers to a client drawing
@@ -473,8 +451,20 @@ impl Coordinator {
         path: &str,
         ctx: WriteCtx,
         redo: bool,
+        root: Option<&str>,
     ) -> Result<bool, OrigoFSError> {
-        let key = RoomKey::Flat(path.to_string());
+        // `root` picks the shape, exactly as it does on the socket: a tree room is
+        // keyed by its `XmlFragment` root, and the two shapes can hold the same
+        // path at once. Guessing from the flat key alone would have made undo
+        // silently unavailable to every rich-text editor, which is the shape it
+        // matters most on.
+        let key = match root {
+            Some(root) => RoomKey::Tree {
+                root: root.to_string(),
+                path: path.to_string(),
+            },
+            None => RoomKey::Flat(path.to_string()),
+        };
         let room = self.rooms.lock().await.get(&key).map(|s| s.room.clone());
         let Some(room) = room else {
             // An undo stack is the room's, and a room exists only while somebody
@@ -485,13 +475,13 @@ impl Coordinator {
             return Ok(false);
         };
 
-        // The ACL check lives in the engine (`Fs::undo_coedit`), not here, so a
-        // second surface cannot forget it.
+        // The ACL check lives in the engine (`Fs::undo_coedit`/`_tree`), not here,
+        // so a second surface cannot forget it.
         let frame = {
             let doc = room.doc.lock().await;
             match &*doc {
                 RoomDoc::Flat(d) => self.ws.undo_coedit(ctx, path, d, redo).await?,
-                RoomDoc::Tree(_) => doc.undo(ctx, redo)?, // refuses, naming the gap
+                RoomDoc::Tree(d) => self.ws.undo_coedit_tree(ctx, path, d, redo).await?,
             }
         };
         if frame.is_empty() {
@@ -996,6 +986,15 @@ pub(crate) struct UndoReq {
     /// differs.
     #[serde(default)]
     redo: bool,
+    /// The `XmlFragment` root, for a tree-shaped document — the same `root` the
+    /// tree socket was opened with. Absent means the flat shape.
+    ///
+    /// Required rather than inferred because both shapes can hold the same path
+    /// at once, so there is genuinely no way to guess: defaulting to flat would
+    /// make undo silently unavailable to every rich-text editor, which is the
+    /// shape it matters most on.
+    #[serde(default)]
+    root: Option<String>,
 }
 
 /// Undo (or redo) the authenticated actor's most recent edit to a live co-edited
@@ -1028,7 +1027,11 @@ pub(crate) async fn coedit_undo(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    match state.coedit.undo(&path, ctx, req.redo).await {
+    match state
+        .coedit
+        .undo(&path, ctx, req.redo, req.root.as_deref())
+        .await
+    {
         // `changed` distinguishes "undone" from "nothing to undo", which a client
         // drawing the affordance needs in order to grey the button out. Both are
         // successes; only one of them moved the document.

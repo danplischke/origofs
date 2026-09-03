@@ -2013,6 +2013,23 @@ impl Workspace {
         self.fs.undo_coedit(ctx, path, doc, redo).await
     }
 
+    /// [`undo_coedit`](Self::undo_coedit) for a tree-shaped document (#92).
+    ///
+    /// The live document moves immediately; the *file* moves when the host next
+    /// calls [`checkpoint_coedit_tree`](Self::checkpoint_coedit_tree) with its own
+    /// serialized bytes, because origofs does not own the schema. Requires the
+    /// `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn undo_coedit_tree(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditTreeDoc,
+        redo: bool,
+    ) -> Result<Vec<u8>> {
+        self.fs.undo_coedit_tree(ctx, path, doc, redo).await
+    }
+
     /// Propose a change to a co-edited `path` as a **CRDT merge** rather than a
     /// whole file body (issue #75 §3.2): the review row records the document's Yjs
     /// state vector as its base and `doc`'s opaque `encodeStateAsUpdate` blob as the

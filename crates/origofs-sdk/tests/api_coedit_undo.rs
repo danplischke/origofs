@@ -120,14 +120,23 @@ async fn serve() -> (Server, i64, i64) {
 
 /// `POST /v1/coedit-undo/{path}` as `tok`, returning the status and body.
 async fn post_undo(srv: &Server, tok: &str, path: &str, redo: bool) -> (u16, String) {
+    post_undo_body(srv, tok, path, serde_json::json!({ "redo": redo })).await
+}
+
+/// The same request with an arbitrary body — for the tree shape, which must name
+/// its `root`.
+async fn post_undo_body(
+    srv: &Server,
+    tok: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> (u16, String) {
     let req = axum::http::Request::builder()
         .method("POST")
         .uri(format!("/v1/coedit-undo/{path}"))
         .header("authorization", format!("Bearer {tok}"))
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({ "redo": redo })).unwrap(),
-        ))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let res = srv.app.clone().oneshot(req).await.unwrap();
     let status = res.status().as_u16();
@@ -300,4 +309,52 @@ async fn undo_without_a_live_room_changes_nothing() {
 async fn undo_requires_a_credential() {
     let (srv, _alice, _bob) = serve().await;
     assert_eq!(post_undo_anonymous(&srv, "doc.md").await, 401);
+}
+
+/// The tree shape reaches undo through the same route, naming its `XmlFragment`
+/// root. Both shapes can hold the same path at once, so the root is what picks
+/// the room — a flat-only default would have made undo silently unavailable to
+/// every rich-text editor, which is the shape it matters most on.
+#[tokio::test]
+async fn the_tree_shape_undoes_through_the_same_route() {
+    let (srv, _alice, _bob) = serve().await;
+    let url = format!("ws://{}/v1/coedit-tree/doc.md?token=tok-alice", srv.addr);
+    let (mut a, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let a_aware = Awareness::new(Doc::new());
+    pump(&mut a, &a_aware).await;
+
+    // Type into the fragment the tree socket serves.
+    let update = {
+        let frag = a_aware
+            .doc()
+            .get_or_insert_xml_fragment(origofs_sdk::DEFAULT_TREE_ROOT);
+        let mut txn = a_aware.doc().transact_mut();
+        use yrs::types::xml::XmlFragment;
+        frag.push_back(&mut txn, yrs::types::xml::XmlTextPrelim::new("hello"));
+        txn.encode_update_v1()
+    };
+    a.send(Ws::Binary(frame(&[Y::Sync(SyncMessage::Update(update))])))
+        .await
+        .unwrap();
+    // Let the server apply it before asking for the undo.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Without a root this addresses the *flat* room, which nobody opened.
+    let (status, body) = post_undo(&srv, "tok-alice", "doc.md", false).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("\"changed\":false"),
+        "a root-less request reached the tree room: {body}"
+    );
+
+    // With it, the undo lands.
+    let (status, body) = post_undo_body(
+        &srv,
+        "tok-alice",
+        "doc.md",
+        serde_json::json!({ "redo": false, "root": origofs_sdk::DEFAULT_TREE_ROOT }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"changed\":true"), "{body}");
 }

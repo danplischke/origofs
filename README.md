@@ -524,8 +524,12 @@ Four things to know before building on it:
   and your stack goes when your last socket on that document closes. Two tabs
   share one stack. For anything durable, reach for `revert_session` (a whole
   sitting), the trash (a delete), or `checkout` (a commit).
-- **Flat documents only** so far. The tree shape refuses and says so rather than
-  claiming there is nothing to undo.
+- **Both shapes work.** A tree document names its `XmlFragment` root in the
+  request (`{"redo": false, "root": "content"}`) — the same `root` its socket was
+  opened with. Both shapes can hold one path at once, so the root is what picks
+  the room, and a request without one addresses the flat shape. The tree's *file*
+  still moves only when your next `coedit-tree-checkpoint` lands bytes, because
+  origofs cannot serialize a tree; the live document moves immediately.
 
 While a document is open, its stored bytes are the last **checkpoint** — real,
 fully attributed, but possibly behind what people are typing. origofs records that
