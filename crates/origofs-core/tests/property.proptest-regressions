@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 737afefd0b9f6b26acf8473367928507a53db6811b5bff473994f1548880b334 # shrinks to reqs = [LockRequest { owner: "a", holder: "h", pid: 1, start: 0, end: 9223372036854775807, kind: Shared }, LockRequest { owner: "a", holder: "h", pid: 1, start: 0, end: 9223372036854775807, kind: Shared }], last = LockRequest { owner: "a", holder: "h", pid: 1, start: 0, end: 0, kind: Exclusive }

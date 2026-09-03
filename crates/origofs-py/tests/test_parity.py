@@ -1609,3 +1609,38 @@ async def test_a_cache_config_carries_both_bounds():
     assert "8589934592" in repr(c) and "2147483648" in repr(c)
     c = origofs.CacheConfig("/tmp/origofs-cache", max_bytes=1 << 20, min_free_bytes=1 << 21)
     assert "1048576" in repr(c) and "2097152" in repr(c)
+
+
+# --- POSIX advisory locks (#119) ------------------------------------------
+
+
+@asyncio_test
+async def test_posix_locks_switch_and_listing_are_bound():
+    """The switch and the listing, which is the whole Python-side surface.
+
+    Binding these is the point of #120's rule rather than an afterthought: the
+    locks are taken by *mounts*, so the process that needs to see them is exactly
+    the kind of Python service that has no mount of its own — a FastAPI handler
+    answering "who is holding this file". Without a binding an operator could turn
+    the feature on with the CLI and no Python service could observe any of it.
+
+    Taking a lock is deliberately *not* bound. An advisory lock is owned by an open
+    file description and kept alive by the mount's lease renewer; one taken by a
+    library call would have neither and would expire under its holder inside a
+    minute, which is worse than not offering it.
+    """
+    ws = await workspace()
+    await ws.write("/f.bin", b"data\n")
+
+    assert await ws.posix_locks_enabled() is False, "must default off"
+    # Readable while off, and an empty list rather than an error -- "nothing holds
+    # this" is a real answer a service should be able to render.
+    assert await ws.posix_locks("/f.bin") == []
+
+    await ws.set_posix_locks_enabled(True)
+    assert await ws.posix_locks_enabled() is True
+    assert await ws.posix_locks("/f.bin") == []
+
+    # Reversible: a workspace is not locked into answering `setlk` forever.
+    await ws.set_posix_locks_enabled(False)
+    assert await ws.posix_locks_enabled() is False

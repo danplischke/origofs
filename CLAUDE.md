@@ -515,6 +515,66 @@ compiling at all until #107.
   trying a candidate yrs, and drop the `#[ignore]`s in the change that moves the
   pin. `fuzz_targets/coedit_state_decode.rs` drives the same path and is expected
   to abort.
+- **There are two things called a lock, and they are unrelated (#119).**
+  `Fs::lock` is the durable, named, git-LFS-style claim on a **path**, taken by a
+  person so nobody else edits a binary; it outlives every process involved.
+  `vfs_setlk_as` is a POSIX **advisory byte-range** lock on an *inode*, owned by an
+  open file description and dead with the process. Neither can be expressed in the
+  other's table, which is why `posix_lock` is its own.
+  - **Why it is stored at all.** A FUSE filesystem that does not implement `setlk`
+    still has working advisory locks — the kernel serves them locally, per mount —
+    so an in-process table would reimplement what already works. The only thing
+    missing, and the only reason to answer `setlk`, is coordination *between*
+    mounts. That is why the table is durable rather than in-memory.
+  - **Off by default** (`origofs posix-locks on`), because answering `setlk` takes
+    locking *away* from the kernel's local handling: a bug here breaks what works
+    today. Same reasoning and same default as `acl_enforce_reads` and trash
+    retention. Mounts read it once, at mount time.
+  - **A durable table cannot be tidied by a process that has died**, so every row
+    carries a `holder` (the mount instance — a clean unmount deletes its rows) and
+    an `expires_at` lease that a live mount renews on a timer. Renewing only on
+    lock operations would not do: a process that takes a lock and then works for
+    five minutes would lose it. Expired rows are dropped inside the same
+    transaction that next touches the inode, so nothing needs a background reaper.
+  - **The semantics live in `posixlock.rs` and touch no database.** Splitting a
+    range somebody re-locks the middle of, downgrading half of an exclusive lock,
+    an unlock that punches a hole — that is where this gets subtle, and it is
+    unit-tested directly rather than through two backends. Each backend only runs
+    `resolve` inside a transaction. **That transaction is the correctness
+    boundary**: SQLite takes `BEGIN IMMEDIATE` and Postgres a per-inode
+    `pg_advisory_xact_lock`, because read-decide-write must be serialized or two
+    mounts both find no conflict and both insert. `SELECT … FOR UPDATE` is *not*
+    enough on Postgres — there are no gap locks, and the rows in question do not
+    exist yet.
+  - **`F_SETLKW` replies from off the session thread.** `fuser`'s dispatch loop is
+    single-threaded (`Config::n_threads` defaults to 1 and this mount does not
+    raise it), so waiting inline would freeze every operation on the mountpoint
+    for the duration. The waiter moves the `ReplyEmpty` onto the mount's runtime
+    and answers later. It is bounded (30s) because `fuser` exposes no
+    `FUSE_INTERRUPT` hook here, so an unbounded wait could never be cancelled.
+  - **Authorization follows what the lock claims**: exclusive takes the write
+    check, shared takes the read guard (inert unless `acl_enforce_reads`), and
+    **unlocking is never refused** — an actor whose grant was revoked mid-flight
+    must still be able to let go, or the range stays stuck until its lease runs
+    out.
+  - **NFS has none of this**, and not by choice: `nfsserve` exposes no NLM hooks,
+    and NFSv3 locking is a separate protocol. `fallocate`/`copy_file_range` from
+    the same issue are answered on FUSE (`vfs_copy_range_as`/`vfs_allocate_as`)
+    and remain absent on NFS for the same reason — `nfsserve` never surfaces the
+    operations.
+  - **Four test tiers, because each one misses what the next catches.**
+    `property.rs` asserts the resolver's invariants over arbitrary op sequences —
+    states are built by *folding* random requests, never generated directly, since
+    a hand-made lock set is mostly states the resolver cannot emit.
+    `posix_lock_sim.rs` is the seeded DST: it drives the **real store** and
+    compares the rows against the reference model (`posixlock::apply`) after every
+    step, because `resolve` can be perfect while the SQL translation is not — a
+    `DELETE` that misses its row, an expiry filter off by one. It carries a
+    negative control that deliberately breaks the model and requires the
+    comparison to notice. `concurrency.rs` covers contention. The
+    `posix_lock_resolve` fuzz target is the deeper search of the same invariants;
+    note CI only `cargo check`s the fuzz crate, which is exactly why the
+    properties also run in-crate.
 - **Path traversal is rejected at every metadata boundary.** `validate_component`
   (`engine.rs`) refuses `.`/`..`/`/`/NUL in a single name so a poisoned name can
   never be *stored* — which is what stops it escaping during host materialization
@@ -546,6 +606,39 @@ compiling at all until #107.
   (`touch`), and the sweep re-checks an object's age at the moment it deletes it
   (`delete_if_older_than`) so a long pass cannot act on an age it read minutes
   earlier. A backend that cannot date its objects collects nothing.
+- **Upgrading origofs must never require rewriting a bucket, and the two stores
+  get opposite treatments because they fail in opposite directions.** Content is
+  immutable and hash-addressed, so a format change mints *new* objects and leaves
+  every old one valid — the rules live in `format.rs` (never re-encode a shipped
+  version; add a decoder arm; raise `max_read_version` a release before
+  `write_version`), and `tests/format.rs` pins the v1 bytes *and* their hashes so a
+  silent re-address fails in CI rather than in a bucket. It also pins the FastCDC
+  boundaries, because re-chunking is not a correctness break but is a total dedup
+  break. The metadata DB is the opposite: rewritten in place, forward-only, no
+  down-migrations by design.
+  - **Anything a dependency owns is pinned in *data*, not left to the crate.** The
+    encrypted-at-rest layout is the sharp case: `EncryptedStore` frames objects
+    `ORGE | version | AEAD(…)` (bare pre-envelope objects read forever — the AEAD
+    tag, not the header, is what finally decides between the two shapes), and the
+    Argon2id cost is `KdfParams::LEGACY` recorded per store in a `kdf` sidecar
+    rather than `argon2::Params::default()`, a constant the crate has already moved
+    once. Both failures would have surfaced as `Corrupt("wrong key or corrupt
+    data")` — the wrong-passphrase message — on intact data.
+    `tests/encryption.rs` pins the ciphertext of a fixed `(passphrase, salt,
+    plaintext)`, which pins Argon2id, the BLAKE3 nonce derivation, the cipher and
+    the framing at once.
+  - **`min_reader_version` is the field that locks a fleet out; `format_version` is
+    advisory.** They are separate constants deliberately: stamping them together on
+    *open* meant the first node to upgrade took the store away from every node that
+    had not, before writing a single new-version object. Raise `MIN_READER_VERSION`
+    only in the release that starts writing objects older readers genuinely cannot
+    use.
+  - **The rollback path is a backup, not a down-migration.** An older binary meeting
+    a newer DB refuses it (`UnsupportedVersion`) *before* touching it, so the DB is
+    left exactly as found; `origofs migrate --check` shows a pending step and
+    `--backup` snapshots before applying. Both read the store **unmigrated, ahead of
+    the workspace open** — opening is the migration runner, so anything asking after
+    the open can only describe what it just did.
 - **The content store can rebuild the DB, but not attribution.** It is a
   self-describing Merkle DAG with a mirrored ref table, so `origofs fsck --rebuild`
   (SDK `rebuild`/`scan`) restores committed files, dirs, symlinks, and branches

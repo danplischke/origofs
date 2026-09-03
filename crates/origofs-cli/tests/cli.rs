@@ -1505,6 +1505,69 @@ fn schema_version_agrees_with_migrate_on_a_fresh_workspace() {
         .stdout_has("nothing to apply");
 }
 
+/// A pending migration has to be *visible* before it is applied, and until these
+/// two subcommands were moved ahead of the workspace open it could not be: opening
+/// runs the migration runner, so both of them reported the state they had just
+/// created. An operator could not answer "will this deploy migrate my database?",
+/// which is the question that decides whether to take a backup — the only thing
+/// that makes a forward-only upgrade reversible.
+#[test]
+fn migrate_check_sees_a_pending_upgrade_and_applies_nothing() {
+    let ws = Ws::bare();
+
+    let pending = ws
+        .run(&["migrate", "--check"])
+        .expect_ok("migrate --check")
+        .stdout_has("schema v0 -> v")
+        .stdout_has("step(s) pending")
+        .stdout_has("nothing applied")
+        .trimmed()
+        .to_string();
+
+    // Still untouched: `--check` reports, it does not migrate.
+    ws.run(&["schema-version"])
+        .expect_ok("schema-version")
+        .stdout_has("schema version: v0")
+        .stdout_has("step(s) pending");
+    assert!(
+        pending.contains("-> v"),
+        "the check must name the target version: {pending:?}"
+    );
+
+    ws.run(&["migrate"])
+        .expect_ok("migrate")
+        .stdout_has("migrated schema v0 -> v")
+        .stdout_has("forward-only");
+
+    ws.run(&["migrate", "--check"])
+        .expect_ok("migrate --check")
+        .stdout_has("nothing to apply");
+}
+
+/// `--backup` is the whole rollback plan for an upgrade: migrations are
+/// forward-only, so the snapshot taken immediately before the step is the only way
+/// back. It must land *before* anything is applied — a backup of the migrated
+/// database protects against nothing.
+#[test]
+fn migrate_backup_snapshots_the_database_before_applying() {
+    let ws = Ws::bare();
+    let dest = ws.scratch("pre-upgrade.db");
+
+    ws.run(&["migrate", "--backup", dest.to_str().unwrap()])
+        .expect_ok("migrate --backup")
+        .stdout_has("migrated schema v0 -> v");
+
+    let size = std::fs::metadata(&dest)
+        .unwrap_or_else(|e| panic!("backup {} missing: {e}", dest.display()))
+        .len();
+    assert!(size > 0, "the pre-migration backup is empty");
+
+    // Having taken one, the command does not also nag about not having one.
+    ws.run(&["migrate", "--check"])
+        .expect_ok("migrate --check")
+        .stdout_has("nothing to apply");
+}
+
 /// `presence` shows *live* collaborators, and the CLI is not one: each
 /// invocation opens a session and exits without ever heartbeating. So an empty
 /// listing is correct, and the regression it guards is the opposite — presence
@@ -2192,6 +2255,15 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         (
             "require-attribution",
             Exempt("administrative: sets whether attribution is mandatory"),
+        ),
+        (
+            "posix-locks",
+            Exempt(
+                "administrative: sets whether this workspace answers `fcntl` \
+                 advisory locks, and lists the locks held. Touches no file content \
+                 — an advisory lock is coordination between cooperating processes, \
+                 not a change to the tree, so there is nothing to attribute.",
+            ),
         ),
         (
             "quota",
@@ -3046,4 +3118,49 @@ fn a_byte_quota_refuses_the_write_that_would_exceed_it() {
         .expect_ok("under the cap");
     ws.write_as("/big.txt", alice, "0123456789abcdef0123456789")
         .expect_err("over the cap");
+}
+
+/// The switch is reachable and reversible, and reads back what was set.
+///
+/// It exists at all because an engine feature with no surface cannot be turned on
+/// without writing Rust — the failure #115, #116 and #124 all shared.
+#[test]
+fn posix_locks_switch_round_trips() {
+    let ws = Ws::init();
+    ws.run(&["posix-locks"])
+        .expect_ok("read the default")
+        .stdout_has("off");
+    ws.run(&["posix-locks", "on"])
+        .expect_ok("turn it on")
+        .stdout_has("on");
+    ws.run(&["posix-locks"])
+        .expect_ok("read it back")
+        .stdout_has("on");
+    ws.run(&["posix-locks", "off"])
+        .expect_ok("and back off")
+        .stdout_has("off");
+}
+
+#[test]
+fn posix_locks_rejects_an_unknown_setting() {
+    let ws = Ws::init();
+    ws.run(&["posix-locks", "maybe"])
+        .expect_err("a bogus setting")
+        .stderr_has("expected `on` or `off`");
+}
+
+/// An empty listing has to say whether locking is even on: "nothing holds this"
+/// and "we are not answering locks" are different answers to the same command.
+#[test]
+fn listing_locks_on_a_path_distinguishes_off_from_empty() {
+    let ws = Ws::init();
+    ws.run_in(&["write", "/f.bin"], "data\n")
+        .expect_ok("a file to ask about");
+    ws.run(&["posix-locks", "--path", "/f.bin"])
+        .expect_ok("listing while off")
+        .stdout_has("locking is off");
+    ws.run(&["posix-locks", "on"]).expect_ok("turn it on");
+    ws.run(&["posix-locks", "--path", "/f.bin"])
+        .expect_ok("listing while on and unlocked")
+        .stdout_has("locking is on");
 }

@@ -10,6 +10,11 @@ use crate::content::ContentStore;
 use crate::engine::{Fs, validate_component};
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
+use crate::posixlock::{LockAnswer, LockKind, LockRequest};
+use crate::types::{DirEntry, DirEntryAttr, DirPage, FileKind, Ino, Inode, InodeInit, Owner};
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
+use std::collections::HashMap;
 
 /// The `fallocate(2)` modes this filesystem can honour (issue #119).
 ///
@@ -28,10 +33,6 @@ pub enum AllocateMode {
     /// `FALLOC_FL_ZERO_RANGE`: zero the range, extending if it runs past the end.
     ZeroRange,
 }
-use crate::types::{DirEntry, DirEntryAttr, DirPage, FileKind, Ino, Inode, InodeInit, Owner};
-use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
-use std::collections::HashMap;
 
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
@@ -1220,5 +1221,114 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
              is under sustained concurrent modification",
             Self::VFS_CAS_ATTEMPTS
         )))
+    }
+
+    // --- POSIX advisory locks (issue #119) -------------------------------
+
+    /// Whether this workspace answers `fcntl` advisory locks itself.
+    ///
+    /// **Off by default, and the default is the point.** A FUSE mount that does
+    /// not implement `setlk` still has working advisory locks — the kernel serves
+    /// them locally, per mount — so every existing deployment has locking today.
+    /// Answering `setlk` *takes that over*, which means a bug here breaks what
+    /// currently works. Turning it on buys the one thing local locking cannot do:
+    /// coordination between separate mounts. That is a trade an operator makes,
+    /// not one an upgrade makes for them. Same reasoning as `acl_enforce_reads`
+    /// and trash retention.
+    pub async fn posix_locks_enabled(&self) -> Result<bool> {
+        Ok(self
+            .meta
+            .get_config(crate::posixlock::ENABLED_KEY)
+            .await?
+            .as_deref()
+            == Some("1"))
+    }
+
+    /// Turn cross-mount advisory locking on or off for this workspace.
+    pub async fn set_posix_locks_enabled(&self, on: bool) -> Result<()> {
+        self.meta
+            .set_config(crate::posixlock::ENABLED_KEY, if on { "1" } else { "0" })
+            .await
+    }
+
+    /// Test whether `req` would be granted on `ino` — `fcntl(F_GETLK)`.
+    ///
+    /// A read: it reports another process's lock, so it runs the read guard, which
+    /// like every other read check is inert unless `acl_enforce_reads` is on.
+    pub async fn vfs_getlk_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        req: &LockRequest,
+    ) -> Result<LockAnswer> {
+        if !self.posix_locks_enabled().await? {
+            return Ok(LockAnswer::NotEnabled);
+        }
+        self.guard_read(ctx, "test a lock on", ino).await?;
+        let held = self.meta.posix_locks(ino, self.now_secs()).await?;
+        Ok(match crate::posixlock::test(&held, req) {
+            Some(l) => LockAnswer::Held(l),
+            None => LockAnswer::Free,
+        })
+    }
+
+    /// Acquire, downgrade or release a lock on `ino` — `fcntl(F_SETLK)`.
+    ///
+    /// The authorization follows what the lock actually claims. An **exclusive**
+    /// lock says "nobody else writes these bytes", which is a writer's claim, so it
+    /// takes the write check. A **shared** lock says "nobody writes these bytes
+    /// while I read them" — a reader's claim, so it takes the read guard.
+    /// **Unlocking** is checked by nothing: it only ever removes ranges this owner
+    /// already holds, and an actor whose grant was revoked mid-flight must still be
+    /// able to let go. Refusing a release would strand the lock until its lease ran
+    /// out, which is worse for everyone including the revoker.
+    pub async fn vfs_setlk_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        req: &LockRequest,
+    ) -> Result<LockAnswer> {
+        if !self.posix_locks_enabled().await? {
+            return Ok(LockAnswer::NotEnabled);
+        }
+        match req.kind {
+            LockKind::Exclusive => self.guard_write(ctx, "lock", ino).await?,
+            LockKind::Shared => self.guard_read(ctx, "lock for reading", ino).await?,
+            LockKind::Unlock => {}
+        }
+        let now = self.now_secs();
+        let conflict = self
+            .meta
+            .apply_posix_lock(ino, req, now + crate::posixlock::LEASE_SECS, now)
+            .await?;
+        Ok(match conflict {
+            Some(l) => LockAnswer::Held(l),
+            None => LockAnswer::Free,
+        })
+    }
+
+    /// Every advisory lock currently held on `ino`, live leases only.
+    ///
+    /// Introspection, and the counterpart to [`Fs::locks`](Self::locks) for the
+    /// LFS-style claims. `getlk` answers only "what blocks *me*", which cannot show
+    /// a caller the locks it already holds or two readers sharing a range.
+    /// Unchecked, exactly as `locks()` is: it reports the mount's own bookkeeping,
+    /// and the paths are not in it.
+    pub async fn posix_locks(&self, ino: Ino) -> Result<Vec<crate::posixlock::PosixLock>> {
+        self.meta.posix_locks(ino, self.now_secs()).await
+    }
+
+    /// Drop every advisory lock a mount instance holds — a clean unmount.
+    ///
+    /// Not a `vfs_` op and not guarded: a mount releasing its own rows on the way
+    /// down is cleanup, and making it refusable would leave the rows to expire.
+    pub async fn release_posix_locks_for_holder(&self, holder: &str) -> Result<u64> {
+        self.meta.release_posix_locks_for_holder(holder).await
+    }
+
+    /// Push out the lease on a mount instance's locks; called while it is alive.
+    pub async fn renew_posix_lease(&self, holder: &str) -> Result<u64> {
+        let until = self.now_secs() + crate::posixlock::LEASE_SECS;
+        self.meta.renew_posix_lease(holder, until).await
     }
 }

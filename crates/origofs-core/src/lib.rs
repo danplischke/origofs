@@ -36,6 +36,7 @@ pub mod objectstore;
 pub mod pack;
 pub mod perf;
 pub mod portable;
+pub mod posixlock;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod recover;
@@ -102,7 +103,7 @@ pub use content::{
 };
 pub use corpus::{Passage, PassageOptions, Segmentation};
 #[cfg(feature = "encryption")]
-pub use encrypt::EncryptedStore;
+pub use encrypt::{EncryptedStore, KdfParams};
 pub use engine::{Fs, INTERNAL_DIR, is_internal_path, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
 pub use portable::{Cell, DUMP_FORMAT, DUMP_TABLES, LoadReport, Row};

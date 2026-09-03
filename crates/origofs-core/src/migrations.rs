@@ -253,6 +253,34 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V20,
         postgres: V20,
     },
+    // V21 — POSIX advisory locks (`fcntl(F_SETLK)`), issue #119. origofs already had
+    // a `lock` before this, and it is a **different object with the same word**: that
+    // one is a durable, named, git-LFS-style claim on a *path*, taken by a person to
+    // stop a binary being edited concurrently, and it outlives every process involved.
+    // This one is per-open-file-description, byte-ranged, addressed by inode, and dies
+    // with the process that took it. Neither can be expressed in the other's table.
+    //
+    // **Durable rather than in-process, deliberately.** When a FUSE filesystem does
+    // not implement `setlk`, the kernel still serves advisory locks *locally* — so a
+    // per-mount table would duplicate what already works and add nothing. The only
+    // thing that is missing, and the only reason to answer `setlk` at all, is
+    // coordination *between* mounts: two processes on two machines against one
+    // workspace. That has to live where both can see it.
+    //
+    // The price of durability is that a crashed mount cannot clean up after itself, so
+    // every row carries `expires_at` (a lease the holder renews) and `holder` (the
+    // mount instance, so a clean unmount drops its rows at once). Without those, one
+    // `kill -9` wedges a byte range until somebody edits the database by hand.
+    //
+    // No surrogate key: one owner's ranges on one inode never overlap once normalized,
+    // so `start_off` identifies a row within `(workspace, ino, owner)` and the split /
+    // merge path can address rows directly. `end_off` is **inclusive**, POSIX-style,
+    // with `i64::MAX` standing for end-of-file.
+    Migration {
+        version: 21,
+        sqlite: V21,
+        postgres: V21,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -487,6 +515,28 @@ CREATE TABLE IF NOT EXISTS acl(
     PRIMARY KEY (workspace_id, actor_id, path_prefix)
 );
 CREATE INDEX IF NOT EXISTS idx_acl_actor ON acl(workspace_id, actor_id);
+";
+
+// V21 — POSIX advisory locks (see the migration entry above). `start_off`/`end_off`
+// rather than `start`/`end` because `end` is reserved in SQL; the range is inclusive
+// and `i64::MAX` means end-of-file. One statement set serves both engines.
+const V21: &str = "
+CREATE TABLE IF NOT EXISTS posix_lock(
+    workspace_id BIGINT NOT NULL,
+    ino          BIGINT NOT NULL,
+    owner        TEXT   NOT NULL,
+    holder       TEXT   NOT NULL,
+    pid          BIGINT NOT NULL,
+    start_off    BIGINT NOT NULL,
+    end_off      BIGINT NOT NULL,
+    exclusive    BIGINT NOT NULL,
+    acquired_at  BIGINT NOT NULL,
+    expires_at   BIGINT NOT NULL,
+    PRIMARY KEY (workspace_id, ino, owner, start_off)
+);
+CREATE INDEX IF NOT EXISTS idx_posix_lock_ino ON posix_lock(workspace_id, ino);
+CREATE INDEX IF NOT EXISTS idx_posix_lock_holder ON posix_lock(holder);
+CREATE INDEX IF NOT EXISTS idx_posix_lock_expiry ON posix_lock(expires_at);
 ";
 
 // V19 — trash (see the migration entry above). `content_hash` is the manifest
