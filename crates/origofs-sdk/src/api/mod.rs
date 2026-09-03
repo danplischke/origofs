@@ -564,7 +564,13 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
             .route(
                 "/coedit-tree-checkpoint/{*path}",
                 post(coedit::coedit_tree_checkpoint),
-            );
+            )
+            // Undo/redo (#146) rides beside the socket rather than on it: the
+            // result travels the room's own fan-out, so only the request needs a
+            // channel, and a new y-sync message tag would risk the unmodified
+            // Yjs clients the socket deliberately serves. It authenticates
+            // itself like its neighbours here.
+            .route("/coedit-undo/{*path}", post(coedit::coedit_undo));
     }
     // Per-request metrics wrap the *data* surface only, outside the read gate so a
     // rejected (401) request is still counted. Liveness/readiness and the scrape

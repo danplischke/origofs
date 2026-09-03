@@ -57,6 +57,11 @@ fn an_actor_undoes_their_own_typing() {
     assert_eq!(doc.text(), "hello");
     assert!(doc.can_undo(1));
 
+    // A peer holding the pre-undo state, as every other socket in the room does.
+    let peer = CoeditDoc::new();
+    peer.apply_update(&doc.state_update()).expect("peer");
+    assert_eq!(peer.text(), "hello");
+
     let relay = doc.undo_as(ALICE).expect("undo");
     assert_eq!(doc.text(), "");
     assert!(
@@ -64,11 +69,14 @@ fn an_actor_undoes_their_own_typing() {
         "an undo that changed the document must relay"
     );
 
-    // The relayed update carries the undo to a peer replica, which is why undo
-    // needs no new message type on the y-sync wire.
-    let peer = CoeditDoc::new();
-    peer.apply_update(&doc.state_update()).expect("peer");
-    assert_eq!(peer.text(), "");
+    // The frame carries the undo to that peer through the room's ordinary
+    // fan-out — which is why undo needs no new message type on the y-sync wire.
+    peer.apply_relayed(&relay).expect("fan out the undo");
+    assert_eq!(
+        peer.text(),
+        "",
+        "the undo did not reach a peer through the frame the room broadcasts"
+    );
 }
 
 #[test]

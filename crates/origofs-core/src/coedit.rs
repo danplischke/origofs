@@ -447,13 +447,16 @@ impl CoeditDoc {
         self.undo.lock().get(&actor).is_some_and(|m| m.can_redo())
     }
 
-    /// Undo `ctx`'s actor's most recent action, returning the update to relay to
-    /// peers — or an empty vector if there was nothing to undo.
+    /// Undo `ctx`'s actor's most recent action, returning the **y-sync frame** to
+    /// fan out to the room — or an empty vector if there was nothing to undo.
     ///
-    /// The return shape is [`apply_update_as`](Self::apply_update_as)'s on
-    /// purpose: an undo produces an ordinary y-sync update, so it travels the
-    /// room's existing fan-out and needs no new message type on the wire. Only
-    /// the *request* needed a channel, and that is the caller's problem.
+    /// The bytes are framed exactly as
+    /// [`handle_sync`](Self::handle_sync)'s `broadcast` is, and for the same
+    /// reason: an undo produces an ordinary y-sync `Update`, so it travels the
+    /// room's existing fan-out and nothing new goes on the wire. Only the
+    /// *request* needed a channel, and that is the surface's problem. Framing it
+    /// here rather than at the surface also keeps `yrs` out of the callers — the
+    /// SDK depends on it only as a dev-dependency.
     ///
     /// Scoped to the actor's own origins, so this can only ever pop something
     /// they did. A colleague's paragraph is not reachable from here, which is the
@@ -495,8 +498,12 @@ impl CoeditDoc {
         }
 
         // Encode exactly what the pop did, the same way `apply_update_as` encodes
-        // exactly what a client's update did.
-        Ok(self.doc.transact().encode_state_as_update_v1(&sv_before))
+        // exactly what a client's update did, then frame it as the `Update`
+        // message a room's fan-out carries.
+        let delta = self.doc.transact().encode_state_as_update_v1(&sv_before);
+        let mut frame = EncoderV1::new();
+        Message::Sync(SyncMessage::Update(delta)).encode(&mut frame);
+        Ok(frame.to_vec())
     }
 
     /// Reconstruct a document from a serialized state produced by
@@ -1344,6 +1351,49 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// so blame shows each collaborator's exact character ranges (sub-line and
     /// interleaved). `ctx` is the actor performing the checkpoint (recorded on the
     /// op-log); any span the CRDT left unattributed falls back to `ctx`.
+    /// Undo (or, with `redo`, redo) `ctx`'s actor's most recent action on the
+    /// live document at `path`, returning the y-sync update to fan out to the
+    /// room — empty when there was nothing to pop.
+    ///
+    /// # Why the write check
+    ///
+    /// **An undo is a write**, so it takes `WRITE` at the path exactly as
+    /// [`open_coedit`](Self::open_coedit) does. The WebSocket that carries a
+    /// room authenticates but does not authorize, and the request arriving on an
+    /// already-open socket proves only that the actor could open it — the same
+    /// reasoning that made both checkpoints re-check as a backstop.
+    ///
+    /// Two consequences worth stating rather than discovering. A propose-only
+    /// actor has no undo at all, and is refused rather than silently no-op'd:
+    /// there is no such thing as a proposed undo, and an editor that showed the
+    /// key working while nothing happened would be worse than one that says no.
+    /// And an actor whose grant is revoked mid-session loses undo immediately,
+    /// which is the right way round — unlike releasing a POSIX lock, leaving an
+    /// edit *un*-undone strands nothing.
+    ///
+    /// The scoping to the actor's own work is not this check's job: it is the
+    /// transaction origins, and it holds whatever the ACLs say. This decides
+    /// whether the caller may write here at all.
+    pub async fn undo_coedit(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditDoc,
+        redo: bool,
+    ) -> Result<Vec<u8>> {
+        let verb = if redo {
+            "redo an edit to"
+        } else {
+            "undo an edit to"
+        };
+        self.ensure_may_write_at(ctx, verb, path).await?;
+        if redo {
+            doc.redo_as(ctx)
+        } else {
+            doc.undo_as(ctx)
+        }
+    }
+
     pub async fn checkpoint_coedit(
         &self,
         ctx: WriteCtx,

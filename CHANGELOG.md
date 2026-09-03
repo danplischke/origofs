@@ -7,6 +7,56 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ## [Unreleased]
 
+### Added
+
+- **Per-actor undo/redo in live co-editing (#146).** Every editor a host binds
+  to this expects Ctrl+Z to work and to undo *the user's own* typing. There was
+  no undo stack, no redo, and no inverse-op journal anywhere in the tree.
+  `revert_session` is the nearest thing and is deliberately the wrong shape for
+  it: a filter over authorship, not a rewind over time, whose unit is a whole
+  session across every file it touched. `POST /v1/coedit-undo/{path}` (with
+  `{"redo": true}` for the other direction) pops one actor's own most recent
+  action on a live flat document.
+
+  The prerequisite was that **no CRDT transaction carried an origin**.
+  `transact_mut_with` appeared nowhere, so `yrs` had nothing to scope an undo
+  by. That is a trap rather than a gap, and the direction of `yrs`'s default is
+  why: an origin-less transaction is tracked exactly while no actor origin has
+  been included, so an `UndoManager` attached to the old code would have
+  captured not merely everyone's edits but every frame arriving over the
+  cross-worker relay — a Ctrl+Z popping an edit made on a worker this process
+  never spoke to. Setting origins on the attributed client paths closes that
+  **by exclusion**, so the paths that carry no origin (the relay, an
+  unattributed merge, the reconstruction paths) now say why they carry none,
+  and `tests/coedit_origin.rs` pins the `yrs` behaviour underneath it.
+
+  **An undo is an ordinary forward edit, and that is a ruling.** Text an undo
+  removes leaves blame like any deletion; text it restores comes back carrying
+  the author attribute it had, so undoing someone else's deletion gives the text
+  back to *its* author rather than to whoever pressed the key. Nothing touches
+  the blame index and `checkpoint_coedit` needs no special case. The alternative
+  — undo unwinds the record, as if the insert never happened — was rejected: in
+  a filesystem whose premise is that every edit is attributable, an undo that
+  erases evidence is a way for an agent to write, be reviewed, and then launder
+  the edit out of the append-only op-log.
+
+  Three consequences worth knowing rather than discovering. **An undo is a
+  write**, so it takes `WRITE` at the path exactly as `open_coedit` does — a
+  propose-only actor is refused rather than silently no-op'd, because there is
+  no such thing as a proposed undo. **A stack does not outlive the room**: it is
+  an editor affordance, not history, so it does not survive a reconnect, a
+  `checkout`, or a worker restart, and an actor's stack is dropped when *their*
+  last socket leaves rather than when the room empties. And **the tree shape is
+  not covered yet** — it refuses, naming the gap, rather than reporting an empty
+  stack to an editor whose user has been typing.
+
+  The request rides beside the socket rather than on it: the result travels the
+  room's existing y-sync fan-out, so only the request needed a channel, and a
+  new message tag would risk the unmodified Yjs clients the socket exists to
+  serve. `yrs`'s `sync` feature is now required — without it `UndoManager` is
+  not `Send + Sync`, and a room sharing one document across socket tasks could
+  not hold the stacks at all.
+
 ### Changed
 
 - **The co-edit CRDT sidecars are versioned, so their framing can be evolved

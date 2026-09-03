@@ -58,6 +58,16 @@ const FANOUT_CAPACITY: usize = 256;
 #[cfg(feature = "postgres")]
 const RELAY_ORIGIN: u64 = u64::MAX;
 
+/// The fan-out origin tag for a frame produced by an undo/redo request rather
+/// than by a socket, so every local socket receives it.
+///
+/// Distinct from a connection id for the reason the relay's is: a socket skips
+/// frames it originated because it has already applied that edit locally, and
+/// the socket whose user pressed Ctrl+Z has *not* — the pop happened on the
+/// server. Reusing the requester's connection id would leave exactly the one
+/// client that asked for the undo showing the un-undone document.
+const UNDO_ORIGIN: u64 = u64::MAX - 1;
+
 /// Which document shape a room holds: the flat `Y.Text` every source file uses, or
 /// the `Y.XmlFragment` tree a rich-text editor binds to (#92).
 ///
@@ -92,6 +102,44 @@ impl RoomDoc {
         match self {
             Self::Flat(d) => d.handle_sync(ctx, data),
             Self::Tree(d) => d.handle_sync(ctx, data),
+        }
+    }
+
+    /// Start tracking `ctx`'s edits for undo, at the moment a socket joins.
+    ///
+    /// A no-op on a tree room: undo is flat-only for now (see
+    /// [`undo`](Self::undo)), and tracking a stack nothing can pop would just
+    /// hold memory for the room's lifetime.
+    fn track_undo(&self, ctx: WriteCtx) {
+        match self {
+            Self::Flat(d) => d.track_undo(ctx),
+            Self::Tree(_) => {}
+        }
+    }
+
+    /// Drop `actor`'s undo stack, when their last socket on this room leaves.
+    fn untrack_undo(&self, actor: i64) {
+        match self {
+            Self::Flat(d) => d.untrack_undo(actor),
+            Self::Tree(_) => {}
+        }
+    }
+
+    /// Undo (or redo) `ctx`'s actor's most recent action, returning the y-sync
+    /// update to fan out — empty when there was nothing to pop.
+    ///
+    /// **Flat rooms only.** The tree shape refuses rather than returning an empty
+    /// update, because the two are not the same answer and a client cannot tell
+    /// them apart: "you have nothing to undo" would be a lie told to an editor
+    /// whose user has been typing. Undo there needs its own `UndoManager` over
+    /// the `Y.XmlFragment`, which is the remaining half of #146.
+    fn undo(&self, ctx: WriteCtx, redo: bool) -> Result<Vec<u8>, OrigoFSError> {
+        match self {
+            Self::Flat(d) if redo => d.redo_as(ctx),
+            Self::Flat(d) => d.undo_as(ctx),
+            Self::Tree(_) => Err(OrigoFSError::InvalidArgument(
+                "undo is not available on a tree-shaped co-edit document yet (#146)".into(),
+            )),
         }
     }
 
@@ -260,6 +308,14 @@ impl RoomKey {
 struct RoomSlot {
     room: Arc<Room>,
     conns: usize,
+    /// Sockets attached per actor, so an actor's undo stack is dropped when
+    /// *their* last socket leaves rather than when the room empties.
+    ///
+    /// `conns` cannot answer this: one person closing a tab while a colleague
+    /// keeps the room open must lose their stack, and the room stays alive. The
+    /// stack is per-actor state, so its lifetime is the actor's presence in the
+    /// room, not the room's.
+    actors: HashMap<i64, usize>,
     /// The most recent joiner's context. A periodic checkpoint has no connection
     /// of its own to borrow an identity from, and this is the same one the final
     /// checkpoint on last leave would have used. It only ever names the op-log
@@ -396,6 +452,62 @@ impl Coordinator {
         }
     }
 
+    /// Undo (or, with `redo`, redo) `ctx`'s actor's most recent action on the
+    /// live flat document at `path`, fanning the result out to the room.
+    ///
+    /// Returns whether anything was actually popped, so a caller can tell "undone"
+    /// from "nothing to undo" — the two are different answers to a client drawing
+    /// a Ctrl+Z affordance, and collapsing them would leave it unable to grey the
+    /// button out.
+    ///
+    /// # Why this is a request beside the socket rather than a frame on it
+    ///
+    /// The result travels the room's existing fan-out, so only the *request*
+    /// needed a channel. Putting it on the y-sync stream would mean a new message
+    /// tag, and this endpoint deliberately serves unmodified Yjs clients — that
+    /// is the contract `apply_update_as` exists to keep — so a tag they do not
+    /// know is a risk taken for nothing. A separate request also inherits the
+    /// authenticated principal and the ACL check without re-deriving either.
+    pub(crate) async fn undo(
+        &self,
+        path: &str,
+        ctx: WriteCtx,
+        redo: bool,
+    ) -> Result<bool, OrigoFSError> {
+        let key = RoomKey::Flat(path.to_string());
+        let room = self.rooms.lock().await.get(&key).map(|s| s.room.clone());
+        let Some(room) = room else {
+            // An undo stack is the room's, and a room exists only while somebody
+            // has the document open. With nothing open there is nothing to undo —
+            // not an error, and deliberately not an implicit `open_coedit` either:
+            // opening here would leave the path marked live with no socket whose
+            // disconnect ever clears it, the same leak `checkpoint_tree` avoids.
+            return Ok(false);
+        };
+
+        // The ACL check lives in the engine (`Fs::undo_coedit`), not here, so a
+        // second surface cannot forget it.
+        let frame = {
+            let doc = room.doc.lock().await;
+            match &*doc {
+                RoomDoc::Flat(d) => self.ws.undo_coedit(ctx, path, d, redo).await?,
+                RoomDoc::Tree(_) => doc.undo(ctx, redo)?, // refuses, naming the gap
+            }
+        };
+        if frame.is_empty() {
+            return Ok(false);
+        }
+
+        room.touch_edit(self.epoch);
+        let frame = Bytes::from(frame);
+        // `UNDO_ORIGIN` matches no connection id, so *every* local socket gets it
+        // — including the one whose user pressed the key, which unlike a socket's
+        // own edit has not applied this locally.
+        let _ = room.tx.send((UNDO_ORIGIN, frame.clone()));
+        self.relay_publish(&key, frame);
+        Ok(true)
+    }
+
     /// Spawn the relay drain task once, on the first socket (we're in an async
     /// context by then). A no-op without the relay, or after the first call.
     fn ensure_relay(&self) {
@@ -418,9 +530,16 @@ impl Coordinator {
         let mut rooms = self.rooms.lock().await;
         if let Some(slot) = rooms.get_mut(key) {
             slot.conns += 1;
+            *slot.actors.entry(ctx.actor).or_insert(0) += 1;
             // The newest joiner is who a background checkpoint runs as, matching
             // what the final checkpoint on last leave would have used.
             slot.ctx = ctx;
+            // Start capturing this actor's edits *now*. A `yrs` undo manager only
+            // sees transactions that commit after it exists, so this cannot wait
+            // until the first Ctrl+Z — by then everything typed is unreachable.
+            // Idempotent per session: a second tab joins the stack the actor
+            // already has rather than starting a rival one.
+            slot.room.doc.lock().await.track_undo(ctx);
             return Ok(slot.room.clone());
         }
         let doc = match key {
@@ -455,11 +574,15 @@ impl Coordinator {
             last_checkpoint_ms: AtomicU64::new(now),
             dirty: AtomicBool::new(false),
         });
+        // Before the first socket syncs, so nothing the joiner types escapes the
+        // stack — see the note in the rejoin path above.
+        room.doc.lock().await.track_undo(ctx);
         rooms.insert(
             key.clone(),
             RoomSlot {
                 room: room.clone(),
                 conns: 1,
+                actors: HashMap::from([(ctx.actor, 1)]),
                 ctx,
             },
         );
@@ -548,6 +671,19 @@ impl Coordinator {
         let evict = match rooms.get_mut(key) {
             Some(slot) => {
                 slot.conns = slot.conns.saturating_sub(1);
+                // This actor's undo stack lives exactly as long as they have a
+                // socket here. Dropping it on *their* last leave rather than on
+                // the room's keeps one person closing a tab from holding a stack
+                // open for as long as a colleague keeps typing — and dropping it
+                // at all is the deliberate ruling that undo is an editor
+                // affordance, not history: it does not survive a reconnect.
+                if let Some(n) = slot.actors.get_mut(&ctx.actor) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        slot.actors.remove(&ctx.actor);
+                        slot.room.doc.lock().await.untrack_undo(ctx.actor);
+                    }
+                }
                 slot.conns == 0
             }
             None => return,
@@ -844,6 +980,62 @@ pub(crate) async fn coedit_tree_checkpoint(
             "path": path,
             "bytes": req.body.len(),
             "spans": spans.len(),
+        }))
+        .into_response(),
+        Err(e) => super::ApiError::OrigoFS(e).into_response(),
+    }
+}
+
+/// The body of an undo/redo request. Deliberately empty of identity: like every
+/// other mutation here, the actor is resolved server-side from the credential and
+/// the request never names one.
+#[derive(serde::Deserialize)]
+pub(crate) struct UndoReq {
+    /// Redo instead of undo. One route rather than two because the request,
+    /// the authorization and the fan-out are identical and only the direction
+    /// differs.
+    #[serde(default)]
+    redo: bool,
+}
+
+/// Undo (or redo) the authenticated actor's most recent edit to a live co-edited
+/// document (#146).
+///
+/// A request beside the socket rather than a frame on it: the *result* already
+/// travels the room's y-sync fan-out, so only the request needed a channel, and
+/// putting it on the stream would mean a message tag the unmodified Yjs clients
+/// this endpoint serves do not know. It also means undo inherits the ordinary
+/// authenticated principal and the engine's `WRITE` check instead of re-deriving
+/// either — an undo is a write, and the socket authenticates without authorizing.
+pub(crate) async fn coedit_undo(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<UndoReq>,
+) -> Response {
+    let Some(principal) = state.auth.authenticate(&headers).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated: a valid credential is required",
+        )
+            .into_response();
+    };
+    let ctx = match session_bound_ctx(&state, &principal).await {
+        Ok(ctx) => ctx,
+        Err(e) => return super::ApiError::OrigoFS(e).into_response(),
+    };
+    let path = match scope_path(&state.scope, &path) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    match state.coedit.undo(&path, ctx, req.redo).await {
+        // `changed` distinguishes "undone" from "nothing to undo", which a client
+        // drawing the affordance needs in order to grey the button out. Both are
+        // successes; only one of them moved the document.
+        Ok(changed) => axum::Json(serde_json::json!({
+            "path": path,
+            "redo": req.redo,
+            "changed": changed,
         }))
         .into_response(),
         Err(e) => super::ApiError::OrigoFS(e).into_response(),

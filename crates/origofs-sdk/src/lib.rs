@@ -1993,6 +1993,26 @@ impl Workspace {
         self.fs.checkpoint_coedit(ctx, path, doc).await
     }
 
+    /// Undo (or, with `redo`, redo) `ctx`'s actor's most recent action on the
+    /// live document at `path`, returning the y-sync update to fan out to the
+    /// room — empty when there was nothing to pop.
+    ///
+    /// Scoped to that actor's own edits, so it can never reach a collaborator's
+    /// work or anything that arrived over the cross-worker relay. Takes `WRITE`
+    /// at the path, like opening the document does — see
+    /// [`Fs::undo_coedit`](origofs_core::Fs::undo_coedit). Requires the `coedit`
+    /// feature.
+    #[cfg(feature = "coedit")]
+    pub async fn undo_coedit(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditDoc,
+        redo: bool,
+    ) -> Result<Vec<u8>> {
+        self.fs.undo_coedit(ctx, path, doc, redo).await
+    }
+
     /// Propose a change to a co-edited `path` as a **CRDT merge** rather than a
     /// whole file body (issue #75 §3.2): the review row records the document's Yjs
     /// state vector as its base and `doc`'s opaque `encodeStateAsUpdate` blob as the
