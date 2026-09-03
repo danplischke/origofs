@@ -18,12 +18,15 @@ use crate::engine::Fs;
 use crate::error::{OrigoFSError, Result};
 use crate::format;
 use crate::metadata::MetadataStore;
+use parking_lot::Mutex;
 use similar::{ChangeTag, TextDiff};
+use std::collections::HashMap;
 use std::sync::Arc;
 use yrs::encoding::read::Cursor;
 use yrs::sync::{Message, MessageReader, SyncMessage};
 use yrs::types::Attrs;
 use yrs::types::text::YChange;
+use yrs::undo::UndoManager;
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{
@@ -153,6 +156,21 @@ pub(crate) fn parse_author(value: &str) -> (i64, i64) {
 pub struct CoeditDoc {
     doc: Doc,
     text: TextRef,
+    /// Per-**actor** undo stacks (#146), created by
+    /// [`track_undo`](Self::track_undo) and dropped by
+    /// [`untrack_undo`](Self::untrack_undo).
+    ///
+    /// Keyed by actor rather than by session, so a person with the document open
+    /// in two tabs gets one stack — which is what every editor does, and what
+    /// "undo my own typing" means to the person pressing the key. Each of their
+    /// sessions contributes its own origin to the same manager.
+    ///
+    /// A `Mutex` because `yrs` needs `&mut UndoManager` to pop a stack while
+    /// every other method here takes `&self`. **Never take this lock while
+    /// holding a transaction on `doc`**: `undo_blocking` opens its own write
+    /// transaction, so the two locks have a fixed order — undo map first, never
+    /// the reverse.
+    undo: Mutex<HashMap<i64, UndoManager<()>>>,
 }
 
 impl Default for CoeditDoc {
@@ -183,7 +201,11 @@ impl CoeditDoc {
             ..Default::default()
         });
         let text = doc.get_or_insert_text("content");
-        Self { doc, text }
+        Self {
+            doc,
+            text,
+            undo: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Insert `chunk` at character `index`, attributed to `ctx`.
@@ -361,6 +383,120 @@ impl CoeditDoc {
     /// room's fan-out.
     pub fn handle_sync(&self, ctx: WriteCtx, data: &[u8]) -> Result<SyncReply> {
         drive_sync(&self.doc, data, |update| self.apply_update_as(ctx, update))
+    }
+
+    // --- undo / redo (#146) ---------------------------------------------
+    //
+    // An undo here is an ordinary forward edit, and that is a deliberate ruling
+    // rather than an implementation detail. Text an undo removes disappears from
+    // blame like any other deletion; text it restores comes back carrying the
+    // author attribute it had, because `yrs` re-integrates the original items
+    // rather than fresh copies (pinned by `tests/coedit_undo.rs`). So nothing
+    // here needs to touch the blame index, and `checkpoint_coedit` stays honest
+    // with no special case.
+    //
+    // The alternative — undo *unwinds* the record, as if the insert never
+    // happened — was rejected. This is a filesystem whose premise is that every
+    // edit is attributable to the actor that made it, and an undo that erases
+    // evidence is a way for an agent to write, be reviewed, and then launder the
+    // edit out of the append-only op-log. `revert_session` already made this
+    // call the other way, appending a `revert` op rather than popping one.
+
+    /// Start tracking `ctx`'s edits so its actor can undo them.
+    ///
+    /// **Must be called before the edits it should cover.** A `yrs`
+    /// [`UndoManager`] captures changes by observing transactions as they commit;
+    /// one created afterwards sees an empty stack, however recent the edit. So
+    /// this belongs at the point a co-editing socket opens, not at the point
+    /// somebody presses Ctrl+Z — by then it is too late for everything they
+    /// typed.
+    ///
+    /// Idempotent per session: calling it again for an actor adds that session's
+    /// origin to the actor's existing stack, so a second tab joins the stack it
+    /// already has rather than starting a rival one.
+    pub fn track_undo(&self, ctx: WriteCtx) {
+        let mut undo = self.undo.lock();
+        let mgr = undo.entry(ctx.actor).or_insert_with(|| {
+            // Scoped to the text: a change outside it is not this document's
+            // content and has no business on a content undo stack.
+            UndoManager::new(&self.doc, &self.text)
+        });
+        // Including any actor origin is also what makes the origin-*less* paths
+        // (the cross-worker relay, an unattributed merge) untracked — see
+        // [`author_origin`]. Until the first call here, this manager would
+        // capture them.
+        mgr.include_origin(author_origin(ctx));
+    }
+
+    /// Drop `actor`'s undo stack — at their last socket's disconnect.
+    ///
+    /// Undo is an editor affordance, not history: a stack does not outlive the
+    /// room, and nothing tries to rebuild one. Dropping the manager unsubscribes
+    /// it from the document.
+    pub fn untrack_undo(&self, actor: i64) {
+        self.undo.lock().remove(&actor);
+    }
+
+    /// Whether `actor` has anything to undo (`can_redo`: to redo).
+    pub fn can_undo(&self, actor: i64) -> bool {
+        self.undo.lock().get(&actor).is_some_and(|m| m.can_undo())
+    }
+
+    /// Whether `actor` has anything to redo.
+    pub fn can_redo(&self, actor: i64) -> bool {
+        self.undo.lock().get(&actor).is_some_and(|m| m.can_redo())
+    }
+
+    /// Undo `ctx`'s actor's most recent action, returning the update to relay to
+    /// peers — or an empty vector if there was nothing to undo.
+    ///
+    /// The return shape is [`apply_update_as`](Self::apply_update_as)'s on
+    /// purpose: an undo produces an ordinary y-sync update, so it travels the
+    /// room's existing fan-out and needs no new message type on the wire. Only
+    /// the *request* needed a channel, and that is the caller's problem.
+    ///
+    /// Scoped to the actor's own origins, so this can only ever pop something
+    /// they did. A colleague's paragraph is not reachable from here, which is the
+    /// entire reason the origins exist.
+    pub fn undo_as(&self, ctx: WriteCtx) -> Result<Vec<u8>> {
+        self.pop(ctx, false)
+    }
+
+    /// Redo the action `ctx`'s actor most recently undid. Same return shape as
+    /// [`undo_as`](Self::undo_as).
+    pub fn redo_as(&self, ctx: WriteCtx) -> Result<Vec<u8>> {
+        self.pop(ctx, true)
+    }
+
+    /// The shared body of [`undo_as`](Self::undo_as) and
+    /// [`redo_as`](Self::redo_as).
+    fn pop(&self, ctx: WriteCtx, redo: bool) -> Result<Vec<u8>> {
+        let mut undo = self.undo.lock();
+        let Some(mgr) = undo.get_mut(&ctx.actor) else {
+            // Not an error: an actor with no manager has nothing to undo, which
+            // is what a client asking too early (or after a reconnect onto a
+            // fresh room) should be told. Refusing would make a benign race look
+            // like a failure.
+            return Ok(Vec::new());
+        };
+
+        // Pin the pre-image *and drop the read transaction* before popping:
+        // `undo_blocking` opens its own write transaction on the same document,
+        // so holding this across the call would deadlock.
+        let sv_before = self.doc.transact().state_vector();
+
+        let changed = if redo {
+            mgr.redo_blocking()
+        } else {
+            mgr.undo_blocking()
+        };
+        if !changed {
+            return Ok(Vec::new());
+        }
+
+        // Encode exactly what the pop did, the same way `apply_update_as` encodes
+        // exactly what a client's update did.
+        Ok(self.doc.transact().encode_state_as_update_v1(&sv_before))
     }
 
     /// Reconstruct a document from a serialized state produced by
