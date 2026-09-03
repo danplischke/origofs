@@ -508,7 +508,7 @@ It is a request *beside* the socket rather than a message on it, because the
 result already travels the room's y-sync fan-out — only the request needed a
 channel, and a new message tag would break the unmodified Yjs clients the socket
 exists to serve. The response says `changed`, distinguishing "undone" from
-"nothing to undo" so you can grey the button out.
+"nothing to undo" so you can grey the button out, and `available` (see below).
 
 Four things to know before building on it:
 
@@ -531,24 +531,25 @@ Four things to know before building on it:
   still moves only when your next `coedit-tree-checkpoint` lands bytes, because
   origofs cannot serialize a tree; the live document moves immediately.
 
-**Across workers, an undo stack is per worker.** A room lives in one process's
-memory and so does its undo stack, so behind a load balancer one person with two
-tabs can get two stacks — each holding what was typed through *its* worker.
-Edits still converge (an undo is an ordinary CRDT update, and a relayed frame is
-never captured on the receiving worker's stack), and each Ctrl+Z takes back that
-tab's own edit. What changes is the granularity: same-worker tabs share a stack,
-cross-worker tabs do not, so it follows your routing.
+**Across workers, exactly one holds an actor's stack.** A room lives in one
+process's memory and so does its undo stack, so behind a load balancer one
+person with two tabs can land on two workers. Letting both keep a stack is not
+safe: origofs's author stamp is written in the same undo step as the insert it
+describes, so one worker's undo can strip a stamp the other's restore needs, and
+the restored text comes back **unattributed** for the next checkpoint to credit
+to whoever triggered it.
 
-One measured consequence is worth knowing before you deploy behind a
-round-robin balancer. If the *same* actor deletes their own text through one
-worker and undoes the original insert through the other, the restored text comes
-back **unattributed** — origofs's author stamp lives in the same undo step as the
-insert it describes, so one worker's undo removes a stamp the other's restore
-needs. The next checkpoint then credits those bytes to whoever triggered it.
-`coedit_undo_multiworker.rs` pins the exact precondition. Closing it properly
-means one stack per (actor, path) across workers — a claim with a lease — which
-is a larger piece than undo itself. **Route an actor's sockets for one path to
-one worker** (sticky sessions on actor+path) and none of this arises.
+So a worker **claims** `(path, actor)` before it starts recording undo, and only
+one can hold it. The response says `available` alongside `changed`, and they are
+different answers: `available: false` means the actor's history exists but lives
+on another worker — show "undo is active in another window", not "nothing to
+undo". The claim carries a 60-second lease a live worker renews, so a crashed one
+frees the actor rather than denying them undo forever, and it is released as soon
+as the holding worker's last socket for that actor closes. Nothing changes for a
+single-worker deployment: two tabs there are the same holder and share one stack.
+
+You can avoid ever seeing `available: false` by routing an actor's sockets for
+one path to one worker (sticky sessions on actor+path).
 
 While a document is open, its stored bytes are the last **checkpoint** — real,
 fully attributed, but possibly behind what people are typing. origofs records that

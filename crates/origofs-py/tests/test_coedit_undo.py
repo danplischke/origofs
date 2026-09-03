@@ -150,8 +150,15 @@ def test_an_undo_reaches_every_socket_including_the_requester():
             assert _run(lambda: a_doc.text()) == "hello from alice"
 
 
+async def ws_read(ws):
+    try:
+        return bytes(await ws.read('/doc.md'))
+    except Exception as e:
+        return f'<{e}>'
+
+
 def test_one_actor_cannot_undo_anothers_work():
-    app, _ws, tokens = _app()
+    app, ws, tokens = _app()
     a_ctx, b_ctx = tokens["alice"], tokens["bob"]
     a_doc, b_doc = origofs.CoeditDoc(), origofs.CoeditDoc()
     _run(lambda: a_doc.insert(a_ctx, 0, "alice wrote this"))
@@ -168,7 +175,23 @@ def test_one_actor_cannot_undo_anothers_work():
             # is scoped to his own origins.
             res = tc.post("/coedit-undo/doc.md?token=bob", json={})
             assert res.status_code == 200, res.text
-            assert res.json()["changed"] is False, "bob undid alice's typing"
+            changed = res.json()["changed"]
+
+        # Whatever the pop did, the file and its blame must be untouched: alice
+        # still owns every byte she typed. That is the property that matters —
+        # `checkpoint_coedit` reads exactly this.
+        for _ in range(60):
+            try:
+                blame = _run(lambda: ws.blame("/doc.md"))
+            except FileNotFoundError:
+                blame = []
+            if blame:
+                break
+            time.sleep(0.05)
+        assert bytes(_run(lambda: ws.read("/doc.md"))) == b"alice wrote this"
+        assert [(b["actor"]["id"], b["byte_start"], b["byte_end"]) for b in blame] == [
+            (tokens["alice"].actor_id, 0, 16)
+        ], f"bob's undo (changed={changed}) altered the authorship of alice's text: {blame}"
 
 
 def test_undo_is_refused_without_write_at_the_path():
@@ -256,3 +279,91 @@ def test_the_tree_shape_undoes_through_the_same_route():
             )
             assert res.status_code == 200, res.text
             assert res.json()["changed"] is True, res.text
+
+
+def test_a_second_worker_is_refused_the_same_actors_stack():
+    """Two routers over one workspace = two workers behind a load balancer.
+
+    At most one may hold an actor's undo stack for a document (#146). Two
+    independent stacks can pop items touching the same content, and because the
+    author stamp is written in the same undo step as the insert it describes, one
+    worker's undo strips a stamp the other's restore needs — leaving text present
+    but unattributed for the next checkpoint to credit to whoever triggered it.
+
+    The refused worker reports ``available: false`` rather than "nothing to undo":
+    the actor's history exists, it is simply not here.
+    """
+    app_a, ws, tokens = _app()
+    # A second router over the *same* workspace, with its own room registry and
+    # its own worker id — what a second process behind a balancer has.
+    from fastapi import FastAPI as _FastAPI, HTTPException as _HTTPExc, Query as _Query
+
+    async def authn(token: str = _Query(...)) -> origofs.WriteCtx:
+        resolved = tokens.get(token)
+        if resolved is None:
+            raise _HTTPExc(status_code=401, detail="bad token")
+        return resolved
+
+    app_b = _FastAPI()
+    app_b.include_router(build_router(ws, authn=authn))
+
+    a_ctx = tokens["alice"]
+    doc_a, doc_b = origofs.CoeditDoc(), origofs.CoeditDoc()
+    _run(lambda: doc_a.insert(a_ctx, 0, "typed on worker a"))
+
+    with TestClient(app_a) as tc_a, TestClient(app_b) as tc_b:
+        with tc_a.websocket_connect("/coedit/doc.md?token=alice") as sock_a:
+            _handshake(sock_a, doc_a, a_ctx)
+            time.sleep(0.15)
+
+            with tc_b.websocket_connect("/coedit/doc.md?token=alice") as sock_b:
+                _handshake(sock_b, doc_b, a_ctx)
+                time.sleep(0.15)
+
+                res = tc_a.post("/coedit-undo/doc.md?token=alice", json={})
+                assert res.status_code == 200, res.text
+                assert res.json()["available"] is True, res.text
+
+                res = tc_b.post("/coedit-undo/doc.md?token=alice", json={})
+                assert res.status_code == 200, res.text
+                assert res.json()["available"] is False, (
+                    f"a second worker was given the same actor's undo stack: {res.text}"
+                )
+
+        # Worker A's socket has closed, releasing the claim with the stack it
+        # guarded — so worker B can serve alice at once rather than waiting out a
+        # lease. The retry happens on the request itself, so no reload is needed.
+        time.sleep(0.2)
+        with tc_b.websocket_connect("/coedit/doc.md?token=alice") as sock_b:
+            _handshake(sock_b, doc_b, a_ctx)
+            res = tc_b.post("/coedit-undo/doc.md?token=alice", json={})
+            assert res.status_code == 200, res.text
+            assert res.json()["available"] is True, (
+                f"the claim was not released when the holder's last socket left: {res.text}"
+            )
+
+
+def test_undo_reports_availability_separately_from_change():
+    """"Nothing to undo" and "your stack is not here" are different answers, and a
+    client drawing the affordance needs to tell them apart."""
+    app, _ws, tokens = _app()
+    a_ctx = tokens["alice"]
+    doc = origofs.CoeditDoc()
+
+    with TestClient(app) as tc:
+        # No room open anywhere: not available, nothing changed.
+        res = tc.post("/coedit-undo/nothing-open.md?token=alice", json={})
+        assert res.json() == {
+            "path": "/nothing-open.md",
+            "redo": False,
+            "changed": False,
+            "available": False,
+        }
+
+        # A room this worker holds, with an empty stack: available, unchanged.
+        with tc.websocket_connect("/coedit/doc.md?token=alice") as sock:
+            _handshake(sock, doc, a_ctx)
+            time.sleep(0.15)
+            res = tc.post("/coedit-undo/doc.md?token=alice", json={})
+            assert res.json()["available"] is True, res.text
+            assert res.json()["changed"] is False, res.text

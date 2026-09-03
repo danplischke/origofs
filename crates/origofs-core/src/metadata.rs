@@ -416,6 +416,40 @@ pub trait MetadataStore: Send + Sync {
     /// Push out the lease on every lock a mount instance holds.
     async fn renew_posix_lease(&self, holder: &str, expires_at: i64) -> Result<u64>;
 
+    // --- co-editing undo claims (#146) -----------------------------------
+
+    /// Claim the undo stack for `(path, actor_id)` on behalf of `holder`, or
+    /// renew a claim `holder` already has. Returns whether `holder` now owns it.
+    ///
+    /// Answers `false` when a **different** worker holds a live claim, which is
+    /// the whole point: at most one worker may keep an actor's undo stack for a
+    /// document, so two independent stacks can never pop overlapping items and
+    /// strip an author stamp between them (see the V22 migration). An expired
+    /// claim is taken over, because the worker holding it can no longer be
+    /// renewing the lease.
+    ///
+    /// Read-decide-write, so it must be **one atomic statement or one
+    /// transaction** — two workers claiming at once must not both be told yes.
+    async fn claim_undo_stack(
+        &self,
+        path: &str,
+        actor_id: i64,
+        holder: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool>;
+
+    /// Drop `holder`'s claim on `(path, actor_id)` — the actor's last socket on
+    /// this worker leaving. A claim held by someone else is left alone.
+    async fn release_undo_stack(&self, path: &str, actor_id: i64, holder: &str) -> Result<bool>;
+
+    /// Drop every claim one worker holds — a clean shutdown, so the next worker
+    /// to see the actor does not wait out a lease.
+    async fn release_undo_claims_for_holder(&self, holder: &str) -> Result<u64>;
+
+    /// Push out the lease on every claim a worker holds.
+    async fn renew_undo_claims(&self, holder: &str, expires_at: i64) -> Result<u64>;
+
     // --- attribution -----------------------------------------------------
 
     async fn create_actor(&self, init: ActorInit) -> Result<i64>;
@@ -893,6 +927,27 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn renew_posix_lease(&self, holder: &str, expires_at: i64) -> Result<u64> {
         (**self).renew_posix_lease(holder, expires_at).await
+    }
+    async fn claim_undo_stack(
+        &self,
+        path: &str,
+        actor_id: i64,
+        holder: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool> {
+        (**self)
+            .claim_undo_stack(path, actor_id, holder, expires_at, now)
+            .await
+    }
+    async fn release_undo_stack(&self, path: &str, actor_id: i64, holder: &str) -> Result<bool> {
+        (**self).release_undo_stack(path, actor_id, holder).await
+    }
+    async fn release_undo_claims_for_holder(&self, holder: &str) -> Result<u64> {
+        (**self).release_undo_claims_for_holder(holder).await
+    }
+    async fn renew_undo_claims(&self, holder: &str, expires_at: i64) -> Result<u64> {
+        (**self).renew_undo_claims(holder, expires_at).await
     }
     async fn create_actor(&self, init: ActorInit) -> Result<i64> {
         (**self).create_actor(init).await

@@ -2996,6 +2996,98 @@ impl Workspace {
         })
     }
 
+    /// Claim the undo stack for ``(path, actor_id)`` on behalf of ``holder``
+    /// (this worker), or renew a claim it already has. Returns whether it now
+    /// owns it.
+    ///
+    /// **A worker must hold this before calling ``doc.track_undo``.** At most one
+    /// may keep an actor's stack for a document: two independent stacks can pop
+    /// items touching the same content, and because origofs's author stamp is
+    /// written in the same undo step as the insert it describes, one worker's
+    /// undo can strip a stamp the other's restore needs — leaving text present
+    /// but unattributed, which the next checkpoint credits to the checkpointer.
+    ///
+    /// Single-worker deployments are unaffected: two tabs are the same holder, so
+    /// both claims succeed and they share one stack.
+    fn claim_undo_stack<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        actor_id: i64,
+        holder: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.claim_undo_stack(&path, actor_id, &holder)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Drop ``holder``'s claim on ``(path, actor_id)`` — the actor's last socket
+    /// on this worker leaving, so another worker can serve them immediately
+    /// rather than waiting out a lease.
+    fn release_undo_stack<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        actor_id: i64,
+        holder: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.release_undo_stack(&path, actor_id, &holder)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Drop every undo claim ``holder`` has — a clean shutdown.
+    fn release_undo_claims_for_holder<'py>(
+        &self,
+        py: Python<'py>,
+        holder: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.release_undo_claims_for_holder(&holder)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Push out the lease on every undo claim ``holder`` has. A live worker calls
+    /// this on a timer at well under the lease (60s).
+    fn renew_undo_claims<'py>(
+        &self,
+        py: Python<'py>,
+        holder: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.renew_undo_claims(&holder).await.map_err(to_pyerr)
+        })
+    }
+
+    /// The ``WRITE`` check an undo takes, on its own — for a surface that must
+    /// authorize *before* looking up whether a room is open or who holds its undo
+    /// stack, since both are facts about the document a refused actor must not
+    /// learn. Raises ``PermissionError`` when the actor may not write at `path`.
+    #[pyo3(signature = (ctx, path, redo=false))]
+    fn ensure_may_undo<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        redo: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.ensure_may_undo(c, &path, redo).await.map_err(to_pyerr)
+        })
+    }
+
     /// ``undo_coedit`` for a **tree-shaped** document (issue #92).
     ///
     /// The live document moves immediately; the *file* moves when you next call

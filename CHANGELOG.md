@@ -57,22 +57,35 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
   not `Send + Sync`, and a room sharing one document across socket tasks could
   not hold the stacks at all.
 
-  **Across workers a stack is per worker, and one consequence is a known
-  limitation.** A room and its undo stack live in one process's memory, so behind
-  a load balancer one person with two tabs can hold two stacks. Measured, that is
-  mostly benign: the stacks are disjoint (a relayed frame is never captured on
-  the receiving worker, which is the origin asymmetry paying off again), edits
-  converge, and each Ctrl+Z takes back that tab's own edit. What differs is
-  granularity — same-worker tabs share a stack, cross-worker tabs do not — so it
-  follows the balancer's routing. But if one actor deletes their own text through
-  one worker and undoes the original insert through the other, the restored text
-  comes back **unattributed**, because the author stamp is written in the same
-  undo step as the insert it describes; the next checkpoint then credits those
-  bytes to whoever triggered it. `coedit_undo_multiworker.rs` pins the exact
-  precondition alongside a single-worker control showing it is specifically a
-  cross-worker effect. Closing it means one stack per (actor, path) across
-  workers — a claim with a lease, the shape `posixlock` uses — which is a larger
-  piece than undo itself; sticky sessions on actor+path avoid it entirely.
+  **Exactly one worker holds an actor's stack, enforced by a claim.** A room and
+  its undo stack live in one process's memory, so behind a load balancer one
+  person with two tabs can land on two workers. Most of what follows is benign —
+  the stacks are disjoint (a relayed frame is never captured on the receiving
+  worker, the origin asymmetry paying off again) and edits converge — but one
+  interleaving is not: if an actor deletes their own text through one worker and
+  undoes the original insert through the other, the restored text comes back
+  **unattributed**, because the author stamp is written in the same undo step as
+  the insert it describes. The next checkpoint then credits those bytes to
+  whoever triggered it, which in a filesystem premised on per-actor attribution
+  is the harm class that counts.
+
+  A new `coedit_undo_claim` table (schema v22) removes the precondition rather
+  than patching the symptom: a worker claims `(path, actor)` before it records
+  anything, and only one can hold it. It carries the two columns `posix_lock`
+  carries and for the same reasons — a `holder`, so a clean shutdown drops its
+  claims at once, and a 60-second `expires_at` lease a live worker renews, so a
+  worker that is OOM-killed frees the actor instead of denying them undo until
+  somebody edits the database by hand. The claim is released the moment the
+  holding worker's last socket for that actor closes, and re-attempted on each
+  undo request, so a person whose other tab has closed does not have to reload.
+
+  The response therefore carries `available` alongside `changed`, and they are
+  different answers: `available: false` means the actor's history exists but is
+  on another worker, so a client should say "undo is active in another window"
+  rather than "nothing to undo". Single-worker deployments are unaffected — two
+  tabs are the same holder and share one stack. `coedit_undo_multiworker.rs`
+  keeps the original measurement, deliberately claim-free, as the record of why
+  the claim is there.
 
   Reachable from Python too, on the same terms: `CoeditDoc`/`CoeditTreeDoc` gain
   `track_undo`/`untrack_undo`/`can_undo`/`can_redo`, `Workspace` gains

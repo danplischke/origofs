@@ -244,15 +244,22 @@ async fn one_actor_cannot_undo_anothers_work_through_the_route() {
         .unwrap();
     converge(&mut b, &b_aware, "alice wrote this").await;
 
-    // Bob has WRITE, so he is authorized — and still has nothing to undo,
+    // Bob has WRITE, so he is authorized — and still cannot reach alice's work,
     // because the stack is scoped to his own origins.
     let (status, body) = post_undo(&srv, "tok-bob", "doc.md", false).await;
     assert_eq!(status, 200, "{body}");
-    assert!(
-        body.contains("\"changed\":false"),
+
+    // Asserted on the document rather than on `changed`, deliberately. A client
+    // that only synced can leave a formatting-level step of its own on its stack,
+    // so `changed` is occasionally true for a pop with no visible effect — see
+    // `Coordinator::undo`. What must never move is alice's text and its
+    // authorship, which is what `checkpoint_coedit` reads.
+    converge(&mut b, &b_aware, "alice wrote this").await;
+    assert_eq!(
+        text_of(&b_aware),
+        "alice wrote this",
         "bob undid alice's typing: {body}"
     );
-    assert_eq!(text_of(&b_aware), "alice wrote this");
 }
 
 /// An undo is a write, so it takes `WRITE` at the path. Bob can read the document
@@ -357,4 +364,98 @@ async fn the_tree_shape_undoes_through_the_same_route() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("\"changed\":true"), "{body}");
+}
+
+/// Two workers over **one workspace**, the shape a load balancer produces: the
+/// second is refused the actor's undo stack, and says so rather than reporting
+/// "nothing to undo".
+///
+/// This is what makes the engine-level defect in
+/// `origofs-core/tests/coedit_undo_multiworker.rs` unreachable in a deployment.
+/// Two independent stacks for one actor can pop items touching the same content
+/// and strip an author stamp between them, leaving restored text unattributed
+/// for the next checkpoint to credit to whoever triggered it. At most one worker
+/// may hold the stack, so the pair cannot arise.
+#[tokio::test]
+async fn a_second_worker_is_refused_the_same_actors_stack() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let alice = ws.create_human("alice", None).await.unwrap();
+    let alice_s = ws.create_session(alice, Some("web")).await.unwrap();
+    let auth = Arc::new(BearerAuth::new().with_token("tok-alice", alice, Some(alice_s)));
+    let ws = Arc::new(ws);
+
+    // Two routers over the same workspace = two workers. Each builds its own
+    // `Coordinator`, so each has its own room registry and its own worker id —
+    // exactly what two processes behind a balancer have.
+    async fn worker(ws: Arc<Workspace>, auth: Arc<BearerAuth>) -> (Router, std::net::SocketAddr) {
+        let app = router(ws, auth);
+        // Bind before spawning: the address has to be known to the test, and
+        // waiting for it from inside the spawned task would deadlock a
+        // current-thread runtime.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = app.clone();
+        tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+        (app, addr)
+    }
+    let (app_a, addr_a) = worker(ws.clone(), auth.clone()).await;
+    let (app_b, addr_b) = worker(ws.clone(), auth.clone()).await;
+
+    let srv = |app: Router, addr: std::net::SocketAddr| Server {
+        addr,
+        app,
+        ws: ws.clone(),
+        _dir: tempfile::tempdir().unwrap(),
+    };
+    let (srv_a, srv_b) = (srv(app_a, addr_a), srv(app_b, addr_b));
+
+    // Alice opens a tab on each worker.
+    let doc_a = origofs_sdk::CoeditDoc::new();
+    let (mut sock_a, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr_a}/v1/coedit/doc.md?token=tok-alice"))
+            .await
+            .unwrap();
+    let aware_a = Awareness::new(Doc::new());
+    pump(&mut sock_a, &aware_a).await;
+    let _ = &doc_a;
+
+    let (mut sock_b, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr_b}/v1/coedit/doc.md?token=tok-alice"))
+            .await
+            .unwrap();
+    let aware_b = Awareness::new(Doc::new());
+    pump(&mut sock_b, &aware_b).await;
+
+    // The first worker holds alice's stack.
+    let (status, body) = post_undo(&srv_a, "tok-alice", "doc.md", false).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("\"available\":true"),
+        "the first worker should hold the stack: {body}"
+    );
+
+    // The second is refused it, and reports that rather than "nothing to undo" —
+    // alice's history exists, it is simply not here.
+    let (status, body) = post_undo(&srv_b, "tok-alice", "doc.md", false).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("\"available\":false"),
+        "a second worker was given the same actor's undo stack: {body}"
+    );
+
+    // Alice closes the first tab; the claim is released with it, so the second
+    // worker can serve her immediately rather than waiting out a lease.
+    sock_a.send(Ws::Close(None)).await.ok();
+    drop(sock_a);
+    for _ in 0..40 {
+        let (_, body) = post_undo(&srv_b, "tok-alice", "doc.md", false).await;
+        if body.contains("\"available\":true") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the claim was not released when the holding worker's last socket left");
 }

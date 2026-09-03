@@ -34,6 +34,15 @@ use yrs::{
     Transact, Update,
 };
 
+/// How long a co-editing undo-stack claim stands without renewal (#146).
+///
+/// The trade is between how long a crashed worker denies an actor undo and how
+/// often a live one writes a renewal. A minute matches
+/// [`posixlock::LEASE_SECS`](crate::posixlock::LEASE_SECS) and for the same
+/// reasons; the failure it bounds is milder here, since waiting one out costs a
+/// greyed-out button rather than a stuck byte range.
+pub const UNDO_CLAIM_LEASE_SECS: i64 = 60;
+
 /// The formatting-attribute key under which each run's `"actor,session"` is kept.
 /// Shared with [`crate::coedit_tree`], which stamps the same key on tree nodes.
 pub(crate) const AUTHOR_KEY: &str = "a";
@@ -1408,6 +1417,51 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// so blame shows each collaborator's exact character ranges (sub-line and
     /// interleaved). `ctx` is the actor performing the checkpoint (recorded on the
     /// op-log); any span the CRDT left unattributed falls back to `ctx`.
+    /// Claim the undo stack for `(path, actor_id)` on behalf of `holder`, or
+    /// renew a claim `holder` already has. Returns whether `holder` now owns it.
+    ///
+    /// **A worker must hold this before tracking an actor's edits.** At most one
+    /// worker may keep an actor's stack for a document, because two independent
+    /// stacks popping overlapping items can strip an author stamp between them
+    /// and leave restored text unattributed — see the V22 migration for the
+    /// mechanism, and `tests/coedit_undo_multiworker.rs` for the measurement.
+    ///
+    /// Nothing changes for a single-worker deployment: two tabs there are the
+    /// same holder, so both claims succeed and they share one stack exactly as
+    /// before. It bites only when routing splits an actor across workers, and
+    /// there the honest answer is that the second tab has no undo — which a
+    /// client can say, unlike a stack that quietly corrupts attribution.
+    pub async fn claim_undo_stack(&self, path: &str, actor_id: i64, holder: &str) -> Result<bool> {
+        let now = self.now_secs();
+        self.meta
+            .claim_undo_stack(path, actor_id, holder, now + UNDO_CLAIM_LEASE_SECS, now)
+            .await
+    }
+
+    /// Drop `holder`'s claim on `(path, actor_id)` — the actor's last socket on
+    /// this worker leaving.
+    pub async fn release_undo_stack(
+        &self,
+        path: &str,
+        actor_id: i64,
+        holder: &str,
+    ) -> Result<bool> {
+        self.meta.release_undo_stack(path, actor_id, holder).await
+    }
+
+    /// Drop every claim `holder` has — a clean shutdown, so the next worker to
+    /// see those actors does not wait out a lease that nobody will renew.
+    pub async fn release_undo_claims_for_holder(&self, holder: &str) -> Result<u64> {
+        self.meta.release_undo_claims_for_holder(holder).await
+    }
+
+    /// Push out the lease on every claim `holder` has. A live worker calls this
+    /// on a timer at well under [`UNDO_CLAIM_LEASE_SECS`].
+    pub async fn renew_undo_claims(&self, holder: &str) -> Result<u64> {
+        let expires_at = self.now_secs() + UNDO_CLAIM_LEASE_SECS;
+        self.meta.renew_undo_claims(holder, expires_at).await
+    }
+
     /// Undo (or, with `redo`, redo) `ctx`'s actor's most recent action on the
     /// live document at `path`, returning the y-sync update to fan out to the
     /// room — empty when there was nothing to pop.
@@ -1470,7 +1524,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// The `WRITE` check both shapes' undo takes, with the verb the refusal will
     /// name. One place so the two cannot drift into disagreeing about whether an
     /// undo is a write.
-    async fn ensure_may_undo_at(&self, ctx: WriteCtx, path: &str, redo: bool) -> Result<()> {
+    ///
+    /// **Public because a surface must be able to run it before anything else.**
+    /// A coordinator has to decide whether a room is even open, and whether this
+    /// worker holds the actor's stack, to answer an undo request — and both of
+    /// those are facts about the document that an actor with no write right must
+    /// not learn. So the check runs first, before any lookup, exactly as the read
+    /// and write checks elsewhere do; [`undo_coedit`](Self::undo_coedit) and
+    /// [`undo_coedit_tree`](Self::undo_coedit_tree) then re-run it as the backstop
+    /// for a caller that reached them directly.
+    pub async fn ensure_may_undo_at(&self, ctx: WriteCtx, path: &str, redo: bool) -> Result<()> {
         let verb = if redo {
             "redo an edit to"
         } else {

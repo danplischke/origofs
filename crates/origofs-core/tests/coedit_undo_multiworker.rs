@@ -2,10 +2,18 @@
 //!
 //! A room is per-worker in-memory state, and so is an undo stack. Behind a load
 //! balancer one person with two tabs can land on two workers, each holding its
-//! own manager over its own replica. This file is what that actually does,
-//! measured rather than reasoned about — the first three properties are better
-//! than they sound, and the fourth is a real limitation that needs to fail
-//! loudly here rather than be discovered in a blame index.
+//! own manager over its own replica. This file is what that actually does at the
+//! **engine** level, measured rather than reasoned about — the first three
+//! properties are better than they sound, and the fourth is the defect that
+//! `claim_undo_stack` exists to make unreachable.
+//!
+//! Nothing here goes through the claim, deliberately: these drive `CoeditDoc`
+//! directly, which is the layer that has no idea other workers exist. The
+//! coordinator is what refuses the second worker a stack
+//! (`coedit_undo_claim.rs` for the claim itself, `api_coedit_undo.rs` for it
+//! holding end to end). Keeping this file claim-free is what keeps it an honest
+//! record of *why* the claim is there — delete the claim and these still pass,
+//! which is exactly the point.
 //!
 //! The stacks are **disjoint**, which is what makes the first three work: an
 //! edit reaches the other worker over the relay, and `apply_relayed` is
@@ -128,7 +136,8 @@ fn overlapping_stacks_converge() {
     assert_eq!(w1.text(), w2.text(), "the replicas diverged");
 }
 
-/// **The limitation, pinned so it cannot regress unnoticed.**
+/// **The defect the claim exists to prevent, pinned so the reason cannot be
+/// forgotten.**
 ///
 /// In the interleaving above, the restored text comes back **unattributed**.
 ///
@@ -149,12 +158,15 @@ fn overlapping_stacks_converge() {
 /// items and `yrs` will not restore content whose insert it has itself popped
 /// (`single_worker_keeps_authorship_across_the_same_interleaving` below).
 ///
-/// Closing it properly means one undo stack per (actor, path) across workers —
-/// a claim with a lease, the shape `posixlock` uses — which is a larger piece
-/// than the undo feature itself. Until then this test states the exact
-/// precondition, so a fix can delete it and a regression cannot hide.
+/// **It is not reachable through a coordinator either, and that is the fix.**
+/// `Fs::claim_undo_stack` gives at most one worker an actor's stack for a path,
+/// so the two managers below cannot both exist in a running deployment. This
+/// test constructs them by hand precisely because the layer it exercises has no
+/// claim in it: it is the measurement the claim is justified by, and it must
+/// keep reporting the wrong answer for as long as the claim is what stands
+/// between a deployment and this outcome.
 #[test]
-fn known_limitation_cross_worker_undo_can_strip_an_author_stamp() {
+fn two_unclaimed_stacks_strip_an_author_stamp_which_is_why_the_claim_exists() {
     let (w1, w2) = (CoeditDoc::new(), CoeditDoc::new());
     w1.track_undo(ALICE);
     w2.track_undo(ALICE);
@@ -180,10 +192,11 @@ fn known_limitation_cross_worker_undo_can_strip_an_author_stamp() {
     assert_eq!(
         spans,
         vec![(0, 0, 5)],
-        "This test documents a KNOWN LIMITATION: cross-worker undo strips the \
-         author stamp, leaving restored text unattributed. If this now reports \
-         alice (1, 10, 5), the limitation has been fixed — delete this test and \
-         the note in the README, and say so."
+        "Two independent stacks no longer strip the author stamp. That is the \
+         outcome `claim_undo_stack` exists to make unreachable in a deployment, \
+         so if it is now unreachable *here* — at the layer with no claim in it — \
+         something else has changed and the claim may no longer be load-bearing. \
+         Work out which before deleting anything."
     );
 }
 

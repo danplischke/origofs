@@ -1055,6 +1055,25 @@ class Workspace:
     async def undo_coedit_tree(
         self, ctx: WriteCtx, path: str, doc: CoeditTreeDoc, redo: bool = False
     ) -> bytes: ...
+    # The WRITE check on its own, for a surface that must authorize before looking
+    # up whether a room is open or who holds its stack -- both are facts about the
+    # document a refused actor must not learn. Raises PermissionError.
+    async def ensure_may_undo(
+        self, ctx: WriteCtx, path: str, redo: bool = False
+    ) -> None: ...
+    # At most one worker may hold an actor's undo stack for a document (#146): two
+    # independent stacks can strip an author stamp between them, leaving restored
+    # text unattributed for the next checkpoint to credit to the checkpointer. A
+    # worker must hold the claim before calling `doc.track_undo`. Single-worker
+    # deployments are unaffected -- two tabs are the same holder.
+    async def claim_undo_stack(
+        self, path: str, actor_id: int, holder: str
+    ) -> bool: ...
+    async def release_undo_stack(
+        self, path: str, actor_id: int, holder: str
+    ) -> bool: ...
+    async def release_undo_claims_for_holder(self, holder: str) -> int: ...
+    async def renew_undo_claims(self, holder: str) -> int: ...
     # The tree shape (#92): a Y.XmlFragment a rich-text editor binds to natively.
     # origofs does not own the document schema, so the *host* serializes and says
     # which byte ranges came from which co-edit node; origofs resolves each node to
