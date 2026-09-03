@@ -1,7 +1,10 @@
-# Documentation site — `mkdocs serve` / `mkdocs build --strict`.
+# Documentation site — `zensical serve` / `zensical build --strict`.
 #
-# Pinned to MkDocs 1.x on purpose. MkDocs 2.0 is a from-scratch rewrite with no
-# plugin system, no theming system and no migration path, and Material for MkDocs
-# requires `mkdocs<2`. See CONTRIBUTING.md.
-mkdocs==1.6.1
-mkdocs-material==9.7.7
+# Zensical (https://zensical.org) is the static site generator from the Material
+# for MkDocs team. It replaces the MkDocs + Material stack this site started on:
+# MkDocs 2.0 is a from-scratch rewrite with no plugin system, no theming system
+# and no migration path, and Zensical is that team's answer to it.
+#
+# Pinned exactly, because Zensical is alpha (0.0.x) and its config format is not
+# stable yet. Bump deliberately and re-run `zensical build --strict`.
+zensical==0.0.58

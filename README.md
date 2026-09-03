@@ -24,7 +24,7 @@ and every byte knows who wrote it.**
 ---
 
 > **Documentation.** The user-facing docs live in [`docs/`](docs/index.md) and
-> build into a site with `mkdocs serve`. This README is the tour; the docs are
+> build into a site with `zensical serve`. This README is the tour; the docs are
 > where the guides and the reference live.
 
 ## What origofs is
