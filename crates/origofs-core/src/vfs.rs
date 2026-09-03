@@ -10,6 +10,24 @@ use crate::content::ContentStore;
 use crate::engine::{Fs, validate_component};
 use crate::error::{OrigoFSError, Result};
 use crate::metadata::MetadataStore;
+
+/// The `fallocate(2)` modes this filesystem can honour (issue #119).
+///
+/// Deliberately not `libc` flags: the engine states what it is being asked to do,
+/// and each surface maps its own constants onto this — which is also where an
+/// unsupported combination is refused rather than approximated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocateMode {
+    /// Extend the file if the range runs past the end.
+    Allocate,
+    /// `FALLOC_FL_KEEP_SIZE` alone: reserve without changing the size — nothing to
+    /// do in a store that does not reserve blocks.
+    KeepSize,
+    /// `FALLOC_FL_PUNCH_HOLE`: zero the range, size unchanged.
+    PunchHole,
+    /// `FALLOC_FL_ZERO_RANGE`: zero the range, extending if it runs past the end.
+    ZeroRange,
+}
 use crate::types::{DirEntry, DirEntryAttr, DirPage, FileKind, Ino, Inode, InodeInit, Owner};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
@@ -1044,5 +1062,163 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
         }
         Ok(DirPage { entries, ..page })
+    }
+
+    // --- fallocate / copy_file_range (issue #119) ------------------------
+
+    /// Copy `len` bytes from `src` at `src_off` to `dst` at `dst_off`, returning
+    /// how many were actually copied — `copy_file_range(2)`.
+    ///
+    /// **The point is that no bytes move.** Content is chunked and
+    /// content-addressed, so a range copy is a matter of pointing the destination
+    /// manifest at chunks that already exist. Only the (at most two) chunks
+    /// straddling the ends are read and re-stored, which makes copying a gigabyte
+    /// cost about what copying a kilobyte costs. Without this the kernel falls back
+    /// to a read/write loop, which on this write path is the expensive case.
+    ///
+    /// A short copy is normal rather than an error: the count is clamped at the
+    /// source's end of file, exactly as the syscall specifies.
+    pub async fn vfs_copy_range_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        src: Ino,
+        src_off: u64,
+        dst: Ino,
+        dst_off: u64,
+        len: u64,
+    ) -> Result<u64> {
+        self.guard_read(ctx, "copy from", src).await?;
+        self.guard_write(ctx, "copy into", dst).await?;
+
+        // Overlapping ranges within one file are undefined for the syscall and
+        // refused by it. Refuse rather than guess: the surgery below reads the
+        // source before writing, so an overlap would quietly copy pre-image bytes
+        // and look like it had worked.
+        if src == dst {
+            let (s_end, d_end) = (src_off.saturating_add(len), dst_off.saturating_add(len));
+            if src_off < d_end && dst_off < s_end {
+                return Err(OrigoFSError::InvalidArgument(
+                    "copy_file_range: source and destination ranges overlap in one file".into(),
+                ));
+            }
+        }
+
+        for _ in 0..Self::VFS_CAS_ATTEMPTS {
+            let source = self.vfs_getattr(src).await?;
+            let base = match source.content {
+                Some(h) => self.load_manifest(&h).await?,
+                None => crate::chunk::Manifest::default(),
+            };
+            let taken = self.slice_chunks(&base, src_off, len).await?;
+            let copied: u64 = taken.iter().map(|c| c.len as u64).sum();
+            if copied == 0 {
+                return Ok(0);
+            }
+
+            let target = self.vfs_getattr(dst).await?;
+            let pre = target.content;
+            let into = match target.content {
+                Some(h) => self.load_manifest(&h).await?,
+                None => crate::chunk::Manifest::default(),
+            };
+            self.check_quota_for_ino(dst, into.size.max(dst_off.saturating_add(copied)))
+                .await?;
+            let (mhash, size) = self.replace_range(&into, dst_off, taken).await?;
+
+            let mut tx = self.meta.begin().await?;
+            if !tx.set_content_if(dst, pre.as_ref(), mhash, size).await? {
+                continue; // lost the CAS: re-read and redo, as `vfs_write` does
+            }
+            tx.commit().await?;
+            return Ok(copied);
+        }
+        Err(OrigoFSError::Conflict(format!(
+            "ino {dst}: copy_file_range lost {} compare-and-set races in a row; the \
+             file is under sustained concurrent modification",
+            Self::VFS_CAS_ATTEMPTS
+        )))
+    }
+
+    /// `fallocate(2)`, in the modes a content-addressed store can honour.
+    ///
+    /// There is nothing to preallocate here — blocks are not reserved, content
+    /// exists once it is written — so the honest reading of each mode is its
+    /// *observable* result rather than its allocation:
+    ///
+    /// * [`Allocate`](AllocateMode::Allocate) extends the file when the range runs
+    ///   past the end and otherwise does nothing. It cannot reserve space, so it is
+    ///   a size change and not a promise about later writes.
+    /// * [`KeepSize`](AllocateMode::KeepSize) is a genuine no-op: it asks for
+    ///   blocks without changing the size, and there are no blocks to ask for.
+    /// * [`PunchHole`](AllocateMode::PunchHole) zeroes the range and keeps the
+    ///   size; [`ZeroRange`](AllocateMode::ZeroRange) zeroes it and may extend.
+    ///   Both write deduplicated zero chunks, so punching a hole *releases* space
+    ///   once gc runs rather than consuming it.
+    ///
+    /// The modes that move data — `COLLAPSE_RANGE`, `INSERT_RANGE` — are absent,
+    /// and the surface says so rather than handing back a near miss.
+    pub async fn vfs_allocate_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        ino: Ino,
+        offset: u64,
+        len: u64,
+        mode: AllocateMode,
+    ) -> Result<()> {
+        self.guard_write(ctx, "allocate in", ino).await?;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            OrigoFSError::TooLarge(format!("allocate end overflows u64 (ino {ino})"))
+        })?;
+        if len == 0 || mode == AllocateMode::KeepSize {
+            return Ok(());
+        }
+
+        for _ in 0..Self::VFS_CAS_ATTEMPTS {
+            let inode = self.vfs_getattr(ino).await?;
+            let pre = inode.content;
+            let base = match inode.content {
+                Some(h) => self.load_manifest(&h).await?,
+                None => crate::chunk::Manifest::default(),
+            };
+
+            let (mhash, size) = match mode {
+                AllocateMode::KeepSize => unreachable!("returned above"),
+                AllocateMode::Allocate => {
+                    if end <= base.size {
+                        return Ok(());
+                    }
+                    self.check_quota_for_ino(ino, end).await?;
+                    self.resize_body(&base, end).await?
+                }
+                AllocateMode::PunchHole | AllocateMode::ZeroRange => {
+                    // Punching keeps the size, so it only zeroes what already
+                    // exists; zeroing may extend, and anything past the old end is
+                    // a hole either way.
+                    let stop = if mode == AllocateMode::PunchHole {
+                        end.min(base.size)
+                    } else {
+                        end
+                    };
+                    if offset >= stop {
+                        return Ok(());
+                    }
+                    self.check_quota_for_ino(ino, base.size.max(stop)).await?;
+                    let zeros = self.zero_chunks(stop - offset).await?;
+                    self.replace_range(&base, offset, zeros).await?
+                }
+            };
+
+            let mut tx = self.meta.begin().await?;
+            if !tx.set_content_if(ino, pre.as_ref(), mhash, size).await? {
+                continue;
+            }
+            tx.commit().await?;
+            return Ok(());
+        }
+        Err(OrigoFSError::Conflict(format!(
+            "ino {ino}: allocate lost {} compare-and-set races in a row; the file \
+             is under sustained concurrent modification",
+            Self::VFS_CAS_ATTEMPTS
+        )))
     }
 }
