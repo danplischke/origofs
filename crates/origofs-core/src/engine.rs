@@ -100,6 +100,11 @@ const SPLICE_MARGIN: usize = 1;
 /// chunks.
 const HOLE_CHUNK: u32 = crate::chunk::MAX_CHUNK;
 
+/// Total bytes a chunk list covers.
+fn head_len(chunks: &[ChunkRef]) -> u64 {
+    chunks.iter().map(|c| c.len as u64).sum()
+}
+
 /// The chunks covering `[off, end)` of `manifest`, each as `(hash, from, len)`
 /// **relative to that chunk**.
 ///
@@ -1027,6 +1032,120 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             }
         }
 
+        self.seal(Manifest { size, chunks }).await
+    }
+
+    /// Split a chunk list at byte position `at`, returning what lies before it and
+    /// what lies after.
+    ///
+    /// This is the primitive behind range copies and hole punching (#119), and its
+    /// whole point is what it *does not* do: every chunk falling entirely on one
+    /// side moves **by reference**. Only a chunk straddling `at` is read back and
+    /// its two halves re-stored, so splitting anywhere in a file costs one chunk of
+    /// I/O rather than a pass over the range.
+    ///
+    /// The halves are stored as-is rather than re-chunked. Re-chunking would find
+    /// content-defined boundaries and dedup better, but it would also read and hash
+    /// the surrounding region — the cost this exists to avoid. A split is therefore
+    /// a forced boundary, exactly like the seams `splice_body` documents.
+    async fn split_chunks_at(
+        &self,
+        chunks: &[ChunkRef],
+        at: u64,
+    ) -> Result<(Vec<ChunkRef>, Vec<ChunkRef>)> {
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        let mut pos = 0u64;
+        for c in chunks {
+            let (cs, ce) = (pos, pos + c.len as u64);
+            pos = ce;
+            if ce <= at {
+                before.push(*c);
+            } else if cs >= at {
+                after.push(*c);
+            } else {
+                let head = (at - cs) as usize;
+                let bytes = self.content.get_range(&c.hash, 0, c.len as u64).await?;
+                before.push(ChunkRef {
+                    hash: self.content.put(&bytes[..head]).await?,
+                    len: head as u32,
+                });
+                after.push(ChunkRef {
+                    hash: self.content.put(&bytes[head..]).await?,
+                    len: c.len - head as u32,
+                });
+            }
+        }
+        Ok((before, after))
+    }
+
+    /// `len` bytes of zeroes as chunk references.
+    ///
+    /// Deduplicated by construction: a hole is whole `HOLE_CHUNK` runs of zeroes,
+    /// content-addressed like anything else, so punching a hole in a hundred files
+    /// stores one object and a hundred references to it.
+    pub(crate) async fn zero_chunks(&self, len: u64) -> Result<Vec<ChunkRef>> {
+        let mut out = Vec::new();
+        self.append_hole(&mut out, len).await?;
+        Ok(out)
+    }
+
+    /// The chunks covering `[offset, offset + len)` of `manifest`, clamped to its
+    /// end. Interior chunks come back by reference; at most the two straddling the
+    /// ends are materialized.
+    pub(crate) async fn slice_chunks(
+        &self,
+        manifest: &Manifest,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<ChunkRef>> {
+        let end = offset.saturating_add(len).min(manifest.size);
+        if offset >= end {
+            return Ok(Vec::new());
+        }
+        let (_, tail) = self.split_chunks_at(&manifest.chunks, offset).await?;
+        let (mid, _) = self.split_chunks_at(&tail, end - offset).await?;
+        Ok(mid)
+    }
+
+    /// Replace the range starting at `offset` of `manifest` with `new`.
+    ///
+    /// The replaced length is `new`'s own length rather than a separate argument:
+    /// an in-place replacement is always same-for-same, and taking a `len` that
+    /// could disagree with `new` would silently shift every byte after the range.
+    ///
+    /// A replacement starting past the end fills the gap with zero chunks first,
+    /// the same way a write past EOF does — a file grown this way is holes, not a
+    /// materialized run of zeroes.
+    pub(crate) async fn replace_range(
+        &self,
+        manifest: &Manifest,
+        offset: u64,
+        new: Vec<ChunkRef>,
+    ) -> Result<(Option<Hash>, u64)> {
+        let len = head_len(&new);
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| OrigoFSError::TooLarge("range end overflows u64".into()))?;
+
+        let mut head = manifest.chunks.clone();
+        if offset > manifest.size {
+            // The gap between EOF and `offset` is a hole, not bytes to allocate.
+            self.append_hole(&mut head, offset - manifest.size).await?;
+        }
+        let (before, _) = self.split_chunks_at(&head, offset).await?;
+        let tail = if end >= manifest.size {
+            Vec::new()
+        } else {
+            self.split_chunks_at(&manifest.chunks, end).await?.1
+        };
+
+        let mut chunks = before;
+        chunks.extend(new);
+        chunks.extend(tail);
+        let size = head_len(&chunks);
+        if size == 0 {
+            return Ok((None, 0));
+        }
         self.seal(Manifest { size, chunks }).await
     }
 

@@ -559,7 +559,9 @@ compiling at all until #107.
     out.
   - **NFS has none of this**, and not by choice: `nfsserve` exposes no NLM hooks,
     and NFSv3 locking is a separate protocol. `fallocate`/`copy_file_range` from
-    the same issue also remain absent.
+    the same issue are answered on FUSE (`vfs_copy_range_as`/`vfs_allocate_as`)
+    and remain absent on NFS for the same reason — `nfsserve` never surfaces the
+    operations.
   - **Four test tiers, because each one misses what the next catches.**
     `property.rs` asserts the resolver's invariants over arbitrary op sequences —
     states are built by *folding* random requests, never generated directly, since
