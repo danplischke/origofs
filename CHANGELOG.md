@@ -57,6 +57,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
   not `Send + Sync`, and a room sharing one document across socket tasks could
   not hold the stacks at all.
 
+  **Across workers a stack is per worker, and one consequence is a known
+  limitation.** A room and its undo stack live in one process's memory, so behind
+  a load balancer one person with two tabs can hold two stacks. Measured, that is
+  mostly benign: the stacks are disjoint (a relayed frame is never captured on
+  the receiving worker, which is the origin asymmetry paying off again), edits
+  converge, and each Ctrl+Z takes back that tab's own edit. What differs is
+  granularity — same-worker tabs share a stack, cross-worker tabs do not — so it
+  follows the balancer's routing. But if one actor deletes their own text through
+  one worker and undoes the original insert through the other, the restored text
+  comes back **unattributed**, because the author stamp is written in the same
+  undo step as the insert it describes; the next checkpoint then credits those
+  bytes to whoever triggered it. `coedit_undo_multiworker.rs` pins the exact
+  precondition alongside a single-worker control showing it is specifically a
+  cross-worker effect. Closing it means one stack per (actor, path) across
+  workers — a claim with a lease, the shape `posixlock` uses — which is a larger
+  piece than undo itself; sticky sessions on actor+path avoid it entirely.
+
   Reachable from Python too, on the same terms: `CoeditDoc`/`CoeditTreeDoc` gain
   `track_undo`/`untrack_undo`/`can_undo`/`can_redo`, `Workspace` gains
   `undo_coedit`/`undo_coedit_tree`, and the FastAPI router serves the same

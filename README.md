@@ -531,6 +531,25 @@ Four things to know before building on it:
   still moves only when your next `coedit-tree-checkpoint` lands bytes, because
   origofs cannot serialize a tree; the live document moves immediately.
 
+**Across workers, an undo stack is per worker.** A room lives in one process's
+memory and so does its undo stack, so behind a load balancer one person with two
+tabs can get two stacks — each holding what was typed through *its* worker.
+Edits still converge (an undo is an ordinary CRDT update, and a relayed frame is
+never captured on the receiving worker's stack), and each Ctrl+Z takes back that
+tab's own edit. What changes is the granularity: same-worker tabs share a stack,
+cross-worker tabs do not, so it follows your routing.
+
+One measured consequence is worth knowing before you deploy behind a
+round-robin balancer. If the *same* actor deletes their own text through one
+worker and undoes the original insert through the other, the restored text comes
+back **unattributed** — origofs's author stamp lives in the same undo step as the
+insert it describes, so one worker's undo removes a stamp the other's restore
+needs. The next checkpoint then credits those bytes to whoever triggered it.
+`coedit_undo_multiworker.rs` pins the exact precondition. Closing it properly
+means one stack per (actor, path) across workers — a claim with a lease — which
+is a larger piece than undo itself. **Route an actor's sockets for one path to
+one worker** (sticky sessions on actor+path) and none of this arises.
+
 While a document is open, its stored bytes are the last **checkpoint** — real,
 fully attributed, but possibly behind what people are typing. origofs records that
 as a per-path **live marker**, and the rule is to *surface* the staleness, never to

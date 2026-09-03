@@ -121,6 +121,23 @@ impl UndoStacks {
     /// Undo is an editor affordance, not history: a stack does not outlive the
     /// room, and nothing tries to rebuild one. Dropping the manager unsubscribes
     /// it from the document.
+    ///
+    /// # A stack is per worker, and that has one sharp edge
+    ///
+    /// A room is one process's memory, so behind a load balancer one actor with
+    /// two tabs can hold two stacks. Mostly benign — they are disjoint, since a
+    /// relayed frame carries no origin and is never captured on the receiving
+    /// worker, so each pops only what was typed through it and the replicas
+    /// converge. But the author stamp is a formatting attribute written in the
+    /// same transaction as the insert it describes, so one worker's undo of an
+    /// insert removes a stamp the *other* worker's undo of a deletion then
+    /// restores content without — and `checkpoint_coedit` credits an
+    /// unattributed span to the checkpointer.
+    ///
+    /// `tests/coedit_undo_multiworker.rs` pins the precondition, with a
+    /// single-worker control proving it is specifically a cross-worker effect.
+    /// The real fix is one stack per (actor, path) across workers; sticky
+    /// routing on actor+path avoids it meanwhile.
     pub(crate) fn untrack(&self, actor: i64) {
         self.inner.lock().remove(&actor);
     }
