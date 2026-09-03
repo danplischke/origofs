@@ -1,0 +1,7 @@
+# Documentation site — `mkdocs serve` / `mkdocs build --strict`.
+#
+# Pinned to MkDocs 1.x on purpose. MkDocs 2.0 is a from-scratch rewrite with no
+# plugin system, no theming system and no migration path, and Material for MkDocs
+# requires `mkdocs<2`. See CONTRIBUTING.md.
+mkdocs==1.6.1
+mkdocs-material==9.7.7

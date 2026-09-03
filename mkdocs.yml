@@ -1,0 +1,115 @@
+site_name: origofs
+site_description: >-
+  A filesystem where humans and AI agents share the same files, and every edit
+  is recorded against the actor that made it.
+site_url: https://danplischke.github.io/origofs/
+repo_url: https://github.com/danplischke/origofs
+repo_name: danplischke/origofs
+edit_uri: edit/main/docs/
+copyright: Released under the MIT license.
+
+docs_dir: docs
+site_dir: site
+
+# Working documents, not user-facing pages. They stay in the repo; they are not
+# published.
+exclude_docs: |
+  IMPROVEMENT_PLAN.md
+  REVIEW.md
+
+theme:
+  name: material
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Follow the system theme
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+plugins:
+  - search
+
+# A broken cross-reference should fail the build, not go out in the published
+# site. `mkdocs build --strict` turns these warnings into an error.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Install: getting-started/install.md
+      - Quickstart: getting-started/quickstart.md
+      - Core concepts: getting-started/concepts.md
+  - Guides:
+      - Working with agents: guides/agents.md
+      - Attribution and blame: guides/attribution.md
+      - Propose and review: guides/review.md
+      - Versioning and branches: guides/versioning.md
+      - POSIX mounts: guides/mounts.md
+      - Running for a team: guides/teams.md
+      - Operating a workspace: guides/operating.md
+      - Backup and recovery: guides/backup-and-recovery.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Configuration: reference/configuration.md
+      - Storage backends: reference/storage-backends.md
+      - HTTP API: reference/http-api.md
+      - MCP server: reference/mcp.md
+      - Python: reference/python.md
+  - Internals:
+      - Design: DESIGN.md
+      - Limits: LIMITS.md
+      - Multi-tenancy: MULTI_TENANCY.md
+      - Deploying on GCS + Postgres: DEPLOY-GCS-POSTGRES.md

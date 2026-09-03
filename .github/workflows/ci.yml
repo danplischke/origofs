@@ -823,6 +823,22 @@ jobs:
   # all. This job compiles it and then exercises the whole production-shaped stack
   # (Postgres metadata + MinIO content) the compose file describes, so a break in
   # either the image or the wiring fails here rather than in someone's deploy.
+  docs:
+    name: Docs (mkdocs --strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # `--strict` turns a broken cross-reference into a failure, so a page that
+    # links to a heading someone renamed does not ship as a dead link.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r requirements-docs.txt
+      - name: Build
+        run: mkdocs build --strict
+
   docker:
     name: Docker image + compose stack
     runs-on: ubuntu-latest

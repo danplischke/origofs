@@ -45,6 +45,31 @@ pytest tests/
 MSRV is **1.88** (let-chains, plus the dependency graph's own floor) and is pinned
 in CI. Raising it is a breaking change.
 
+## Documentation
+
+The user-facing docs live in `docs/` and build with MkDocs + Material:
+
+```bash
+pip install -r requirements-docs.txt
+mkdocs serve                 # http://127.0.0.1:8000, live reload
+mkdocs build --strict        # what CI runs — a broken link fails the build
+```
+
+`--strict` is the point: a page linking to a heading someone renamed fails
+rather than shipping as a dead link. CI runs it on every PR.
+
+**The pin on `mkdocs==1.6.1` is deliberate.** MkDocs 2.0 is a from-scratch
+rewrite that removes the plugin system and the theming system with no migration
+path, and Material for MkDocs requires `mkdocs<2`, so the two cannot be installed
+together. 1.6.1 is the current stable release, not a legacy one.
+
+Two files in `docs/` are working documents rather than pages and are excluded
+from the build in `mkdocs.yml`: `IMPROVEMENT_PLAN.md` and `REVIEW.md`. Everything
+else in `docs/` is published, so a new file needs a `nav` entry.
+
+Prose only — there is no rustdoc in the site. If you change a command's flags,
+the page describing it is part of the change.
+
 ## Invariants that will bite you
 
 These are enforced, sometimes by a test that fails structurally rather than
