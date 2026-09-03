@@ -12,6 +12,7 @@ and every byte knows who wrote it.**
 [![rust](https://img.shields.io/badge/rust-1.88%2B-dea584)](#install)
 [![design](https://img.shields.io/badge/docs-DESIGN.md-informational)](docs/DESIGN.md)
 
+[**Documentation**](docs/index.md) ·
 [**What it is**](#what-origofs-is) · [**Quickstart**](#quickstart) ·
 [**Agents**](#working-with-agents) ·
 [**Attribution**](#know-who-did-what) · [**Versioning**](#versioning) ·
@@ -21,6 +22,10 @@ and every byte knows who wrote it.**
 </div>
 
 ---
+
+> **Documentation.** The user-facing docs live in [`docs/`](docs/index.md) and
+> build into a site with `zensical serve`. This README is the tour; the docs are
+> where the guides and the reference live.
 
 ## What origofs is
 

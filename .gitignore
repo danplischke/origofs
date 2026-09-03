@@ -11,3 +11,6 @@ mutants.out.old/
 
 # maturin/pytest virtualenv for the Python bindings
 crates/origofs-py/.venv/
+
+# docs site build output (`zensical build` / `zensical serve`)
+/site/
