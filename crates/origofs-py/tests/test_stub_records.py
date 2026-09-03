@@ -33,6 +33,12 @@ NOT_EXERCISED = {
     "ConflictRecord": "needs a conflicted merge; covered by origofs-core/tests/merge.rs",
     # Reached only through the coedit surface, which test_coedit.py drives.
     "LiveMarker": "co-editing surface; covered by test_coedit.py",
+    # Only a *mount* can take one: an advisory lock is owned by an open file
+    # description and kept alive by the mount's lease renewer, so there is no
+    # library call that creates one and none should be added -- a lock with no
+    # renewer expires under its holder. Shape pinned on the Rust side by
+    # origofs-core/tests/posix_locks.rs.
+    "PosixLockRecord": "needs a mount to take a lock; covered by origofs-core/tests/posix_locks.rs",
 }
 
 
