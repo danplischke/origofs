@@ -490,6 +490,43 @@ proxy logs by default. Each connection is bound to a **session**, opened for it
 if the credential didn't name one, so a sitting's live edits can be undone as a
 unit with `revert_session`.
 
+#### Ctrl+Z — `POST /coedit-undo/{path}`
+
+Undo pops **one actor's own** most recent action, never a collaborator's
+paragraph and never an edit that arrived from another worker. Send
+`{"redo": true}` for the other direction:
+
+```js
+await fetch(`/v1/coedit-undo/notes.md`, {
+  method: "POST",
+  headers: { authorization: `Bearer ${token}` },
+  body: JSON.stringify({ redo: false }),
+})
+```
+
+It is a request *beside* the socket rather than a message on it, because the
+result already travels the room's y-sync fan-out — only the request needed a
+channel, and a new message tag would break the unmodified Yjs clients the socket
+exists to serve. The response says `changed`, distinguishing "undone" from
+"nothing to undo" so you can grey the button out.
+
+Four things to know before building on it:
+
+- **An undo is a write**, so it takes `WRITE` at the path exactly as opening the
+  document does. A propose-only actor is refused (`403`), not silently ignored —
+  there is no such thing as a proposed undo.
+- **Undo does not rewrite authorship.** Undoing a deletion gives the text back to
+  *its* author, not to whoever pressed the key, and the op-log keeps every edit
+  that happened. An undo that erased evidence would be a way to launder an
+  agent's edits out of the audit trail, which is the opposite of the point.
+- **A stack does not outlive the room.** Undo is an editor affordance, not
+  history: it does not survive a reconnect, a `checkout`, or a worker restart,
+  and your stack goes when your last socket on that document closes. Two tabs
+  share one stack. For anything durable, reach for `revert_session` (a whole
+  sitting), the trash (a delete), or `checkout` (a commit).
+- **Flat documents only** so far. The tree shape refuses and says so rather than
+  claiming there is nothing to undo.
+
 While a document is open, its stored bytes are the last **checkpoint** — real,
 fully attributed, but possibly behind what people are typing. origofs records that
 as a per-path **live marker**, and the rule is to *surface* the staleness, never to
@@ -801,7 +838,9 @@ blame, commit/log/status, diff, branches/checkout, the suggestion review queue,
 the change feed, presence, actors/sessions, and the
 [co-editing](#live-co-editing-crdt) WebSockets at `/coedit/{path}` and
 `/coedit-tree/{path}` with its `/coedit-tree-checkpoint/{path}` (long-lived rooms
-are created once per router, not per request).
+are created once per router, not per request). Per-actor
+[undo/redo](#ctrlz--post-coedit-undopath) is on the Rust API only for now; the
+FastAPI router keeps its own room registry and has not been given the route yet.
 
 One workspace can hold many tenants under scoped paths. Pass `root=` — fixed, or
 a dependency resolving it per request — and the router scopes itself:
