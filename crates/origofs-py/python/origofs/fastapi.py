@@ -463,12 +463,17 @@ class _Room:
 
     __slots__ = (
         "doc", "conns", "ctx", "path", "xml_root",
-        "last_edit", "last_checkpoint", "dirty",
+        "last_edit", "last_checkpoint", "dirty", "actors",
     )
 
     def __init__(self, doc: Any, ctx: Any, path: str, xml_root: Optional[str] = None) -> None:
         self.doc = doc
         self.conns: set[_Conn] = set()
+        # Sockets attached per actor, so an actor's undo stack is dropped when
+        # *their* last socket leaves rather than when the room empties (#146).
+        # `conns` cannot answer that: one person closing a tab while a colleague
+        # keeps the room open must lose their stack, and the room stays alive.
+        self.actors: dict[int, int] = {}
         # The workspace path this room edits, and -- for a tree room (#92) -- the
         # `XmlFragment` root it is bound to. `xml_root` is `None` for the flat
         # shape, and is what decides how the room reaches durable storage: the
@@ -718,6 +723,19 @@ class _Rooms:
                 # The newest joiner is who a background checkpoint runs as.
                 room.ctx = ctx
             room.conns.add(conn)
+            # Start capturing this actor's edits *now* (#146). An undo manager only
+            # sees transactions that commit after it exists, so this cannot wait
+            # until the first Ctrl+Z -- by then everything typed is unreachable.
+            # Idempotent per session: a second tab joins the stack the actor
+            # already has rather than starting a rival one.
+            actor = ctx.actor_id
+            room.actors[actor] = room.actors.get(actor, 0) + 1
+            try:
+                await room.doc.track_undo(ctx)
+            except AttributeError:
+                # An older extension without undo support. Co-editing itself is
+                # unaffected, so a missing affordance must not fail the connection.
+                pass
             return room
 
     async def leave(self, key: tuple, ctx: Any, conn: _Conn) -> None:
@@ -726,6 +744,21 @@ class _Rooms:
             if room is None:
                 return
             room.conns.discard(conn)
+            # This actor's undo stack lives exactly as long as they have a socket
+            # here -- dropping it on *their* last leave keeps one person closing a
+            # tab from holding a stack open for as long as a colleague keeps
+            # typing. Dropping it at all is the ruling that undo is an editor
+            # affordance, not history: it does not survive a reconnect.
+            actor = ctx.actor_id
+            remaining = room.actors.get(actor, 0) - 1
+            if remaining > 0:
+                room.actors[actor] = remaining
+            else:
+                room.actors.pop(actor, None)
+                try:
+                    await room.doc.untrack_undo(actor)
+                except AttributeError:
+                    pass
             if not room.conns:
                 # Final write-back under the registry lock so a concurrent join
                 # can't fork a fresh room off a half-written sidecar -- or clear
@@ -770,6 +803,39 @@ class _Rooms:
         # The host has crystallized these bytes, so the room is no longer behind.
         room.dirty = False
         room.last_checkpoint = time.monotonic()
+
+    async def undo(self, key: tuple, ctx: Any, redo: bool = False) -> bool:
+        """Undo (or redo) `ctx`'s actor's most recent action on a live room,
+        fanning the result out to every socket attached to it (#146).
+
+        Returns whether anything was actually popped, so a caller can tell "undone"
+        from "nothing to undo" -- different answers to a client drawing a Ctrl+Z
+        affordance, and collapsing them leaves it unable to grey the button out.
+
+        With no room open there is nothing to undo. Deliberately *not* an implicit
+        open: opening here would mark the path live with no socket whose disconnect
+        ever clears it, the same leak `checkpoint_tree` avoids above.
+        """
+        room = self._rooms.get(key)
+        if room is None:
+            return False
+        # The `WRITE` check lives in the engine (`undo_coedit`), not here, so a
+        # second surface cannot forget it -- an undo is a write, and the socket
+        # authenticates without authorizing.
+        if room.xml_root is None:
+            frame = await self._ws.undo_coedit(ctx, room.path, room.doc, redo)
+        else:
+            frame = await self._ws.undo_coedit_tree(ctx, room.path, room.doc, redo)
+        if not frame:
+            return False
+        room.touch_edit()
+        # `None` as the sender, so *every* socket receives it -- including the one
+        # whose user pressed the key, which unlike its own edits has not applied
+        # this locally. Passing that socket as the sender would leave exactly the
+        # client that asked for the undo showing the un-undone document.
+        room.fanout(None, frame)
+        await self.publish(key, frame)
+        return True
 
 
 # --- router factory ---------------------------------------------------------
@@ -1607,6 +1673,46 @@ def build_router(
         # other route gets, rather than a second one that could drift from it.
         await _run(rooms.checkpoint_tree(_tree_key(p, xml_root), ctx, body, spans))
         return {"path": p, "bytes": len(body), "spans": len(spans)}
+
+    @router.post("/coedit-undo/{path:path}")
+    async def coedit_undo(
+        path: str,
+        payload: Optional[dict] = None,
+        ctx: Any = Depends(authn),
+        root: str = Depends(_root),
+    ) -> dict:
+        """Undo (or redo) the authenticated actor's most recent edit to a live
+        co-edited document (#146).
+
+        Body: ``{"redo": false, "root": "content"}`` — both optional. ``root``
+        names the ``XmlFragment`` of a **tree** document, the same one its socket
+        was opened with; omit it for the flat shape. It is required rather than
+        inferred because both shapes can hold one path at once, so there is
+        genuinely nothing to guess from.
+
+        A request beside the socket rather than a message on it: the *result*
+        already travels the room's y-sync fan-out, so only the request needed a
+        channel, and a new message tag would break the unmodified Yjs clients the
+        socket exists to serve.
+
+        Undo pops **your own** most recent action — never a collaborator's
+        paragraph, and never an edit relayed from another worker. An undo is a
+        write, so it takes ``WRITE`` at the path exactly as opening the document
+        does and answers 403 otherwise; a propose-only actor is refused rather
+        than silently ignored, because there is no such thing as a proposed undo.
+
+        ``changed`` distinguishes "undone" from "nothing to undo", which a client
+        drawing the affordance needs in order to grey the button out. Both are
+        successes; only one of them moved the document.
+        """
+        payload = payload or {}
+        p = _scoped(root, path)
+        redo = bool(payload.get("redo", False))
+        xml_root = payload.get("root")
+        key = _flat_key(p) if xml_root is None else _tree_key(p, xml_root)
+        ctx = await _session_bound(ws, ctx)
+        changed = await _run(rooms.undo(key, ctx, redo))
+        return {"path": p, "redo": redo, "changed": changed}
 
     # --- trash (issue #115) -------------------------------------------------
 

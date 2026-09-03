@@ -57,6 +57,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
   not `Send + Sync`, and a room sharing one document across socket tasks could
   not hold the stacks at all.
 
+  Reachable from Python too, on the same terms: `CoeditDoc`/`CoeditTreeDoc` gain
+  `track_undo`/`untrack_undo`/`can_undo`/`can_redo`, `Workspace` gains
+  `undo_coedit`/`undo_coedit_tree`, and the FastAPI router serves the same
+  `POST /coedit-undo/{path}` — which is real code rather than a re-export,
+  because that router keeps its own room registry. Per #120's rule: a pyo3
+  method, its `.pyi` entry and a test are part of an engine feature, not
+  follow-up work.
+
 ### Changed
 
 - **The co-edit CRDT sidecars are versioned, so their framing can be evolved

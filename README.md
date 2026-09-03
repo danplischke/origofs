@@ -842,9 +842,8 @@ blame, commit/log/status, diff, branches/checkout, the suggestion review queue,
 the change feed, presence, actors/sessions, and the
 [co-editing](#live-co-editing-crdt) WebSockets at `/coedit/{path}` and
 `/coedit-tree/{path}` with its `/coedit-tree-checkpoint/{path}` (long-lived rooms
-are created once per router, not per request). Per-actor
-[undo/redo](#ctrlz--post-coedit-undopath) is on the Rust API only for now; the
-FastAPI router keeps its own room registry and has not been given the route yet.
+are created once per router, not per request), and per-actor
+[undo/redo](#ctrlz--post-coedit-undopath) at `/coedit-undo/{path}`.
 
 One workspace can hold many tenants under scoped paths. Pass `root=` — fixed, or
 a dependency resolving it per request — and the router scopes itself:
