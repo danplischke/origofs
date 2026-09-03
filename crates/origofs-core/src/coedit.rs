@@ -27,8 +27,8 @@ use yrs::types::text::YChange;
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{
-    Any, Doc, GetString, OffsetKind, Options, Out, ReadTxn, StateVector, Text, TextRef, Transact,
-    Update,
+    Any, Doc, GetString, OffsetKind, Options, Origin, Out, ReadTxn, StateVector, Text, TextRef,
+    Transact, Update,
 };
 
 /// The formatting-attribute key under which each run's `"actor,session"` is kept.
@@ -43,6 +43,33 @@ pub(crate) fn author_value(ctx: WriteCtx) -> String {
 /// The author formatting attribute for `ctx`, as a `yrs` attribute set.
 pub(crate) fn author_attrs(ctx: WriteCtx) -> Attrs {
     Attrs::from([(AUTHOR_KEY.into(), Any::from(author_value(ctx)))])
+}
+
+/// The `yrs` **transaction origin** for `ctx`'s edits — the same
+/// `"actor,session"` string [`author_value`] stamps on the content itself, so a
+/// transaction and the runs it introduces name their author identically.
+///
+/// # Why every attributed mutation must set one (#146)
+///
+/// `yrs`'s [`UndoManager`](yrs::undo::UndoManager) scopes an undo to a set of
+/// tracked origins, which is what makes "undo *my* typing, not my colleague's
+/// paragraph" expressible at all. Its filter has a default that bites: an
+/// origin-**less** transaction is tracked exactly while no origin has been
+/// included (`should_skip` in `yrs`'s `undo.rs` compares
+/// `tracked_origins.len() == 1`, the manager's own). Every transaction in this
+/// module used to be origin-less, so a manager attached then would have captured
+/// not just every actor's edits but every frame arriving over the cross-worker
+/// relay — undoing changes that were never made on this worker at all.
+///
+/// Setting the origin here is what closes that, and it closes it *by exclusion*:
+/// once one actor origin is included, origin-less transactions stop being
+/// tracked. So the paths that deliberately carry **no** origin —
+/// [`apply_relayed`], [`CoeditDoc::apply_update`], the reconstruction paths — are
+/// excluded for free, and that is load-bearing rather than incidental. Do not
+/// "tidy up" by giving them origins too: `tests/coedit_origin.rs` fails if the
+/// asymmetry is lost, and pins the `yrs` behaviour it rests on.
+pub(crate) fn author_origin(ctx: WriteCtx) -> Origin {
+    Origin::from(author_value(ctx))
 }
 
 /// The **raw** `AUTHOR_KEY` value a run carries, or `None` when it carries none
@@ -161,12 +188,18 @@ impl CoeditDoc {
 
     /// Insert `chunk` at character `index`, attributed to `ctx`.
     pub fn insert(&self, ctx: WriteCtx, index: u32, chunk: &str) {
-        let mut txn = self.doc.transact_mut();
+        let mut txn = self.doc.transact_mut_with(author_origin(ctx));
         self.text
             .insert_with_attributes(&mut txn, index, chunk, author_attrs(ctx));
     }
 
     /// Remove `len` characters starting at `index`.
+    ///
+    /// Takes no [`WriteCtx`], so the transaction carries no origin and is
+    /// invisible to every per-actor undo stack — see [`author_origin`]. That is
+    /// the honest answer for a removal with nobody to attribute it to; a caller
+    /// that wants its deletion to be undoable has an actor and should drive the
+    /// document through [`apply_update_as`](Self::apply_update_as).
     pub fn remove(&self, index: u32, len: u32) {
         let mut txn = self.doc.transact_mut();
         self.text.remove_range(&mut txn, index, len);
@@ -195,6 +228,10 @@ impl CoeditDoc {
     }
 
     /// Merge a peer's update into this document (idempotent and commutative).
+    ///
+    /// Unattributed, and therefore **deliberately origin-less**: nobody's undo
+    /// stack should offer to pop a merge this process did not perform. See
+    /// [`author_origin`].
     pub fn apply_update(&self, update: &[u8]) -> Result<()> {
         let update = Update::decode_v1(update)
             .map_err(|e| OrigoFSError::InvalidArgument(format!("bad co-edit update: {e}")))?;
@@ -236,7 +273,13 @@ impl CoeditDoc {
         // reader can ever see the un-normalised intermediate state. (The room
         // lock already serialises this against the checkpoint sweeper; this
         // removes the class rather than the instance.)
-        let mut txn = self.doc.transact_mut();
+        //
+        // The transaction carries `ctx`'s origin (#146), which is what lets a
+        // per-actor `UndoManager` tell this client's typing from everyone else's.
+        // Being one transaction matters twice over here: the authorship repair
+        // below lands *inside* it, so an undo pops the content and its author
+        // stamp together and can never strand one without the other.
+        let mut txn = self.doc.transact_mut_with(author_origin(ctx));
 
         // Pin the pre-image: its authorship (to carry across survivors) and its
         // state vector (to encode exactly this update's effect for relay).
@@ -896,6 +939,15 @@ pub(crate) fn apply_relayed(doc: &Doc, frame: &[u8]) -> Result<()> {
         if let Message::Sync(SyncMessage::Update(u) | SyncMessage::SyncStep2(u)) = msg {
             let update = Update::decode_v1(&u)
                 .map_err(|e| OrigoFSError::InvalidArgument(format!("bad co-edit update: {e}")))?;
+            // **Deliberately origin-less, and this is not an oversight to fix.**
+            //
+            // A relayed frame is another worker's clients' work, already
+            // attributed there. Giving it an origin would put it on *this*
+            // worker's per-actor undo stacks, so a Ctrl+Z here would pop an edit
+            // made on a machine this process never spoke to. Leaving it bare is
+            // what excludes it, because `author_origin`'s note explains the
+            // `yrs` filter treats origin-less transactions as untracked the
+            // moment any actor origin is included. See `tests/coedit_origin.rs`.
             doc.transact_mut()
                 .apply_update(update)
                 .map_err(|e| OrigoFSError::InvalidArgument(format!("apply co-edit update: {e}")))?;

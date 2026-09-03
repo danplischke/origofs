@@ -73,9 +73,9 @@
 
 use crate::attribution::WriteCtx;
 use crate::coedit::{
-    AUTHOR_KEY, COEDIT_SIDECAR_DIR, SyncReply, attr_or_null, author_attrs, author_value,
-    diverging_runs, doc_range, drive_sync, intended_stamps, parse_author, raw_attr, raw_author,
-    scan_runs, stamp_tiling,
+    AUTHOR_KEY, COEDIT_SIDECAR_DIR, SyncReply, attr_or_null, author_attrs, author_origin,
+    author_value, diverging_runs, doc_range, drive_sync, intended_stamps, parse_author, raw_attr,
+    raw_author, scan_runs, stamp_tiling,
 };
 use crate::content::ContentStore;
 use crate::engine::Fs;
@@ -251,7 +251,7 @@ impl CoeditTreeDoc {
     /// y-sync, where [`apply_update_as`](Self::apply_update_as) attributes them.
     pub fn append_text(&self, ctx: WriteCtx, tag: &str, text: &str) -> String {
         let node = self.fresh_node_id();
-        let mut txn = self.doc.transact_mut();
+        let mut txn = self.doc.transact_mut_with(author_origin(ctx));
         let el = self
             .frag
             .push_back(&mut txn, yrs::types::xml::XmlElementPrelim::empty(tag));
@@ -286,6 +286,9 @@ impl CoeditTreeDoc {
     /// Merge a peer's update into this document (idempotent and commutative),
     /// **without** attribution. Client input must go through
     /// [`handle_sync`](Self::handle_sync) instead.
+    ///
+    /// Unattributed, so **deliberately origin-less** and invisible to every
+    /// per-actor undo stack — see [`author_origin`](crate::coedit::author_origin).
     pub fn apply_update(&self, update: &[u8]) -> Result<()> {
         let update = Update::decode_v1(update)
             .map_err(|e| OrigoFSError::InvalidArgument(format!("bad co-edit update: {e}")))?;
@@ -321,8 +324,17 @@ impl CoeditTreeDoc {
         let before = self.scan();
         let sv_before = self.doc.transact().state_vector();
 
+        // Both transactions carry `ctx`'s origin (#146), so a per-actor
+        // `UndoManager` sees this client's work and not the relay's — see
+        // [`author_origin`](crate::coedit::author_origin).
+        //
+        // Unlike the flat shape, this is genuinely **two** transactions: the walk
+        // in `reconcile` borrows a read transaction and cannot be folded into the
+        // write one. Sharing the origin is what keeps them one undoable action —
+        // `yrs` merges consecutive same-origin transactions into a single stack
+        // item inside its capture window, and both of these land in the same tick.
         self.doc
-            .transact_mut()
+            .transact_mut_with(author_origin(ctx))
             .apply_update(update)
             .map_err(|e| OrigoFSError::InvalidArgument(format!("apply co-edit update: {e}")))?;
 
@@ -592,7 +604,9 @@ impl CoeditTreeDoc {
         if text_fixes.is_empty() && element_fixes.is_empty() {
             return; // authorship already agrees — the common case, writes nothing
         }
-        let mut txn = self.doc.transact_mut();
+        // Same origin as the apply this repairs, so the two are one undoable
+        // action rather than an edit whose author stamp cannot be undone with it.
+        let mut txn = self.doc.transact_mut_with(author_origin(ctx));
         for (text, fixes) in text_fixes {
             for (index, len, (author, node)) in fixes {
                 let attrs = Attrs::from([
