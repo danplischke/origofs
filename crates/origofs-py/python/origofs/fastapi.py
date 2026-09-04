@@ -161,10 +161,17 @@ _ROUTE_GROUPS: "dict[str, tuple[tuple[Optional[str], str], ...]]" = {
     # Live co-editing: both sockets, plus the checkpoint route the tree socket
     # cannot work without -- origofs cannot serialize a tree, so the host lands
     # the bytes. Mounting the socket without it would give a room nobody can save.
+    #
+    # Undo belongs here for the same reason (#146): it acts only on a live room,
+    # so it is meaningless without the sockets and useless to mount separately.
+    # It is a request beside the socket rather than a message on it because the
+    # result travels the room's own y-sync fan-out -- only the request needed a
+    # channel -- so it is one of this group's routes despite being plain REST.
     "coedit": (
         (None, "/coedit/{path:path}"),
         (None, "/coedit-tree/{path:path}"),
         ("POST", "/coedit-tree-checkpoint/{path:path}"),
+        ("POST", "/coedit-undo/{path:path}"),
     ),
     # Recovering uncommitted deletions.
     "trash": (
