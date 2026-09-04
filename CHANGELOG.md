@@ -9,6 +9,40 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ### Changed
 
+- **The tree co-editing room is confirmed compatible with PlateJS/Slate, and the
+  claim is now pinned by a test against the real client** (#152). It was reported
+  as wire-*incompatible*: `@platejs/yjs` binds through `@slate-yjs/core`, which
+  roots its document at a `Y.XmlText`, where origofs binds a `Y.XmlFragment` — so
+  "the two peers never converge".
+
+  The root-type observation is right; the conclusion is not. Yjs keys root types
+  by **name**, and `doc.get(name, T)` binds a view of whatever branch is already
+  there rather than asserting a type the peer must match, so both sides address
+  the same branch. `origofs-core/tests/coedit_tree_slate.rs` drives bytes captured
+  from a real `yjs@13` + `@slate-yjs/core@1.0.2` client through the real
+  `CoeditTreeDoc`: the document lands, the Slate value round-trips through
+  `yTextToSlateElement`, and two connections editing it are still blamed per run.
+  `tests/fixtures/slate_yjs_client.mjs` regenerates the fixtures.
+
+  What the docs never said, and what most likely produced the report, is that
+  origofs's `a` (author) and `n` (node id) stamps are ordinary Yjs *formatting
+  attributes* — and on the Slate binding a formatting attribute is a **mark**, so
+  every text node arrives with two marks it did not author. That is deliberate:
+  `n` is the token a host cites in its span map at checkpoint time, so it has to
+  be readable from the client. A schema must **ignore** them rather than strip
+  them, because the server re-asserts them on every apply. Documented on the
+  module, the socket, the README and the teams guide.
+
+  Also corrected: `y-slate` is not a package and is no longer named anywhere —
+  the Slate binding is `@slate-yjs/core`, which is what `@platejs/yjs` wraps. And
+  `api_coedit_tree_ws.rs` no longer calls its raw `yrs::Doc` client "what PlateJS
+  runs": that is the `y-prosemirror`/TipTap shape, and modelling the client rather
+  than using one is how the compatibility claim went unchecked in the first place.
+
+  Not done, and not doable: an `XmlText`-**rooted** room. `XmlTextRef` does not
+  implement yrs's `RootRef` ("not bound to be used as root-level types"), so the
+  pinned yrs cannot create one, and #144 leaves no upgrade path.
+
 - **Encrypted objects are versioned, and the Argon2id cost belongs to the store
   rather than to a dependency.** Everything else in a bucket could be evolved
   without rewriting it; the ciphertext could not. `EncryptedStore` wrote the bare
@@ -86,6 +120,56 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ### Added
 
+- **`Workspace.aclose()` and `async with`, so a long-lived host can release the
+  backends on purpose** (#154). A server opens a workspace in its startup hook and
+  had nothing to await at shutdown: the Postgres pool is reclaimed when the last
+  handle drops, and an embedder cannot make a drop happen on demand — so a reload,
+  or a test app entering a second lifespan, left the old pool alive holding its
+  connections. `close` is on `Workspace` in Rust and bound as `aclose` in Python,
+  where a deterministic async teardown is spelled that way.
+
+  It reaches the real backend the way `ping` does: `close` is on both store traits
+  with a no-op default, `PostgresMetadataStore` closes its pool, and every
+  decorator forwards, so a close on `VerifyingStore(PackStore(…))` is not one that
+  stops at the outside. It is **one-way and idempotent** — a call afterwards fails
+  `Unavailable` rather than hanging or silently reconnecting, because a call after
+  shutdown is a lifecycle bug and a store that quietly comes back hides it, while
+  a teardown hook that runs twice is ordinary. There is deliberately no
+  synchronous `close()` in Python: every I/O method there is async, so one would
+  have to block on the runtime, and doing that from inside the event loop where a
+  shutdown hook lives deadlocks.
+
+  An S3/GCS backend has no override and says so at the call site — `object_store`
+  exposes no shutdown hook, so it is released by dropping it and the deterministic
+  half of a shutdown is the metadata pool.
+
+- **`build_router(include=…/exclude=…)` and `build_coedit_router`** (#153). The
+  FastAPI router mounted origofs's entire REST surface or nothing, behind one
+  `authn`. For a host that stores bodies in origofs but owns its own access model
+  that is the wrong shape — it wants the co-editing socket and routes every
+  mutation through its own authorized endpoints — and with a single gate, a caller
+  who satisfies `authn` could reach *every* mutating route. In an app whose own
+  endpoints enforce more than `authn` does (a role, a lock), that is an auth
+  bypass: a viewer `PUT`ting over a body their own endpoint would have refused.
+  The workaround was to reach into `router.routes` and re-register the one route
+  wanted, coupling to a path string and a route class.
+
+  Routes are now grouped by capability — `files`, `blame`, `history`,
+  `suggestions`, `revert`, `actors`, `presence`, `coedit`, `trash`, `health`
+  (`ROUTE_GROUPS`) — and either list selects them. Prefer `include`: an allowlist
+  keeps meaning what it said when origofs adds a group, where a denylist quietly
+  starts mounting it. An unknown group name **raises**, because the quiet version
+  of that bug is the dangerous one — a typo in `include` mounts nothing and a typo
+  in `exclude` mounts everything, and both look like a working call. Omitting both
+  is unfiltered and byte-identical to today, so no existing deployment moves.
+
+  A new route must join a group: `test_every_route_belongs_to_exactly_one_group`
+  fails otherwise, the same discipline the MCP tool and CLI subcommand
+  classifications already carry. Note that read and write routes *already* carry
+  different gates — `authn` is applied only to mutating routes, `reader` only to
+  reads — so gating them separately needs no new parameter; what this adds is
+  which routes exist at all.
+
 - **`origofs migrate --check` and `--backup <path>`, and a schema report that
   precedes the migration it reports on.** Opening a workspace *is* the migration
   runner, and both of these subcommands ran after the open — so `origofs migrate`,
@@ -129,7 +213,7 @@ and it carries everything since `v0.0.2`.
 
 - **A structured (`Y.XmlFragment`) co-editing shape, so rich-text editors bind
   natively (#92).** `CoeditDoc` models a document as one flat `Y.Text`, but every
-  mainstream rich-text CRDT binding — `@platejs/yjs`, `y-prosemirror`, `y-slate`,
+  mainstream rich-text CRDT binding — `@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror`,
   TipTap — binds to a structured tree, so none of them could attach to an origofs
   room. Hosts had to mirror: serialize the editor to text on every change and diff
   it against the shared `Y.Text`. That converges, but the caret is lost on every

@@ -1135,3 +1135,147 @@ def test_a_write_granted_actor_still_writes_directly():
         return await ws.read("/deep/dir/big.md")
 
     assert len(asyncio.run(_big())) == len(big)
+
+
+# --- route groups (#153) ---------------------------------------------------
+#
+# `build_router` mounted the whole REST surface or nothing, so a host that stores
+# bodies in origofs but owns its own access model had to reach into
+# `router.routes` and re-register the one route it wanted — coupling to a path
+# string and a route class. These pin the supported way to say it.
+
+
+def _paths(router):
+    """(method, path) for every route on `router`; method None for a websocket."""
+    out = set()
+    for r in router.routes:
+        methods = getattr(r, "methods", None)
+        if methods:
+            out |= {(m, r.path) for m in methods if m not in ("HEAD", "OPTIONS")}
+        else:
+            out.add((None, r.path))
+    return out
+
+
+def test_include_mounts_only_the_named_groups():
+    """The headline: ask for `coedit` and the mutating REST surface is not there."""
+    from origofs.fastapi import build_coedit_router
+
+    full = _paths(build_router(FakeWs(), authn=header_authn))
+    only = _paths(build_router(FakeWs(), authn=header_authn, include=["coedit"]))
+
+    assert (None, "/coedit/{path:path}") in only
+    assert (None, "/coedit-tree/{path:path}") in only
+    # The checkpoint route comes with the tree socket, because origofs cannot
+    # serialize a tree — mounting the socket alone gives a room nobody can save.
+    assert ("POST", "/coedit-tree-checkpoint/{path:path}") in only
+    assert only < full
+
+    # And the routes whose reachability was the actual bug are gone: a caller who
+    # satisfies `authn` can no longer PUT over a body the app's own endpoints
+    # protect with more than `authn` checks.
+    for gone in [
+        ("PUT", "/files/{path:path}"),
+        ("DELETE", "/files/{path:path}"),
+        ("POST", "/rename"),
+        ("POST", "/commit"),
+        ("POST", "/revert-session"),
+        ("POST", "/actors"),
+        ("DELETE", "/trash/{sid}"),
+    ]:
+        assert gone not in only, f"{gone} should not be on a coedit-only router"
+
+    # The named helper is exactly the same surface.
+    assert _paths(build_coedit_router(FakeWs(), authn=header_authn)) == only
+
+
+def test_exclude_is_the_complement_of_include():
+    full = _paths(build_router(FakeWs(), authn=header_authn))
+    without = _paths(build_router(FakeWs(), authn=header_authn, exclude=["history"]))
+    assert ("POST", "/commit") in full and ("POST", "/commit") not in without
+    assert ("GET", "/log") not in without
+    # Everything else survives.
+    assert ("PUT", "/files/{path:path}") in without
+    assert (None, "/coedit/{path:path}") in without
+
+
+def test_the_default_router_is_unfiltered_and_unchanged():
+    """No `include`/`exclude` must mean exactly the surface every caller has today.
+
+    The filter only runs when filtering was asked for, so a gap in the group table
+    can never silently change an existing deployment's routes.
+    """
+    from origofs.fastapi import ROUTE_GROUPS
+
+    default = _paths(build_router(FakeWs(), authn=header_authn))
+    everything = _paths(
+        build_router(FakeWs(), authn=header_authn, include=sorted(ROUTE_GROUPS))
+    )
+    assert default == everything
+
+
+def test_a_typo_in_a_group_name_raises_rather_than_mounting_the_wrong_surface():
+    """The quiet failure is the dangerous one.
+
+    A typo in `include` mounts nothing; a typo in `exclude` mounts everything.
+    Both look like a working call, and one of them is an auth bypass.
+    """
+    with pytest.raises(ValueError, match="unknown route group"):
+        build_router(FakeWs(), authn=header_authn, include=["coedits"])
+    with pytest.raises(ValueError, match="unknown route group"):
+        build_router(FakeWs(), authn=header_authn, exclude=["histry"])
+    with pytest.raises(ValueError, match="not both"):
+        build_router(FakeWs(), authn=header_authn, include=["coedit"], exclude=["history"])
+
+
+def test_every_route_belongs_to_exactly_one_group():
+    """The guard that keeps the table honest as routes are added.
+
+    A new route with no group is invisible to the tests above — it would just
+    quietly appear on, or vanish from, a filtered router. Here it fails: the
+    group table is part of adding a route, the same way the MCP tool
+    classification and the CLI subcommand classification are.
+    """
+    from origofs.fastapi import _GROUP_OF, _ROUTE_GROUPS, _route_keys
+
+    router = build_router(FakeWs(), authn=header_authn)
+    unclaimed = sorted(
+        k for r in router.routes for k in _route_keys(r) if k not in _GROUP_OF
+    )
+    assert not unclaimed, (
+        f"routes with no group: {unclaimed}. Add each to `_ROUTE_GROUPS` in "
+        f"origofs/fastapi.py — a route nobody classified cannot be included or "
+        f"excluded, so it ships on every filtered router by accident."
+    )
+
+    # …and the reverse: an entry naming a route that no longer exists reads as a
+    # considered decision while protecting nothing.
+    live = _paths(router)
+    stale = sorted(
+        k for keys in _ROUTE_GROUPS.values() for k in keys if k not in live
+    )
+    assert not stale, f"_ROUTE_GROUPS names routes that no longer exist: {stale}"
+
+    # Exactly one group each — a route in two groups would be mounted by either,
+    # which makes `include` mean less than it says.
+    seen = [k for keys in _ROUTE_GROUPS.values() for k in keys]
+    assert len(seen) == len(set(seen)), "a route is listed in more than one group"
+
+
+def test_a_filtered_router_still_serves_the_routes_it_kept():
+    """Filtering must not break the closures the surviving routes depend on.
+
+    The co-editing room registry and its sweeper are built once for the whole
+    router; dropping the REST routes must not take them with it.
+    """
+    app = FastAPI()
+    app.include_router(
+        build_router(FakeWs(), authn=header_authn, exclude=["files"]), prefix="/v1"
+    )
+    client = TestClient(app)
+    # A kept route answers normally...
+    assert client.get("/v1/health").status_code == 200
+    # ...and a dropped one is genuinely not routed, rather than 401/403.
+    assert client.put(
+        "/v1/files/a.txt", content=b"x", headers={"x-actor-id": "1"}
+    ).status_code == 404

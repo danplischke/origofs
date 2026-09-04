@@ -2,7 +2,7 @@
 
 A client speaking the Yjs **y-sync** protocol connects to ``/coedit-tree/{path}``
 over a ``Y.XmlFragment`` — the shape ``@platejs/yjs`` / ``y-prosemirror`` /
-``y-slate`` bind to natively — and its content is attributed to the authenticated
+``@slate-yjs/core`` bind to natively — and its content is attributed to the authenticated
 actor server-side. The **host** then lands the bytes by POSTing its own
 serialization plus a span map, because origofs does not own the document schema.
 
