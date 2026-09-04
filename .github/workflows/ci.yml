@@ -818,6 +818,22 @@ jobs:
           path: ./cache
           key: bench-${{ runner.os }}-${{ github.run_id }}
 
+  docs:
+    name: Docs (zensical --strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # `--strict` turns a broken cross-reference into a failure, so a page that
+    # links to a heading someone renamed does not ship as a dead link.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r requirements-docs.txt
+      - name: Build
+        run: zensical build --strict
+
   # The shipped deployment artifact. Nothing else in CI builds the image, which is
   # how it came to pin a Rust older than the workspace MSRV and stop building at
   # all. This job compiles it and then exercises the whole production-shaped stack

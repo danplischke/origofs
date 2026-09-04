@@ -775,7 +775,7 @@ class CoeditDoc:
 
 class CoeditTreeDoc:
     """A live **tree-shaped** co-edited document (issue #92): a ``Y.XmlFragment`` a
-    rich-text editor (``@platejs/yjs``, ``y-prosemirror``, ``y-slate``, TipTap) binds
+    rich-text editor (``@platejs/yjs``/``@slate-yjs/core``, ``y-prosemirror``, TipTap) binds
     to natively, instead of ``CoeditDoc``'s flat ``Y.Text``.
 
     Obtain a server-side room doc from ``Workspace.open_coedit_tree``, drive it with
@@ -1257,6 +1257,14 @@ class Workspace:
     async def gc_with_grace(self, grace_secs: int) -> GcReport: ...
     async def flush(self) -> None: ...
     async def repack(self) -> int: ...
+    # Deterministic shutdown (#154): release the Postgres pool and any backend
+    # clients instead of waiting for the Rust handle to be dropped. Flushes
+    # first, so a packed store's buffer is sealed rather than discarded.
+    # One-way and idempotent; later calls fail "unavailable" rather than
+    # silently reconnecting. No sync `close()` — see the method's docstring.
+    async def aclose(self) -> None: ...
+    async def __aenter__(self) -> "Workspace": ...
+    async def __aexit__(self, *args: Any) -> None: ...
     # The metadata DB is the half nothing can reconstruct: blame, the audit log,
     # actors, and uncommitted edits live only there. This is the thing to back up.
     async def backup_metadata(self, dest: str) -> str: ...

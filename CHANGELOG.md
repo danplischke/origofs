@@ -99,6 +99,87 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ### Changed
 
+- **The tree co-editing room is confirmed compatible with PlateJS/Slate, and the
+  claim is now pinned by a test against the real client** (#152). It was reported
+  as wire-*incompatible*: `@platejs/yjs` binds through `@slate-yjs/core`, which
+  roots its document at a `Y.XmlText`, where origofs binds a `Y.XmlFragment` — so
+  "the two peers never converge".
+
+  The root-type observation is right; the conclusion is not. Yjs keys root types
+  by **name**, and `doc.get(name, T)` binds a view of whatever branch is already
+  there rather than asserting a type the peer must match, so both sides address
+  the same branch. `origofs-core/tests/coedit_tree_slate.rs` drives bytes captured
+  from a real `yjs@13` + `@slate-yjs/core@1.0.2` client through the real
+  `CoeditTreeDoc`: the document lands, the Slate value round-trips through
+  `yTextToSlateElement`, and two connections editing it are still blamed per run.
+  `tests/fixtures/slate_yjs_client.mjs` regenerates the fixtures.
+
+  What the docs never said, and what most likely produced the report, is that
+  origofs's `a` (author) and `n` (node id) stamps are ordinary Yjs *formatting
+  attributes* — and on the Slate binding a formatting attribute is a **mark**, so
+  every text node arrives with two marks it did not author. That is deliberate:
+  `n` is the token a host cites in its span map at checkpoint time, so it has to
+  be readable from the client. A schema must **ignore** them rather than strip
+  them, because the server re-asserts them on every apply. Documented on the
+  module, the socket, the README and the teams guide.
+
+  Also corrected: `y-slate` is not a package and is no longer named anywhere —
+  the Slate binding is `@slate-yjs/core`, which is what `@platejs/yjs` wraps. And
+  `api_coedit_tree_ws.rs` no longer calls its raw `yrs::Doc` client "what PlateJS
+  runs": that is the `y-prosemirror`/TipTap shape, and modelling the client rather
+  than using one is how the compatibility claim went unchecked in the first place.
+
+  Not done, and not doable: an `XmlText`-**rooted** room. `XmlTextRef` does not
+  implement yrs's `RootRef` ("not bound to be used as root-level types"), so the
+  pinned yrs cannot create one, and #144 leaves no upgrade path.
+
+- **Encrypted objects are versioned, and the Argon2id cost belongs to the store
+  rather than to a dependency.** Everything else in a bucket could be evolved
+  without rewriting it; the ciphertext could not. `EncryptedStore` wrote the bare
+  AEAD output, so nothing recorded which cipher, nonce derivation or KDF had
+  produced an object — and the failure that implies is the least legible one in
+  the system: a changed scheme decrypts to nothing and reports
+  `Corrupt("wrong key or corrupt data")`, which is exactly what a mistyped
+  passphrase looks like, on data that is perfectly intact.
+
+  Objects are now framed `ORGE | version | AEAD(…)` under `format.rs`'s existing
+  rules. It costs five bytes and changes no address — the address is the
+  *plaintext* hash (convergent encryption), never the stored bytes. **Objects
+  written by earlier origofs carry no header and are read forever.** Ciphertext is
+  indistinguishable from random, so roughly one legacy object in 2^32 begins with
+  `ORGE` by chance; the header therefore only chooses which interpretation to try
+  first and the **AEAD tag decides**, making a coincidence cost one extra open
+  instead of a false corruption report. A ciphertext from a newer origofs is
+  `UnsupportedVersion` ("upgrade"), not `Corrupt` ("restore a backup").
+
+  The key-derivation parameters were `argon2::Params::default()` — a constant the
+  dependency owns, and one it has already moved once (0.4 → 0.5 raised `m_cost`
+  from 4096 to 19456). A second such change would have re-derived a different key
+  for every existing store on a routine `cargo update`, reported as a wrong
+  passphrase, with nothing in the store recording what the real cost had been.
+  They are now pinned as `KdfParams::LEGACY` and **recorded per store**, in a `kdf`
+  sidecar beside the salt (same namespace, same reasoning: outside the
+  content-addressed space so GC cannot sweep it, beside the content so it survives
+  a metadata-DB loss). A store holding a salt but no descriptor predates this and
+  is legacy by definition — the distinction matters the day `KdfParams::current()`
+  is raised, which is now a safe thing to do. `tests/encryption.rs` pins the
+  ciphertext of a fixed `(passphrase, salt, plaintext)`, which pins the whole chain
+  — Argon2id, BLAKE3's keyed nonce derivation, XChaCha20-Poly1305 and the framing —
+  so a dependency bump that moves any of it fails in CI rather than in a bucket.
+
+- **The store descriptor's two fields move independently, so a fleet survives its
+  own rollout.** `min_reader_version` is the field that gates: raising it locks
+  every older build out of the *whole* store at open. It was stamped equal to
+  `format_version`, and stamped on **open** — so the day `write_version` went to 2,
+  the first node to upgrade would have taken the bucket away from every node that
+  had not, before a single v2 object existed anywhere. That is the exact inversion
+  of rule 3 ("ship the reader before the writer"), in the mechanism meant to
+  enforce it. `format_version` is advisory now and still rises on open;
+  `min_reader_version` comes from its own `MIN_READER_VERSION` constant, raised
+  deliberately in the release that starts writing genuinely non-additive objects.
+  Neither field is ever lowered, so an older build re-opening a store cannot erase
+  a newer one's warning.
+
 - **The co-edit CRDT sidecars are versioned, so their framing can be evolved
   without reading as "this document has no history".** Both shapes treated a
   sidecar they could not parse as an *absent* one — the flat shape rebuilds from
@@ -127,6 +208,81 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
   never write a byte of. The loud per-document error is the proportionate
   replacement, and it is what the descriptor was covering for.
 
+### Added
+
+- **`Workspace.aclose()` and `async with`, so a long-lived host can release the
+  backends on purpose** (#154). A server opens a workspace in its startup hook and
+  had nothing to await at shutdown: the Postgres pool is reclaimed when the last
+  handle drops, and an embedder cannot make a drop happen on demand — so a reload,
+  or a test app entering a second lifespan, left the old pool alive holding its
+  connections. `close` is on `Workspace` in Rust and bound as `aclose` in Python,
+  where a deterministic async teardown is spelled that way.
+
+  It reaches the real backend the way `ping` does: `close` is on both store traits
+  with a no-op default, `PostgresMetadataStore` closes its pool, and every
+  decorator forwards, so a close on `VerifyingStore(PackStore(…))` is not one that
+  stops at the outside. It is **one-way and idempotent** — a call afterwards fails
+  `Unavailable` rather than hanging or silently reconnecting, because a call after
+  shutdown is a lifecycle bug and a store that quietly comes back hides it, while
+  a teardown hook that runs twice is ordinary. There is deliberately no
+  synchronous `close()` in Python: every I/O method there is async, so one would
+  have to block on the runtime, and doing that from inside the event loop where a
+  shutdown hook lives deadlocks.
+
+  An S3/GCS backend has no override and says so at the call site — `object_store`
+  exposes no shutdown hook, so it is released by dropping it and the deterministic
+  half of a shutdown is the metadata pool.
+
+- **`build_router(include=…/exclude=…)` and `build_coedit_router`** (#153). The
+  FastAPI router mounted origofs's entire REST surface or nothing, behind one
+  `authn`. For a host that stores bodies in origofs but owns its own access model
+  that is the wrong shape — it wants the co-editing socket and routes every
+  mutation through its own authorized endpoints — and with a single gate, a caller
+  who satisfies `authn` could reach *every* mutating route. In an app whose own
+  endpoints enforce more than `authn` does (a role, a lock), that is an auth
+  bypass: a viewer `PUT`ting over a body their own endpoint would have refused.
+  The workaround was to reach into `router.routes` and re-register the one route
+  wanted, coupling to a path string and a route class.
+
+  Routes are now grouped by capability — `files`, `blame`, `history`,
+  `suggestions`, `revert`, `actors`, `presence`, `coedit`, `trash`, `health`
+  (`ROUTE_GROUPS`) — and either list selects them. Prefer `include`: an allowlist
+  keeps meaning what it said when origofs adds a group, where a denylist quietly
+  starts mounting it. An unknown group name **raises**, because the quiet version
+  of that bug is the dangerous one — a typo in `include` mounts nothing and a typo
+  in `exclude` mounts everything, and both look like a working call. Omitting both
+  is unfiltered and byte-identical to today, so no existing deployment moves.
+
+  A new route must join a group: `test_every_route_belongs_to_exactly_one_group`
+  fails otherwise, the same discipline the MCP tool and CLI subcommand
+  classifications already carry. Note that read and write routes *already* carry
+  different gates — `authn` is applied only to mutating routes, `reader` only to
+  reads — so gating them separately needs no new parameter; what this adds is
+  which routes exist at all.
+
+- **`origofs migrate --check` and `--backup <path>`, and a schema report that
+  precedes the migration it reports on.** Opening a workspace *is* the migration
+  runner, and both of these subcommands ran after the open — so `origofs migrate`,
+  documented as the deliberate deploy step, could only ever answer "already
+  current", and `schema-version` reported the version the same process had just
+  created. A pending migration was therefore unobservable, which made "should I
+  take a backup first?" unanswerable in practice.
+
+  Both now read the metadata store *unmigrated*, ahead of the open. `--check`
+  reports what would be applied and exits; `--backup` snapshots the database
+  before the first step and applies nothing if the snapshot fails, because a
+  backup taken after the step protects against nothing. Migrations are forward-only
+  and there are deliberately no down-migrations — one that dropped a column a newer
+  build had been filling would destroy every row written since the upgrade — so
+  that snapshot is the whole rollback plan, and the command says so when you
+  migrate without one.
+
+  The guard on the other side already existed and is now covered: an older binary
+  meeting a newer database refuses it as `UnsupportedVersion` **before** touching
+  it, leaving the database byte-for-byte as found, so rolling the binaries forward
+  again is a recovery rather than a repair
+  (`origofs-core/tests/schema_rollback.rs`).
+
 ## [0.0.3] — 2026-08-30
 
 The 0.1.0 section below announced a tagged release, but the `v0.1.0` tag was
@@ -147,7 +303,7 @@ and it carries everything since `v0.0.2`.
 
 - **A structured (`Y.XmlFragment`) co-editing shape, so rich-text editors bind
   natively (#92).** `CoeditDoc` models a document as one flat `Y.Text`, but every
-  mainstream rich-text CRDT binding — `@platejs/yjs`, `y-prosemirror`, `y-slate`,
+  mainstream rich-text CRDT binding — `@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror`,
   TipTap — binds to a structured tree, so none of them could attach to an origofs
   room. Hosts had to mirror: serialize the editor to text on every change and diff
   it against the shared `Y.Text`. That converges, but the caret is lost on every

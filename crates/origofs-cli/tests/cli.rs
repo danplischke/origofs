@@ -1505,6 +1505,69 @@ fn schema_version_agrees_with_migrate_on_a_fresh_workspace() {
         .stdout_has("nothing to apply");
 }
 
+/// A pending migration has to be *visible* before it is applied, and until these
+/// two subcommands were moved ahead of the workspace open it could not be: opening
+/// runs the migration runner, so both of them reported the state they had just
+/// created. An operator could not answer "will this deploy migrate my database?",
+/// which is the question that decides whether to take a backup — the only thing
+/// that makes a forward-only upgrade reversible.
+#[test]
+fn migrate_check_sees_a_pending_upgrade_and_applies_nothing() {
+    let ws = Ws::bare();
+
+    let pending = ws
+        .run(&["migrate", "--check"])
+        .expect_ok("migrate --check")
+        .stdout_has("schema v0 -> v")
+        .stdout_has("step(s) pending")
+        .stdout_has("nothing applied")
+        .trimmed()
+        .to_string();
+
+    // Still untouched: `--check` reports, it does not migrate.
+    ws.run(&["schema-version"])
+        .expect_ok("schema-version")
+        .stdout_has("schema version: v0")
+        .stdout_has("step(s) pending");
+    assert!(
+        pending.contains("-> v"),
+        "the check must name the target version: {pending:?}"
+    );
+
+    ws.run(&["migrate"])
+        .expect_ok("migrate")
+        .stdout_has("migrated schema v0 -> v")
+        .stdout_has("forward-only");
+
+    ws.run(&["migrate", "--check"])
+        .expect_ok("migrate --check")
+        .stdout_has("nothing to apply");
+}
+
+/// `--backup` is the whole rollback plan for an upgrade: migrations are
+/// forward-only, so the snapshot taken immediately before the step is the only way
+/// back. It must land *before* anything is applied — a backup of the migrated
+/// database protects against nothing.
+#[test]
+fn migrate_backup_snapshots_the_database_before_applying() {
+    let ws = Ws::bare();
+    let dest = ws.scratch("pre-upgrade.db");
+
+    ws.run(&["migrate", "--backup", dest.to_str().unwrap()])
+        .expect_ok("migrate --backup")
+        .stdout_has("migrated schema v0 -> v");
+
+    let size = std::fs::metadata(&dest)
+        .unwrap_or_else(|e| panic!("backup {} missing: {e}", dest.display()))
+        .len();
+    assert!(size > 0, "the pre-migration backup is empty");
+
+    // Having taken one, the command does not also nag about not having one.
+    ws.run(&["migrate", "--check"])
+        .expect_ok("migrate --check")
+        .stdout_has("nothing to apply");
+}
+
 /// `presence` shows *live* collaborators, and the CLI is not one: each
 /// invocation opens a session and exits without ever heartbeating. So an empty
 /// listing is correct, and the regression it guards is the opposite — presence

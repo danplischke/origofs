@@ -44,6 +44,23 @@ pub trait MetadataStore: Send + Sync {
         self.schema_version().await.map(|_| ())
     }
 
+    /// Release the backend's resources — connection pools, sockets, background
+    /// tasks — and make this store unusable (issue #154).
+    ///
+    /// The default is a no-op, which is the honest answer for a store holding
+    /// nothing a drop would not already release. Postgres overrides it: its pool
+    /// is reference-counted and reclaimed only when the last handle drops, and an
+    /// embedder that opened a workspace in a server's startup hook has no way to
+    /// make that happen at shutdown — which is what this exists for.
+    ///
+    /// **Closing is one-way and every later call fails**, rather than silently
+    /// reconnecting. A shutdown that leaves the store usable is not a shutdown,
+    /// and a call arriving after one is a bug in the host's lifecycle worth
+    /// surfacing. Idempotent, so a double close is not an error.
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Write a consistent snapshot of this store to `dest`, returning a
     /// human-readable description of what was produced.
     ///
@@ -736,6 +753,9 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn ping(&self) -> Result<()> {
         (**self).ping().await
+    }
+    async fn close(&self) -> Result<()> {
+        (**self).close().await
     }
     async fn backup_to(&self, dest: &std::path::Path) -> Result<String> {
         (**self).backup_to(dest).await

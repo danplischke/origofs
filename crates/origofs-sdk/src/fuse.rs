@@ -27,12 +27,13 @@
 
 use crate::{Event, FileKind, Inode, OrigoFSError, Owner, Workspace, WriteCtx};
 use fuser::{
-    BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
-    FopenFlags, Generation, INodeNo, LockOwner, MountOption, Notifier, OpenFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
-    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    BackgroundSession, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle,
+    FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, MountOption, Notifier,
+    OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use origofs_core::posixlock::{LOCK_EOF, LockAnswer, LockKind, LockRequest};
+use origofs_core::vfs::AllocateMode;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
@@ -1288,6 +1289,38 @@ pub fn spawn_as(ws: Workspace, mountpoint: &Path, ctx: Option<WriteCtx>) -> std:
     })
 }
 
+/// Map the kernel's `FALLOC_FL_*` bits onto what the engine can honour.
+///
+/// `None` means "this filesystem does not do that", which the caller turns into
+/// `EOPNOTSUPP` — the answer the syscall documents for a mode a filesystem does
+/// not support. `COLLAPSE_RANGE` and `INSERT_RANGE` shift every byte after the
+/// range, and approximating either would silently corrupt a file, so they are
+/// refused rather than attempted.
+#[cfg(target_os = "linux")]
+fn allocate_mode(mode: i32) -> Option<AllocateMode> {
+    const KEEP_SIZE: i32 = libc::FALLOC_FL_KEEP_SIZE;
+    const PUNCH_HOLE: i32 = libc::FALLOC_FL_PUNCH_HOLE;
+    const ZERO_RANGE: i32 = libc::FALLOC_FL_ZERO_RANGE;
+    match mode {
+        0 => Some(AllocateMode::Allocate),
+        m if m == KEEP_SIZE => Some(AllocateMode::KeepSize),
+        // Punching requires `KEEP_SIZE`; the kernel rejects it without, so accept
+        // either spelling rather than second-guessing what arrived.
+        m if m == PUNCH_HOLE || m == PUNCH_HOLE | KEEP_SIZE => Some(AllocateMode::PunchHole),
+        m if m == ZERO_RANGE || m == ZERO_RANGE | KEEP_SIZE => Some(AllocateMode::ZeroRange),
+        _ => None,
+    }
+}
+
+/// Non-Linux mounts see only the portable modes; the rest are Linux extensions.
+#[cfg(not(target_os = "linux"))]
+fn allocate_mode(mode: i32) -> Option<AllocateMode> {
+    match mode {
+        0 => Some(AllocateMode::Allocate),
+        _ => None,
+    }
+}
+
 fn errno(e: &OrigoFSError) -> Errno {
     match e {
         OrigoFSError::NotFound(_) => Errno::ENOENT,
@@ -2105,6 +2138,71 @@ impl Filesystem for OrigoFSFuse {
                 tracing::warn!(ino = h.ino, error = %e, "fuse: flush at release failed");
                 reply.error(errno(&e));
             }
+        }
+    }
+
+    /// `fallocate(2)`. Unsupported modes are refused rather than approximated.
+    fn fallocate(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let Some(mode) = allocate_mode(mode) else {
+            return reply.error(Errno::EOPNOTSUPP);
+        };
+        // Buffered writes for this inode have to land first: the engine works from
+        // the stored body, so a pending buffer would be written back afterwards and
+        // silently undo the hole (issue #112's buffering, this operation's problem).
+        if let Err(e) = self.flush_ino(ino.0 as i64) {
+            return reply.error(errno(&e));
+        }
+        match self.blk(
+            self.ws
+                .fs()
+                .vfs_allocate_as(self.ctx, ino.0 as i64, offset, length, mode),
+        ) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// `copy_file_range(2)` — served by referencing the source's chunks rather
+    /// than copying bytes, which is the whole reason to implement it.
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        ino_in: INodeNo,
+        _fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        _fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        _flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        // Both sides must be on disk before the manifests are read and rewritten.
+        for ino in [ino_in, ino_out] {
+            if let Err(e) = self.flush_ino(ino.0 as i64) {
+                return reply.error(errno(&e));
+            }
+        }
+        match self.blk(self.ws.fs().vfs_copy_range_as(
+            self.ctx,
+            ino_in.0 as i64,
+            offset_in,
+            ino_out.0 as i64,
+            offset_out,
+            len,
+        )) {
+            // A short copy is normal: the kernel re-issues from where this stopped.
+            Ok(n) => reply.written(n as u32),
+            Err(e) => reply.error(errno(&e)),
         }
     }
 }

@@ -977,13 +977,22 @@ pub(crate) async fn coedit_ws(
 }
 
 /// `GET /coedit-tree/{*path}` — the same y-sync socket over the **tree** document
-/// shape (#92), so `@platejs/yjs`, `y-prosemirror`, `y-slate` or TipTap can bind
+/// shape (#92), so `@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror` or TipTap can bind
 /// natively instead of mirroring a flat `Y.Text`.
 ///
 /// Identical in every other respect: same authentication, same frame cap, same
 /// per-connection session. It differs only in what reaches durable storage — see
 /// [`Coordinator::checkpoint_tree`], which the host calls with its own serialized
 /// bytes, because origofs does not own the document schema.
+///
+/// **Slate and Plate work here** even though `@slate-yjs/core` roots at a
+/// `Y.XmlText` rather than the `Y.XmlFragment` this binds — Yjs keys root types
+/// by name, so both peers address the same branch (issue #152). What such a host
+/// must handle is that origofs's `a`/`n` stamps arrive as ordinary formatting
+/// attributes, which on that binding means two extra **marks** on every Slate
+/// text node; ignore them rather than stripping them, since the server
+/// re-asserts them on every apply. `origofs_core::coedit_tree`'s module docs
+/// carry the detail.
 pub(crate) async fn coedit_tree_ws(
     State(state): State<AppState>,
     Path(path): Path<String>,

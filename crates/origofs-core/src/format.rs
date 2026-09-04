@@ -121,6 +121,57 @@ pub(crate) const PACK_INDEX: ObjectKind = ObjectKind {
     max_read_version: 2,
 };
 
+/// The envelope wrapped around every encrypted object
+/// ([`EncryptedStore`](crate::encrypt::EncryptedStore), `encryption` feature).
+///
+/// Everything else in a store could already be evolved; the ciphertext could not.
+/// `EncryptedStore` wrote the bare AEAD output, so the cipher, the nonce
+/// derivation and the KDF were pinned by the *binary* rather than recorded in the
+/// bytes — and there was no way to change any of them without making every
+/// existing object unreadable. Worse, the failure would have surfaced as
+/// `Corrupt("wrong key or corrupt data")`, which is what a wrong passphrase looks
+/// like: an upgrade would have read as an operator error.
+///
+/// The header names the scheme, so a v2 arm can define a different one and v1
+/// objects keep decrypting forever. It costs 5 bytes per object and changes no
+/// address — the address is the *plaintext* hash (convergent encryption), never
+/// the stored bytes.
+///
+/// **Objects written before this existed carry no header**, and the decoder
+/// accepts them for good: see `encrypt::EncryptedStore::decrypt` for how the two
+/// are told apart, and why the AEAD tag — not the header — is what ultimately
+/// decides.
+#[cfg(feature = "encryption")]
+pub(crate) const ENCRYPTED: ObjectKind = ObjectKind {
+    tag: b"ORGE",
+    name: "encrypted object",
+    write_version: 1,
+    max_read_version: 1,
+};
+
+/// The key-derivation descriptor stored beside the Argon2id salt
+/// (`origofs-sdk`'s `kdf` sidecar, `encryption` feature).
+///
+/// Argon2id parameters were the `argon2` crate's `Params::default()` — a constant
+/// owned by a dependency, not by origofs and not by the store. That default has
+/// already moved once (0.4 → 0.5 raised `m_cost` from 4096 to 19456), and if it
+/// moves again every passphrase-derived key changes and every object in every
+/// encrypted store becomes undecryptable, presenting as "wrong passphrase".
+///
+/// Recording the parameters next to the salt they are used with makes the
+/// derivation a property of the *store* instead of the build: a store carries the
+/// cost it was created with, forever, and a future origofs is free to raise the
+/// default for new stores without touching existing ones. A store with no
+/// descriptor predates this and used [`crate::encrypt`]'s pinned legacy
+/// parameters, which is exactly what the absent case falls back to.
+#[cfg(feature = "encryption")]
+pub(crate) const KDF: ObjectKind = ObjectKind {
+    tag: b"ORGK",
+    name: "key-derivation descriptor",
+    write_version: 1,
+    max_read_version: 1,
+};
+
 /// Co-edit CRDT sidecar, flat (`Y.Text`) shape (`crate::coedit`, `coedit` feature).
 ///
 /// Unlike every other kind here the sidecar is not a content-store object — it is
@@ -165,7 +216,29 @@ pub(crate) const COEDIT_TREE_SIDECAR: ObjectKind = ObjectKind {
 /// by a newer origofs is a loud `UnsupportedVersion` at the one document that
 /// meets it, never the "unparseable, so absent" fallback the version byte exists
 /// to prevent.
+///
+/// [`ENCRYPTED`] and [`KDF`] are excluded for a different reason again: the store
+/// descriptor is stamped on **every** store, and folding an encryption-only kind
+/// into it would raise the format version of unencrypted stores that can never
+/// contain one. An envelope bump is caught loudly at the first object read, and
+/// encryption is opt-in — the same trade as the sidecars, from the other side.
 const GRAPH_KINDS: [&ObjectKind; 4] = [&MANIFEST, &TREE, &COMMIT, &REFS];
+
+/// The oldest build that can read **everything this build writes**.
+///
+/// Deliberately its own constant rather than `current_format_version()`, because
+/// the two answer different questions and conflating them breaks a mixed-version
+/// fleet at exactly the moment rule 3 exists to protect it. `write_version` says
+/// what this build emits; this says what a *reader* must be to keep up. They
+/// diverge whenever a bump is additive — a new object kind, a field older readers
+/// can ignore, a version only some paths ever produce — which is the common case.
+///
+/// It is stamped into the store descriptor's `min_reader_version`, and that is the
+/// field that **locks older builds out of the whole store at open**. So raising
+/// this is the deliberate, fleet-breaking act: it belongs in the same release that
+/// starts writing genuinely non-additive objects, never in the release that merely
+/// *learns* to write a new version. Everything shipped so far is v1, so it is 1.
+const MIN_READER_VERSION: u8 = 1;
 
 /// The highest object-graph format version this build ever writes.
 pub(crate) fn current_format_version() -> u8 {
@@ -270,7 +343,35 @@ impl StoreDescriptor {
     pub(crate) fn current() -> Self {
         Self {
             format_version: current_format_version(),
-            min_reader_version: current_format_version(),
+            min_reader_version: MIN_READER_VERSION,
+        }
+    }
+
+    /// The descriptor to store once `self` (what the store advertises) has been
+    /// met by `current` (what this build is): each field raised to the higher of
+    /// the two, never lowered.
+    ///
+    /// The two fields are raised **independently**, and that is the whole point.
+    /// They used to move together — `current()` set `min_reader_version` to
+    /// `format_version`, and `check_store_format` wrote the pair whenever the
+    /// format version advanced — so the first node in a fleet to upgrade stamped a
+    /// `min_reader_version` every other node failed on, at *open*, before a single
+    /// object of the new version existed anywhere in the bucket. That inverts rule
+    /// 3 ("ship the reader before the writer"): an upgrade that was supposed to be
+    /// invisible took the store away from everyone who had not taken it yet.
+    ///
+    /// Now `format_version` rises on its own — it is advisory, it says what may be
+    /// *inside* — and `min_reader_version` rises only when
+    /// [`MIN_READER_VERSION`] does, which is a decision a human makes when a bump
+    /// genuinely cannot be read by older builds. In that case the lockout at open
+    /// is the correct behaviour, and it is what the descriptor is for.
+    ///
+    /// Neither field is ever lowered: an older build re-opening a store must not
+    /// erase a newer one's warning to everybody else.
+    pub(crate) fn raised_over(self, current: Self) -> Self {
+        Self {
+            format_version: self.format_version.max(current.format_version),
+            min_reader_version: self.min_reader_version.max(current.min_reader_version),
         }
     }
 
@@ -325,9 +426,19 @@ mod tests {
     #[cfg(not(feature = "coedit"))]
     const COEDIT_KINDS: [&ObjectKind; 0] = [];
 
+    /// Likewise for `encryption`.
+    #[cfg(feature = "encryption")]
+    const ENCRYPTION_KINDS: [&ObjectKind; 2] = [&ENCRYPTED, &KDF];
+    #[cfg(not(feature = "encryption"))]
+    const ENCRYPTION_KINDS: [&ObjectKind; 0] = [];
+
     /// Every kind this build knows.
     fn all() -> Vec<&'static ObjectKind> {
-        ALL.iter().chain(COEDIT_KINDS.iter()).copied().collect()
+        ALL.iter()
+            .chain(COEDIT_KINDS.iter())
+            .chain(ENCRYPTION_KINDS.iter())
+            .copied()
+            .collect()
     }
 
     #[test]
@@ -417,5 +528,62 @@ mod tests {
         }
         .check_readable()
         .expect("min_reader_version is what gates, not format_version");
+    }
+
+    /// The two fields move independently, and a fleet's ability to survive its
+    /// own rollout depends on it.
+    ///
+    /// `current()` used to set `min_reader_version` to `format_version`, so the
+    /// first node to upgrade stamped a descriptor every *other* node failed to
+    /// open — before any object of the new version existed. An additive bump has
+    /// to leave the gate where it is.
+    #[test]
+    fn an_additive_bump_raises_the_advisory_field_and_not_the_gate() {
+        let stored = StoreDescriptor {
+            format_version: 1,
+            min_reader_version: 1,
+        };
+        // A build that writes v2 objects older builds can still read.
+        let additive = StoreDescriptor {
+            format_version: 2,
+            min_reader_version: 1,
+        };
+        assert_eq!(stored.raised_over(additive), additive);
+        stored
+            .raised_over(additive)
+            .check_readable()
+            .expect("an additive bump must not lock this build out");
+
+        // A build whose objects older readers genuinely cannot use: the gate moves,
+        // and locking them out at open is then the correct behaviour.
+        let breaking = StoreDescriptor {
+            format_version: 2,
+            min_reader_version: 2,
+        };
+        assert_eq!(stored.raised_over(breaking), breaking);
+        assert!(breaking.check_readable().is_err());
+    }
+
+    /// An older build re-opening a store must not erase the warning a newer one
+    /// left for everybody else.
+    #[test]
+    fn neither_field_is_ever_lowered() {
+        let stored = StoreDescriptor {
+            format_version: 4,
+            min_reader_version: 3,
+        };
+        assert_eq!(stored.raised_over(StoreDescriptor::current()), stored);
+    }
+
+    /// What this build actually stamps on a fresh store. `MIN_READER_VERSION` is
+    /// a separate decision from `write_version`, so it can lag it — but it can
+    /// never exceed what this build can read, or a store would be unopenable by
+    /// the build that created it.
+    #[test]
+    fn the_stamp_this_build_writes_is_self_consistent() {
+        let d = StoreDescriptor::current();
+        assert!(d.min_reader_version <= d.format_version);
+        assert!(d.min_reader_version <= max_readable_format_version());
+        d.check_readable().expect("we can read what we stamp");
     }
 }

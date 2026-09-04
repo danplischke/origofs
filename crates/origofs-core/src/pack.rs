@@ -758,6 +758,19 @@ impl ContentStore for PackStore {
         self.data.ping().await
     }
 
+    /// Close both stores, without sealing the pending buffer.
+    ///
+    /// Unlike `ping`, which asks only the backend because it alone gates
+    /// readiness, close has to reach *both*: the index is a real store holding
+    /// real handles. Anything still buffered is discarded — see the trait's note
+    /// on why flushing is the caller's call, and `Workspace::close`, which makes
+    /// it for the workspace.
+    async fn close(&self) -> Result<()> {
+        let index = self.index.close().await;
+        let data = self.data.close().await;
+        data.and(index)
+    }
+
     async fn delete(&self, hash: &Hash) -> Result<u64> {
         let staged = {
             let mut p = self.pending.lock();

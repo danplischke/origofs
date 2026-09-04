@@ -343,6 +343,26 @@ pub trait ContentStore: Send + Sync {
     async fn ping(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Release the backend's resources — HTTP clients, connection pools, open
+    /// handles — and make this store unusable (issue #154).
+    ///
+    /// The default is a no-op: a local directory or an in-memory map holds
+    /// nothing that a drop would not already release. An object-store backend
+    /// overrides it, and every decorator forwards, so a close on the outermost
+    /// store reaches the real backend the same way [`ping`](ContentStore::ping)
+    /// does.
+    ///
+    /// **This does not flush.** A [`PackStore`](crate::pack::PackStore) buffers
+    /// chunks in memory until a pack is sealed, and deciding to write them is a
+    /// durability call that belongs to the caller, not to a teardown path — so
+    /// close releases what is open and says nothing about what is pending. A
+    /// caller driving the trait directly should call
+    /// [`flush`](ContentStore::flush) itself; the SDK's `Workspace::close` does.
+    /// Idempotent, so a double close is not an error.
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Validate a sidecar name so it can be used as a single path/key component.
@@ -849,6 +869,9 @@ impl<T: ContentStore + ?Sized> ContentStore for Arc<T> {
     }
     async fn ping(&self) -> Result<()> {
         (**self).ping().await
+    }
+    async fn close(&self) -> Result<()> {
+        (**self).close().await
     }
 }
 
@@ -1463,6 +1486,17 @@ impl ContentStore for TieredStore {
         // The backend is authoritative for durability; the cache is best-effort.
         self.backend.ping().await
     }
+
+    /// Close both tiers. The cache is closed too — it is a real store holding
+    /// real handles, and leaving it open would defeat the point of a shutdown.
+    async fn close(&self) -> Result<()> {
+        let cache = self.cache.close().await;
+        let backend = self.backend.close().await;
+        // Both are attempted before either error is returned: a cache that fails
+        // to close must not leave the backend's sockets open. The backend's error
+        // wins, since it is the tier that owns the durable resources.
+        backend.and(cache)
+    }
 }
 
 /// A [`ContentStore`] decorator that **verifies integrity on read**: every
@@ -1603,5 +1637,8 @@ impl ContentStore for VerifyingStore {
 
     async fn ping(&self) -> Result<()> {
         self.inner.ping().await
+    }
+    async fn close(&self) -> Result<()> {
+        self.inner.close().await
     }
 }

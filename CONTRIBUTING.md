@@ -45,6 +45,34 @@ pytest tests/
 MSRV is **1.88** (let-chains, plus the dependency graph's own floor) and is pinned
 in CI. Raising it is a breaking change.
 
+## Documentation
+
+The user-facing docs live in `docs/` and build with
+[Zensical](https://zensical.org), the static site generator from the Material for
+MkDocs team:
+
+```bash
+pip install -r requirements-docs.txt
+zensical serve                 # http://localhost:8000, live reload
+zensical build --strict        # what CI runs — a broken link fails the build
+```
+
+`--strict` is the point: a page linking to a heading someone renamed fails
+rather than shipping as a dead link. CI runs it on every PR.
+
+**Zensical is alpha (0.0.x), so `requirements-docs.txt` pins it exactly.** Its
+config format is not stable yet; bump the pin deliberately and re-run the strict
+build. It reads `zensical.toml` — and, as a compatibility path, a `mkdocs.yml`
+too, though this repo uses the native config.
+
+Everything under `docs/` is published, so a new page needs a `nav` entry in
+`zensical.toml`. Zensical has no `exclude_docs`, which is why the working
+documents that used to live in `docs/` — `IMPROVEMENT_PLAN.md` and `REVIEW.md` —
+sit in `notes/` instead. Put working notes there, not in `docs/`.
+
+Prose only — there is no rustdoc in the site. If you change a command's flags,
+the page describing it is part of the change.
+
 ## Invariants that will bite you
 
 These are enforced, sometimes by a test that fails structurally rather than

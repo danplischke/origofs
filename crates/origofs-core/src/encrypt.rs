@@ -26,9 +26,26 @@
 //! store (so it survives a metadata-DB loss). Losing the key means the data is
 //! unrecoverable; the wrong key fails loudly rather than returning garbage (the
 //! AEAD tag won't verify).
+//!
+//! **Upgrading origofs must not make a store unreadable, so both halves of that
+//! are pinned in data rather than in the binary.**
+//!
+//! 1. *The stored bytes are versioned.* Every object written is
+//!    `ORGE | version | AEAD(...)` ([`crate::format::ENCRYPTED`]), so a future
+//!    build can define a v2 scheme and still decrypt every v1 object. Objects
+//!    written before the envelope existed carry no header and are read forever —
+//!    see [`EncryptedStore::decrypt`].
+//! 2. *The Argon2id cost is the store's, not the crate's.* The parameters were
+//!    `argon2::Params::default()`, a constant a dependency owns and has already
+//!    changed once. [`KdfParams::LEGACY`] pins the values every existing store was
+//!    built with, and `origofs-sdk` records the parameters actually used beside the
+//!    salt, so raising the default for new stores can never re-derive a different
+//!    key for an old one. The failure this avoids is the nastiest kind: a changed
+//!    key is indistinguishable from a wrong passphrase.
 
 use crate::content::ContentStore;
 use crate::error::{OrigoFSError, Result};
+use crate::format;
 use crate::types::Hash;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -37,6 +54,91 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use std::sync::Arc;
 
 const NONCE_CONTEXT: &str = "origofs content nonce v1";
+
+/// The Argon2id cost parameters a store derives its key with.
+///
+/// Recorded per store (`origofs-sdk` writes them beside the salt) rather than read
+/// from the `argon2` crate at run time. See the module docs, and
+/// [`crate::format::KDF`] for why a dependency's `Params::default()` is not a
+/// safe place to keep something every byte in a store depends on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KdfParams {
+    /// Memory cost, in KiB.
+    pub m_cost: u32,
+    /// Time cost — the number of passes.
+    pub t_cost: u32,
+    /// Degree of parallelism.
+    pub p_cost: u32,
+}
+
+impl KdfParams {
+    /// The parameters every origofs store created before [`KdfParams`] existed was
+    /// built with: `argon2` 0.5's `Params::default()`, frozen here as origofs's own
+    /// constants.
+    ///
+    /// **Never change these values.** They are not a policy choice about how hard
+    /// a passphrase should be to crack — they are the only record of how existing
+    /// keys were derived, and moving them by one makes every such store
+    /// permanently undecryptable. Raise the cost for *new* stores by changing
+    /// [`KdfParams::current`] instead; the parameters travel with the store.
+    pub const LEGACY: Self = Self {
+        m_cost: 19 * 1024,
+        t_cost: 2,
+        p_cost: 1,
+    };
+
+    /// What a store created by this build records and derives with.
+    ///
+    /// Equal to [`LEGACY`](Self::LEGACY) today. Raising it is safe — every store
+    /// carries the parameters it was made with — but it makes opening a *new*
+    /// store measurably slower, so it is a deliberate change and not a default to
+    /// drift.
+    pub const fn current() -> Self {
+        Self::LEGACY
+    }
+
+    /// `ORGK | version | m_cost | t_cost | p_cost` (little-endian `u32`s).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = format::KDF.header().to_vec();
+        out.extend_from_slice(&self.m_cost.to_le_bytes());
+        out.extend_from_slice(&self.t_cost.to_le_bytes());
+        out.extend_from_slice(&self.p_cost.to_le_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        match format::KDF.version_of(bytes)? {
+            1 => {
+                let body = &bytes[format::HEADER_LEN..];
+                if body.len() < 12 {
+                    return Err(format::KDF.malformed());
+                }
+                let u32_at =
+                    |i: usize| u32::from_le_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+                let params = Self {
+                    m_cost: u32_at(0),
+                    t_cost: u32_at(4),
+                    p_cost: u32_at(8),
+                };
+                // A zero in any field is not a cost anyone chose; it is a
+                // truncated or zeroed sidecar. Deriving from it would either fail
+                // inside Argon2 or — worse, if a future Argon2 tolerated it —
+                // silently produce a key nothing else agrees on.
+                if params.m_cost == 0 || params.t_cost == 0 || params.p_cost == 0 {
+                    return Err(format::KDF.malformed());
+                }
+                Ok(params)
+            }
+            v => Err(format::KDF.unsupported(v)),
+        }
+    }
+
+    fn to_argon2(self) -> Result<argon2::Params> {
+        argon2::Params::new(self.m_cost, self.t_cost, self.p_cost, None).map_err(|e| {
+            OrigoFSError::Content(format!("invalid Argon2id parameters {self:?}: {e}"))
+        })
+    }
+}
 
 /// A content store that encrypts objects at rest over an inner store.
 pub struct EncryptedStore {
@@ -57,13 +159,34 @@ impl EncryptedStore {
     /// `(passphrase, salt)` must be used on every open. The salt is not secret but
     /// must be persisted somewhere durable that travels with the store — origofs-sdk
     /// keeps it beside the content store so it survives a metadata-DB loss.
+    ///
+    /// Derives with [`KdfParams::LEGACY`], which is what every store made before
+    /// the parameters were recorded used. A caller that knows the store's
+    /// parameters — `origofs-sdk` reads them from the `kdf` sidecar — should use
+    /// [`from_passphrase_with_params`](Self::from_passphrase_with_params).
     pub fn from_passphrase(
         inner: Arc<dyn ContentStore>,
         passphrase: &str,
         salt: &[u8],
     ) -> Result<Self> {
-        use argon2::{Algorithm, Argon2, Params, Version};
-        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
+        Self::from_passphrase_with_params(inner, passphrase, salt, KdfParams::LEGACY)
+    }
+
+    /// [`from_passphrase`](Self::from_passphrase) with the store's own recorded
+    /// Argon2id cost.
+    ///
+    /// `params` must be the parameters the store's existing objects were keyed
+    /// with; a different value derives a different key and every read fails the
+    /// AEAD tag, indistinguishably from a wrong passphrase. That is precisely why
+    /// they are stored rather than defaulted — see [`KdfParams`].
+    pub fn from_passphrase_with_params(
+        inner: Arc<dyn ContentStore>,
+        passphrase: &str,
+        salt: &[u8],
+        params: KdfParams,
+    ) -> Result<Self> {
+        use argon2::{Algorithm, Argon2, Version};
+        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.to_argon2()?);
         let mut key = [0u8; 32];
         argon
             .hash_password_into(passphrase.as_bytes(), salt, &mut key)
@@ -82,36 +205,102 @@ impl EncryptedStore {
         XNonce::from(nonce)
     }
 
+    /// Encrypt, and frame the result as `ORGE | version | AEAD(...)`.
+    ///
+    /// The 5-byte header is what makes the scheme evolvable: without it the
+    /// cipher, the nonce derivation and the KDF were pinned by whichever binary
+    /// happened to write the object, and nothing in the bucket recorded which. See
+    /// [`crate::format::ENCRYPTED`].
     fn encrypt(&self, storage_key: &Hash, plaintext: &[u8]) -> Result<Vec<u8>> {
-        self.cipher
+        let sealed = self
+            .cipher
             .encrypt(&self.nonce_for(storage_key), plaintext)
-            .map_err(|_| OrigoFSError::Content("encryption failed".into()))
+            .map_err(|_| OrigoFSError::Content("encryption failed".into()))?;
+        let mut out = Vec::with_capacity(format::HEADER_LEN + sealed.len());
+        out.extend_from_slice(&format::ENCRYPTED.header());
+        out.extend_from_slice(&sealed);
+        Ok(out)
     }
 
-    fn decrypt(&self, storage_key: &Hash, ciphertext: &[u8]) -> Result<Vec<u8>> {
+    /// One AEAD open attempt. Returns the plaintext or nothing; the caller decides
+    /// what a failure *means*, because a first failure here is routine (it is how
+    /// the two stored shapes are told apart) and only the last one is an error
+    /// worth logging.
+    fn open(&self, storage_key: &Hash, sealed: &[u8]) -> Option<Vec<u8>> {
         self.cipher
-            .decrypt(&self.nonce_for(storage_key), ciphertext)
-            .map_err(|_| {
-                // `Corrupt`, not a generic `Content` error. A failed AEAD tag is an
-                // integrity failure on a stored object — the same event
-                // `VerifyingStore` reports as `Corrupt` — and the encrypted recipes
-                // deliberately do not stack a `VerifyingStore` (the AEAD already
-                // authenticates), so this is the *only* place an encrypted stack can
-                // report one. Reporting it as a plain content error put it in a
-                // different `code()`/`class()` bucket than the identical failure on
-                // every other stack, so an operator filtering for corruption saw
-                // nothing.
-                //
-                // A wrong key produces the same tag failure, hence the message: the
-                // two are cryptographically indistinguishable here.
-                tracing::warn!(
-                    hash = %storage_key.to_hex(),
-                    "content failed authenticated decryption"
-                );
-                OrigoFSError::Corrupt(format!(
-                    "decryption failed for {storage_key} (wrong key or corrupt data)"
-                ))
-            })
+            .decrypt(&self.nonce_for(storage_key), sealed)
+            .ok()
+    }
+
+    /// Decrypt an object in either stored shape.
+    ///
+    /// Two shapes exist and both must be readable forever: the versioned envelope
+    /// this build writes (`ORGE | version | AEAD`), and the **bare AEAD output**
+    /// written by every origofs before the envelope existed. Upgrading must not
+    /// require rewriting a bucket, so the old shape is not deprecated — it is
+    /// supported.
+    ///
+    /// Telling them apart starts with the header but does not end there.
+    /// Ciphertext is indistinguishable from random, so roughly one legacy object
+    /// in 2^32 begins with the bytes `ORGE` by coincidence, and one in 2^40 also
+    /// carries a plausible version byte. Sniffing alone would therefore fail a
+    /// perfectly good object — rarely, unreproducibly, and reported as corruption.
+    ///
+    /// So the header only chooses which interpretation to *try first*, and the
+    /// **AEAD tag decides**. A misread envelope fails to authenticate and falls
+    /// back to the legacy reading (and vice versa); a misread can never yield the
+    /// wrong plaintext, only one extra open. The cost is one redundant AEAD
+    /// attempt on a path that already failed, which is the error path.
+    ///
+    /// An envelope version this build is too old to decode is reported as
+    /// [`OrigoFSError::UnsupportedVersion`] — "upgrade origofs" — but only after
+    /// the legacy reading has been tried and failed, since that is the shape a
+    /// coincidental tag actually has.
+    fn decrypt(&self, storage_key: &Hash, stored: &[u8]) -> Result<Vec<u8>> {
+        let mut too_new = None;
+        if format::ENCRYPTED.tagged(stored) {
+            match format::ENCRYPTED.version_of(stored) {
+                Ok(1) => {
+                    if let Some(plaintext) = self.open(storage_key, &stored[format::HEADER_LEN..]) {
+                        return Ok(plaintext);
+                    }
+                }
+                // Unreachable while `version_of` caps at `max_read_version`; this
+                // is the arm a v2 envelope is added beside.
+                Ok(_) => {}
+                Err(e) => too_new = Some(e),
+            }
+        }
+        if let Some(plaintext) = self.open(storage_key, stored) {
+            return Ok(plaintext);
+        }
+        if let Some(e) = too_new {
+            return Err(e);
+        }
+        Err(self.undecryptable(storage_key))
+    }
+
+    /// The error for an object no interpretation could authenticate.
+    ///
+    /// `Corrupt`, not a generic `Content` error. A failed AEAD tag is an integrity
+    /// failure on a stored object — the same event `VerifyingStore` reports as
+    /// `Corrupt` — and the encrypted recipes deliberately do not stack a
+    /// `VerifyingStore` (the AEAD already authenticates), so this is the *only*
+    /// place an encrypted stack can report one. Reporting it as a plain content
+    /// error put it in a different `code()`/`class()` bucket than the identical
+    /// failure on every other stack, so an operator filtering for corruption saw
+    /// nothing.
+    ///
+    /// A wrong key produces the same tag failure, hence the message: the two are
+    /// cryptographically indistinguishable here.
+    fn undecryptable(&self, storage_key: &Hash) -> OrigoFSError {
+        tracing::warn!(
+            hash = %storage_key.to_hex(),
+            "content failed authenticated decryption"
+        );
+        OrigoFSError::Corrupt(format!(
+            "decryption failed for {storage_key} (wrong key or corrupt data)"
+        ))
     }
 }
 
@@ -265,5 +454,166 @@ impl ContentStore for EncryptedStore {
 
     async fn ping(&self) -> Result<()> {
         self.inner.ping().await
+    }
+    async fn close(&self) -> Result<()> {
+        self.inner.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::MemStore;
+
+    fn store() -> (Arc<MemStore>, EncryptedStore) {
+        let backend = Arc::new(MemStore::new());
+        let enc = EncryptedStore::new(backend.clone(), [7u8; 32]);
+        (backend, enc)
+    }
+
+    /// The envelope is what makes the scheme evolvable at all: without it nothing
+    /// in the bucket says which cipher, nonce derivation or KDF produced an
+    /// object, so no future build could change any of them.
+    #[tokio::test]
+    async fn stored_objects_carry_a_versioned_envelope() {
+        let (backend, enc) = store();
+        let hash = enc.put(b"hello origofs").await.unwrap();
+
+        let stored = backend.get(&hash).await.unwrap();
+        assert_eq!(&stored[..4], b"ORGE");
+        assert_eq!(stored[4], 1, "envelope format version");
+        // header + plaintext + the AEAD tag, and nothing else.
+        assert_eq!(
+            stored.len(),
+            format::HEADER_LEN + b"hello origofs".len() + 16
+        );
+        assert_eq!(&enc.get(&hash).await.unwrap()[..], b"hello origofs");
+    }
+
+    /// Every object written before the envelope existed is bare AEAD output. An
+    /// upgrade must not require rewriting a bucket, so these stay readable —
+    /// forever, not for a deprecation window.
+    #[tokio::test]
+    async fn objects_written_before_the_envelope_still_decrypt() {
+        let (backend, enc) = store();
+        let plaintext = b"written by an older origofs";
+        let hash = Hash::of(plaintext);
+
+        // Exactly what the pre-envelope `encrypt` produced: no header.
+        let legacy = enc
+            .cipher
+            .encrypt(&enc.nonce_for(&hash), &plaintext[..])
+            .unwrap();
+        assert_ne!(&legacy[..4], b"ORGE");
+        backend.put_keyed(&hash, &legacy).await.unwrap();
+
+        assert_eq!(&enc.get(&hash).await.unwrap()[..], plaintext);
+    }
+
+    /// An envelope version this build is too old to read is an upgrade problem,
+    /// not a corruption report — the same distinction every other object kind
+    /// makes, and the reason `UnsupportedVersion` exists.
+    #[tokio::test]
+    async fn an_envelope_from_a_newer_origofs_says_upgrade() {
+        let (backend, enc) = store();
+        let hash = Hash::of(b"whatever");
+
+        let mut future = b"ORGE\x02".to_vec();
+        future.extend_from_slice(&[0u8; 32]);
+        backend.put_keyed(&hash, &future).await.unwrap();
+
+        let e = enc.get(&hash).await.unwrap_err();
+        assert_eq!(e.code(), "unsupported_version");
+        assert!(e.is_unsupported_version());
+    }
+
+    /// Bytes that authenticate under no interpretation are still corruption, and
+    /// must not be reported as "upgrade origofs".
+    #[tokio::test]
+    async fn undecryptable_bytes_are_still_corrupt() {
+        let (backend, enc) = store();
+        let hash = Hash::of(b"whatever");
+        backend.put_keyed(&hash, &[0u8; 48]).await.unwrap();
+
+        assert_eq!(enc.get(&hash).await.unwrap_err().code(), "corrupt");
+    }
+
+    /// The whole point of recording the parameters: a store keyed at one cost must
+    /// not be re-derived at another. This is the failure mode a changed
+    /// `Params::default()` would have caused silently, made explicit.
+    #[tokio::test]
+    async fn a_different_kdf_cost_derives_a_different_key() {
+        let backend = Arc::new(MemStore::new());
+        let a = EncryptedStore::from_passphrase_with_params(
+            backend.clone(),
+            "hunter2",
+            b"a fixed 16-byte!",
+            KdfParams::LEGACY,
+        )
+        .unwrap();
+        let hash = a.put(b"payload").await.unwrap();
+
+        let b = EncryptedStore::from_passphrase_with_params(
+            backend.clone(),
+            "hunter2",
+            b"a fixed 16-byte!",
+            KdfParams {
+                t_cost: KdfParams::LEGACY.t_cost + 1,
+                ..KdfParams::LEGACY
+            },
+        )
+        .unwrap();
+        // Indistinguishable from a wrong passphrase — which is exactly why the
+        // parameters travel with the store rather than with the binary.
+        assert_eq!(b.get(&hash).await.unwrap_err().code(), "corrupt");
+    }
+
+    #[test]
+    fn kdf_params_round_trip_and_reject_nonsense() {
+        let p = KdfParams::current();
+        assert_eq!(KdfParams::decode(&p.encode()).unwrap(), p);
+
+        // A zeroed or truncated sidecar is not a cost anyone chose.
+        let mut zeroed = KdfParams::LEGACY;
+        zeroed.t_cost = 0;
+        assert_eq!(
+            KdfParams::decode(&zeroed.encode()).unwrap_err().code(),
+            "content_error"
+        );
+        assert_eq!(
+            KdfParams::decode(&p.encode()[..10]).unwrap_err().code(),
+            "content_error"
+        );
+
+        // Written by a newer origofs: "upgrade", not "corrupt".
+        let mut future = p.encode();
+        future[4] = 2;
+        assert_eq!(
+            KdfParams::decode(&future).unwrap_err().code(),
+            "unsupported_version"
+        );
+    }
+
+    /// A canary on the `argon2` crate, not a test of origofs.
+    ///
+    /// [`KdfParams::LEGACY`] is a frozen copy of `argon2` 0.5's `Params::default()`
+    /// — the values every encrypted store created before the parameters were
+    /// recorded was keyed with. **If this fails after an `argon2` upgrade, do not
+    /// change `LEGACY` to match**: the crate moved its default, our pin is what
+    /// keeps those stores readable, and the correct response is to delete this
+    /// assertion (its job is done) and decide separately whether
+    /// [`KdfParams::current`] should adopt the new cost for *new* stores.
+    #[test]
+    fn legacy_params_are_the_crate_default_this_build_was_pinned_against() {
+        let d = argon2::Params::default();
+        assert_eq!(
+            (d.m_cost(), d.t_cost(), d.p_cost()),
+            (
+                KdfParams::LEGACY.m_cost,
+                KdfParams::LEGACY.t_cost,
+                KdfParams::LEGACY.p_cost
+            ),
+        );
+        assert_eq!(d.output_len(), None, "32-byte output is the default");
     }
 }

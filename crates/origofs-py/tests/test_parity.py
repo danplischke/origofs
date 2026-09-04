@@ -484,6 +484,13 @@ RUST_ONLY = {
     "write_reader": "bound as `write_path`",
     "write_reader_as": "bound as `write_path_as`",
     "is_ready": "bound as `ready`, which returns the full report rather than a bool",
+    "close": (
+        "bound as `aclose`, plus `async with`. Python spells a deterministic "
+        "async teardown `aclose` -- `close` there reads as the synchronous one, "
+        "which this deliberately is not: every I/O method here is async, so a sync "
+        "close would have to block on the runtime, and doing that from inside the "
+        "running event loop where a server's shutdown hook lives deadlocks."
+    ),
     # -- Rust idiom with no Python meaning --
     "new": "constructor over Arc<dyn ...> backends a Python caller cannot build",
     "open": "same; the `open_*` constructors are the Python surface",
@@ -1644,3 +1651,46 @@ async def test_posix_locks_switch_and_listing_are_bound():
     # Reversible: a workspace is not locked into answering `setlk` forever.
     await ws.set_posix_locks_enabled(False)
     assert await ws.posix_locks_enabled() is False
+
+
+# --- deterministic shutdown (#154) ----------------------------------------
+
+
+@asyncio_test
+async def test_aclose_releases_the_workspace_and_is_idempotent():
+    """`aclose()` is the deterministic teardown a long-lived host had no way to do.
+
+    A FastAPI lifespan opens a workspace at startup and wants its Postgres pool
+    gone at shutdown. Before #154 there was nothing to await: the backends are
+    released when the Rust handle drops, and Python cannot make a drop happen on
+    demand, so a reload or a second lifespan left the old pool alive.
+    """
+    ws = await workspace()
+    await ws.write("/a.txt", b"open for business")
+    assert bytes(await ws.read("/a.txt")) == b"open for business"
+
+    await ws.aclose()
+    # A teardown hook that runs twice -- a lifespan unwinding through an error
+    # path, a test app re-entering -- is ordinary, not an error.
+    await ws.aclose()
+
+
+@asyncio_test
+async def test_a_workspace_is_an_async_context_manager():
+    """`async with` closes on the way out, including when the body raises.
+
+    Entering does no work: `open_*` is the constructor, so the workspace is
+    already open by the time the block has one. The block exists for the exit.
+    """
+    ws = await workspace()
+    async with ws as entered:
+        assert entered is ws
+        await entered.write("/in-block.txt", b"hello")
+        assert bytes(await entered.read("/in-block.txt")) == b"hello"
+
+    # `__aexit__` returns None rather than a true value, so an exception raised
+    # inside the block propagates instead of being swallowed by the cleanup.
+    ws2 = await workspace()
+    with pytest.raises(ValueError):
+        async with ws2:
+            raise ValueError("boom")

@@ -1,0 +1,133 @@
+# Zensical — https://zensical.org
+#
+# Build the user-facing documentation site:
+#
+#     pip install -r requirements-docs.txt
+#     zensical serve            # http://localhost:8000, live reload
+#     zensical build --strict   # what CI runs
+#
+# Everything under `docs/` is published, so a new page needs a `nav` entry.
+# Zensical has no `exclude_docs`, which is why the working documents that used to
+# sit in `docs/` (IMPROVEMENT_PLAN.md, REVIEW.md) now live in `notes/`.
+
+[project]
+site_name = "origofs"
+site_description = "A filesystem where humans and AI agents share the same files, and every edit is recorded against the actor that made it."
+site_url = "https://danplischke.github.io/origofs/"
+repo_url = "https://github.com/danplischke/origofs"
+repo_name = "danplischke/origofs"
+edit_uri = "edit/main/docs/"
+copyright = "Released under the MIT license."
+
+nav = [
+  { "Home" = "index.md" },
+  { "Getting started" = [
+    { "Install" = "getting-started/install.md" },
+    { "Quickstart" = "getting-started/quickstart.md" },
+    { "Core concepts" = "getting-started/concepts.md" },
+  ] },
+  { "Guides" = [
+    { "Working with agents" = "guides/agents.md" },
+    { "Attribution and blame" = "guides/attribution.md" },
+    { "Propose and review" = "guides/review.md" },
+    { "Versioning and branches" = "guides/versioning.md" },
+    { "POSIX mounts" = "guides/mounts.md" },
+    { "Running for a team" = "guides/teams.md" },
+    { "Operating a workspace" = "guides/operating.md" },
+    { "Backup and recovery" = "guides/backup-and-recovery.md" },
+  ] },
+  { "Reference" = [
+    { "CLI" = "reference/cli.md" },
+    { "Configuration" = "reference/configuration.md" },
+    { "Storage backends" = "reference/storage-backends.md" },
+    { "HTTP API" = "reference/http-api.md" },
+    { "MCP server" = "reference/mcp.md" },
+    { "Python" = "reference/python.md" },
+  ] },
+  { "Internals" = [
+    { "Design" = "DESIGN.md" },
+    { "Limits" = "LIMITS.md" },
+    { "Multi-tenancy" = "MULTI_TENANCY.md" },
+    { "Deploying on GCS + Postgres" = "DEPLOY-GCS-POSTGRES.md" },
+  ] },
+]
+
+# A broken cross-reference should fail the build, not go out in the published
+# site. `zensical build --strict` turns these warnings into an error.
+[project.validation]
+invalid_links = true
+invalid_link_anchors = true
+
+[project.theme]
+language = "en"
+features = [
+  "content.action.edit",
+  "content.code.annotate",
+  "content.code.copy",
+  "content.tabs.link",
+  "content.tooltips",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.instant",
+  "navigation.instant.prefetch",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.top",
+  "navigation.tracking",
+  "search.highlight",
+  "toc.follow",
+]
+
+[project.theme.icon]
+repo = "fontawesome/brands/github"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Follow the system theme"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/danplischke/origofs"
+
+[project.markdown_extensions]
+abbr = {}
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+md_in_html = {}
+tables = {}
+toc.permalink = true
+pymdownx.betterem = {}
+pymdownx.caret = {}
+pymdownx.details = {}
+pymdownx.emoji.emoji_generator = "zensical.extensions.emoji.to_svg"
+pymdownx.emoji.emoji_index = "zensical.extensions.emoji.twemoji"
+pymdownx.highlight.anchor_linenums = true
+pymdownx.highlight.line_spans = "__span"
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.inlinehilite = {}
+pymdownx.keys = {}
+pymdownx.mark = {}
+pymdownx.smartsymbols = {}
+pymdownx.superfences = {}
+pymdownx.tabbed.alternate_style = true
+pymdownx.tasklist.custom_checkbox = true
+pymdownx.tilde = {}

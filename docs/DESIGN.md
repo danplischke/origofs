@@ -187,6 +187,30 @@ with the pre-versioning single-byte framings (`1`/`2`) still read forever — un
 build out of the *whole* store at open, and co-editing is an opt-in feature (`coedit`) most workspaces never
 write a byte of; the loud per-document error is the proportionate replacement.
 
+**Encrypted objects carry the same header, and the Argon2id cost lives in the store.** `EncryptedStore` wrote the
+bare AEAD output, so nothing in a bucket recorded which cipher, nonce derivation or KDF had produced an object:
+the one format in the store that could not be evolved, and the one whose failure is least legible — a changed
+scheme decrypts to nothing and reports `Corrupt("wrong key or corrupt data")`, indistinguishable from a wrong
+passphrase on data that is perfectly intact. Objects are now framed `ORGE | version | AEAD(…)`, five bytes that
+change no address (the address is the *plaintext* hash — convergent encryption). Bare pre-envelope objects are
+read forever, and since ciphertext is indistinguishable from random, the header only picks which interpretation
+to try first: the **AEAD tag decides**, so a coincidental `ORGE` prefix (one object in 2^32) costs one extra open
+rather than a false corruption report. The key-derivation parameters were `argon2::Params::default()` — a
+constant the dependency owns and has already moved once (0.4 → 0.5 raised `m_cost` from 4096 to 19456) — so a
+routine `cargo update` could have re-derived a different key for every existing store. They are now pinned
+(`KdfParams::LEGACY`) and recorded per store, in a `kdf` sidecar beside the salt; a store with a salt and no
+descriptor predates this and is legacy by definition. `tests/encryption.rs` pins the ciphertext of a fixed
+`(passphrase, salt, plaintext)`, which fixes the whole chain — Argon2id, BLAKE3's keyed nonce, XChaCha20-Poly1305
+and the framing — against a silent dependency bump.
+
+**`format_version` and `min_reader_version` move independently, and that is what makes an upgrade survivable.**
+`min_reader_version` is the field that gates, so raising it locks every older build out of the *whole* store at
+open. It used to be stamped equal to `format_version`, and stamped on **open** — so the first node in a fleet to
+upgrade would have taken the bucket away from every node that had not, before writing a single object of the new
+version. That inverts rule 3. `format_version` is advisory ("objects this new may be inside") and rises on open;
+`min_reader_version` comes from a separate `MIN_READER_VERSION` constant that is raised deliberately, in the
+release that starts writing objects older readers genuinely cannot use. Neither is ever lowered.
+
 **Packs are versioned at the end, not the start.** A pack object *begins* with raw user bytes: a chunk whose
 contents start with `ORGP` would be indistinguishable from a header, so byte 0 cannot carry a trustworthy tag
 here. The footer can — it is always origofs's own framing, never user data: `… ‖ trailer ‖ trailer_len(u32) ‖
@@ -301,6 +325,27 @@ audit log, change feed, presence, suggestions, and locks.
 Migrations are authored once as dialect-neutral steps with a thin per-engine emitter (`refinery`/`sqlx`
 migrations with two SQL variants where they diverge). Connection pooling via `deadpool`/`sqlx` pool; PgBouncer
 in front for large fleets.
+
+**Upgrade and rollback.** The content store and the metadata store fail in opposite directions, so they get
+opposite treatments. Content is immutable and versioned per object: a newer origofs adds objects, an older one
+keeps reading the ones it knows, and nothing is ever migrated. The database is rewritten in place and **forward
+only** — `MIGRATIONS` is append-only, and there are deliberately **no down-migrations**, because a step that
+dropped the column a newer build had been filling would destroy every row written since the upgrade, silently.
+That leaves three rules:
+
+1. **An older binary refuses a newer database, before touching it.** `Fs::init` compares `schema_meta` against
+   `latest_schema_version()` and reports `UnsupportedVersion` ("upgrade origofs"), the same error and the same
+   remedy as the content-store version byte. Without it the runner would apply the steps it happens to know and
+   work against a schema it does not — past V11 and V13, which changed primary keys, that is the shape that
+   corrupts rather than the shape that fails. The refusal is a precondition, so the database is left byte-for-byte
+   as found and rolling forward again is a recovery, not a repair (`origofs-core/tests/schema_rollback.rs`).
+2. **The way back is a backup taken before the step.** `origofs migrate --backup <path>` snapshots first and
+   applies nothing if the snapshot fails (SQLite's online backup API; Postgres has no in-process equivalent and
+   says so, pointing at `pg_dump`).
+3. **A pending migration has to be visible before it is applied.** Opening a workspace *is* the migration runner,
+   so `origofs migrate` and `origofs schema-version` read the store unmigrated, ahead of the open — otherwise both
+   could only ever report the state the same process had just created, and "should I take a backup?" was
+   unanswerable.
 
 ### 4c. Versioning & Gitflow
 
@@ -477,7 +522,7 @@ Both funnel into one attribution store, so blame is uniform regardless of path.
 
 **Two document shapes, one protocol (ruling, #92).** A co-edited document is either a flat `Y.Text` or a
 `Y.XmlFragment` **tree**. The flat shape is right for source files and anything a diff tool reads; the tree
-shape exists because every mainstream rich-text CRDT binding (`@platejs/yjs`, `y-prosemirror`, `y-slate`,
+shape exists because every mainstream rich-text CRDT binding (`@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror`,
 TipTap) binds to a structured document and cannot attach to flat text. Without it a host had to *mirror* —
 serialize its editor to text on every change and diff it against the shared `Y.Text` — which loses the caret on
 every remote edit, turns serializer round-trip noise into authored bytes, and, worst, caps attribution at the

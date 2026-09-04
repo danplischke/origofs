@@ -137,3 +137,68 @@ async fn an_existing_local_encrypted_workspace_still_opens() {
         b"0123456789abcdef"
     );
 }
+
+/// The Argon2id cost a store predating the `kdf` descriptor is read at.
+///
+/// The parameters used to come from `argon2::Params::default()`, a constant the
+/// crate owns and has moved before. What replaces it has to answer one question
+/// correctly forever: a store that already holds objects was keyed at the *old*
+/// cost, and must go on being keyed at it even after this build's default is
+/// raised. A salt with no descriptor beside it is exactly that store.
+///
+/// The assertion is on the recorded value rather than on a decryption failure,
+/// because `LEGACY` and `current()` are equal today — this is the guard that fails
+/// the day someone raises `current()` and drops the distinction, which would
+/// re-key every existing store at once and report it as a wrong passphrase.
+#[tokio::test]
+async fn a_store_predating_the_kdf_descriptor_keeps_the_legacy_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = dir.path().join("cas");
+    std::fs::create_dir_all(&cas).unwrap();
+    // A store as an older origofs left it: a salt, and nothing describing the cost.
+    std::fs::write(cas.join("keysalt"), b"0123456789abcdef").unwrap();
+    assert!(!cas.join("kdf").exists());
+
+    let ws = Workspace::open_local_encrypted(dir.path().join("m.db"), &cas, "pass")
+        .await
+        .unwrap();
+    ws.write("/f.txt", b"hello").await.unwrap();
+    assert_eq!(&ws.read("/f.txt").await.unwrap()[..], b"hello");
+
+    // Made explicit rather than changed: the store is now self-describing, and it
+    // describes what it always was.
+    let recorded = std::fs::read(cas.join("kdf")).unwrap();
+    assert_eq!(
+        origofs_sdk::KdfParams::decode(&recorded).unwrap(),
+        origofs_sdk::KdfParams::LEGACY,
+        "a store that predates the descriptor must be read at the legacy cost"
+    );
+}
+
+/// A store with neither a salt nor a descriptor is genuinely new, and is the only
+/// kind that may be created at this build's current cost.
+#[tokio::test]
+async fn a_fresh_store_records_the_current_kdf_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = dir.path().join("cas");
+
+    let ws = Workspace::open_local_encrypted(dir.path().join("m.db"), &cas, "pass")
+        .await
+        .unwrap();
+    ws.write("/f.txt", b"hello").await.unwrap();
+
+    let recorded = std::fs::read(cas.join("kdf")).unwrap();
+    assert_eq!(
+        origofs_sdk::KdfParams::decode(&recorded).unwrap(),
+        origofs_sdk::KdfParams::current()
+    );
+
+    // And it is stable across reopens — a second open must adopt what is there,
+    // never re-derive.
+    drop(ws);
+    let ws2 = Workspace::open_local_encrypted(dir.path().join("m.db"), &cas, "pass")
+        .await
+        .unwrap();
+    assert_eq!(&ws2.read("/f.txt").await.unwrap()[..], b"hello");
+    assert_eq!(std::fs::read(cas.join("kdf")).unwrap(), recorded);
+}

@@ -18,11 +18,11 @@ name = "_origofs"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-origofs-core = { version = "0.0.4", path = "../origofs-core" }
+origofs-core = { version = "0.0.6", path = "../origofs-core" }
 # `coedit` is always on for the Python bindings: a wheel is one artifact, so live
 # co-editing (CoeditDoc + the y-sync surface) ships in every build rather than
 # hiding behind a Cargo feature a `pip install` couldn't select.
-origofs-sdk = { version = "0.0.4", path = "../origofs-sdk", features = ["coedit"] }
+origofs-sdk = { version = "0.0.6", path = "../origofs-sdk", features = ["coedit"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync"] }
 pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
 pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
@@ -33,7 +33,7 @@ pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
 # it isn't available. These are feature-gated modules of the sdk, enabled here —
 # Cargo unions these features with the base `coedit` above.
 [target.'cfg(unix)'.dependencies]
-origofs-sdk = { version = "0.0.4", path = "../origofs-sdk", features = ["nfs"] }
+origofs-sdk = { version = "0.0.6", path = "../origofs-sdk", features = ["nfs"] }
 
 # FUSE is **Linux-only for the wheel**, narrower than the sdk's own `cfg(unix)`
 # reach. `fuser` links `libfuse` at build time, which on macOS means the macFUSE
@@ -48,7 +48,7 @@ origofs-sdk = { version = "0.0.4", path = "../origofs-sdk", features = ["nfs"] }
 # Building origofs-py from source on a Mac with macFUSE installed is still
 # possible — enable the sdk's `fuse` feature and the `fuser` dep by hand.
 [target.'cfg(target_os = "linux")'.dependencies]
-origofs-sdk = { version = "0.0.4", path = "../origofs-sdk", features = ["fuse"] }
+origofs-sdk = { version = "0.0.6", path = "../origofs-sdk", features = ["fuse"] }
 # `fuser::BackgroundSession` is held directly in a pyclass field (src/lib.rs).
 fuser = "0.17"
 

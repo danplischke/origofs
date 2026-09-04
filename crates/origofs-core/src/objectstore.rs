@@ -641,6 +641,12 @@ impl ContentStore for ObjectContentStore {
         }
     }
 
+    // No `close` override, deliberately (issue #154). `object_store` exposes no
+    // shutdown hook on its backends — the underlying `reqwest` client owns a
+    // connection pool it reclaims when the last `Arc` drops, and there is nothing
+    // to ask it to do sooner. Saying so here rather than writing a no-op that
+    // looks like a decision: an S3/GCS store is released by dropping it, so the
+    // deterministic half of a shutdown is the metadata pool.
     async fn ping(&self) -> Result<()> {
         // A HEAD on a sentinel path: a NotFound means the bucket answered (it is
         // reachable and we are authenticated); any other error means we could not

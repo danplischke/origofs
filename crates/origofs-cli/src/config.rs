@@ -197,6 +197,41 @@ impl Config {
         toml::from_str(&text).with_context(|| format!("parsing config file {}", path.display()))
     }
 
+    /// The workspace's metadata database path, as this configuration resolves it.
+    /// Postgres has none; the default is `<workspace>/meta.db`.
+    fn sqlite_db_path(&self, workspace: &Path) -> PathBuf {
+        match &self.metadata {
+            Metadata::Sqlite { path } => path.clone().unwrap_or_else(|| workspace.join("meta.db")),
+            Metadata::Postgres { .. } => workspace.join("meta.db"),
+        }
+    }
+
+    /// The metadata store **alone, unmigrated** — no content backend, no `init`.
+    ///
+    /// Every other path into a workspace runs `Fs::init`, which *is* the migration
+    /// runner. That makes the schema unobservable before it changes: `origofs
+    /// schema-version` reported the version it had just created, and `origofs
+    /// migrate` — documented as the deliberate deploy step — could only ever say
+    /// "already current", because opening the workspace two lines earlier had
+    /// applied everything. An operator could not answer "will this deploy migrate
+    /// my database?", let alone take a backup first, which is the one thing that
+    /// makes the upgrade reversible.
+    ///
+    /// So these two subcommands get a store that has been opened and nothing more.
+    /// Nothing here writes: SQLite creates an empty file if none exists (which
+    /// reports version 0, the fresh case), and Postgres only connects.
+    pub async fn open_metadata_unmigrated(
+        &self,
+        workspace: &Path,
+    ) -> Result<Arc<dyn MetadataStore>> {
+        Ok(match &self.metadata {
+            Metadata::Sqlite { .. } => {
+                Arc::new(SqliteMetadataStore::open(self.sqlite_db_path(workspace))?)
+            }
+            Metadata::Postgres { dsn } => Arc::new(PostgresMetadataStore::connect(dsn).await?),
+        })
+    }
+
     /// Open the workspace this configuration describes, routing to the matching
     /// `Workspace::open_*` constructor. `workspace` is the `--workspace` directory:
     /// it roots any defaulted path and homes local sidecars (the pack index, the
