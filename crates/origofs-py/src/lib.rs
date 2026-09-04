@@ -2996,9 +2996,11 @@ impl Workspace {
         })
     }
 
-    /// Claim the undo stack for ``(path, actor_id)`` on behalf of ``holder``
-    /// (this worker), or renew a claim it already has. Returns whether it now
-    /// owns it.
+    /// Claim the undo stack for the document ``(path, root)`` on behalf of
+    /// ``holder`` (this worker), or renew a claim it already has. ``root`` is the
+    /// ``XmlFragment`` root of a tree document and defaults to the flat shape's
+    /// empty string — a *document* is ``(path, shape)``, not a path, and one path
+    /// may be open in both at once. Returns whether it now owns it.
     ///
     /// **A worker must hold this before calling ``doc.track_undo``.** At most one
     /// may keep an actor's stack for a document: two independent stacks can pop
@@ -3009,34 +3011,40 @@ impl Workspace {
     ///
     /// Single-worker deployments are unaffected: two tabs are the same holder, so
     /// both claims succeed and they share one stack.
+    #[pyo3(signature = (path, actor_id, holder, root=None))]
     fn claim_undo_stack<'py>(
         &self,
         py: Python<'py>,
         path: String,
         actor_id: i64,
         holder: String,
+        root: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
+        let root = root.unwrap_or_default();
         future_into_py(py, async move {
-            ws.claim_undo_stack(&path, actor_id, &holder)
+            ws.claim_undo_stack(&path, &root, actor_id, &holder)
                 .await
                 .map_err(to_pyerr)
         })
     }
 
-    /// Drop ``holder``'s claim on ``(path, actor_id)`` — the actor's last socket
-    /// on this worker leaving, so another worker can serve them immediately
-    /// rather than waiting out a lease.
+    /// Drop ``holder``'s claim on the document ``(path, root)`` — the actor's
+    /// last socket on this worker leaving, so another worker can serve them
+    /// immediately rather than waiting out a lease.
+    #[pyo3(signature = (path, actor_id, holder, root=None))]
     fn release_undo_stack<'py>(
         &self,
         py: Python<'py>,
         path: String,
         actor_id: i64,
         holder: String,
+        root: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
+        let root = root.unwrap_or_default();
         future_into_py(py, async move {
-            ws.release_undo_stack(&path, actor_id, &holder)
+            ws.release_undo_stack(&path, &root, actor_id, &holder)
                 .await
                 .map_err(to_pyerr)
         })

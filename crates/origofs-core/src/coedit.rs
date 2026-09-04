@@ -1417,8 +1417,14 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// so blame shows each collaborator's exact character ranges (sub-line and
     /// interleaved). `ctx` is the actor performing the checkpoint (recorded on the
     /// op-log); any span the CRDT left unattributed falls back to `ctx`.
-    /// Claim the undo stack for `(path, actor_id)` on behalf of `holder`, or
-    /// renew a claim `holder` already has. Returns whether `holder` now owns it.
+    /// Claim the undo stack for the document `(path, root)` on behalf of
+    /// `holder`, or renew a claim it already has. Returns whether it now owns it.
+    ///
+    /// `root` is the `XmlFragment` root of a tree-shaped document, empty for the
+    /// flat shape. A *document* is `(path, shape)`, not a path: one path may be
+    /// open in both at once and they are two documents with two stacks, so a
+    /// claim keyed on the path alone lets one shape's release free a claim the
+    /// other still has a live stack under.
     ///
     /// **A worker must hold this before tracking an actor's edits.** At most one
     /// worker may keep an actor's stack for a document, because two independent
@@ -1431,22 +1437,38 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// before. It bites only when routing splits an actor across workers, and
     /// there the honest answer is that the second tab has no undo — which a
     /// client can say, unlike a stack that quietly corrupts attribution.
-    pub async fn claim_undo_stack(&self, path: &str, actor_id: i64, holder: &str) -> Result<bool> {
-        let now = self.now_secs();
-        self.meta
-            .claim_undo_stack(path, actor_id, holder, now + UNDO_CLAIM_LEASE_SECS, now)
-            .await
-    }
-
-    /// Drop `holder`'s claim on `(path, actor_id)` — the actor's last socket on
-    /// this worker leaving.
-    pub async fn release_undo_stack(
+    pub async fn claim_undo_stack(
         &self,
         path: &str,
+        root: &str,
         actor_id: i64,
         holder: &str,
     ) -> Result<bool> {
-        self.meta.release_undo_stack(path, actor_id, holder).await
+        let now = self.now_secs();
+        self.meta
+            .claim_undo_stack(
+                path,
+                root,
+                actor_id,
+                holder,
+                now + UNDO_CLAIM_LEASE_SECS,
+                now,
+            )
+            .await
+    }
+
+    /// Drop `holder`'s claim on the document `(path, root)` — the actor's last
+    /// socket on this worker leaving.
+    pub async fn release_undo_stack(
+        &self,
+        path: &str,
+        root: &str,
+        actor_id: i64,
+        holder: &str,
+    ) -> Result<bool> {
+        self.meta
+            .release_undo_stack(path, root, actor_id, holder)
+            .await
     }
 
     /// Drop every claim `holder` has — a clean shutdown, so the next worker to

@@ -459,3 +459,74 @@ async fn a_second_worker_is_refused_the_same_actors_stack() {
     }
     panic!("the claim was not released when the holding worker's last socket left");
 }
+
+/// A path open in BOTH shapes at once — which `_tree_key`'s own comment says is
+/// legitimate ("a terminal editor on the flat shape, a browser on the tree").
+#[tokio::test]
+async fn the_two_shapes_of_one_path_do_not_share_an_undo_claim() {
+    let (srv, _alice, _bob) = serve().await;
+
+    let (mut flat, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{}/v1/coedit/doc.md?token=tok-alice",
+        srv.addr
+    ))
+    .await
+    .unwrap();
+    let flat_aware = Awareness::new(Doc::new());
+    pump(&mut flat, &flat_aware).await;
+
+    let (mut tree, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{}/v1/coedit-tree/doc.md?token=tok-alice",
+        srv.addr
+    ))
+    .await
+    .unwrap();
+    let tree_aware = Awareness::new(Doc::new());
+    pump(&mut tree, &tree_aware).await;
+
+    // Both are alice's own documents; both must offer her undo.
+    let (_, flat_body) = post_undo(&srv, "tok-alice", "doc.md", false).await;
+    assert!(
+        flat_body.contains("\"available\":true"),
+        "flat shape: {flat_body}"
+    );
+    let (_, tree_body) = post_undo_body(
+        &srv,
+        "tok-alice",
+        "doc.md",
+        serde_json::json!({ "root": origofs_sdk::DEFAULT_TREE_ROOT }),
+    )
+    .await;
+    assert!(
+        tree_body.contains("\"available\":true"),
+        "the tree shape of the same path was refused alice's undo stack, because \
+         the claim is keyed by path and ignores the shape: {tree_body}"
+    );
+
+    // Now close the flat socket. Its release must not strip the claim the tree
+    // room is still relying on.
+    flat.send(Ws::Close(None)).await.ok();
+    drop(flat);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Ask the *store*, not this worker: `hold_undo` short-circuits on its own
+    // in-memory `undo_held`, so it would answer "yes" from a stale belief. The
+    // invariant is that nobody else can take the claim while a live stack exists.
+    let stolen = srv
+        .ws
+        .claim_undo_stack(
+            "/doc.md",
+            origofs_sdk::DEFAULT_TREE_ROOT,
+            _alice,
+            "some-other-worker",
+        )
+        .await
+        .unwrap();
+    assert!(
+        !stolen,
+        "closing the flat socket released the claim the still-open tree room \
+         still has a live stack under, so another worker just took it — the \
+         two-stack condition the claim exists to prevent. The claim is keyed by \
+         path and ignores the document shape."
+    );
+}

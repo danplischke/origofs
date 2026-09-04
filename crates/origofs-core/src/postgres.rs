@@ -1905,6 +1905,7 @@ impl MetadataStore for PostgresMetadataStore {
     async fn claim_undo_stack(
         &self,
         path: &str,
+        root: &str,
         actor_id: i64,
         holder: &str,
         expires_at: i64,
@@ -1920,9 +1921,9 @@ impl MetadataStore for PostgresMetadataStore {
         let n = c
             .execute(
                 "INSERT INTO coedit_undo_claim \
-                   (workspace_id, path, actor_id, holder, claimed_at, expires_at) \
-                 VALUES ($1, $2, $3, $4, $6, $5) \
-                 ON CONFLICT (workspace_id, path, actor_id) DO UPDATE SET \
+                   (workspace_id, path, root, actor_id, holder, claimed_at, expires_at) \
+                 VALUES ($1, $2, $7, $3, $4, $6, $5) \
+                 ON CONFLICT (workspace_id, path, root, actor_id) DO UPDATE SET \
                    holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at \
                  WHERE coedit_undo_claim.holder = EXCLUDED.holder \
                     OR coedit_undo_claim.expires_at <= $6",
@@ -1933,21 +1934,29 @@ impl MetadataStore for PostgresMetadataStore {
                     &holder,
                     &expires_at,
                     &now,
+                    &root,
                 ],
             )
             .await?;
         Ok(n > 0)
     }
 
-    async fn release_undo_stack(&self, path: &str, actor_id: i64, holder: &str) -> Result<bool> {
+    async fn release_undo_stack(
+        &self,
+        path: &str,
+        root: &str,
+        actor_id: i64,
+        holder: &str,
+    ) -> Result<bool> {
         let c = self.client().await?;
         // Scoped to `holder`: a claim since taken over by another worker (this
         // one's lease expired) is not ours to drop.
         let n = c
             .execute(
                 "DELETE FROM coedit_undo_claim \
-                 WHERE workspace_id = $1 AND path = $2 AND actor_id = $3 AND holder = $4",
-                &[&self.workspace_id, &path, &actor_id, &holder],
+                 WHERE workspace_id = $1 AND path = $2 AND root = $5 \
+                   AND actor_id = $3 AND holder = $4",
+                &[&self.workspace_id, &path, &actor_id, &holder, &root],
             )
             .await?;
         Ok(n > 0)

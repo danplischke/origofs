@@ -271,6 +271,21 @@ impl RoomKey {
         }
     }
 
+    /// The `XmlFragment` root, or `""` for the flat shape — the second half of a
+    /// document's identity, alongside its path.
+    ///
+    /// An undo claim is keyed on both. One path may legitimately be open in both
+    /// shapes at once (this registry keys on the shape for exactly that reason),
+    /// and they are two documents with two independent stacks; a claim on the
+    /// path alone let one shape's release free a claim the other still had a
+    /// live stack under.
+    fn claim_root(&self) -> &str {
+        match self {
+            Self::Flat(_) => "",
+            Self::Tree { root, .. } => root,
+        }
+    }
+
     /// The routing key peers publish and subscribe under.
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     fn relay_key(&self) -> String {
@@ -586,7 +601,7 @@ impl Coordinator {
         }
         let held = self
             .ws
-            .claim_undo_stack(key.path(), ctx.actor, &self.origin)
+            .claim_undo_stack(key.path(), key.claim_root(), ctx.actor, &self.origin)
             .await
             .unwrap_or(false);
         if held {
@@ -798,7 +813,12 @@ impl Coordinator {
                         if slot.undo_held.remove(&ctx.actor) {
                             let _ = self
                                 .ws
-                                .release_undo_stack(key.path(), ctx.actor, &self.origin)
+                                .release_undo_stack(
+                                    key.path(),
+                                    key.claim_root(),
+                                    ctx.actor,
+                                    &self.origin,
+                                )
                                 .await;
                         }
                     }

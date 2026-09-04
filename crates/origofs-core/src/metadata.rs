@@ -418,8 +418,13 @@ pub trait MetadataStore: Send + Sync {
 
     // --- co-editing undo claims (#146) -----------------------------------
 
-    /// Claim the undo stack for `(path, actor_id)` on behalf of `holder`, or
-    /// renew a claim `holder` already has. Returns whether `holder` now owns it.
+    /// Claim the undo stack for `(path, root, actor_id)` on behalf of `holder`,
+    /// or renew a claim `holder` already has. Returns whether `holder` now owns it.
+    ///
+    /// `root` is the `XmlFragment` root of a tree-shaped document, and the empty
+    /// string for the flat shape. It is part of the identity because a *document*
+    /// is `(path, shape)`: one path may be open in both at once, and they are two
+    /// documents with two independent undo stacks.
     ///
     /// Answers `false` when a **different** worker holds a live claim, which is
     /// the whole point: at most one worker may keep an actor's undo stack for a
@@ -433,15 +438,22 @@ pub trait MetadataStore: Send + Sync {
     async fn claim_undo_stack(
         &self,
         path: &str,
+        root: &str,
         actor_id: i64,
         holder: &str,
         expires_at: i64,
         now: i64,
     ) -> Result<bool>;
 
-    /// Drop `holder`'s claim on `(path, actor_id)` — the actor's last socket on
-    /// this worker leaving. A claim held by someone else is left alone.
-    async fn release_undo_stack(&self, path: &str, actor_id: i64, holder: &str) -> Result<bool>;
+    /// Drop `holder`'s claim on `(path, root, actor_id)` — the actor's last socket
+    /// on this worker leaving. A claim held by someone else is left alone.
+    async fn release_undo_stack(
+        &self,
+        path: &str,
+        root: &str,
+        actor_id: i64,
+        holder: &str,
+    ) -> Result<bool>;
 
     /// Drop every claim one worker holds — a clean shutdown, so the next worker
     /// to see the actor does not wait out a lease.
@@ -931,17 +943,26 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     async fn claim_undo_stack(
         &self,
         path: &str,
+        root: &str,
         actor_id: i64,
         holder: &str,
         expires_at: i64,
         now: i64,
     ) -> Result<bool> {
         (**self)
-            .claim_undo_stack(path, actor_id, holder, expires_at, now)
+            .claim_undo_stack(path, root, actor_id, holder, expires_at, now)
             .await
     }
-    async fn release_undo_stack(&self, path: &str, actor_id: i64, holder: &str) -> Result<bool> {
-        (**self).release_undo_stack(path, actor_id, holder).await
+    async fn release_undo_stack(
+        &self,
+        path: &str,
+        root: &str,
+        actor_id: i64,
+        holder: &str,
+    ) -> Result<bool> {
+        (**self)
+            .release_undo_stack(path, root, actor_id, holder)
+            .await
     }
     async fn release_undo_claims_for_holder(&self, holder: &str) -> Result<u64> {
         (**self).release_undo_claims_for_holder(holder).await

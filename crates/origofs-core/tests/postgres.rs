@@ -937,3 +937,168 @@ fn ev_owned(path: &str) -> EventInit {
         branch: None,
     }
 }
+
+// --- co-editing undo-stack claims (#146) ------------------------------------
+
+/// The claim's exclusion on the backend that actually matters for it.
+///
+/// SQLite cannot test this properly: its store serializes every call through one
+/// `parking_lot::Mutex` around a single `Connection`, so "concurrent" claimants
+/// there are executed one at a time and the test passes even against a
+/// deliberately non-atomic read-then-write (verified). Postgres runs each
+/// claimant on its own pooled connection, so the upsert's atomicity is the only
+/// thing standing between two workers and two live undo stacks — which is the
+/// two-stack condition that strips an author stamp and leaves restored text
+/// unattributed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn postgres_concurrent_undo_claims_produce_exactly_one_winner() {
+    let Some(dsn) = dsn() else {
+        eprintln!("skipping postgres undo claim: ORIGOFS_PG_TEST_URL unset");
+        return;
+    };
+    let _guard = pg_lock().lock().await;
+    reset(&dsn).await;
+    let meta = Arc::new(PostgresMetadataStore::connect(&dsn).await.unwrap());
+    meta.init().await.unwrap();
+
+    const NOW: i64 = 1_000_000;
+    const LEASE: i64 = 3600;
+
+    // Every claimant races for the same (path, actor) on its own connection.
+    let mut tasks = Vec::new();
+    for i in 0..24 {
+        let meta = meta.clone();
+        tasks.push(tokio::spawn(async move {
+            meta.claim_undo_stack("/doc.md", "", 7, &format!("worker-{i}"), NOW + LEASE, NOW)
+                .await
+                .unwrap()
+        }));
+    }
+    let mut winners = 0;
+    for t in tasks {
+        if t.await.unwrap() {
+            winners += 1;
+        }
+    }
+    assert_eq!(
+        winners, 1,
+        "{winners} workers were granted the same actor's undo stack; the claim \
+         upsert is not atomic, so two live stacks can exist and an undo on one \
+         can strip an author stamp the other's restore needs"
+    );
+}
+
+/// The rest of the claim contract, on Postgres — the same assertions
+/// `coedit_undo_claim.rs` makes on SQLite, because the two backends author their
+/// own SQL and only running both proves they agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_undo_claim_contract_matches_sqlite() {
+    let Some(dsn) = dsn() else {
+        eprintln!("skipping postgres undo claim contract: ORIGOFS_PG_TEST_URL unset");
+        return;
+    };
+    let _guard = pg_lock().lock().await;
+    reset(&dsn).await;
+    let meta = PostgresMetadataStore::connect(&dsn).await.unwrap();
+    meta.init().await.unwrap();
+
+    const NOW: i64 = 1_000_000;
+    const LEASE: i64 = 3600;
+    let claim = async |path: &str, actor: i64, holder: &str| -> bool {
+        meta.claim_undo_stack(path, "", actor, holder, NOW + LEASE, NOW)
+            .await
+            .unwrap()
+    };
+
+    // Exclusive, and the holder may re-claim (that is how a rejoin renews).
+    assert!(claim("/doc.md", 7, "worker-a").await);
+    assert!(!claim("/doc.md", 7, "worker-b").await);
+    assert!(claim("/doc.md", 7, "worker-a").await);
+
+    // Per (path, actor): another actor here, or the same actor elsewhere, is free.
+    assert!(claim("/doc.md", 8, "worker-b").await);
+    assert!(claim("/other.md", 7, "worker-b").await);
+
+    // A release names its holder, so a lapsed worker cannot drop its successor's.
+    assert!(
+        !meta
+            .release_undo_stack("/doc.md", "", 7, "worker-b")
+            .await
+            .unwrap()
+    );
+    assert!(
+        meta.release_undo_stack("/doc.md", "", 7, "worker-a")
+            .await
+            .unwrap()
+    );
+    assert!(claim("/doc.md", 7, "worker-b").await);
+
+    // An expired claim is taken over — the lease is what stops one crash denying
+    // an actor undo until somebody edits the database by hand.
+    assert!(
+        meta.claim_undo_stack("/stale.md", "", 9, "crashed", NOW - 1, NOW - 2)
+            .await
+            .unwrap()
+    );
+    assert!(claim("/stale.md", 9, "worker-c").await);
+
+    // Renewal extends only the holder's claims.
+    assert!(
+        meta.claim_undo_stack("/r.md", "", 1, "worker-a", NOW - 1, NOW - 2)
+            .await
+            .unwrap()
+    );
+    assert!(
+        meta.claim_undo_stack("/r.md", "", 2, "worker-b", NOW - 1, NOW - 2)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        meta.renew_undo_claims("worker-a", NOW + LEASE)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        !claim("/r.md", 1, "worker-c").await,
+        "renewed, not takeable"
+    );
+    assert!(
+        claim("/r.md", 2, "worker-c").await,
+        "still expired, takeable"
+    );
+
+    // A document is (path, shape): the two shapes of one path are separate, and
+    // releasing one must not free the other.
+    assert!(
+        meta.claim_undo_stack("/shape.md", "", 5, "worker-a", NOW + LEASE, NOW)
+            .await
+            .unwrap()
+    );
+    assert!(
+        meta.claim_undo_stack("/shape.md", "content", 5, "worker-b", NOW + LEASE, NOW)
+            .await
+            .unwrap(),
+        "the tree shape was refused a claim the flat shape holds"
+    );
+    assert!(
+        meta.release_undo_stack("/shape.md", "", 5, "worker-a")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !meta
+            .claim_undo_stack("/shape.md", "content", 5, "worker-c", NOW + LEASE, NOW)
+            .await
+            .unwrap(),
+        "releasing the flat shape's claim freed the tree shape's live one"
+    );
+
+    // A clean shutdown drops everything that worker holds, and nothing else.
+    let before = meta
+        .release_undo_claims_for_holder("worker-b")
+        .await
+        .unwrap();
+    assert!(before > 0);
+    assert!(claim("/doc.md", 8, "worker-d").await);
+}

@@ -887,19 +887,32 @@ CREATE TABLE IF NOT EXISTS symlink(
 );
 ";
 
-// V22 — the co-editing undo-stack claim (see the migration entry above). Keyed by
-// `(workspace, path, actor)`: the unit is one actor's stack for one document, not
-// the room, because two *different* actors in the same room hold independent
-// stacks and always could.
+// V22 — the co-editing undo-stack claim (see the migration entry above).
+//
+// Keyed by `(workspace, path, root, actor)`. Two parts of that are easy to get
+// wrong, and one of them was:
+//
+// **`actor`**, because two *different* actors in the same room hold independent
+// stacks and always could — the unit is one actor's stack, not the room.
+//
+// **`root`**, because a document is `(path, shape)` and not a path. One path may
+// legitimately be open in both shapes at once — a terminal editor on the flat
+// `Y.Text`, a browser on the `Y.XmlFragment` — which is exactly why the room
+// registry keys on the shape too. Keyed on `path` alone, the two shapes shared
+// one claim: closing the flat editor deleted the row while the tree room still
+// held a live stack under it, and another worker could then claim it. That is
+// the two-stack condition the claim exists to prevent, reintroduced by the
+// prevention. `root` is the empty string for the flat shape, which has none.
 const V22: &str = "
 CREATE TABLE IF NOT EXISTS coedit_undo_claim(
     workspace_id BIGINT NOT NULL,
     path         TEXT   NOT NULL,
+    root         TEXT   NOT NULL,
     actor_id     BIGINT NOT NULL,
     holder       TEXT   NOT NULL,
     claimed_at   BIGINT NOT NULL,
     expires_at   BIGINT NOT NULL,
-    PRIMARY KEY (workspace_id, path, actor_id)
+    PRIMARY KEY (workspace_id, path, root, actor_id)
 );
 CREATE INDEX IF NOT EXISTS idx_coedit_undo_claim_holder ON coedit_undo_claim(holder);
 CREATE INDEX IF NOT EXISTS idx_coedit_undo_claim_expiry ON coedit_undo_claim(expires_at);

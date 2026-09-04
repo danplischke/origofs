@@ -2023,8 +2023,9 @@ impl Workspace {
         self.fs.ensure_may_undo_at(ctx, path, redo).await
     }
 
-    /// Claim the undo stack for `(path, actor_id)` on behalf of `holder` (this
-    /// worker), or renew a claim it already has. Returns whether it now owns it.
+    /// Claim the undo stack for the document `(path, root)` on behalf of `holder`
+    /// (this worker), or renew a claim it already has. `root` is empty for the
+    /// flat shape. Returns whether it now owns it.
     ///
     /// A worker must hold this before tracking an actor's edits for undo: at most
     /// one may, because two independent stacks popping overlapping items can
@@ -2032,19 +2033,29 @@ impl Workspace {
     /// Single-worker deployments are unaffected — two tabs are the same holder.
     /// Requires the `coedit` feature.
     #[cfg(feature = "coedit")]
-    pub async fn claim_undo_stack(&self, path: &str, actor_id: i64, holder: &str) -> Result<bool> {
-        self.fs.claim_undo_stack(path, actor_id, holder).await
+    pub async fn claim_undo_stack(
+        &self,
+        path: &str,
+        root: &str,
+        actor_id: i64,
+        holder: &str,
+    ) -> Result<bool> {
+        self.fs.claim_undo_stack(path, root, actor_id, holder).await
     }
 
-    /// Drop `holder`'s claim on `(path, actor_id)`.
+    /// Drop `holder`'s claim on the document `(path, root)`. `root` is empty for
+    /// the flat shape; a document is `(path, shape)`, not a path.
     #[cfg(feature = "coedit")]
     pub async fn release_undo_stack(
         &self,
         path: &str,
+        root: &str,
         actor_id: i64,
         holder: &str,
     ) -> Result<bool> {
-        self.fs.release_undo_stack(path, actor_id, holder).await
+        self.fs
+            .release_undo_stack(path, root, actor_id, holder)
+            .await
     }
 
     /// Drop every undo claim `holder` has — a clean shutdown.

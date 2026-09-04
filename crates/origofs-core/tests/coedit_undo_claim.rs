@@ -34,7 +34,19 @@ async fn store() -> Arc<SqliteMetadataStore> {
 
 /// A claim with an hour of lease left, as of [`NOW`].
 async fn claim(m: &SqliteMetadataStore, path: &str, actor: i64, holder: &str) -> bool {
-    m.claim_undo_stack(path, actor, holder, NOW + LEASE, NOW)
+    claim_shape(m, path, "", actor, holder).await
+}
+
+/// The same, for a document of a given shape — `""` flat, an `XmlFragment` root
+/// for the tree.
+async fn claim_shape(
+    m: &SqliteMetadataStore,
+    path: &str,
+    root: &str,
+    actor: i64,
+    holder: &str,
+) -> bool {
+    m.claim_undo_stack(path, root, actor, holder, NOW + LEASE, NOW)
         .await
         .unwrap()
 }
@@ -42,7 +54,7 @@ async fn claim(m: &SqliteMetadataStore, path: &str, actor: i64, holder: &str) ->
 /// A claim whose lease ran out before [`NOW`] — the shape a crashed worker leaves.
 async fn stale_claim(m: &SqliteMetadataStore, path: &str, actor: i64, holder: &str) {
     assert!(
-        m.claim_undo_stack(path, actor, holder, NOW - 1, NOW - 2)
+        m.claim_undo_stack(path, "", actor, holder, NOW - 1, NOW - 2)
             .await
             .unwrap()
     );
@@ -86,7 +98,7 @@ async fn releasing_frees_the_actor_immediately() {
     assert!(!claim(&m, "/doc.md", 7, "worker-b").await);
 
     assert!(
-        m.release_undo_stack("/doc.md", 7, "worker-a")
+        m.release_undo_stack("/doc.md", "", 7, "worker-a")
             .await
             .unwrap()
     );
@@ -101,7 +113,7 @@ async fn a_release_cannot_drop_someone_elses_claim() {
 
     assert!(claim(&m, "/doc.md", 7, "worker-a").await);
     assert!(
-        !m.release_undo_stack("/doc.md", 7, "worker-b")
+        !m.release_undo_stack("/doc.md", "", 7, "worker-b")
             .await
             .unwrap(),
         "a stale worker deleted the claim its successor holds"
@@ -190,7 +202,7 @@ async fn concurrent_claims_produce_exactly_one_winner() {
     for i in 0..16 {
         let m = m.clone();
         tasks.push(tokio::spawn(async move {
-            m.claim_undo_stack("/doc.md", 7, &format!("worker-{i}"), NOW + LEASE, NOW)
+            m.claim_undo_stack("/doc.md", "", 7, &format!("worker-{i}"), NOW + LEASE, NOW)
                 .await
                 .unwrap()
         }));
@@ -206,4 +218,42 @@ async fn concurrent_claims_produce_exactly_one_winner() {
         "{winners} workers were granted the same actor's undo stack; the claim is \
          not atomic"
     );
+}
+
+/// A **document** is `(path, shape)`, not a path. One path may legitimately be
+/// open in both shapes at once — a terminal editor on the flat `Y.Text`, a
+/// browser on the `Y.XmlFragment` — which is why the room registry keys on the
+/// shape too.
+///
+/// Keyed on the path alone, the two shared one claim row, and the consequence
+/// was not merely "one shape has no undo": closing the flat editor **deleted the
+/// row while the tree room still held a live stack under it**, so another worker
+/// could then claim it. That is the two-stack condition the claim exists to
+/// prevent, reintroduced by the prevention.
+#[tokio::test]
+async fn the_two_shapes_of_one_path_are_separate_documents() {
+    let m = store().await;
+
+    // Both shapes of one path, same actor: two documents, two claims.
+    assert!(claim_shape(&m, "/doc.md", "", 7, "worker-a").await);
+    assert!(
+        claim_shape(&m, "/doc.md", "content", 7, "worker-b").await,
+        "the tree shape was refused a claim the flat shape holds; they are \
+         different documents with independent undo stacks"
+    );
+
+    // Releasing one must not free the other.
+    assert!(
+        m.release_undo_stack("/doc.md", "", 7, "worker-a")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !claim_shape(&m, "/doc.md", "content", 7, "worker-c").await,
+        "releasing the flat shape's claim freed the tree shape's, which still \
+         has a live stack under it — another worker just took it"
+    );
+
+    // …and two different fragment roots are two documents as well.
+    assert!(claim_shape(&m, "/doc.md", "other-root", 7, "worker-c").await);
 }

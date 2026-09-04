@@ -715,7 +715,9 @@ class _Rooms:
         taking it if it does not already (#146).
 
         At most one worker may keep an actor's stack for a document -- see
-        `_Room.undo_held` for what goes wrong otherwise. A failure to reach the
+        `_Room.undo_held` for what goes wrong otherwise. The claim is keyed on the
+        room's `(path, xml_root)`, because a *document* is a path plus a shape and
+        one path may legitimately be open in both at once. A failure to reach the
         store is treated as *not held*, so a metadata blip costs an actor their
         undo rather than risking a second live stack: undo is an affordance,
         attribution is the product.
@@ -725,7 +727,9 @@ class _Rooms:
             return True  # already ours; the lease renewer keeps it
         try:
             held = bool(
-                await self._ws.claim_undo_stack(room.path, actor, self._origin)
+                await self._ws.claim_undo_stack(
+                    room.path, actor, self._origin, room.xml_root or ""
+                )
             )
         except (AttributeError, Exception):
             # An older extension without the claim, or a store blip.
@@ -830,7 +834,7 @@ class _Rooms:
                     room.undo_held.discard(actor)
                     try:
                         await self._ws.release_undo_stack(
-                            room.path, actor, self._origin
+                            room.path, actor, self._origin, room.xml_root or ""
                         )
                     except (AttributeError, Exception):
                         pass

@@ -1534,12 +1534,13 @@ impl MetadataStore for SqliteMetadataStore {
     async fn claim_undo_stack(
         &self,
         path: &str,
+        root: &str,
         actor_id: i64,
         holder: &str,
         expires_at: i64,
         now: i64,
     ) -> Result<bool> {
-        let (path, holder) = (path.to_string(), holder.to_string());
+        let (path, root, holder) = (path.to_string(), root.to_string(), holder.to_string());
         blocking_section(move || {
             let conn = self.lock();
             // One statement, so read-decide-write is atomic without an explicit
@@ -1548,28 +1549,43 @@ impl MetadataStore for SqliteMetadataStore {
             // workers racing here cannot both be told yes.
             let n = conn.execute(
                 "INSERT INTO coedit_undo_claim \
-                   (workspace_id, path, actor_id, holder, claimed_at, expires_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?6, ?5) \
-                 ON CONFLICT(workspace_id, path, actor_id) DO UPDATE SET \
+                   (workspace_id, path, root, actor_id, holder, claimed_at, expires_at) \
+                 VALUES (?1, ?2, ?7, ?3, ?4, ?6, ?5) \
+                 ON CONFLICT(workspace_id, path, root, actor_id) DO UPDATE SET \
                    holder = excluded.holder, expires_at = excluded.expires_at \
                  WHERE coedit_undo_claim.holder = excluded.holder \
                     OR coedit_undo_claim.expires_at <= ?6",
-                params![self.workspace_id, path, actor_id, holder, expires_at, now],
+                params![
+                    self.workspace_id,
+                    path,
+                    actor_id,
+                    holder,
+                    expires_at,
+                    now,
+                    root
+                ],
             )?;
             Ok(n > 0)
         })
     }
 
-    async fn release_undo_stack(&self, path: &str, actor_id: i64, holder: &str) -> Result<bool> {
-        let (path, holder) = (path.to_string(), holder.to_string());
+    async fn release_undo_stack(
+        &self,
+        path: &str,
+        root: &str,
+        actor_id: i64,
+        holder: &str,
+    ) -> Result<bool> {
+        let (path, root, holder) = (path.to_string(), root.to_string(), holder.to_string());
         blocking_section(move || {
             let conn = self.lock();
             // Scoped to `holder`: a claim that has since been taken over by another
             // worker (this one's lease expired) is not ours to drop.
             let n = conn.execute(
                 "DELETE FROM coedit_undo_claim \
-                 WHERE workspace_id = ?1 AND path = ?2 AND actor_id = ?3 AND holder = ?4",
-                params![self.workspace_id, path, actor_id, holder],
+                 WHERE workspace_id = ?1 AND path = ?2 AND root = ?5 \
+                   AND actor_id = ?3 AND holder = ?4",
+                params![self.workspace_id, path, actor_id, holder, root],
             )?;
             Ok(n > 0)
         })

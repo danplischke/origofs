@@ -70,8 +70,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
   is the harm class that counts.
 
   A new `coedit_undo_claim` table (schema v22) removes the precondition rather
-  than patching the symptom: a worker claims `(path, actor)` before it records
-  anything, and only one can hold it. It carries the two columns `posix_lock`
+  than patching the symptom: a worker claims `(path, root, actor)` before it
+  records anything, and only one can hold it. Keyed on the fragment `root` as
+  well as the path because a **document is `(path, shape)`**: one path may be
+  open in both shapes at once, and they are two documents with two stacks. It carries the two columns `posix_lock`
   carries and for the same reasons — a `holder`, so a clean shutdown drops its
   claims at once, and a 60-second `expires_at` lease a live worker renews, so a
   worker that is OOM-killed frees the actor instead of denying them undo until
