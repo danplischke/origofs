@@ -827,6 +827,23 @@ fn posix_lock_key(workspace_id: i64, ino: Ino) -> i64 {
 
 #[async_trait]
 impl MetadataStore for PostgresMetadataStore {
+    /// Close the connection pool (issue #154).
+    ///
+    /// The pool is shared by every clone of this store — `for_workspace` hands
+    /// out handles over the same one — so this closes it for all of them. That is
+    /// the point: an embedder calling it at shutdown wants the sockets gone, not
+    /// gone for one handle while a forgotten clone keeps them.
+    ///
+    /// `deadpool` closes idle connections immediately and in-flight ones as they
+    /// are returned, and every later `get()` fails with `Closed` — which reaches
+    /// a caller as a classified `Backend`/`Unavailable` error through
+    /// `From<PoolError>`, so a call after shutdown says the store is unavailable
+    /// rather than hanging on an acquisition that will never be served.
+    async fn close(&self) -> Result<()> {
+        self.pool.close();
+        Ok(())
+    }
+
     async fn init(&self) -> Result<()> {
         let mut c = self.client().await?;
         let now = now_secs();

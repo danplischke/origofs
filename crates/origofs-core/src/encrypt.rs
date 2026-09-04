@@ -455,6 +455,9 @@ impl ContentStore for EncryptedStore {
     async fn ping(&self) -> Result<()> {
         self.inner.ping().await
     }
+    async fn close(&self) -> Result<()> {
+        self.inner.close().await
+    }
 }
 
 #[cfg(test)]

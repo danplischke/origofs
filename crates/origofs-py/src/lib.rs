@@ -1299,7 +1299,7 @@ impl CoeditDoc {
 }
 
 /// A live **tree-shaped** co-edited document (issue #92): a `Y.XmlFragment` a
-/// rich-text editor (`@platejs/yjs`, `y-prosemirror`, `y-slate`, TipTap) binds to
+/// rich-text editor (`@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror`, TipTap) binds to
 /// natively, instead of `CoeditDoc`'s flat `Y.Text`.
 ///
 /// Obtain one from [`Workspace.open_coedit_tree`], drive it with the same y-sync
@@ -2888,8 +2888,8 @@ impl Workspace {
     }
 
     /// Open a **tree-shaped** live co-editing document for `path` (issue #92),
-    /// rooted at the ``XmlFragment`` named `root` — the shape `@platejs/yjs`,
-    /// `y-prosemirror` and `y-slate` bind to natively.
+    /// rooted at the ``XmlFragment`` named `root` — the shape
+    /// `@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror` and TipTap bind to natively.
     ///
     /// Resumes from the sidecar when it is still coherent with the file; otherwise
     /// the document opens **empty** with ``resumed()`` false, because rebuilding a
@@ -3842,6 +3842,69 @@ impl Workspace {
     fn repack<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move { ws.repack().await.map_err(to_pyerr) })
+    }
+
+    /// Release this workspace's backend resources (issue #154).
+    ///
+    /// A long-lived host — a FastAPI lifespan, a worker supervisor — opens a
+    /// workspace at startup and wants its Postgres pool gone at shutdown. There
+    /// was nothing to await: the pool is reclaimed when the Rust handle drops,
+    /// and Python cannot make that happen on demand, so a reload or a second
+    /// lifespan left the old pool alive holding its connections.
+    ///
+    /// Flushes first, so a packed content store's buffered chunks are sealed
+    /// rather than discarded — a shutdown that loses writes is not one.
+    ///
+    /// One-way, and there is no reopen: call ``open_pg`` again, which is cheap.
+    /// Later calls fail with an "unavailable" backend error rather than hanging
+    /// or silently reconnecting, because a call after shutdown is a lifecycle bug
+    /// and a store that quietly comes back hides it. Idempotent — a teardown hook
+    /// that runs twice is fine.
+    ///
+    /// ```python
+    /// @asynccontextmanager
+    /// async def lifespan(app):
+    ///     app.state.ws = await origofs.Workspace.open_pg(dsn, cas)
+    ///     yield
+    ///     await app.state.ws.aclose()
+    /// ```
+    ///
+    /// There is deliberately no synchronous ``close()``. Every I/O method here is
+    /// async, so the only way to offer one would be to block on the runtime — and
+    /// called from inside a running event loop, which is where a server\'s
+    /// shutdown hook lives, that deadlocks instead of closing. A footgun shaped
+    /// like a convenience is worse than an absent method.
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.close().await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Enter an ``async with`` block, yielding this workspace unchanged.
+    ///
+    /// The workspace is already open by the time it exists — ``open_*`` is the
+    /// constructor — so entering does no work. The block exists for the exit.
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move { Ok(slf) })
+    }
+
+    /// Leave an ``async with`` block, closing the workspace.
+    ///
+    /// Returns ``None`` (never a true value), so an exception raised inside the
+    /// block propagates: closing is cleanup, not error handling.
+    #[pyo3(signature = (*_args))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _args: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.close().await.map_err(to_pyerr)?;
+            Ok(())
+        })
     }
 
     /// Write a consistent snapshot of the **metadata** store to `dest`, returning

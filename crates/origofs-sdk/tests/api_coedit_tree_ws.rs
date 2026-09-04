@@ -1,8 +1,15 @@
 //! The structured co-editing surface (#92) end to end: a genuine Yjs client — a
-//! raw `yrs::Doc` driven by the stock y-sync `DefaultProtocol`, exactly what
-//! `@platejs/yjs` and `y-prosemirror` run — binds to `/v1/coedit-tree/{path}` over
-//! a `Y.XmlFragment`, and the host lands the bytes with its own span map. Requires
-//! the `api` + `coedit` features.
+//! raw `yrs::Doc` driven by the stock y-sync `DefaultProtocol` — binds to
+//! `/v1/coedit-tree/{path}` over a `Y.XmlFragment`, and the host lands the bytes
+//! with its own span map. Requires the `api` + `coedit` features.
+//!
+//! This client is the **`y-prosemirror`/TipTap** shape, and used to claim it was
+//! `@platejs/yjs`'s too. It is not: Plate binds through `@slate-yjs/core`, which
+//! roots at a `Y.XmlText`, so this exercises the socket and the checkpoint but
+//! says nothing about that binding — which is how the compatibility claim in
+//! #152 went unchecked. The Slate half is pinned separately, against bytes from
+//! a real `@slate-yjs/core` client, in
+//! `origofs-core/tests/coedit_tree_slate.rs`.
 #![cfg(all(feature = "api", feature = "coedit"))]
 
 use axum::Router;

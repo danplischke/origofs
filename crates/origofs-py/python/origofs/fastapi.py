@@ -58,7 +58,7 @@ import os
 import tempfile
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Optional, Union
 
 try:
     from fastapi import (
@@ -87,7 +87,176 @@ if TYPE_CHECKING:  # import only for type checkers; the module loads without the
 # It may be sync or async and may declare its own FastAPI dependencies/params.
 AuthnDep = Callable[..., Union["Any", Awaitable["Any"]]]
 
-__all__ = ["build_router", "CheckpointPolicy"]
+__all__ = ["build_router", "build_coedit_router", "CheckpointPolicy", "ROUTE_GROUPS"]
+
+
+# --- route groups (issue #153) ----------------------------------------------
+#
+# `build_router` mounted origofs's entire REST surface or nothing. For a host that
+# stores bodies in origofs but owns the access model, that is the wrong shape: it
+# wants the co-editing socket and routes every mutation through its own authorized
+# endpoints. With one router there was no supported way to say so, so integrators
+# reached into `router.routes` and re-registered the one route they wanted --
+# coupling to a path string and a route class that a version bump can change.
+#
+# Each route belongs to exactly one group, named for the capability rather than
+# the URL, because a caller is choosing what the surface can *do*.
+#
+# A websocket is keyed with `None` for its method: it has none, and pairing the
+# path with a method that does not exist would make the two kinds of route look
+# comparable when they are not.
+_ROUTE_GROUPS: "dict[str, tuple[tuple[Optional[str], str], ...]]" = {
+    # Reading and changing files and directories.
+    "files": (
+        ("GET", "/files/{path:path}"),
+        ("PUT", "/files/{path:path}"),
+        ("DELETE", "/files/{path:path}"),
+        ("GET", "/dirs/{path:path}"),
+        ("POST", "/dirs/{path:path}"),
+        ("GET", "/stat/{path:path}"),
+        ("POST", "/rename"),
+    ),
+    # Per-byte attribution. Its own group because it is the read a host is most
+    # likely to want without granting the rest of `files`.
+    "blame": (("GET", "/blame/{path:path}"),),
+    # Commits, branches, checkout, and the views over them. Workspace-wide by
+    # nature -- a scoped router already refuses most of these with 403.
+    "history": (
+        ("POST", "/commit"),
+        ("GET", "/log"),
+        ("GET", "/status"),
+        ("GET", "/diff"),
+        ("GET", "/diff/file"),
+        ("GET", "/branches"),
+        ("POST", "/branches"),
+        ("POST", "/checkout"),
+    ),
+    # The propose-and-review queue, both document shapes. The tree-suggestion
+    # routes sit here rather than in `coedit` because proposing and accepting is
+    # the review path; the socket is not.
+    "suggestions": (
+        ("POST", "/suggestions"),
+        ("GET", "/suggestions"),
+        ("GET", "/suggestions/{sid}"),
+        ("GET", "/suggestions/{sid}/diff"),
+        ("POST", "/suggestions/{sid}/accept"),
+        ("POST", "/suggestions/{sid}/reject"),
+        ("POST", "/coedit-tree-suggest/{path:path}"),
+        ("GET", "/coedit-tree-suggestions/{sid}/update"),
+        ("POST", "/coedit-tree-suggestions/{sid}/accept"),
+    ),
+    # Undo everything one actor did in one session. Its own group: it is the most
+    # destructive route here and the one most likely to be withheld.
+    "revert": (("POST", "/revert-session"),),
+    # Registering actors and opening sessions. Workspace-wide by design --
+    # identity is store-wide in origofs, so these are never tenant-scoped.
+    "actors": (("POST", "/actors"), ("POST", "/sessions")),
+    # The change feed and who is currently where.
+    "presence": (
+        ("GET", "/events"),
+        ("GET", "/presence"),
+        ("POST", "/presence"),
+        ("POST", "/presence/touch"),
+    ),
+    # Live co-editing: both sockets, plus the checkpoint route the tree socket
+    # cannot work without -- origofs cannot serialize a tree, so the host lands
+    # the bytes. Mounting the socket without it would give a room nobody can save.
+    "coedit": (
+        (None, "/coedit/{path:path}"),
+        (None, "/coedit-tree/{path:path}"),
+        ("POST", "/coedit-tree-checkpoint/{path:path}"),
+    ),
+    # Recovering uncommitted deletions.
+    "trash": (
+        ("GET", "/trash"),
+        ("POST", "/trash/{sid}/restore"),
+        ("DELETE", "/trash/{sid}"),
+    ),
+    # Liveness and readiness. Ungated and unscoped, as they are on the Rust API:
+    # a probe that needs a credential reads as an unhealthy backend.
+    "health": (("GET", "/health"), ("GET", "/readyz")),
+}
+
+#: The route groups :func:`build_router` understands, for ``include``/``exclude``.
+#: Read it rather than hard-coding names -- it is the list the validation checks
+#: against, so a name from here is a name that works.
+ROUTE_GROUPS = frozenset(_ROUTE_GROUPS)
+
+# (method, path) -> group. Built once; the reverse of the table above.
+_GROUP_OF = {key: group for group, keys in _ROUTE_GROUPS.items() for key in keys}
+
+
+def _route_keys(route: Any) -> "list[tuple[Optional[str], str]]":
+    """The ``(method, path)`` keys identifying ``route``, or ``[]`` if it has none.
+
+    A websocket route has no ``methods``; an HTTP route can in principle carry
+    several, so every one is looked up and they must agree.
+    """
+    path = getattr(route, "path", None)
+    if path is None:
+        return []
+    methods = getattr(route, "methods", None)
+    if not methods:
+        return [(None, path)]
+    # HEAD is synthesized by Starlette alongside GET and is not a route anyone
+    # declared, so it is not something the table should have to name.
+    return [(m, path) for m in sorted(methods) if m not in ("HEAD", "OPTIONS")]
+
+
+def _resolve_groups(
+    include: "Optional[Iterable[str]]", exclude: "Optional[Iterable[str]]"
+) -> "Optional[frozenset[str]]":
+    """The groups to mount, or ``None`` for "everything, unfiltered"."""
+    if include is not None and exclude is not None:
+        raise ValueError(
+            "pass `include` or `exclude`, not both -- one names what to mount and "
+            "the other what to drop, and together they only say the same thing twice"
+        )
+    if include is None and exclude is None:
+        return None
+    names = frozenset(include if include is not None else exclude)  # type: ignore[arg-type]
+    unknown = sorted(names - ROUTE_GROUPS)
+    if unknown:
+        # Loud, because the quiet version of this bug is the dangerous one: a
+        # typo in `include` mounts nothing and a typo in `exclude` mounts
+        # everything, and both look like a working call.
+        raise ValueError(
+            f"unknown route group(s): {unknown}. Known groups: "
+            f"{sorted(ROUTE_GROUPS)} (see `origofs.fastapi.ROUTE_GROUPS`)"
+        )
+    return names if include is not None else ROUTE_GROUPS - names
+
+
+def _filter_routes(router: "APIRouter", keep: "frozenset[str]") -> None:
+    """Drop every route whose group is not in ``keep``, in place.
+
+    Filtering after the fact rather than skipping registration is deliberate: the
+    router's closures -- the co-editing room registry, its sweeper, the relay --
+    are built once for the whole router and the surviving routes still need them.
+    It is also what an integrator was already doing by hand, minus the coupling.
+
+    Every route must be claimed by exactly one group. An unclaimed one raises
+    rather than being silently kept or silently dropped -- both of those are ways
+    to ship a surface nobody chose. This only runs when filtering was asked for,
+    so a mapping gap can never change the default router's behaviour.
+    """
+    kept = []
+    for route in router.routes:
+        keys = _route_keys(route)
+        if not keys:
+            kept.append(route)  # not a path route (a Mount, say); leave it alone
+            continue
+        groups = {_GROUP_OF.get(k) for k in keys}
+        if None in groups:
+            missing = sorted(k for k in keys if k not in _GROUP_OF)
+            raise RuntimeError(
+                f"origofs.fastapi: route(s) {missing} belong to no group, so "
+                f"`include`/`exclude` cannot say whether to mount them. This is a "
+                f"bug in origofs -- please report it."
+            )
+        if groups & keep:
+            kept.append(route)
+    router.routes[:] = kept
 
 
 # --- request bodies ---------------------------------------------------------
@@ -803,6 +972,8 @@ def build_router(
     reader: Optional[AuthnDep] = None,
     root: Optional[Union[str, AuthnDep]] = None,
     checkpoint: Optional["CheckpointPolicy"] = None,
+    include: Optional[Iterable[str]] = None,
+    exclude: Optional[Iterable[str]] = None,
     **router_kwargs: Any,
 ) -> "APIRouter":
     """Build an :class:`~fastapi.APIRouter` serving ``ws``.
@@ -869,10 +1040,51 @@ def build_router(
         to checkpointing 5 seconds after a room goes quiet and at least every 60
         seconds while it stays busy — see :class:`CheckpointPolicy`, which also
         explains what the durability window is without it.
+    include:
+        Mount only these route groups (issue #153). Names come from
+        :data:`ROUTE_GROUPS`: ``files``, ``blame``, ``history``, ``suggestions``,
+        ``revert``, ``actors``, ``presence``, ``coedit``, ``trash``, ``health``.
+        Omit for the whole surface, which is what every existing caller gets.
+
+        This is for the host that stores bodies in origofs but owns the access
+        model: it wants the co-editing socket and routes every mutation through
+        its own authorized endpoints. Without it, a caller who satisfies ``authn``
+        can reach *every* mutating route, which is an auth bypass in an app whose
+        own endpoints enforce more than ``authn`` does — a viewer ``PUT``ting over
+        a body their role-and-lock checks would have refused::
+
+            app.include_router(build_router(ws, authn=authn, include=["coedit"]))
+
+        Prefer ``include`` to ``exclude``. An allowlist keeps meaning what it said
+        when origofs adds a route group; a denylist quietly starts mounting it.
+    exclude:
+        The complement of ``include`` — mount everything except these groups.
+        Mutually exclusive with it.
+
+        Read the note above before reaching for this: a group added in a later
+        origofs release is not in your ``exclude`` list, so it appears on your
+        app the moment you upgrade. That is the right default for "I want the
+        surface, minus commits", and the wrong one for "I want a small surface".
+
+        An unknown group name in either list raises, rather than being ignored: a
+        typo in ``include`` mounts nothing and a typo in ``exclude`` mounts
+        everything, and both look like a working call.
     **router_kwargs:
         Forwarded to :class:`~fastapi.APIRouter` (``prefix``, ``tags``,
         router-wide ``dependencies=[...]``, …).
+
+    Notes
+    -----
+    Read routes and mutating routes already carry **different** gates: ``authn``
+    is applied only to routes that change something, and ``reader`` only to the
+    ones that do not. So "let reads and writes be gated differently" needs no new
+    parameter — pass a stricter ``authn`` than ``reader``. What ``include`` adds
+    is the orthogonal thing: which routes exist at all.
     """
+    # Resolved before anything is built, so a bad group name fails on the call
+    # rather than after a router has been assembled.
+    keep = _resolve_groups(include, exclude)
+
     router = APIRouter(**router_kwargs)
 
     # Shared, long-lived co-editing rooms — created once here, not per request.
@@ -1562,7 +1774,7 @@ def build_router(
         xml_root: str = Query(_DEFAULT_TREE_ROOT, alias="root"),
     ) -> None:
         """Live co-editing over a ``Y.XmlFragment`` — the **tree** shape (#92), so
-        ``@platejs/yjs``, ``y-prosemirror``, ``y-slate`` or TipTap bind natively
+        ``@platejs/yjs``/``@slate-yjs/core``, ``y-prosemirror`` or TipTap bind natively
         instead of mirroring a flat ``Y.Text``.
 
         Identical to ``/coedit/{path}`` in authentication, credential transport and
@@ -1783,7 +1995,44 @@ def build_router(
             response.status_code = 503
         return report
 
+    if keep is not None:
+        _filter_routes(router, keep)
     return router
+
+
+def build_coedit_router(
+    ws: Any,
+    *,
+    authn: AuthnDep,
+    root: Optional[Union[str, AuthnDep]] = None,
+    checkpoint: Optional["CheckpointPolicy"] = None,
+    **router_kwargs: Any,
+) -> "APIRouter":
+    """A router carrying **only** live co-editing (issue #153).
+
+    The two y-sync WebSockets plus the tree checkpoint route they cannot work
+    without — and nothing else: no ``PUT``, no ``DELETE``, no commit, no
+    ``revert-session``. For an app that keeps its bodies in origofs but owns its
+    own access model, this is the whole integration::
+
+        app.include_router(
+            build_coedit_router(ws, authn=my_authn, root=project_root),
+            prefix="/fs",
+        )
+
+    Exactly ``build_router(..., include=["coedit"])``, named because that is the
+    shape people actually asked for and a named function is a stabler thing to
+    depend on than a magic string. There is no ``reader``: nothing here is a read
+    route.
+    """
+    return build_router(
+        ws,
+        authn=authn,
+        root=root,
+        checkpoint=checkpoint,
+        include=["coedit"],
+        **router_kwargs,
+    )
 
 
 async def _serve_coedit(

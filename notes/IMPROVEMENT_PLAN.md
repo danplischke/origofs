@@ -210,7 +210,7 @@ global routes. Solving it only in the Python router leaves the shape unsolved.
 
 The largest and least certain item; sequence it last, but recognise what it
 costs to defer. A flat `TextRef` means no mainstream rich-text binding
-(`@platejs/yjs`, `y-prosemirror`, `y-slate`, TipTap) can attach, so hosts mirror
+(`@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror`, TipTap) can attach, so hosts mirror
 via serialize-diff-write. That degrades in three ways, and the third undercuts
 the project's headline claim: **per-run attribution is only as sharp as the
 host's text diff**, and a common-prefix/suffix diff collapses two concurrent

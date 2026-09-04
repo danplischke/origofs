@@ -458,7 +458,7 @@ A document comes in **two shapes**, and a client picks the one its editor speaks
 | Shape | Endpoint | Bind with |
 |---|---|---|
 | **flat** — one `Y.Text` | `GET /coedit/{path}` | `y-websocket`, any plain-text/Markdown editor |
-| **tree** — a `Y.XmlFragment` | `GET /coedit-tree/{path}` | `@platejs/yjs`, `y-prosemirror`, `y-slate`, TipTap |
+| **tree** — a `Y.XmlFragment` | `GET /coedit-tree/{path}` | `@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror`, TipTap |
 
 The flat shape is the right one for source files and anything a diff tool reads.
 The tree shape is for rich-text editors, which bind to a structured document
@@ -539,8 +539,8 @@ the marker once the final checkpoint has landed.
 
 #### Structured co-editing (rich-text editors)
 
-Every mainstream rich-text CRDT binding — `@platejs/yjs`, `y-prosemirror`,
-`y-slate`, TipTap — binds to a `Y.XmlFragment` **tree**, not a flat `Y.Text`. Point
+Every mainstream rich-text CRDT binding — `@platejs/yjs`/`@slate-yjs/core`,
+`y-prosemirror`, TipTap — binds to a nested XML **tree**, not a flat `Y.Text`. Point
 one at `GET /coedit-tree/{path}?root=content` and it binds directly:
 
 ```js
@@ -550,7 +550,30 @@ new WebsocketProvider(`wss://host/v1/coedit-tree`, "notes.md", doc, {
   protocols: ["origofs", token],
 })
 // …bind doc.getXmlFragment("content") with your editor's Yjs plugin…
+// …or, for PlateJS/Slate: doc.get("content", Y.XmlText), which is what
+//    @slate-yjs/core binds. Both address the same branch — see below.
 ```
+
+**Slate and Plate root at a `Y.XmlText`, and that is fine.** origofs binds the
+room as a `Y.XmlFragment`, which looks like a mismatch, but Yjs keys root types by
+*name*: `doc.get(name, T)` binds a view of whatever branch is already there rather
+than asserting a type the peer must match, so both sides address the same branch
+and converge. Pinned against bytes from a real `@slate-yjs/core` client in
+`crates/origofs-core/tests/coedit_tree_slate.rs`.
+
+The one thing such a host must handle: origofs's `a` (author) and `n` (node id)
+stamps are ordinary Yjs *formatting attributes*, and on the Slate binding a
+formatting attribute is a **mark** — so every text node arrives with two marks it
+did not author.
+
+```json
+{"a": "7,0", "n": "3f2a.0", "bold": true, "text": "world"}
+```
+
+That is deliberate: `n` is the token you cite in the span map at checkpoint time,
+so it has to be readable from the client. Configure your schema to **ignore**
+`a`/`n` rather than strip them — the server re-asserts them on every apply, so a
+normalizer that removes them will fight it.
 
 Content is attributed exactly as on the flat shape — server-side, to the socket's
 authenticated actor, whatever the bytes claim. What differs is how bytes reach

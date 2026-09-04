@@ -2,9 +2,9 @@
 //!
 //! [`crate::coedit`] models a document as one flat `Y.Text`. That is the right
 //! shape for source files and for anything a diff tool reads, but every mainstream
-//! rich-text CRDT binding — `@platejs/yjs`, `y-prosemirror`, `y-slate`, TipTap —
-//! binds to a `Y.XmlFragment` tree instead, so none of them can attach to a flat
-//! room. A host wanting to use one has to *mirror*: serialize its editor to text on
+//! rich-text CRDT binding — `@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror`,
+//! TipTap — binds to a nested XML tree instead, so none of them can attach to a
+//! flat room. A host wanting to use one has to *mirror*: serialize its editor to text on
 //! every change and diff it against the shared `Y.Text`. That converges, but the
 //! caret is lost on every remote edit, serializer round-trip noise shows up as
 //! authored bytes, and — worst — attribution is only ever as sharp as the host's
@@ -15,6 +15,46 @@
 //! editor binds to natively, attributed by the same server-side rule as the flat
 //! path — the text an update *introduces* is stamped with the connection's actor,
 //! never with an author the client names.
+//!
+//! # Which client bindings this actually speaks (issue #152)
+//!
+//! Both families, and the reason is worth stating because it looks like it should
+//! not be true. `y-prosemirror` and TipTap root at a `Y.XmlFragment`, which is what
+//! this module binds. `@slate-yjs/core` — the binding `@platejs/yjs` wraps — roots
+//! at a **`Y.XmlText`** instead, a different type at the shared root, which reads
+//! as a wire incompatibility and was reported as one.
+//!
+//! It is not, because Yjs keys root types by **name**. `doc.get(name, T)` binds a
+//! *view* of whatever branch already exists under that name rather than asserting
+//! a type the peer has to match, so an `XmlFragment`-rooted server and an
+//! `XmlText`-rooted client address the same branch and converge.
+//! `tests/coedit_tree_slate.rs` pins this against bytes from a real
+//! `@slate-yjs/core` client: the document lands, its structure survives a round
+//! trip through `yTextToSlateElement`, and two connections editing it are still
+//! blamed per run.
+//!
+//! Which is fortunate, because the alternative does not exist: yrs cannot create
+//! an `XmlText` root at all. `XmlTextRef` does not implement `RootRef` — "not
+//! bound to be used as root-level types", in the crate's own words — and #144
+//! leaves no upgrade path, so a Slate-shaped room is not a thing that could be
+//! built here.
+//!
+//! **What a Slate or Plate host does have to handle:** the `a` and `n` stamps
+//! below are ordinary Yjs *formatting attributes*, and on this binding a
+//! formatting attribute on a text run is a Slate **mark**. So every text node
+//! arrives carrying two marks it did not author:
+//!
+//! ```json
+//! {"a": "7,0", "n": "3f2a.0", "bold": true, "text": "world"}
+//! ```
+//!
+//! That is by design — `n` is precisely the token the host cites in its span map
+//! at checkpoint time, and it has to be somewhere the client can read. But a
+//! schema that rejects unknown marks, or a normalizer that strips them, will
+//! fight the server: origofs re-asserts the stamps on **every** apply (see
+//! `reconcile`), so stripping them client-side means
+//! they come straight back. Configure the editor to ignore `a`/`n` rather than to
+//! remove them, and read `n` off `ytext.toDelta()` or the text node itself.
 //!
 //! # origofs does not own the schema
 //!

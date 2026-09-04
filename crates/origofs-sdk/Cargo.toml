@@ -112,6 +112,9 @@ metrics = ["origofs-core/metrics"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# tests/close.rs implements `ContentStore` directly, to assert that a close
+# *arrives* at the backend rather than merely that it did not error.
+async-trait = "0.1.91"
 # tests/metrics.rs installs a real Prometheus recorder — the job a *binary* does —
 # so the `/metrics` test asserts against genuine exposition text. `default-features
 # = false` drops the exporter's HTTP listener / push-gateway (and their hyper +

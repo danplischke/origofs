@@ -1410,6 +1410,45 @@ impl Workspace {
         self.fs.content.repack().await
     }
 
+    /// Release this workspace's backend resources and make it unusable
+    /// (issue #154).
+    ///
+    /// A long-lived host — a FastAPI lifespan, a worker supervisor — opens a
+    /// workspace at startup and wants its Postgres pool gone at shutdown. There
+    /// was nothing to call: the pool is reclaimed when the last `Arc` drops, and
+    /// an embedder cannot make a drop happen on demand, so a reload or a second
+    /// lifespan left the old pool alive holding its connections.
+    ///
+    /// **It flushes first**, though not to rescue an ordinary write. The engine
+    /// already pays a durability barrier on the write path — content is sealed
+    /// before the metadata referencing it commits (`store_body`, `seal`) — so a
+    /// file written through this workspace is never sitting in a `PackStore`
+    /// buffer by the time anything closes. The flush is for content put straight
+    /// into the store outside that path, and it costs nothing on a backend that
+    /// does not batch. Ordering, not rescue: sealing needs the store still open.
+    ///
+    /// **Closing is one-way**, and there is no reopen: a workspace is cheap to
+    /// open again. Later calls fail with a `Backend`/`Unavailable` error rather
+    /// than hanging or silently reconnecting, because a call after shutdown is a
+    /// lifecycle bug and a store that quietly comes back hides it. Idempotent, so
+    /// a double close (a lifespan that runs its teardown twice) is not an error.
+    ///
+    /// Clones share the backend, so this closes it for all of them — as it must,
+    /// or a forgotten clone would keep the sockets this exists to release.
+    pub async fn close(&self) -> Result<()> {
+        // Flush before either close: sealing a pack needs the content store still
+        // open, and on a packed remote store it needs the metadata store's
+        // sibling index too.
+        let flushed = self.fs.content.flush().await;
+        // Both stores are closed even if the flush failed. A workspace that could
+        // not seal its buffer is in worse shape, not better, for also leaking its
+        // connections — and the flush error is the one returned, since it is the
+        // one that means data did not land.
+        let content = self.fs.content.close().await;
+        let meta = self.fs.meta.close().await;
+        flushed.and(meta).and(content)
+    }
+
     // --- merge + locks ---------------------------------------------------
 
     /// Merge commit `theirs` into the current branch.
@@ -2030,8 +2069,9 @@ impl Workspace {
     }
 
     /// Open a **tree-shaped** live co-editing document for `path` (issue #92),
-    /// rooted at the `XmlFragment` named `root` — the shape `@platejs/yjs`,
-    /// `y-prosemirror` and `y-slate` bind to natively, as opposed to
+    /// rooted at the `XmlFragment` named `root` — the shape
+    /// `@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror` and TipTap bind to
+    /// natively, as opposed to
     /// [`open_coedit`](Self::open_coedit)'s flat `Y.Text`.
     ///
     /// Resumes from the sidecar when it is still coherent with the file. Otherwise

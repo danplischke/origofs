@@ -102,10 +102,31 @@ A document comes in two shapes, and a client picks the one its editor speaks:
 | Shape | Endpoint | Bind with |
 |---|---|---|
 | **flat** — one `Y.Text` | `GET /coedit/{path}` | `y-websocket`; any plain-text or Markdown editor |
-| **tree** — a `Y.XmlFragment` | `GET /coedit-tree/{path}` | `@platejs/yjs`, `y-prosemirror`, `y-slate`, TipTap |
+| **tree** — a `Y.XmlFragment` | `GET /coedit-tree/{path}` | `@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror`, TipTap |
 
 Use the flat shape for source files and anything a diff tool reads; the tree
 shape for rich-text editors, which bind to a structured document natively.
+
+!!! note "PlateJS and Slate root at a `Y.XmlText` — and still work"
+
+    `@slate-yjs/core`, which `@platejs/yjs` wraps, binds
+    `doc.get("content", Y.XmlText)` rather than the `Y.XmlFragment` origofs binds.
+    That reads as a wire mismatch and is not one: Yjs keys root types by *name*,
+    so `doc.get(name, T)` binds a view of the branch that is already there and
+    both peers converge.
+
+    What such a host must handle is that origofs's `a` (author) and `n` (node id)
+    stamps are ordinary Yjs formatting attributes — which on the Slate binding
+    means two extra **marks** on every text node:
+
+    ```json
+    {"a": "7,0", "n": "3f2a.0", "bold": true, "text": "world"}
+    ```
+
+    `n` is the token you cite in the span map at checkpoint time, so it has to be
+    readable from the client. Configure your schema to **ignore** `a`/`n` rather
+    than strip them: the server re-asserts them on every apply, so a normalizer
+    that removes them will fight it.
 
 **The server stays the sole authority on who wrote what.** Whatever a client's
 bytes claim, each inserted run is attributed to the *authenticated* actor. When a

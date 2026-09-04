@@ -522,7 +522,7 @@ Both funnel into one attribution store, so blame is uniform regardless of path.
 
 **Two document shapes, one protocol (ruling, #92).** A co-edited document is either a flat `Y.Text` or a
 `Y.XmlFragment` **tree**. The flat shape is right for source files and anything a diff tool reads; the tree
-shape exists because every mainstream rich-text CRDT binding (`@platejs/yjs`, `y-prosemirror`, `y-slate`,
+shape exists because every mainstream rich-text CRDT binding (`@platejs/yjs`/`@slate-yjs/core`, `y-prosemirror`,
 TipTap) binds to a structured document and cannot attach to flat text. Without it a host had to *mirror* —
 serialize its editor to text on every change and diff it against the shared `Y.Text` — which loses the caret on
 every remote edit, turns serializer round-trip noise into authored bytes, and, worst, caps attribution at the
