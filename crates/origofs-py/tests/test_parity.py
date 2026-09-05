@@ -543,8 +543,36 @@ def _impl_body(text: str, header: str) -> str:
 
 
 def _pyo3_methods() -> set:
-    body = _impl_body(PYO3.read_text(), "impl Workspace {")
-    return set(re.findall(r"^\s*(?:pub )?fn (\w+)", body, re.M))
+    """Every `Workspace` binding, across the `#[pymethods]` blocks that define it.
+
+    The bindings used to be one 4,166-line `impl Workspace` block in `lib.rs`, and
+    this read exactly that block. They are now one block per topic under
+    `src/workspace/`, so the scan walks all of them — and would have failed with a
+    bare `StopIteration` rather than a diagnosis if it had simply gone on looking
+    in `lib.rs`.
+    """
+    files = [PYO3] + sorted(PYO3.parent.glob("workspace/*.rs"))
+    found = set()
+    for f in files:
+        text = f.read_text()
+        idx = 0
+        while True:
+            at = text.find("impl Workspace {", idx)
+            if at == -1:
+                break
+            body = _impl_body(text[at:], "impl Workspace {")
+            found |= set(re.findall(r"^\s*(?:pub )?fn (\w+)", body, re.M))
+            idx = at + len(body)
+    # A scan that stopped matching would pass every test below while checking
+    # nothing, so make it falsifiable against the surface Python actually sees.
+    # `dir()` is the truth; the scan exists only because it can also see the
+    # `cfg`-gated bindings this build did not compile.
+    live = {n for n in dir(origofs.Workspace) if not n.startswith("_")}
+    assert live <= found, (
+        "the pyo3 source scan missed bindings that the built module exposes, so "
+        f"it is broken rather than the bindings: {sorted(live - found)}"
+    )
+    return found
 
 
 def _stub_methods() -> set:
