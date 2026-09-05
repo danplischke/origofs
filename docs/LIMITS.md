@@ -178,4 +178,7 @@ reachable only by clients you trust. `crates/origofs-core/tests/coedit_malformed
 holds the reproducer (`#[ignore]`d — it takes the suite down rather than failing
 it; run with `--ignored` when trying a candidate `yrs`), and
 `fuzz_targets/coedit_state_decode.rs` drives the same path and is expected to
-abort. See [SECURITY.md](../SECURITY.md).
+abort. See
+[SECURITY.md](https://github.com/danplischke/origofs/blob/main/SECURITY.md) —
+the security policy is a repository file rather than a page on this site, so the
+link has to leave it.

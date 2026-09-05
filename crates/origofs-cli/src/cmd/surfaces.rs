@@ -12,8 +12,8 @@ pub async fn sandbox(
 ) -> Result<()> {
     #[cfg(not(unix))]
     {
-        let _ = (actor, discard, isolate, cmd);
-        return Err(unix_only("sandbox", "an unprivileged overlayfs mount"));
+        let _ = (ws, workspace_dir, actor, discard, isolate, cmd);
+        Err(unix_only("sandbox", "an unprivileged overlayfs mount"))
     }
     #[cfg(unix)]
     {
@@ -74,8 +74,8 @@ pub async fn overlay(
 ) -> Result<()> {
     #[cfg(not(unix))]
     {
-        let _ = (actor, sync_ms, isolate, cmd);
-        return Err(unix_only("overlay", "an unprivileged overlayfs mount"));
+        let _ = (ws, workspace_dir, actor, sync_ms, isolate, cmd);
+        Err(unix_only("overlay", "an unprivileged overlayfs mount"))
     }
     #[cfg(unix)]
     {
@@ -125,8 +125,8 @@ pub async fn overlay(
 pub async fn mount(ws: Workspace, mountpoint: PathBuf, actor: Option<i64>) -> Result<()> {
     #[cfg(not(unix))]
     {
-        let _ = (mountpoint, actor);
-        return Err(unix_only("mount", "FUSE (`/dev/fuse`)"));
+        let _ = (ws, mountpoint, actor);
+        Err(unix_only("mount", "FUSE (`/dev/fuse`)"))
     }
     #[cfg(unix)]
     {
@@ -147,9 +147,8 @@ pub async fn mount(ws: Workspace, mountpoint: PathBuf, actor: Option<i64>) -> Re
         handle
             .join()
             .map_err(|_| anyhow::anyhow!("mount thread panicked"))??;
+        Ok(())
     }
-
-    Ok(())
 }
 
 pub async fn mcp(ws: Workspace, agent_name: String, model: String) -> Result<()> {
@@ -304,8 +303,8 @@ pub async fn serve(ws: Workspace, args: ServeArgs) -> Result<()> {
 pub async fn nfs(ws: Workspace, addr: String, actor: Option<i64>) -> Result<()> {
     #[cfg(not(unix))]
     {
-        let _ = (addr, actor);
-        return Err(unix_only("nfs", "the NFSv3 server surface"));
+        let _ = (ws, addr, actor);
+        Err(unix_only("nfs", "the NFSv3 server surface"))
     }
     #[cfg(unix)]
     {
@@ -323,7 +322,6 @@ pub async fn nfs(ws: Workspace, addr: String, actor: Option<i64>) -> Result<()> 
             "serving origofs over NFSv3 at {addr} (SIGTERM/Ctrl-C to stop)\n  mount with: mount -t nfs -o vers=3,tcp,port=<port>,mountport=<port>,nolock <host>:/ /mnt"
         );
         origofs_sdk::nfs::serve_as(ws, &addr, read_ctx(actor)?).await?;
+        Ok(())
     }
-
-    Ok(())
 }

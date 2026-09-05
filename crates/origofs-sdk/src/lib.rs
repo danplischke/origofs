@@ -627,6 +627,15 @@ impl Workspace {
         // and the versioning bootstrap all live in `Fs::open_workspace` — this
         // used to reach past `Fs` into the metadata store for four of those five
         // steps and duplicate the name rules for the fifth.
+        // `id` is consumed only by the Postgres push-feed re-scope below, so
+        // without that feature nothing reads it.
+        #[cfg_attr(
+            not(feature = "postgres"),
+            expect(
+                unused_variables,
+                reason = "`id` re-scopes the Postgres push feed, which this build has not got"
+            )
+        )]
         let (id, fs) = self.fs.open_workspace(name).await?;
         Ok(Self {
             fs,
