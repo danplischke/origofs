@@ -5,6 +5,27 @@
 //! tier). Both sides are `Arc<dyn …>`, so the backend is chosen at runtime. Later
 //! milestones add commits and attribution behind the same façade.
 
+// A library that panics takes the embedder's process down with it, so the
+// library target may not `unwrap`, `expect`, `unreachable!` or panic out of a
+// function that returns `Result`. The handful of genuinely infallible sites
+// carry `#[expect(..., reason = "...")]`, which is itself checked: if the site
+// stops being infallible the expectation goes stale and the build fails.
+//
+// Declared here rather than in the workspace `[lints]` table because a Cargo
+// lints table applies to *every* target in the package, and an integration test
+// that cannot `.unwrap()` is an integration test nobody writes. `not(test)`
+// leaves the in-crate `#[cfg(test)]` modules alone; the `tests/` directory is a
+// separate crate and never sees this attribute at all.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::panic_in_result_fn
+    )
+)]
+
 use origofs_core::{Fs, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -95,20 +116,21 @@ pub async fn shutdown_signal() {
         use tokio::signal::unix::{SignalKind, signal};
         // If a handler can't be installed, wait forever rather than shutting down
         // immediately — a spurious instant shutdown is far worse than no handler.
+        // `pending::<Signal>()` types the never-completing branch as the same
+        // `Signal` the `Ok` arm yields, so the arm diverges by *never resolving*
+        // rather than by a trailing `unreachable!()` after a `pending::<()>`.
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot listen for SIGTERM; shutdown will not be graceful");
-                std::future::pending::<()>().await;
-                unreachable!()
+                std::future::pending::<tokio::signal::unix::Signal>().await
             }
         };
         let mut int = match signal(SignalKind::interrupt()) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot listen for SIGINT");
-                std::future::pending::<()>().await;
-                unreachable!()
+                std::future::pending::<tokio::signal::unix::Signal>().await
             }
         };
         tokio::select! {

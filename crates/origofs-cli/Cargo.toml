@@ -21,6 +21,9 @@ path = "src/main.rs"
 name = "git-remote-origofs"
 path = "src/bin/git-remote-origofs.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 # Every access surface is now a feature-gated module of the sdk; `full` enables
 # them all (api, mcp, sandbox, git, fuse, nfs). Deliberately NOT `coedit`, so

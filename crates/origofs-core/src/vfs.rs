@@ -1183,7 +1183,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             };
 
             let (mhash, size) = match mode {
-                AllocateMode::KeepSize => unreachable!("returned above"),
+                // Handled by the early return above; repeated as the same
+                // no-op rather than a panic, so a future edit to that guard
+                // degrades into "did nothing" instead of aborting a mount.
+                AllocateMode::KeepSize => return Ok(()),
                 AllocateMode::Allocate => {
                     if end <= base.size {
                         return Ok(());

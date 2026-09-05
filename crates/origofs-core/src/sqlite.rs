@@ -2170,8 +2170,11 @@ struct SqliteTxn {
 }
 
 impl SqliteTxn {
+    #[expect(
+        clippy::expect_used,
+        reason = "`obj`/`guard` is `Some` for the whole life of the transaction: it is taken only by `commit`/`rollback`, which consume the `Box<Self>`, so no handle survives to observe the `None`. A panic here is a use-after-finish bug in this file, not a runtime condition a caller can hit."
+    )]
     fn conn(&self) -> &Connection {
-        // Present until commit consumes the txn; callers never touch it after.
         self.guard.as_deref().expect("transaction already finished")
     }
 }
@@ -2495,6 +2498,12 @@ impl MetaTxn for SqliteTxn {
         })
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "`guard` is `Some` until `commit`/`rollback` consume the `Box<Self>`; \
+                  a panic here is a use-after-finish bug in this file, not a runtime \
+                  condition a caller can reach."
+    )]
     async fn commit(mut self: Box<Self>) -> Result<()> {
         blocking_section(move || {
             let guard = self.guard.take().expect("transaction already finished");
@@ -2503,6 +2512,12 @@ impl MetaTxn for SqliteTxn {
         })
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "`guard` is `Some` until `commit`/`rollback` consume the `Box<Self>`; \
+                  a panic here is a use-after-finish bug in this file, not a runtime \
+                  condition a caller can reach."
+    )]
     async fn rollback(mut self: Box<Self>) -> Result<()> {
         blocking_section(move || {
             let guard = self.guard.take().expect("transaction already finished");

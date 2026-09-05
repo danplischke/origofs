@@ -20,6 +20,9 @@ readme = "../../README.md"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints]
+workspace = true
+
 [dependencies]
 argon2 = { version = "0.5.3", optional = true }
 async-recursion = "1.1.1"

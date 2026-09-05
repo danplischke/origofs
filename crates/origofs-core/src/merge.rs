@@ -630,14 +630,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             None => Vec::new(),
         };
 
-        let text = std::str::from_utf8(&ours_b).is_ok()
-            && std::str::from_utf8(&theirs_b).is_ok()
-            && std::str::from_utf8(&base_b).is_ok();
+        // Decoded once. Testing `is_ok()` and then re-decoding with `unwrap()` was
+        // three redundant UTF-8 validations and three panics standing on the
+        // result of a check twenty lines away.
+        let decoded = (
+            std::str::from_utf8(&base_b),
+            std::str::from_utf8(&ours_b),
+            std::str::from_utf8(&theirs_b),
+        );
 
-        if text {
-            let base_s = std::str::from_utf8(&base_b).unwrap();
-            let ours_s = std::str::from_utf8(&ours_b).unwrap();
-            let theirs_s = std::str::from_utf8(&theirs_b).unwrap();
+        if let (Ok(base_s), Ok(ours_s), Ok(theirs_s)) = decoded {
             let (body, conflict) = match diffy::merge(base_s, ours_s, theirs_s) {
                 Ok(merged) => (merged, false),
                 Err(conflicted) => (conflicted, true),

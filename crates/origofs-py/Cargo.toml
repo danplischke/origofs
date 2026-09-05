@@ -9,6 +9,9 @@ description = "Python bindings for origofs (agent filesystem)"
 keywords.workspace = true
 categories.workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 # The extension is imported as `origofs._origofs` (mixed layout: pure-Python `origofs`
 # package under python/, compiled core as its `_origofs` submodule).

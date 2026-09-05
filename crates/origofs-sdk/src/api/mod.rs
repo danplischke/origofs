@@ -502,6 +502,15 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
     // to "the whole workspace" would fail open — serving every tenant's data from a
     // router meant for one. Panic here rather than degrade: this runs once at
     // startup, not per request.
+    #[expect(
+        clippy::expect_used,
+        reason = "A malformed `root` is a deployment error discovered once at \
+                  startup, and the alternative to panicking is a scope that falls \
+                  back to the whole workspace — a router meant for one tenant \
+                  serving every tenant. Failing closed at boot is the safer half \
+                  of that trade, and there is no caller to return an error to: \
+                  this is an infallible constructor by design."
+    )]
     let scope = match options.root.as_deref() {
         Some(r) => Scope::at(r).expect("ApiOptions::root must be an absolute path without '..'"),
         None => Scope::whole(),

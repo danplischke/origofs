@@ -8,6 +8,27 @@
 //!
 //! See `docs/DESIGN.md` for the full architecture and the milestone roadmap.
 
+// A library that panics takes the embedder's process down with it, so the
+// library target may not `unwrap`, `expect`, `unreachable!` or panic out of a
+// function that returns `Result`. The handful of genuinely infallible sites
+// carry `#[expect(..., reason = "...")]`, which is itself checked: if the site
+// stops being infallible the expectation goes stale and the build fails.
+//
+// Declared here rather than in the workspace `[lints]` table because a Cargo
+// lints table applies to *every* target in the package, and an integration test
+// that cannot `.unwrap()` is an integration test nobody writes. `not(test)`
+// leaves the in-crate `#[cfg(test)]` modules alone; the `tests/` directory is a
+// separate crate and never sees this attribute at all.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::panic_in_result_fn
+    )
+)]
+
 pub mod acl;
 pub mod attribution;
 pub mod chunk;

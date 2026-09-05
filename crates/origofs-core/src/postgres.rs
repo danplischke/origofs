@@ -2491,6 +2491,10 @@ struct PostgresTxn {
 }
 
 impl PostgresTxn {
+    #[expect(
+        clippy::expect_used,
+        reason = "`obj`/`guard` is `Some` for the whole life of the transaction: it is taken only by `commit`/`rollback`, which consume the `Box<Self>`, so no handle survives to observe the `None`. A panic here is a use-after-finish bug in this file, not a runtime condition a caller can hit."
+    )]
     fn conn(&self) -> &Object {
         self.obj.as_ref().expect("transaction already finished")
     }
@@ -2870,6 +2874,10 @@ impl MetaTxn for PostgresTxn {
         Ok(())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "`obj`/`guard` is `Some` for the whole life of the transaction: it is taken only by `commit`/`rollback`, which consume the `Box<Self>`, so no handle survives to observe the `None`. A panic here is a use-after-finish bug in this file, not a runtime condition a caller can hit."
+    )]
     async fn commit(mut self: Box<Self>) -> Result<()> {
         let obj = self.obj.take().expect("transaction already finished");
         obj.batch_execute("COMMIT").await?;
@@ -2877,6 +2885,10 @@ impl MetaTxn for PostgresTxn {
         Ok(())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "`obj`/`guard` is `Some` for the whole life of the transaction: it is taken only by `commit`/`rollback`, which consume the `Box<Self>`, so no handle survives to observe the `None`. A panic here is a use-after-finish bug in this file, not a runtime condition a caller can hit."
+    )]
     async fn rollback(mut self: Box<Self>) -> Result<()> {
         let obj = self.obj.take().expect("transaction already finished");
         // Awaited, unlike the `Drop` path: the connection is clean and back in the
