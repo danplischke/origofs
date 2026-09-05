@@ -1161,7 +1161,10 @@ async fn postgres_edit_ops_at_matches_the_sqlite_contract() {
         gone.iter().map(|o| o.op.as_str()).collect::<Vec<_>>(),
         ["remove", "write"]
     );
-    assert!(gone[0].pre_hash.is_some(), "a delete names what it destroyed");
+    assert!(
+        gone[0].pre_hash.is_some(),
+        "a delete names what it destroyed"
+    );
 
     assert!(fs.edit_ops_at("/never.txt", None).await.unwrap().is_empty());
 }
