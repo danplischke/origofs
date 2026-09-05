@@ -115,3 +115,65 @@ async fn relayed_awareness_is_not_counted_as_unhandled() {
     assert!(!out.broadcast.is_empty(), "awareness is relayed");
     assert!(out.unhandled.is_empty(), "{:?}", out.unhandled);
 }
+
+/// A hostile frame must not make the report grow with it.
+///
+/// These bytes come off a socket this module explicitly does not trust, and one
+/// frame may pack thousands of messages — the API's cap is 16 MiB, which holds
+/// roughly eight million two-byte ones. Recording an entry per *message* would let
+/// a client make the server allocate half the frame again and, worse, render all
+/// of it into a single `warn!` line. The report is the *set* of tags, so it is
+/// bounded by 256 whatever arrives.
+#[tokio::test]
+async fn a_frame_packed_with_unhandled_messages_reports_a_bounded_set() {
+    const N: usize = 5_000;
+    let mut e = EncoderV1::new();
+    for _ in 0..N {
+        // `Message::Custom` through `encode`, so the frame stays in sync: this is
+        // about the size of the report, not about recovering from a malformed
+        // stream (the test below covers that).
+        yrs::sync::Message::Custom(42, b"payload".to_vec()).encode(&mut e);
+    }
+    let doc = CoeditDoc::new();
+    let out = doc.handle_sync(ctx(), &e.to_vec()).unwrap();
+
+    assert_eq!(
+        out.unhandled,
+        vec![42],
+        "one entry per tag, not per message"
+    );
+    assert!(!out.content_changed);
+}
+
+/// A frame the reader **desynchronises** on is bounded the same way, and this is
+/// the realistic shape of the bug #162 is about rather than a contrived one.
+///
+/// A bare y-sync stream decodes as `messageAuth`, which reads a permission byte
+/// and — unless it is `PERMISSION_DENIED` — stops, leaving the rest of that
+/// message in the buffer. The reader then resumes mid-payload and every following
+/// byte is read as a fresh message tag. So a bare frame does not merely fail to
+/// apply: it fragments into junk messages, one per surviving byte. That is exactly
+/// the case where an entry-per-message report would track the frame's size.
+#[tokio::test]
+async fn a_desynchronised_frame_is_bounded_too() {
+    let mut e = EncoderV1::new();
+    for _ in 0..2_000 {
+        e.write_var(2u8); // messageAuth — consumes less than was written
+        e.write_buf(b"aaaaaaaa");
+    }
+    let doc = CoeditDoc::new();
+    // Junk may or may not decode all the way through; either answer is fine, and
+    // what must hold is that a report we *do* produce cannot grow with the input.
+    if let Ok(out) = doc.handle_sync(ctx(), &e.to_vec()) {
+        assert!(
+            out.unhandled.len() <= 256,
+            "a tag set cannot exceed the byte's range, got {}",
+            out.unhandled.len()
+        );
+        let mut sorted = out.unhandled.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), out.unhandled.len(), "tags must be distinct");
+        assert!(!out.content_changed);
+    }
+}
