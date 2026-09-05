@@ -140,7 +140,7 @@ metrics = ["dep:metrics"]
 # This crate, depending on itself, purely to turn on `test-support` for the test
 # and bench targets. A dev-dependency's features do not reach a consumer's build,
 # so `Fs::backends()` exists for `tests/` and for nobody else.
-origofs-core = { path = ".", features = ["test-support"] }
+origofs-core = { version = "0.0.6", path = ".", features = ["test-support"] }
 # pack.rs wraps a backend to inject a mid-repack failure, which needs the same
 # `#[async_trait]` the ContentStore trait is declared with.
 async-trait = "0.1.91"
