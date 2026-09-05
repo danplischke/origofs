@@ -588,6 +588,141 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         Ok(out)
     }
 
+    /// The revisions of a single `path`: every commit whose content for it
+    /// differs from its parent's, newest first.
+    ///
+    /// # Why this is not `diff` in a loop
+    ///
+    /// [`diff`](Self::diff) answers "what changed between these two commits" by
+    /// flattening both trees, so its cost scales with the size of the *repository*.
+    /// Asking it per commit pair to follow one path therefore costs
+    /// `commits x files`, and re-flattens each tree twice over. This resolves the
+    /// path by descending the tree instead ([`tree_path_hash`](Self::tree_path_hash)),
+    /// which costs `commits x depth` and is flat in repository size. Measured on
+    /// 200 commits, going from 500 to 2000 files takes the pairwise diff from
+    /// 25,200 object reads to 89,200 while this stays at 804
+    /// (`examples/path_history_bench.rs`).
+    ///
+    /// A commit is a revision of `path` exactly when its content hash there
+    /// differs from its first parent's, so the walk never reads a file body —
+    /// only trees. Bodies are the caller's to fetch, per revision, through
+    /// [`diff_file`](Self::diff_file).
+    ///
+    /// # Concurrency
+    ///
+    /// Resolving the path in one commit is independent of every other commit, so
+    /// the descents run with the same bounded concurrency as any other read
+    /// (`ORIGOFS_FETCH_CONCURRENCY`). Only the walk that *discovers* the commits
+    /// is serial, and irreducibly so: a commit has to be read before its parent
+    /// is known. Against a simulated 2ms object store that walk is 627ms per 200
+    /// commits where the descents cost 50ms, so it is the floor this cannot get
+    /// under — see the same example.
+    ///
+    /// # First-parent only
+    ///
+    /// Like [`log`](Self::log), this follows first parents. A change that reached
+    /// this branch through a merge is reported at the merge commit rather than at
+    /// the commit that originally made it, which is also what `git log` does by
+    /// default. `limit` caps the revisions *returned*, not the commits examined —
+    /// a path that was never touched still walks the whole history to establish
+    /// that.
+    pub async fn log_path(&self, path: &str, limit: Option<usize>) -> Result<Vec<PathRevision>> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        let parts = Self::split(path)?;
+        if parts.is_empty() {
+            return Err(OrigoFSError::InvalidPath(
+                "log needs a path inside the tree, not the root".into(),
+            ));
+        }
+        let window = crate::engine::fetch_concurrency();
+        let mut out = Vec::new();
+        let mut cursor = self.head_commit().await?;
+        // The oldest commit of the previous window, whose status needs the *next*
+        // (older) commit's hash to decide. Carried across the window boundary so
+        // every commit is still resolved exactly once.
+        let mut carry: Option<(CommitInfo, Option<Hash>)> = None;
+
+        loop {
+            // Discover up to `window` commits. Serial by construction — each
+            // commit names its own parent.
+            let mut batch = Vec::with_capacity(window);
+            while batch.len() < window {
+                let Some(hash) = cursor else { break };
+                let commit = Commit::decode(&self.content.get(&hash).await?)?;
+                cursor = commit.parents.first().copied();
+                batch.push(CommitInfo { hash, commit });
+            }
+            let exhausted = batch.len() < window;
+
+            // Resolve the path in each of them, concurrently.
+            let mut resolved: Vec<(CommitInfo, Option<Hash>)> =
+                stream::iter(batch.into_iter().map(|ci| {
+                    let parts = &parts;
+                    async move {
+                        let h = self.tree_path_hash(ci.commit.tree, parts).await?;
+                        Ok::<_, OrigoFSError>((ci, h))
+                    }
+                }))
+                .buffered(window)
+                .try_collect()
+                .await?;
+
+            if let Some(c) = carry.take() {
+                resolved.insert(0, c);
+            }
+            // Each entry's parent is the next one along, so the last is undecided
+            // until the following window supplies it.
+            for i in 0..resolved.len().saturating_sub(1) {
+                if let Some(rev) = revision(&resolved[i], resolved[i + 1].1) {
+                    out.push(rev);
+                    if limit.is_some_and(|n| out.len() >= n) {
+                        return Ok(out);
+                    }
+                }
+            }
+            carry = resolved.pop();
+
+            if exhausted {
+                // The root commit has no parent, so the path is a revision there
+                // exactly when it exists: that commit introduced it.
+                if let Some((ci, Some(hash))) = carry {
+                    out.push(PathRevision {
+                        commit: ci,
+                        hash: Some(hash),
+                        status: DiffStatus::Added,
+                    });
+                }
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Resolve one path against a commit's root tree by descending it, decoding
+    /// one [`Tree`] per component: `O(depth)` object reads, independent of how
+    /// many files the commit holds.
+    ///
+    /// `None` when the path is absent, and also when a component that has to be a
+    /// directory is not one — a file cannot have children, so nothing is there
+    /// under either reading.
+    pub(crate) async fn tree_path_hash(&self, tree: Hash, parts: &[&str]) -> Result<Option<Hash>> {
+        let mut cur = tree;
+        for (i, part) in parts.iter().enumerate() {
+            let t = Tree::decode(&self.content.get(&cur).await?)?;
+            let Some(e) = t.entries.iter().find(|e| e.name == *part) else {
+                return Ok(None);
+            };
+            if i + 1 == parts.len() {
+                return Ok(Some(e.hash));
+            }
+            if e.kind != TreeKind::Dir {
+                return Ok(None);
+            }
+            cur = e.hash;
+        }
+        Ok(None)
+    }
+
     /// Changes between the working tree and HEAD (like `git status`).
     pub async fn status(&self) -> Result<Vec<DiffEntry>> {
         let base = match self.head_commit().await? {
@@ -652,7 +787,13 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// A unified line diff of one `path` between two refs/commits. Returns an
     /// empty string when the file is byte-identical (or absent) on both sides.
-    /// Binary content is compared lossily as UTF-8.
+    ///
+    /// Content that is not UTF-8 on either side reports that the two versions
+    /// differ rather than returning a patch. It used to be compared through
+    /// `from_utf8_lossy`, which replaces every invalid sequence with U+FFFD: the
+    /// result is a patch that looks applicable and is not, because the bytes it
+    /// claims to add were never in the file. The exact bytes of either side stay
+    /// reachable by content address.
     pub async fn diff_file(&self, from: &str, to: &str, path: &str) -> Result<String> {
         let base = self
             .flatten_commit(self.resolve_commit(from).await?)
@@ -662,19 +803,23 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if base.get(path) == target.get(path) {
             return Ok(String::new());
         }
-        let old = self.side_text(base.get(path)).await?;
-        let new = self.side_text(target.get(path)).await?;
-        Ok(diffy::create_patch(&old, &new).to_string())
+        let (old, new) = (
+            self.side_bytes(base.get(path)).await?,
+            self.side_bytes(target.get(path)).await?,
+        );
+        let (Ok(old), Ok(new)) = (std::str::from_utf8(&old), std::str::from_utf8(&new)) else {
+            return Ok(format!("Binary files differ: {path}\n"));
+        };
+        Ok(diffy::create_patch(old, new).to_string())
     }
 
-    /// Reconstruct one side of a file diff as text (empty if the path is absent).
-    async fn side_text(&self, hash: Option<&Hash>) -> Result<String> {
+    /// Reconstruct one side of a file diff (empty if the path is absent). Bytes
+    /// rather than text, so the caller decides what to do about content that is
+    /// not UTF-8 instead of having it silently replaced.
+    async fn side_bytes(&self, hash: Option<&Hash>) -> Result<bytes::Bytes> {
         match hash {
-            Some(h) => {
-                let bytes = self.content_bytes(h).await?;
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
-            }
-            None => Ok(String::new()),
+            Some(h) => self.content_bytes(h).await,
+            None => Ok(bytes::Bytes::new()),
         }
     }
 
@@ -729,6 +874,33 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
         Ok(())
     }
+}
+
+/// One commit's revision of a single path, from [`Fs::log_path`].
+#[derive(Clone, Debug)]
+pub struct PathRevision {
+    pub commit: CommitInfo,
+    /// The path's content address at this commit; `None` when the commit deleted
+    /// it. For a file this is its manifest hash, for a symlink its target blob.
+    pub hash: Option<Hash>,
+    pub status: DiffStatus,
+}
+
+/// Classify one commit against its parent's hash for the same path, or `None`
+/// when the path is unchanged there (the common case, and why the walk can
+/// decide a commit without reading any file body).
+fn revision(cur: &(CommitInfo, Option<Hash>), parent: Option<Hash>) -> Option<PathRevision> {
+    let status = match (parent, cur.1) {
+        (None, Some(_)) => DiffStatus::Added,
+        (Some(_), None) => DiffStatus::Deleted,
+        (Some(a), Some(b)) if a != b => DiffStatus::Modified,
+        _ => return None,
+    };
+    Some(PathRevision {
+        commit: cur.0.clone(),
+        hash: cur.1,
+        status,
+    })
 }
 
 fn diff_maps(base: &BTreeMap<String, Hash>, work: &BTreeMap<String, Hash>) -> Vec<DiffEntry> {

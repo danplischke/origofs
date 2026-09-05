@@ -550,6 +550,28 @@ impl McpServer {
                     .collect::<Vec<_>>()
                     .join("\n"))
             }
+            "origofs_file_history" => {
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|n| (n as usize).min(1000));
+                let revs = self.ws.log_path_as(self.ctx(), &path()?, limit).await?;
+                if revs.is_empty() {
+                    return Ok("no committed history for this path".into());
+                }
+                Ok(revs
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{} {} {}",
+                            r.status.sigil(),
+                            &r.commit.hash.to_hex()[..12],
+                            r.commit.commit.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
             // An error, not an `Ok` string. Returning `Ok` set `isError: false`,
             // so a typo'd tool name looked to the agent exactly like a call that
             // had worked — and agents act on that.
@@ -730,6 +752,19 @@ fn tool_defs() -> Vec<Value> {
             &["message"],
         ),
         tool("origofs_log", "Show commit history.", json!({}), &[]),
+        tool(
+            "origofs_file_history",
+            "The commits that changed one file, newest first, each marked A/M/D. \
+             Use this rather than reading origofs_log and guessing: it looks at \
+             the path itself, so a commit that touched only other files is not \
+             reported. It says when the file changed, not what changed — pair it \
+             with origofs_blame for who wrote the bytes that are there now.",
+            json!({
+                "path": { "type": "string" },
+                "limit": { "type": "integer", "description": "optional: stop after this many revisions" }
+            }),
+            &["path"],
+        ),
         // The recovery path for the failure this agent is most likely to cause.
         // The engine has had a trash since #115 and no tool exposed it, so an
         // agent that deleted the wrong file had nothing to reach for — and the

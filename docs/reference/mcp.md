@@ -66,6 +66,9 @@ wanted.
 - **`origofs_blame`** — Per-line authorship, human versus agent.
 - **`origofs_commit`** — Snapshot the working tree.
 - **`origofs_log`** — Commit history.
+- **`origofs_file_history`** — The commits that changed one file, newest first, each
+  marked `A`/`M`/`D`. Says *when* a file changed; `origofs_blame` says who wrote the
+  bytes that are in it now.
 
 ### Recovery
 

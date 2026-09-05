@@ -74,7 +74,8 @@ All data routes are under `/v1`.
 | Method | Path |
 |---|---|
 | `POST` | `/v1/commit` |
-| `GET` | `/v1/log` |
+| `GET` | `/v1/log` — commit metadata; workspace-wide |
+| `GET` | `/v1/log/{*path}` — the commits that changed one path |
 | `GET` | `/v1/diff` — changed paths |
 | `GET` | `/v1/diff/file` — one file's line diff |
 | `GET` `POST` | `/v1/branches` — list or create |

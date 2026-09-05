@@ -61,6 +61,7 @@ omitted, and opens its own session labelled `cli`.
 |---|---|
 | `commit -m <MSG>` | Snapshot the working tree. `--actor` is the identity; `--author` is the free-form name recorded inside the object. |
 | `log` | Commit history, HEAD, first-parent. |
+| `log <path>` | Only the commits that changed that path, each marked `A`/`M`/`D`. Resolves the path per commit by descending the tree, so it costs the same in a ten-file workspace and a ten-thousand-file one. `--limit` caps the revisions returned, not the commits walked. |
 | `status` | Working-tree changes relative to HEAD. |
 | `diff <FROM> <TO>` | Changed paths, or one file's line diff with `--path`. |
 | `branch [NAME]` | Create at HEAD, or list when no name is given. |

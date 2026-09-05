@@ -176,8 +176,24 @@ enum Cmd {
         #[arg(long)]
         actor: Option<i64>,
     },
-    /// Show commit history (HEAD, first-parent).
-    Log,
+    /// Show commit history (HEAD, first-parent). With a PATH, show only the
+    /// commits that changed that path — `origofs log /src/main.rs`.
+    Log {
+        /// Limit the history to the commits that changed this path. Resolves the
+        /// path per commit by descending the tree, so it costs the same whether
+        /// the repository holds ten files or ten thousand.
+        path: Option<String>,
+        /// Stop after this many revisions. Caps what is returned, not what is
+        /// walked: a path that was never touched still walks the whole history.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Show working-tree changes relative to HEAD.
     Status,
     /// Compare two refs/commits: changed paths, or one file's line diff with
@@ -1762,16 +1778,36 @@ async fn main() -> Result<()> {
             let branch = ws.current_branch().await?.unwrap_or_else(|| "?".into());
             println!("[{branch} {}] {message}", &hash.to_hex()[..12]);
         }
-        Cmd::Log => {
-            for ci in ws.log().await? {
-                println!(
-                    "{} {}  {}",
-                    &ci.hash.to_hex()[..12],
-                    ci.commit.author,
-                    ci.commit.message
-                );
+        Cmd::Log { path, limit, actor } => match path {
+            None => {
+                for ci in ws.log().await? {
+                    println!(
+                        "{} {}  {}",
+                        &ci.hash.to_hex()[..12],
+                        ci.commit.author,
+                        ci.commit.message
+                    );
+                }
             }
-        }
+            Some(p) => {
+                let revs = match read_ctx(actor)? {
+                    Some(ctx) => ws.log_path_as(ctx, &p, limit).await?,
+                    None => ws.log_path(&p, limit).await?,
+                };
+                if revs.is_empty() {
+                    println!("{p}: no committed history");
+                }
+                for r in revs {
+                    println!(
+                        "{} {} {}  {}",
+                        r.status.sigil(),
+                        &r.commit.hash.to_hex()[..12],
+                        r.commit.commit.author,
+                        r.commit.commit.message
+                    );
+                }
+            }
+        },
         Cmd::Status => {
             let changes = ws.status().await?;
             if changes.is_empty() {

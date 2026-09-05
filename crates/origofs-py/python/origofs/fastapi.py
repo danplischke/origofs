@@ -124,6 +124,7 @@ _ROUTE_GROUPS: "dict[str, tuple[tuple[Optional[str], str], ...]]" = {
     "history": (
         ("POST", "/commit"),
         ("GET", "/log"),
+        ("GET", "/log/{path:path}"),
         ("GET", "/status"),
         ("GET", "/diff"),
         ("GET", "/diff/file"),
@@ -1587,10 +1588,31 @@ def build_router(
     @router.get("/log", dependencies=[Depends(_read_gate)])
     async def log(root: str = Depends(_root)):
         # A shared history: every tenant's commit messages and authors are in it,
-        # and there is no per-path view of a commit list to filter down to.
+        # and a commit list carries no path to filter it down by. The per-path
+        # view below is scopable precisely because it names one.
         if root:
             raise _unscopable("the commit log")
         return await _run(ws.log())
+
+    @router.get("/log/{path:path}", dependencies=[Depends(_read_gate)])
+    async def log_path(
+        path: str,
+        limit: Optional[int] = Query(default=None),
+        root: str = Depends(_root),
+        who: Any = Depends(_read_ctx),
+    ):
+        """The commits that changed one path, newest first.
+
+        Unlike ``/log`` this is scoped and read-checked, because it names a path.
+        It reads no file bodies -- pair it with ``/diff/file`` against a
+        revision's first parent for the patch.
+        """
+        p = _scoped(root, path)
+        if limit is not None:
+            limit = max(0, min(limit, 1000))
+        if who is not None:
+            return await _run(ws.log_path_as(who, p, limit))
+        return await _run(ws.log_path(p, limit))
 
     @router.get("/status", dependencies=[Depends(_read_gate)])
     async def status(root: str = Depends(_root)):

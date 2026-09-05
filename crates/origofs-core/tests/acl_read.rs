@@ -85,8 +85,8 @@ async fn the_switch_takes_effect_without_reopening() {
 
 #[tokio::test]
 async fn every_attributed_read_is_gated() {
-    // All six, because a check on `read` alone leaves blame and ls as side doors —
-    // which is exactly what #124 said made the bit decoration.
+    // A check on `read` alone leaves blame and ls as side doors — which is exactly
+    // what #124 said made the bit decoration.
     let (fs, owner, bob) = fixture().await;
     fs.symlink_as(owner, "/doc.md", "/link").await.unwrap();
     fs.set_acl_default_deny(true).await.unwrap();
@@ -114,6 +114,13 @@ async fn every_attributed_read_is_gated() {
         denied(&fs.blame_as(ctx, "/doc.md").await.unwrap_err()),
         "blame"
     );
+    // Nothing is committed here, so the walk itself would find no history. The
+    // refusal has to come first anyway, or it tells an actor that cannot read the
+    // path whether it has ever been committed.
+    assert!(
+        denied(&fs.log_path_as(ctx, "/doc.md", None).await.unwrap_err()),
+        "log_path"
+    );
 }
 
 #[tokio::test]
@@ -140,6 +147,13 @@ async fn a_read_grant_admits_every_attributed_read() {
     assert!(!fs.ls_as(ctx, "/").await.unwrap().is_empty());
     assert_eq!(fs.readlink_as(ctx, "/link").await.unwrap(), "/doc.md");
     assert!(!fs.blame_as(ctx, "/doc.md").await.unwrap().is_empty());
+    fs.commit_as(owner, "owner", "seed").await.unwrap();
+    assert!(
+        !fs.log_path_as(ctx, "/doc.md", None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // READ alone is not WRITE.
     assert!(
