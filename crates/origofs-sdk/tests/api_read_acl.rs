@@ -267,9 +267,15 @@ async fn a_suggestion_against_an_unreadable_path_is_not_found_rather_than_denied
             .unwrap()
             .id;
     let id =
-        f.ws.suggest(WriteCtx::actor(owner), "/secret.md", b"proposed\n", None)
-            .await
-            .unwrap();
+        f.ws.suggest(
+            WriteCtx::actor(owner),
+            "/secret.md",
+            b"proposed\n",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     f.ws.set_acl_default_deny(true).await.unwrap();
     f.ws.set_acl_enforce_reads(true).await.unwrap();
 

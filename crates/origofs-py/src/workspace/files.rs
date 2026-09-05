@@ -182,7 +182,10 @@ impl Workspace {
     /// suggestion for review. Returns a `WriteOutcome`. The entry point an untrusted
     /// surface routes writes through so a propose-only actor can't land an
     /// unreviewed edit.
-    #[pyo3(signature = (ctx, path, data, summary=None))]
+    ///
+    /// ``replaces`` retires an earlier pending draft of this actor's as this one is
+    /// created — see ``suggest``.
+    #[pyo3(signature = (ctx, path, data, summary=None, replaces=None))]
     fn write_or_propose<'py>(
         &self,
         py: Python<'py>,
@@ -190,12 +193,13 @@ impl Workspace {
         path: String,
         data: Vec<u8>,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         future_into_py(py, async move {
             let outcome = ws
-                .write_or_propose(c, &path, &data, summary.as_deref())
+                .write_or_propose(c, &path, &data, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
             let (wrote, suggestion_id) = match outcome {
@@ -346,19 +350,23 @@ impl Workspace {
     /// Remove `path`, attributed to `ctx` and governed by its write policy: a
     /// `Direct` actor removes it; a propose-only actor's removal is queued for
     /// review. Returns a [`WriteOutcome`].
-    #[pyo3(signature = (ctx, path, summary = None))]
+    ///
+    /// ``replaces`` retires an earlier pending draft of this actor's as this one is
+    /// created — see ``suggest``.
+    #[pyo3(signature = (ctx, path, summary = None, replaces = None))]
     fn remove_or_propose<'py>(
         &self,
         py: Python<'py>,
         ctx: WriteCtx,
         path: String,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         future_into_py(py, async move {
             let outcome = ws
-                .remove_or_propose(c, &path, summary.as_deref())
+                .remove_or_propose(c, &path, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
             let (wrote, suggestion_id) = match outcome {

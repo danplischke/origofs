@@ -110,7 +110,10 @@ async fn accepting_a_proposed_deletion_is_attributed() {
     fs.write("/doomed.txt", b"delete me\n").await.unwrap();
     let before = fs.stat("/doomed.txt").await.unwrap();
 
-    let id = fs.suggest_delete(ctx, "/doomed.txt", None).await.unwrap();
+    let id = fs
+        .suggest_delete(ctx, "/doomed.txt", None, None)
+        .await
+        .unwrap();
     fs.accept_suggestion(id, WriteCtx::actor(reviewer))
         .await
         .unwrap();

@@ -117,7 +117,18 @@ impl Workspace {
     // --- agent-suggestion review queue --------------------------------------
 
     /// Propose an edit to `path` for review (does not touch the working tree).
-    #[pyo3(signature = (ctx, path, data, summary=None))]
+    ///
+    /// ``replaces`` names a pending proposal of your own on this path to retire as
+    /// this one is created — how you **revise** a proposal (#164). Without it a
+    /// revision is a *sibling*: two pending drafts on one base, which origofs
+    /// resolves correctly on accept and incorrectly on reject, where the abandoned
+    /// earlier draft stays pending with a current base and still accepts cleanly.
+    ///
+    /// Opt-in rather than the default for a second proposal on the same path,
+    /// because two drafts a reviewer chooses between is a real workflow and origofs
+    /// cannot tell it from a revision. A caller that does not know its prior id
+    /// finds it with ``list_suggestions("pending", path)``.
+    #[pyo3(signature = (ctx, path, data, summary=None, replaces=None))]
     fn suggest<'py>(
         &self,
         py: Python<'py>,
@@ -125,35 +136,67 @@ impl Workspace {
         path: String,
         data: Vec<u8>,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         future_into_py(py, async move {
             let id = ws
-                .suggest(c, &path, &data, summary.as_deref())
+                .suggest(c, &path, &data, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
             Ok(id)
         })
     }
 
-    /// Propose deleting `path`.
-    #[pyo3(signature = (ctx, path, summary=None))]
+    /// Propose deleting `path`. ``replaces`` retires an earlier draft — see
+    /// ``suggest``.
+    #[pyo3(signature = (ctx, path, summary=None, replaces=None))]
     fn suggest_delete<'py>(
         &self,
         py: Python<'py>,
         ctx: WriteCtx,
         path: String,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         future_into_py(py, async move {
             let id = ws
-                .suggest_delete(c, &path, summary.as_deref())
+                .suggest_delete(c, &path, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
             Ok(id)
+        })
+    }
+
+    /// Withdraw a pending suggestion its author has abandoned, without applying or
+    /// rejecting it (#164).
+    ///
+    /// The standalone form of ``suggest(..., replaces=)``: use it when a draft is
+    /// being retired with **nothing taking its place**. Where a replacement is
+    /// being proposed in the same breath, prefer ``replaces`` — every propose call
+    /// takes it, byte and CRDT alike, and then the two cannot come apart. Distinct
+    /// from ``reject_suggestion``, which records that a reviewer looked and
+    /// declined.
+    ///
+    /// The author may always retire their own; anyone else needs ``WRITE`` at its
+    /// path, exactly as rejecting somebody else's proposal does.
+    #[pyo3(signature = (id, ctx, reason=None))]
+    fn supersede_suggestion<'py>(
+        &self,
+        py: Python<'py>,
+        id: i64,
+        ctx: WriteCtx,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.supersede_suggestion(id, c, reason.as_deref())
+                .await
+                .map_err(to_pyerr)
         })
     }
 
@@ -234,8 +277,9 @@ impl Workspace {
         let ws = self.inner.clone();
         let c = approver.inner;
         future_into_py(py, async move {
-            ws.accept_suggestion(id, c).await.map_err(to_pyerr)?;
-            Ok(())
+            // The address now at the path (`None` for an accepted deletion), so a
+            // caller can confirm what landed without re-reading (#163).
+            ws.accept_suggestion(id, c).await.map_err(to_pyerr)
         })
     }
 

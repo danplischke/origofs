@@ -417,3 +417,66 @@ async def test_the_sidecar_reports_its_root_so_a_reviewer_need_not_know_it():
 
     assert await ws.coedit_tree_root("/doc.md") == "prose"
     assert await ws.coedit_tree_root("/nothing.md") is None
+
+
+# --- the seeding handshake (#158) -------------------------------------------
+
+
+def test_a_checkpoint_over_content_the_room_never_seeded_is_refused():
+    """The reported data loss, over the route that produced it.
+
+    A tree room opened on a file origofs cannot resume from starts *empty* --
+    parsing bytes back into nodes needs the host's schema. Checkpointing that
+    document replaced the file's content with nothing, silently: the reported cost
+    was a 14219-byte document replaced by 222 bytes nine seconds later.
+    """
+    app, ws, (alice, alice_s), _bob = _app()
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+    body = b"# Title\n\nthe document nobody wants to lose\n"
+    _run(lambda: ws.write_as(ctx, "/n.md", body))
+
+    with TestClient(app) as tc:
+        resp = tc.post(
+            "/coedit-tree-checkpoint/n.md?token=alice-token",
+            json={"body": "", "spans": []},
+        )
+    assert resp.status_code == 409, resp.text
+    assert "seeded_from" in resp.text, resp.text
+    assert bytes(_run(lambda: ws.read("/n.md"))) == body
+
+
+def test_seeded_from_file_is_the_way_through():
+    """...and the caller that has accounted for the bytes says so.
+
+    This is the flag a host sends on the first checkpoint after its client seeded
+    the editor from `GET /files/{path}` -- the case origofs cannot distinguish from
+    an empty room about to blank the file, because only the host knows its schema.
+    """
+    app, ws, (alice, alice_s), _bob = _app()
+    ctx = origofs.WriteCtx.session(alice, alice_s)
+    _run(lambda: ws.write_as(ctx, "/n.md", b"original\n"))
+
+    with TestClient(app) as tc:
+        resp = tc.post(
+            "/coedit-tree-checkpoint/n.md?token=alice-token",
+            json={
+                "body": "original\nand more\n",
+                "spans": [],
+                "seeded_from_file": True,
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    assert bytes(_run(lambda: ws.read("/n.md"))) == b"original\nand more\n"
+
+
+def test_a_new_document_still_checkpoints_without_the_flag():
+    """The guard must only fire where content would actually be lost -- creating a
+    document in the editor is the ordinary path and takes no ceremony."""
+    app, ws, _alice, _bob = _app()
+    with TestClient(app) as tc:
+        resp = tc.post(
+            "/coedit-tree-checkpoint/fresh.md?token=alice-token",
+            json={"body": "# fresh\n", "spans": []},
+        )
+    assert resp.status_code == 200, resp.text
+    assert bytes(_run(lambda: ws.read("/fresh.md"))) == b"# fresh\n"

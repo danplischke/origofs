@@ -499,6 +499,7 @@ async fn suggestion_content_reads_base_and_proposed() {
             "/doc.md",
             b"one\ntwo\nthree\n",
             Some("add a line"),
+            None,
         )
         .await
         .unwrap();
@@ -510,7 +511,12 @@ async fn suggestion_content_reads_base_and_proposed() {
 
     // A proposed deletion has no proposed content.
     let del = fs
-        .suggest_delete(WriteCtx::session(claude, sc), "/doc.md", Some("remove it"))
+        .suggest_delete(
+            WriteCtx::session(claude, sc),
+            "/doc.md",
+            Some("remove it"),
+            None,
+        )
         .await
         .unwrap();
     let cd = fs.suggestion_content(del).await.unwrap();
@@ -689,7 +695,13 @@ async fn write_policy_gates_direct_writes_into_suggestions() {
 
     // Alice (direct) lands her write immediately.
     let out = fs
-        .write_or_propose(WriteCtx::session(alice, s_a), "/doc", b"from alice", None)
+        .write_or_propose(
+            WriteCtx::session(alice, s_a),
+            "/doc",
+            b"from alice",
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(out, WriteOutcome::Wrote);
@@ -703,6 +715,7 @@ async fn write_policy_gates_direct_writes_into_suggestions() {
             "/doc",
             b"from ext",
             Some("my edit"),
+            None,
         )
         .await
         .unwrap();

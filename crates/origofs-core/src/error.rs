@@ -36,8 +36,52 @@ pub enum OrigoFSError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// An optimistic-concurrency failure with no more specific shape: a lost CAS,
+    /// a resolution race, a create loop that never won.
+    ///
+    /// Two *named* conflicts split off from this one ([`StaleBase`](Self::StaleBase),
+    /// [`ForeignWrite`](Self::ForeignWrite)) because they demand opposite
+    /// recoveries and callers were reduced to matching the message string to tell
+    /// them apart (#159). Use [`is_conflict`](Self::is_conflict) wherever you mean
+    /// "any conflict" — a bare `Conflict(_)` pattern no longer covers the family.
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// A suggestion's base changed since it was proposed, so accepting it would
+    /// clobber the change that landed in between. The row is marked
+    /// [`Superseded`](crate::suggest::SuggestionStatus::Superseded) as a side
+    /// effect. **Recovery: re-diff against the new base and re-suggest.**
+    ///
+    /// A [`Conflict`](Self::Conflict) until #159; split out because the other
+    /// thing that raised one — [`ForeignWrite`](Self::ForeignWrite) — needs the
+    /// opposite response, and nothing but the message text distinguished them.
+    #[error("conflict: {0}")]
+    StaleBase(String),
+
+    /// The row this request is about has already been resolved — a suggestion that
+    /// is accepted, rejected or superseded is no longer awaiting anything.
+    /// **Recovery: read its status; there is nothing to retry.**
+    ///
+    /// A [`InvalidArgument`](Self::InvalidArgument) until #164, which made it a
+    /// `400` on the HTTP surface and a `ValueError` in Python — both saying the
+    /// *request* was malformed when it was well-formed and merely out of date.
+    /// It is the third thing a reviewing caller has to handle beside
+    /// [`StaleBase`](Self::StaleBase) and the raced-CAS
+    /// [`Conflict`](Self::Conflict), and unlike either of those it is terminal.
+    #[error("conflict: {0}")]
+    AlreadyResolved(String),
+
+    /// The file was written outside the co-editing session since that session last
+    /// agreed with the bytes on disk, so checkpointing the document would destroy
+    /// the foreign write. **Recovery: re-read the file, reseed the document, and
+    /// checkpoint again.**
+    ///
+    /// Raised where the two versions cannot be folded together: always on the tree
+    /// shape (origofs cannot parse bytes back into nodes), and on the flat shape
+    /// only when reconciliation itself is impossible — a missing sidecar, a removed
+    /// file, bytes that are no longer UTF-8.
+    #[error("conflict: {0}")]
+    ForeignWrite(String),
 
     /// The actor is not permitted to perform this operation — today, an actor
     /// whose [`WritePolicy`](crate::WritePolicy) is
@@ -167,11 +211,30 @@ impl OrigoFSError {
     /// (possibly after a backoff). True only for transient backend failures — a
     /// serialization failure, a deadlock, a dropped connection, an exhausted pool.
     ///
-    /// A [`Conflict`](OrigoFSError::Conflict) (an optimistic-concurrency mismatch)
-    /// is deliberately **not** retryable here: the caller must re-read and rebuild
-    /// against the new state, not blindly replay the same write.
+    /// A conflict (an optimistic-concurrency mismatch — see
+    /// [`is_conflict`](Self::is_conflict) for the family) is deliberately **not**
+    /// retryable here: the caller must re-read and rebuild against the new state,
+    /// not blindly replay the same write.
     pub fn retryable(&self) -> bool {
         matches!(self, OrigoFSError::Backend { class, .. } if class.retryable())
+    }
+
+    /// Whether this is an optimistic-concurrency conflict of any shape —
+    /// [`Conflict`](OrigoFSError::Conflict), [`StaleBase`](OrigoFSError::StaleBase),
+    /// or [`ForeignWrite`](OrigoFSError::ForeignWrite).
+    ///
+    /// Splitting the two named conflicts out of `Conflict` (#159) means a bare
+    /// `matches!(e, Conflict(_))` silently stops covering them, and every such site
+    /// was a `409`/"the caller must re-read" decision that still applies to all
+    /// three. Ask this instead; it grows with the family.
+    pub fn is_conflict(&self) -> bool {
+        matches!(
+            self,
+            OrigoFSError::Conflict(_)
+                | OrigoFSError::StaleBase(_)
+                | OrigoFSError::ForeignWrite(_)
+                | OrigoFSError::AlreadyResolved(_)
+        )
     }
 
     /// Whether this error means "an object was written by a newer origofs"
@@ -204,6 +267,9 @@ impl OrigoFSError {
             InvalidPath(_) => "invalid_path",
             InvalidArgument(_) => "invalid_argument",
             Conflict(_) => "conflict",
+            StaleBase(_) => "stale_base",
+            AlreadyResolved(_) => "already_resolved",
+            ForeignWrite(_) => "foreign_write",
             Denied(_) => "denied",
             TooLarge(_) => "too_large",
             Corrupt(_) => "corrupt",
@@ -350,6 +416,27 @@ mod tests {
         let e: OrigoFSError = err.into();
         assert!(!e.retryable());
         assert_eq!(e.code(), "backend_error");
+    }
+
+    #[test]
+    fn the_named_conflicts_are_conflicts_with_their_own_codes() {
+        // #159: a caller must be able to tell "your proposal's base moved" from
+        // "somebody wrote around your live document" *without* reading the message,
+        // while everything that means "any conflict" keeps covering both.
+        let stale = OrigoFSError::StaleBase("s".into());
+        let foreign = OrigoFSError::ForeignWrite("f".into());
+        let resolved = OrigoFSError::AlreadyResolved("r".into());
+        let plain = OrigoFSError::Conflict("c".into());
+        for e in [&stale, &foreign, &resolved, &plain] {
+            assert!(e.is_conflict(), "{e:?} must read as a conflict");
+            assert!(!e.retryable(), "{e:?} must not be blindly replayed");
+            assert!(e.to_string().starts_with("conflict: "));
+        }
+        assert_eq!(stale.code(), "stale_base");
+        assert_eq!(foreign.code(), "foreign_write");
+        assert_eq!(resolved.code(), "already_resolved");
+        assert_eq!(plain.code(), "conflict");
+        assert!(!OrigoFSError::NotFound("x".into()).is_conflict());
     }
 
     #[test]

@@ -60,7 +60,7 @@ async fn stale_accept_supersedes<M: MetadataStore>(fs: Fs<M, Arc<MemStore>>) {
 
     fs.write_as(r, "/notes.md", b"one\n").await.unwrap();
     let id = fs
-        .suggest(a, "/notes.md", b"one\ntwo\n", Some("add a line"))
+        .suggest(a, "/notes.md", b"one\ntwo\n", Some("add a line"), None)
         .await
         .unwrap();
     assert_eq!(
@@ -76,10 +76,14 @@ async fn stale_accept_supersedes<M: MetadataStore>(fs: Fs<M, Arc<MemStore>>) {
 
     // Accepting is refused...
     let err = fs.accept_suggestion(id, r).await.unwrap_err();
+    // `StaleBase`, not a bare `Conflict` (#159): the caller has to be able to tell
+    // "re-diff and re-suggest" from "reseed your co-edit document" without reading
+    // the message, and both used to arrive as the same class.
     assert!(
-        matches!(err, OrigoFSError::Conflict(_)),
+        matches!(err, OrigoFSError::StaleBase(_)),
         "a stale byte suggestion must not be applied: {err:?}"
     );
+    assert_eq!(err.code(), "stale_base");
     // ...the file is untouched (no silent clobber)...
     assert_eq!(
         &fs.read("/notes.md").await.unwrap()[..],
@@ -104,12 +108,16 @@ async fn stale_accept_supersedes<M: MetadataStore>(fs: Fs<M, Arc<MemStore>>) {
         1
     );
 
-    // A second accept reports it as already resolved, not as a fresh conflict.
+    // A second accept reports it as already resolved, not as a fresh stale base --
+    // and as a *conflict*, not a bad request (#164). The row is settled, so the
+    // recovery is "read its status", which is neither of the other two conflicts'.
     let err = fs.accept_suggestion(id, r).await.unwrap_err();
     assert!(
-        matches!(&err, OrigoFSError::InvalidArgument(m) if m.contains("superseded")),
+        matches!(&err, OrigoFSError::AlreadyResolved(m) if m.contains("superseded")),
         "{err:?}"
     );
+    assert_eq!(err.code(), "already_resolved");
+    assert!(err.is_conflict());
 }
 
 #[tokio::test]
@@ -146,11 +154,20 @@ async fn accepting_one_supersedes_the_others_on_that_path() {
     );
 
     fs.write_as(c, "/doc.md", b"base\n").await.unwrap();
-    let first = fs.suggest(a, "/doc.md", b"alice\n", None).await.unwrap();
-    let second = fs.suggest(b, "/doc.md", b"bob\n", None).await.unwrap();
+    let first = fs
+        .suggest(a, "/doc.md", b"alice\n", None, None)
+        .await
+        .unwrap();
+    let second = fs
+        .suggest(b, "/doc.md", b"bob\n", None, None)
+        .await
+        .unwrap();
     // A proposal on another path is none of this path's business.
     fs.write_as(c, "/other.md", b"x\n").await.unwrap();
-    let elsewhere = fs.suggest(a, "/other.md", b"y\n", None).await.unwrap();
+    let elsewhere = fs
+        .suggest(a, "/other.md", b"y\n", None, None)
+        .await
+        .unwrap();
 
     fs.accept_suggestion(first, c).await.unwrap();
 
@@ -191,8 +208,8 @@ async fn a_still_current_proposal_survives() {
 
     fs.write_as(b, "/a.md", b"one\n").await.unwrap();
     fs.write_as(b, "/b.md", b"one\n").await.unwrap();
-    let keep = fs.suggest(a, "/b.md", b"two\n", None).await.unwrap();
-    let apply = fs.suggest(a, "/a.md", b"two\n", None).await.unwrap();
+    let keep = fs.suggest(a, "/b.md", b"two\n", None, None).await.unwrap();
+    let apply = fs.suggest(a, "/a.md", b"two\n", None, None).await.unwrap();
 
     fs.accept_suggestion(apply, b).await.unwrap();
     assert_eq!(

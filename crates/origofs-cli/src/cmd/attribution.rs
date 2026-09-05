@@ -2,21 +2,39 @@
 
 use crate::*;
 
-pub async fn suggest(
-    ws: &Workspace,
-    path: String,
-    actor: i64,
-    session: Option<i64>,
-    summary: Option<String>,
-    from: Option<PathBuf>,
-    delete: bool,
-) -> Result<()> {
+/// Everything `origofs suggest` takes beyond the workspace.
+///
+/// A struct for the same reason `ServeArgs` is one: the flags travel together as
+/// a single match arm's bindings, so nothing named them as a group until the body
+/// became a function. `replaces` (#164) pushed it to eight, and two `Option<i64>`
+/// beside two `Option<String>` is a call waiting to be mis-ordered.
+pub struct SuggestArgs {
+    pub path: String,
+    pub actor: i64,
+    pub session: Option<i64>,
+    pub summary: Option<String>,
+    pub from: Option<PathBuf>,
+    pub delete: bool,
+    pub replaces: Option<i64>,
+}
+
+pub async fn suggest(ws: &Workspace, args: SuggestArgs) -> Result<()> {
+    let SuggestArgs {
+        path,
+        actor,
+        session,
+        summary,
+        from,
+        delete,
+        replaces,
+    } = args;
     let ctx = match session {
         Some(s) => WriteCtx::session(actor, s),
         None => WriteCtx::actor(actor),
     };
     let id = if delete {
-        ws.suggest_delete(ctx, &path, summary.as_deref()).await?
+        ws.suggest_delete(ctx, &path, summary.as_deref(), replaces)
+            .await?
     } else {
         let data = match from {
             Some(p) => std::fs::read(p)?,
@@ -26,9 +44,13 @@ pub async fn suggest(
                 buf
             }
         };
-        ws.suggest(ctx, &path, &data, summary.as_deref()).await?
+        ws.suggest(ctx, &path, &data, summary.as_deref(), replaces)
+            .await?
     };
-    println!("suggestion #{id} created (pending review)");
+    match replaces {
+        Some(old) => println!("suggestion #{id} created (pending review), superseding #{old}"),
+        None => println!("suggestion #{id} created (pending review)"),
+    }
 
     Ok(())
 }
@@ -89,8 +111,10 @@ pub async fn accept(ws: &Workspace, id: i64, actor: i64, session: Option<i64>) -
         Some(s) => WriteCtx::session(actor, s),
         None => WriteCtx::actor(actor),
     };
-    ws.accept_suggestion(id, ctx).await?;
-    println!("accepted suggestion #{id}");
+    match ws.accept_suggestion(id, ctx).await? {
+        Some(hash) => println!("accepted suggestion #{id} -> {hash}"),
+        None => println!("accepted suggestion #{id} (file deleted)"),
+    }
 
     Ok(())
 }
@@ -102,6 +126,25 @@ pub async fn reject(ws: &Workspace, id: i64, actor: i64, session: Option<i64>) -
     };
     ws.reject_suggestion(id, ctx).await?;
     println!("rejected suggestion #{id}");
+
+    Ok(())
+}
+
+/// Withdraw a pending suggestion its author has abandoned, without applying or
+/// rejecting it — distinct from `reject`, which says a reviewer declined.
+pub async fn supersede(
+    ws: &Workspace,
+    id: i64,
+    actor: i64,
+    session: Option<i64>,
+    reason: Option<String>,
+) -> Result<()> {
+    let ctx = match session {
+        Some(s) => WriteCtx::session(actor, s),
+        None => WriteCtx::actor(actor),
+    };
+    ws.supersede_suggestion(id, ctx, reason.as_deref()).await?;
+    println!("superseded suggestion #{id}");
 
     Ok(())
 }

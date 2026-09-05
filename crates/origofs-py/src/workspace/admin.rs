@@ -258,6 +258,13 @@ impl Workspace {
     /// Retire pending suggestions for `path` whose base content has already moved
     /// on, returning how many were superseded. Without this they sit in the review
     /// queue looking actionable and fail on accept.
+    ///
+    /// **"Stale" means the base moved on, and only that** (#164) — not "everything
+    /// obsolete". Two pending proposals from one actor on one unchanged base are
+    /// siblings, both current by this measure, and this returns ``0`` for them.
+    /// Retiring a draft its own author abandoned is a different relation: use
+    /// ``supersede_suggestion(id, ctx)``, or ``replaces`` on ``suggest`` to do it
+    /// as the replacement is proposed.
     fn supersede_stale_suggestions<'py>(
         &self,
         py: Python<'py>,

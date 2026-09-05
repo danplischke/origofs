@@ -293,6 +293,7 @@ async fn coedit_reopen_after_accepted_suggestion_rebuilds_from_file() {
             "/doc",
             b"HELLO WORLD",
             Some("shout"),
+            None,
         )
         .await
         .unwrap();

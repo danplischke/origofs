@@ -87,7 +87,7 @@ pub async fn write(
                     // `origofs policy <actor> propose` had no effect on
                     // `origofs write` — the CLI ignored the gate its own
                     // subcommand sets.
-                    match ws.write_or_propose(ctx, &path, &data, None).await? {
+                    match ws.write_or_propose(ctx, &path, &data, None, None).await? {
                         origofs_sdk::WriteOutcome::Wrote => {}
                         origofs_sdk::WriteOutcome::Proposed(suggestion_id) => {
                             println!(
@@ -163,7 +163,7 @@ pub async fn rm(ws: &Workspace, path: String, actor: Option<i64>) -> Result<()> 
             // is queued for review rather than refused, which is how `write`
             // already behaves. Refusing would make the two inconsistent in the
             // opposite direction.
-            match ws.remove_or_propose(ctx, &path, None).await? {
+            match ws.remove_or_propose(ctx, &path, None, None).await? {
                 origofs_sdk::WriteOutcome::Wrote => {}
                 origofs_sdk::WriteOutcome::Proposed(id) => {
                     println!(

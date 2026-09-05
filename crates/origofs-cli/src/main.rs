@@ -213,6 +213,12 @@ enum Cmd {
         from: Option<PathBuf>,
         #[arg(long)]
         delete: bool,
+        /// Retire this pending suggestion of your own as the new one is created
+        /// -- how you *revise* a proposal rather than stack a second draft beside
+        /// it. Without it, rejecting the revision leaves the earlier draft
+        /// pending with a current base, so it still accepts cleanly (#164).
+        #[arg(long)]
+        replaces: Option<i64>,
     },
     /// List suggestions (filter with `--status` and/or `--path`).
     Suggestions {
@@ -252,6 +258,18 @@ enum Cmd {
         actor: i64,
         #[arg(long)]
         session: Option<i64>,
+    },
+    /// Withdraw a pending suggestion its author has abandoned, without applying
+    /// or rejecting it. Distinct from `reject`, which says a reviewer declined.
+    Supersede {
+        id: i64,
+        #[arg(long)]
+        actor: i64,
+        #[arg(long)]
+        session: Option<i64>,
+        /// Optional note for the change feed.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Create a branch at HEAD, or list branches when no name is given.
     Branch { name: Option<String> },
@@ -1611,7 +1629,22 @@ async fn main() -> Result<()> {
             summary,
             from,
             delete,
-        } => cmd::attribution::suggest(&ws, path, actor, session, summary, from, delete).await?,
+            replaces,
+        } => {
+            cmd::attribution::suggest(
+                &ws,
+                cmd::attribution::SuggestArgs {
+                    path,
+                    actor,
+                    session,
+                    summary,
+                    from,
+                    delete,
+                    replaces,
+                },
+            )
+            .await?
+        }
         Cmd::Suggestions {
             status,
             path,
@@ -1626,6 +1659,12 @@ async fn main() -> Result<()> {
         Cmd::Reject { id, actor, session } => {
             cmd::attribution::reject(&ws, id, actor, session).await?
         }
+        Cmd::Supersede {
+            id,
+            actor,
+            session,
+            reason,
+        } => cmd::attribution::supersede(&ws, id, actor, session, reason).await?,
         Cmd::Branch { name } => cmd::history::branch(&ws, name).await?,
         Cmd::Checkout { branch } => cmd::history::checkout(&ws, branch).await?,
         Cmd::Merge {

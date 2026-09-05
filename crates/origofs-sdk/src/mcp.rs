@@ -186,7 +186,7 @@ impl McpServer {
                 let summary = format!("write {p} via mcp agent");
                 match self
                     .ws
-                    .write_or_propose(self.ctx(), p, data.as_bytes(), Some(&summary))
+                    .write_or_propose(self.ctx(), p, data.as_bytes(), Some(&summary), None)
                     .await?
                 {
                     WriteOutcome::Wrote => Ok(format!("wrote {} bytes to {p}", data.len())),
@@ -247,7 +247,7 @@ impl McpServer {
                 let summary = format!("edit {p} via mcp agent");
                 match self
                     .ws
-                    .write_or_propose(self.ctx(), p, updated.as_bytes(), Some(&summary))
+                    .write_or_propose(self.ctx(), p, updated.as_bytes(), Some(&summary), None)
                     .await?
                 {
                     WriteOutcome::Wrote => Ok(format!(
@@ -264,6 +264,10 @@ impl McpServer {
                 let p = &path()?;
                 let data = args.get("content").and_then(Value::as_str).unwrap_or("");
                 let summary = args.get("summary").and_then(Value::as_str);
+                // Revising, rather than stacking a second draft beside the first
+                // (#164) — this is the tool an agent told "revise your proposal"
+                // reaches for, and without `replaces` it had no way to.
+                let replaces = args.get("replaces").and_then(Value::as_i64);
                 // `mkdir_as`, not the unattributed `mkdir_p`. Creating the
                 // parent is a working-tree mutation like any other, so it has to
                 // carry the agent and pass the write policy — otherwise a
@@ -278,11 +282,15 @@ impl McpServer {
                 }
                 let id = self
                     .ws
-                    .suggest(self.ctx(), p, data.as_bytes(), summary)
+                    .suggest(self.ctx(), p, data.as_bytes(), summary, replaces)
                     .await?;
-                Ok(format!(
-                    "proposed suggestion #{id} for {p} (pending review)"
-                ))
+                Ok(match replaces {
+                    Some(old) => format!(
+                        "proposed suggestion #{id} for {p} (pending review), \
+                         superseding #{old}"
+                    ),
+                    None => format!("proposed suggestion #{id} for {p} (pending review)"),
+                })
             }
             // Proposing against a *live* document is a CRDT merge, not a file
             // body: the base is a state vector rather than a content hash, so a
@@ -294,6 +302,7 @@ impl McpServer {
                 let old = args.get("old").and_then(Value::as_str).unwrap_or("");
                 let new = args.get("new").and_then(Value::as_str).unwrap_or("");
                 let summary = args.get("summary").and_then(Value::as_str);
+                let replaces = args.get("replaces").and_then(Value::as_i64);
                 if old.is_empty() {
                     return Err(OrigoFSError::InvalidArgument(
                         "suggest_coedit: `old` must be non-empty (a CRDT proposal is an edit to \
@@ -337,10 +346,19 @@ impl McpServer {
                 let index = text.find(old).unwrap_or(0) as u32;
                 doc.remove(index, old.len() as u32);
                 doc.insert(self.ctx(), index, new);
-                let id = self.ws.suggest_coedit(self.ctx(), p, &doc, summary).await?;
-                Ok(format!(
-                    "proposed co-edit suggestion #{id} for {p} (a CRDT merge, pending review)"
-                ))
+                let id = self
+                    .ws
+                    .suggest_coedit(self.ctx(), p, &doc, summary, replaces)
+                    .await?;
+                Ok(match replaces {
+                    Some(old) => format!(
+                        "proposed co-edit suggestion #{id} for {p} (a CRDT merge, pending \
+                         review), superseding #{old}"
+                    ),
+                    None => format!(
+                        "proposed co-edit suggestion #{id} for {p} (a CRDT merge, pending review)"
+                    ),
+                })
             }
             "origofs_live" => match args.get("path").and_then(Value::as_str) {
                 Some(p) if !p.is_empty() => {
@@ -422,8 +440,16 @@ impl McpServer {
             }
             "origofs_accept" => {
                 let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
-                self.ws.accept_suggestion(id, self.ctx()).await?;
-                Ok(format!("accepted suggestion #{id}"))
+                match self.ws.accept_suggestion(id, self.ctx()).await? {
+                    Some(hash) => Ok(format!("accepted suggestion #{id}; now at {hash}")),
+                    None => Ok(format!("accepted suggestion #{id}; the file is deleted")),
+                }
+            }
+            "origofs_supersede" => {
+                let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
+                let reason = args.get("reason").and_then(Value::as_str);
+                self.ws.supersede_suggestion(id, self.ctx(), reason).await?;
+                Ok(format!("superseded suggestion #{id}"))
             }
             "origofs_reject" => {
                 let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
@@ -498,7 +524,7 @@ impl McpServer {
                 let summary = format!("delete {}", path()?);
                 match self
                     .ws
-                    .remove_or_propose(self.ctx(), &path()?, Some(&summary))
+                    .remove_or_propose(self.ctx(), &path()?, Some(&summary), None)
                     .await?
                 {
                     WriteOutcome::Wrote => Ok(format!("removed {}", path()?)),
@@ -654,11 +680,18 @@ fn tool_defs() -> Vec<Value> {
         tool(
             "origofs_suggest",
             "Propose an edit to a file for review instead of writing it directly. The \
-             bytes are stored now; the file changes only when a different actor accepts.",
+             bytes are stored now; the file changes only when a different actor accepts. \
+             To *revise* a proposal you already made, pass `replaces` with its id \
+             (origofs_suggestions lists yours) — otherwise the earlier draft stays \
+             pending beside the new one and can still be accepted.",
             json!({
                 "path": { "type": "string" },
                 "content": { "type": "string" },
                 "summary": { "type": "string", "description": "optional note for the reviewer" },
+                "replaces": {
+                    "type": "integer",
+                    "description": "id of your own pending suggestion on this path to retire as this one is created",
+                },
             }),
             &["path", "content"],
         ),
@@ -685,6 +718,17 @@ fn tool_defs() -> Vec<Value> {
             "origofs_reject",
             "Reject a pending suggestion without applying it.",
             json!({ "id": { "type": "integer" } }),
+            &["id"],
+        ),
+        tool(
+            "origofs_supersede",
+            "Withdraw a pending suggestion its author has abandoned, without applying or \
+             rejecting it. Use it on your own drafts; rejecting is what a reviewer does. \
+             Prefer origofs_suggest's `replaces` when you are proposing the replacement now.",
+            json!({
+                "id": { "type": "integer" },
+                "reason": { "type": "string", "description": "optional note for the trail" },
+            }),
             &["id"],
         ),
         tool(
@@ -765,12 +809,18 @@ fn tool_defs() -> Vec<Value> {
          proposal there goes stale on somebody else's keystroke, and accepting it \
          replaces the whole body; this one merges, so a concurrent disjoint edit \
          survives. The document changes only when a different actor accepts, and the \
-         merged text is credited to this agent.",
+         merged text is credited to this agent. To *revise* a proposal you already \
+         made, pass `replaces` with its id (origofs_suggestions lists yours) — otherwise \
+         the earlier draft stays pending beside the new one.",
         json!({
             "path": { "type": "string" },
             "old": { "type": "string", "description": "exact text to replace; must be unique in the document" },
             "new": { "type": "string", "description": "replacement text" },
             "summary": { "type": "string", "description": "optional note for the reviewer" },
+            "replaces": {
+                "type": "integer",
+                "description": "id of your own pending suggestion on this path to retire as this one is created",
+            },
         }),
         &["path", "old", "new"],
     ));
