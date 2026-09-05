@@ -146,6 +146,9 @@ origofs-core = { path = ".", features = ["test-support"] }
 async-trait = "0.1.91"
 criterion = "0.5.1"
 proptest = "1"
+# `sqlite_read_pool.rs` opens a pool connection the same way the backend does,
+# to prove the `query_only` interlock behind the read/write split is armed.
+rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3.27.0"
 tokio-postgres = "0.7"
 # The coedit tests drive a *vanilla* Yjs client (a raw `yrs::Doc` + the stock

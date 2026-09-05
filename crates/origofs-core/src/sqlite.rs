@@ -42,9 +42,54 @@ const INODE_BATCH: usize = 500;
 /// its root is [`INO_ROOT`]. Backfilled by migration V11 (`docs/MULTI_TENANCY.md`).
 const DEFAULT_WORKSPACE: i64 = 1;
 
+/// How many read-only connections a file-backed store opens alongside its writer.
+///
+/// Small on purpose. Each is an open file descriptor and a page cache, and the
+/// win is almost entirely in going from one to several — a read no longer waits
+/// behind a write, or behind another read. Past the core count there is nothing
+/// left to overlap, so it is capped rather than scaled.
+///
+/// Override with `ORIGOFS_SQLITE_READERS`; `0` restores the single-connection
+/// behaviour, where every read serializes on the writer.
+fn reader_count() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if let Ok(v) = std::env::var("ORIGOFS_SQLITE_READERS")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            return n.min(64);
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 4))
+            .unwrap_or(2)
+    })
+}
+
 /// A metadata store backed by a single SQLite database.
 pub struct SqliteMetadataStore {
+    /// The one connection that may write.
+    ///
+    /// SQLite allows a single writer, so serializing writes on one connection is
+    /// not a limitation this imposes — it is the engine's own rule, and holding
+    /// the writer here is what lets a [`SqliteTxn`] pin it for the life of a
+    /// transaction.
     conn: Arc<Mutex<Connection>>,
+    /// Additional read-only connections to the same database file.
+    ///
+    /// Every read *and* write used to serialize on `conn`. WAL was enabled and
+    /// then thrown away: its entire point is that readers do not block on the
+    /// writer or on each other, and one `Mutex<Connection>` made the metadata
+    /// store a global lock for the process. That is invisible for a solo CLI call
+    /// and very visible under a mount, which issues concurrent requests, or a
+    /// `readdir` racing a write.
+    ///
+    /// Empty for an in-memory database, where a second `Connection` would open a
+    /// *different*, empty database rather than another view of this one — see
+    /// [`Self::read`], which falls back to the writer.
+    readers: Arc<Vec<Mutex<Connection>>>,
+    /// Round-robin cursor into `readers`, so concurrent readers spread across the
+    /// pool instead of all queueing on the first one.
+    next_reader: Arc<std::sync::atomic::AtomicUsize>,
     /// The workspace this handle is bound to (default = 1). Workspace-scoped
     /// statements stamp/filter by it; [`SqliteMetadataStore::with_workspace`]
     /// rebinds a handle that shares this connection (`docs/MULTI_TENANCY.md`).
@@ -61,14 +106,35 @@ impl SqliteMetadataStore {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(path.as_ref())?;
         // `busy_timeout` so a second process/writer waits for the lock instead of
         // failing instantly with `SQLITE_BUSY` ("database is locked").
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
         )?;
+
+        // WAL is set on the file, so every connection opened after this one
+        // inherits it and reads a consistent snapshot without blocking the
+        // writer.
+        let mut readers = Vec::with_capacity(reader_count());
+        for _ in 0..reader_count() {
+            let r = Connection::open(path.as_ref())?;
+            // `query_only` is a safety interlock, not a tuning knob: if a method
+            // that mutates is ever routed to the read pool, SQLite refuses the
+            // statement loudly instead of writing on a connection outside the
+            // single-writer discipline. A misclassification becomes a failing
+            // test rather than a corruption.
+            r.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; \
+                 PRAGMA query_only=ON;",
+            )?;
+            readers.push(Mutex::new(r));
+        }
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            readers: Arc::new(readers),
+            next_reader: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             workspace_id: DEFAULT_WORKSPACE,
         })
     }
@@ -79,10 +145,42 @@ impl SqliteMetadataStore {
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            // No read pool: `open_in_memory` gives each connection its own
+            // private database, so a second one would be an empty database
+            // rather than another view of this one. `read()` falls back to the
+            // writer, which is the pre-pool behaviour and correct here.
+            readers: Arc::new(Vec::new()),
+            next_reader: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             workspace_id: DEFAULT_WORKSPACE,
         })
     }
 
+    /// A connection for a **read**.
+    ///
+    /// Picks a free reader if one is available, otherwise blocks on the
+    /// round-robin choice rather than falling back to the writer — taking the
+    /// writer for a read is what this pool exists to stop, and a reader that is
+    /// briefly busy is still faster to wait for than a write in flight.
+    ///
+    /// With no pool (an in-memory database) this is the writer, which is the
+    /// behaviour every read had before the pool existed.
+    fn read(&self) -> MutexGuard<'_, Connection> {
+        if self.readers.is_empty() {
+            return self.lock();
+        }
+        let start = self
+            .next_reader
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..self.readers.len() {
+            let idx = (start + i) % self.readers.len();
+            if let Some(g) = self.readers[idx].try_lock() {
+                return g;
+            }
+        }
+        self.readers[start % self.readers.len()].lock()
+    }
+
+    /// The single writer connection.
     fn lock(&self) -> MutexGuard<'_, Connection> {
         // `parking_lot::Mutex` does not poison: a panic while another operation
         // holds the lock simply releases it on unwind, so a single panicking
@@ -475,7 +573,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get_inode(&self, ino: Ino) -> Result<Option<Inode>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let row = conn
                 .query_row(
                     &format!("SELECT {INODE_COLS} FROM inode WHERE ino = ?1"),
@@ -508,7 +606,7 @@ impl MetadataStore for SqliteMetadataStore {
             if inos.is_empty() {
                 return Ok(Vec::new());
             }
-            let conn = self.lock();
+            let conn = self.read();
             let mut out = Vec::with_capacity(inos.len());
             // SQLite caps bound parameters per statement (999 on older builds), so the
             // IN-list is chunked rather than assuming the caller kept it small.
@@ -642,7 +740,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn lookup(&self, parent: Ino, name: &str) -> Result<Option<Ino>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT ino FROM dentry WHERE parent_ino = ?1 AND name = ?2",
                 params![parent, name],
@@ -684,7 +782,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_dir(&self, parent: Ino) -> Result<Vec<DirEntry>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(
                 "SELECT d.name, d.ino, i.kind
                  FROM dentry d JOIN inode i ON i.ino = d.ino
@@ -717,7 +815,7 @@ impl MetadataStore for SqliteMetadataStore {
         limit: usize,
     ) -> Result<Vec<DirEntry>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let limit = limit as i64;
             // Two statements rather than one with `(?2 IS NULL OR d.name > ?2)`: the
             // OR would defeat the `(parent_ino, name)` primary-key index and turn the
@@ -765,7 +863,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT name FROM dentry WHERE parent_ino = ?1 AND ino = ?2
                  ORDER BY name LIMIT 1",
@@ -779,7 +877,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn parent_of(&self, ino: Ino) -> Result<Option<Ino>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT parent_ino FROM dentry WHERE ino = ?1 LIMIT 1",
                 params![ino],
@@ -792,7 +890,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn child_count(&self, parent: Ino) -> Result<usize> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let n: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM dentry WHERE parent_ino = ?1",
                 params![parent],
@@ -804,7 +902,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn workspace_usage(&self) -> Result<(u64, u64)> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let (n, b): (i64, i64) = conn.query_row(
                 "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM inode WHERE workspace_id = ?1",
                 params![self.workspace_id],
@@ -816,7 +914,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             // `UNION` (not `UNION ALL`) dedups inode ids, so an inode reachable by
             // several names -- a hard link -- is counted once, as `du` does.
             let (n, b): (i64, i64) = conn.query_row(
@@ -837,7 +935,7 @@ impl MetadataStore for SqliteMetadataStore {
     async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
         let table = validated_dump_table(table)?;
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             // Quoted: `ref` is a reserved word in both dialects, and the allowlist
             // above is what makes interpolating the name here safe at all.
             let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\""))?;
@@ -940,7 +1038,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(
                 "SELECT actor_id, path_prefix, perms, granted_at, granted_by FROM acl
                  WHERE workspace_id = ?1 AND (?2 IS NULL OR actor_id = ?2)
@@ -991,7 +1089,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let row = conn
                 .query_row(
                     &format!("SELECT {TRASH_COLS} FROM trash WHERE id = ?1 AND workspace_id = ?2"),
@@ -1005,7 +1103,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(&format!(
                 "SELECT {TRASH_COLS} FROM trash WHERE workspace_id = ?1
                  ORDER BY deleted_at DESC, id DESC"
@@ -1043,7 +1141,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn trash_content_hashes(&self) -> Result<Vec<Hash>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             // Store-wide, not workspace-scoped: `gc` sweeps one shared content
             // store, so a workspace-scoped root would let it reclaim another
             // workspace's trashed content.
@@ -1062,7 +1160,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             Ok(conn
                 .query_row(
                     "SELECT value FROM xattr WHERE ino = ?1 AND name = ?2",
@@ -1098,7 +1196,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare("SELECT name FROM xattr WHERE ino = ?1 ORDER BY name")?;
             let rows = stmt.query_map(params![ino], |r| r.get::<_, String>(0))?;
             let mut out = Vec::new();
@@ -1123,7 +1221,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get_symlink(&self, ino: Ino) -> Result<Option<String>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT target FROM symlink WHERE ino = ?1",
                 params![ino],
@@ -1136,7 +1234,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get_ref(&self, name: &str) -> Result<Option<String>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT value FROM ref WHERE workspace_id = ?1 AND name = ?2",
                 params![self.workspace_id, name],
@@ -1190,7 +1288,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_refs(&self) -> Result<Vec<(String, String)>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt =
                 conn.prepare("SELECT name, value FROM ref WHERE workspace_id = ?1 ORDER BY name")?;
             let rows = stmt.query_map(params![self.workspace_id], |r| {
@@ -1206,7 +1304,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get_config(&self, key: &str) -> Result<Option<String>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT value FROM config WHERE workspace_id = ?1 AND key = ?2",
                 params![self.workspace_id, key],
@@ -1262,6 +1360,8 @@ impl MetadataStore for SqliteMetadataStore {
     fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore> {
         Arc::new(SqliteMetadataStore {
             conn: self.conn.clone(),
+            readers: self.readers.clone(),
+            next_reader: self.next_reader.clone(),
             workspace_id,
         })
     }
@@ -1303,7 +1403,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT id, root_ino FROM workspace WHERE name = ?1",
                 params![name],
@@ -1316,7 +1416,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare("SELECT id, name, root_ino FROM workspace ORDER BY id")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
@@ -1355,7 +1455,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_conflicts(&self) -> Result<Vec<(String, String)>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn
                 .prepare("SELECT path, kind FROM conflict WHERE workspace_id = ?1 ORDER BY path")?;
             let rows = stmt.query_map(params![self.workspace_id], |r| {
@@ -1405,7 +1505,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_locks(&self) -> Result<Vec<(String, String, i64)>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(
                 "SELECT path, owner, acquired_at FROM file_lock WHERE workspace_id = ?1 ORDER BY path",
             )?;
@@ -1426,7 +1526,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn posix_locks(&self, ino: Ino, now: i64) -> Result<Vec<PosixLock>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(
                 "SELECT owner, holder, pid, start_off, end_off, exclusive FROM posix_lock
                  WHERE workspace_id = ?1 AND ino = ?2 AND expires_at > ?3 ORDER BY start_off",
@@ -1639,7 +1739,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get_actor(&self, id: i64) -> Result<Option<Actor>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let row = conn
                 .query_row(
                     "SELECT id, kind, display_name, auth_subject, agent_model, agent_vendor, controller_actor_id, created_at, write_policy
@@ -1709,7 +1809,7 @@ impl MetadataStore for SqliteMetadataStore {
     async fn actor_by_subject(&self, subject: &str) -> Result<Option<Actor>> {
         // Resolve the id under the lock, then reuse get_actor for the row mapping.
         let id: Option<i64> = blocking_section(|| {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT id FROM actor WHERE auth_subject = ?1",
                 params![subject],
@@ -1725,7 +1825,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_actors(&self) -> Result<Vec<Actor>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(
                 "SELECT id, kind, display_name, auth_subject, agent_model, agent_vendor, controller_actor_id, created_at, write_policy
                  FROM actor ORDER BY id",
@@ -1822,7 +1922,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_edit_ops(&self, actor_id: i64, session_id: Option<i64>) -> Result<Vec<EditOp>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(
                 "SELECT id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts
                  FROM edit_op WHERE workspace_id = ?1 AND actor_id = ?2 AND (?3 IS NULL OR session_id = ?3) ORDER BY id",
@@ -1865,7 +1965,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get_blob_blame(&self, content: &Hash) -> Result<Option<String>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT runs FROM blob_blame WHERE workspace_id = ?1 AND content_hash = ?2",
                 params![self.workspace_id, content.to_hex()],
@@ -1902,7 +2002,7 @@ impl MetadataStore for SqliteMetadataStore {
         // two backends answering the same way. See the trait.
         crate::metadata::reject_negative_limit(limit)?;
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(
                 "SELECT seq, actor_id, session_id, kind, path, detail, ts, branch FROM fs_event
                  WHERE workspace_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
@@ -1949,7 +2049,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn active_presence(&self, since_ts: i64) -> Result<Vec<Presence>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(
                 "SELECT p.session_id, p.actor_id, a.display_name, a.kind, p.path, p.last_seen
                  FROM presence p JOIN actor a ON a.id = p.actor_id
@@ -2031,7 +2131,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get_live_doc(&self, path: &str) -> Result<Option<LiveDoc>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT path, session_id, actor_id, content_hash, since, checkpointed_at
                  FROM live_doc WHERE workspace_id = ?1 AND path = ?2",
@@ -2045,7 +2145,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_live_docs(&self) -> Result<Vec<LiveDoc>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(
                 "SELECT path, session_id, actor_id, content_hash, since, checkpointed_at
                  FROM live_doc WHERE workspace_id = ?1 ORDER BY path",
@@ -2097,7 +2197,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get_suggestion(&self, id: i64) -> Result<Option<Suggestion>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             conn.query_row(
                 "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
                      summary, status, created_ts, resolved_ts, resolved_by, kind
@@ -2116,7 +2216,7 @@ impl MetadataStore for SqliteMetadataStore {
         path: Option<&str>,
     ) -> Result<Vec<Suggestion>> {
         blocking_section(move || {
-            let conn = self.lock();
+            let conn = self.read();
             let mut stmt = conn.prepare(
                 "SELECT id, actor_id, session_id, branch, path, base_hash, proposed_hash,
                      summary, status, created_ts, resolved_ts, resolved_by, kind
