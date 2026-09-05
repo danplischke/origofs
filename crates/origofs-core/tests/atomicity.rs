@@ -269,7 +269,7 @@ async fn a_second_accept_of_the_same_suggestion_is_refused() {
             fs.write("/f.txt", b"one\n").await.unwrap();
 
             let id = fs
-                .suggest(WriteCtx::actor(author), "/f.txt", b"one\ntwo\n", None)
+                .suggest(WriteCtx::actor(author), "/f.txt", b"one\ntwo\n", None, None)
                 .await
                 .unwrap();
 

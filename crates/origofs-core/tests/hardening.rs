@@ -72,7 +72,13 @@ async fn gc_keeps_pending_suggestion_content() {
     fs.commit("dan", "base").await.unwrap();
 
     let sid = fs
-        .suggest(WriteCtx::actor(actor), "/f.txt", b"one\ntwo\n", Some("add"))
+        .suggest(
+            WriteCtx::actor(actor),
+            "/f.txt",
+            b"one\ntwo\n",
+            Some("add"),
+            None,
+        )
         .await
         .unwrap();
 
@@ -96,7 +102,7 @@ async fn empty_suggestion_is_not_a_deletion() {
     fs.write("/e.txt", b"stuff\n").await.unwrap();
 
     let sid = fs
-        .suggest(WriteCtx::actor(actor), "/e.txt", b"", None)
+        .suggest(WriteCtx::actor(actor), "/e.txt", b"", None, None)
         .await
         .unwrap();
     fs.accept_suggestion(sid, WriteCtx::actor(reviewer))
@@ -106,7 +112,7 @@ async fn empty_suggestion_is_not_a_deletion() {
     assert_eq!(&fs.read("/e.txt").await.unwrap()[..], b"");
 
     let del = fs
-        .suggest_delete(WriteCtx::actor(actor), "/e.txt", None)
+        .suggest_delete(WriteCtx::actor(actor), "/e.txt", None, None)
         .await
         .unwrap();
     fs.accept_suggestion(del, WriteCtx::actor(reviewer))

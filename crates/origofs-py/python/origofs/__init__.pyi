@@ -109,10 +109,15 @@ class SuggestionRecord(TypedDict):
 
 
 class SuggestionContent(TypedDict):
-    """The bytes behind a suggestion (``suggestion_content``)."""
+    """The two bodies behind a suggestion (``suggestion_content``).
 
-    base: Optional[bytes]
-    proposed: Optional[bytes]
+    ``str``, not ``bytes``: the extension decodes both. The stub said ``bytes``
+    until #163, so anything typed against it was wrong about this field at runtime
+    and `.decode()` on it raised. ``proposed`` is ``None`` for a proposed deletion.
+    """
+
+    base: str
+    proposed: Optional[str]
 
 
 class EditOp(TypedDict):
@@ -570,11 +575,53 @@ class LoadReport(TypedDict):
     total_rows: int
 
 
+# A structural type naming the subset of `Workspace` a host builds on (#163) --
+# `Workspace` is concrete, so a test double or a service layer that wanted to say
+# "something workspace-shaped" had no type to say it with. Defined in
+# `origofs/protocol.py` (real Python, so it is one definition rather than two).
+from .protocol import WorkspaceProtocol as WorkspaceProtocol
+
+
 class OrigoFSError(Exception):
     """Base origofs error (raised for errors without a more specific mapping)."""
 
 class ConflictError(OrigoFSError):
-    """A suggestion's base changed since it was proposed (stale base)."""
+    """An optimistic-concurrency conflict: the thing you were changing moved.
+
+    Raised for several distinct conditions, and until #159 the *only* way to tell
+    them apart was a substring match on the message — which then broke on any
+    rewording. The two that a caller must actually distinguish, because their
+    recoveries are opposite, are the subclasses below; catching ``ConflictError``
+    still catches every shape, and the HTTP surfaces still map all of them to 409.
+    """
+
+class StaleBaseError(ConflictError):
+    """A suggestion's base changed since it was proposed, so it was **not** applied.
+
+    The row is marked ``superseded`` as a side effect. Recovery: re-diff against
+    the current file and re-suggest. Raised by ``accept_suggestion``.
+    """
+
+class AlreadyResolvedError(ConflictError):
+    """The suggestion is already accepted, rejected or superseded.
+
+    Recovery: read its ``status``; there is nothing to retry. Raised by
+    ``accept_suggestion``, ``reject_suggestion``, ``supersede_suggestion`` and
+    ``accept_coedit_tree_suggestion``. It was a ``ValueError`` (and a ``400``) until
+    #164, which said the *request* was malformed when it was well-formed and merely
+    out of date.
+    """
+
+class ForeignWriteError(ConflictError):
+    """The file was written outside the co-editing session since it last agreed
+    with the bytes on disk, so checkpointing would destroy that write.
+
+    Recovery: re-read the file, reseed the document from it (see
+    ``CoeditTreeDoc.seeded_from``), and checkpoint again. Raised by
+    ``checkpoint_coedit_tree`` — always, since origofs cannot parse bytes back into
+    nodes — and by ``checkpoint_coedit`` only when the flat shape cannot reconcile
+    (a missing sidecar, a removed file, bytes that are no longer UTF-8).
+    """
 
 class WriteCtx:
     """The actor context to attribute a write to."""
@@ -721,6 +768,19 @@ class CoeditSyncReply:
         is broadcast too, and every real Yjs client emits it constantly without
         anyone typing."""
         ...
+    @property
+    def unhandled(self) -> bytes:
+        """Outer y-websocket message tags in this payload that carried no effect —
+        ``b""`` for every well-framed payload (#162).
+
+        A non-empty value almost always means the client is sending **bare y-sync**
+        frames rather than the y-websocket envelope this server speaks: a bare
+        ``messageYjsUpdate`` is tag 2, which is ``messageAuth`` in the envelope, so
+        it decodes cleanly and is dropped. The socket then connects, handshakes,
+        reports the right peer count — and never converges, which used to leave
+        nothing anywhere to attribute it to. Surface it to the client or log it;
+        the server also logs it at ``warn``."""
+        ...
 
 class CoeditDoc:
     """A live co-edited document (roadmap M8): a Yjs-compatible CRDT whose inserts
@@ -860,10 +920,42 @@ class CoeditTreeDoc:
         """Whether this document came from a coherent sidecar rather than opening
         empty. **Check before binding an editor**: origofs cannot rebuild a tree from
         a flat file (that needs your schema), so seed from ``read(path)`` when this
-        is ``False`` or a checkpoint writes an empty body over real content."""
+        is ``False``, then declare it with ``seeded_from``.
+
+        Since #158 forgetting to is an error rather than data loss: a checkpoint
+        from an unseeded document over a non-empty file raises
+        :class:`ForeignWriteError`. Note this is a **coroutine** — ``if not
+        doc.resumed()`` (without ``await``) tests a truthy ``Future`` and reads
+        backwards."""
+        ...
+    async def seeded_from(self, body: bytes) -> None:
+        """Declare that this document now represents ``body`` — the seeding
+        handshake (#158)::
+
+            doc = await ws.open_coedit_tree(ctx, path, "content")
+            if not await doc.resumed():
+                body = await ws.read(path)
+                my_parser.seed(doc, body)      # your schema, your parser
+                await doc.seeded_from(body)    # ...and now origofs knows
+
+        origofs cannot parse bytes back into tree nodes, so it cannot tell a
+        document you seeded from the file apart from an empty one about to blank
+        it. This is how you say which it is. Seeding from the file's *current*
+        bytes without parsing them is the deliberate-overwrite escape hatch — "I
+        have looked at what is there and I am replacing it", written down rather
+        than assumed."""
+        ...
+    async def base_hash(self) -> Optional[str]:
+        """Hex BLAKE3 of the body this document is coherent with — what it resumed
+        from, was seeded from, or last crystallized — or ``None`` when it has no
+        established relationship to any file.
+
+        This is what ``checkpoint_coedit_tree`` compares the file against. It is a
+        BLAKE3 of the bytes, *not* the chunk-manifest address ``stat()`` returns;
+        see :func:`content_hash`."""
         ...
     async def is_empty(self) -> bool:
-        """Whether the tree has no nodes at all."""
+        """Whether the tree has no nodes at all. Also a coroutine."""
         ...
     async def plain_text(self) -> str:
         """The whole tree's text in document order, with no structure — for
@@ -991,8 +1083,16 @@ class Workspace:
     async def read_to_path(self, path: str, dest_path: str) -> int: ...
     # Governed by the actor's write policy: a direct actor writes; a propose-only
     # actor's edit is queued as a suggestion (`WriteOutcome.suggestion_id`).
+    # `replaces` retires a pending draft of this actor's on the same path as the
+    # new proposal is created — the way to *revise* rather than stack (#164).
+    # Ignored on the direct-write branch, since nothing is queued there.
     async def write_or_propose(
-        self, ctx: WriteCtx, path: str, data: bytes, summary: Optional[str] = None
+        self,
+        ctx: WriteCtx,
+        path: str,
+        data: bytes,
+        summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> WriteOutcome: ...
     async def set_write_policy(self, actor_id: int, policy: str) -> None: ...
     async def mkdir_p(self, path: str) -> None: ...
@@ -1127,6 +1227,7 @@ class Workspace:
         path: str,
         doc: CoeditTreeDoc,
         summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> int: ...
     async def suggest_coedit_tree_update(
         self,
@@ -1135,6 +1236,7 @@ class Workspace:
         base_sv: bytes,
         update: bytes,
         summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> int: ...
     async def coedit_tree_suggestion_update(self, id: int) -> bytes: ...
     async def merge_coedit_tree_suggestion(
@@ -1156,8 +1258,15 @@ class Workspace:
     # body: base = the document's Yjs state vector, proposal = an
     # `encodeStateAsUpdate` blob, so `accept_suggestion` merges instead of
     # overwriting. The resulting suggestion's `kind` is `"crdt"`.
+    # `replaces` retires an earlier pending draft of this actor's as this one is
+    # created -- see `suggest` (#164).
     async def suggest_coedit(
-        self, ctx: WriteCtx, path: str, doc: CoeditDoc, summary: Optional[str] = None
+        self,
+        ctx: WriteCtx,
+        path: str,
+        doc: CoeditDoc,
+        summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> int: ...
     async def suggest_coedit_update(
         self,
@@ -1166,6 +1275,7 @@ class Workspace:
         base_sv: bytes,
         update: bytes,
         summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> int: ...
     # --- live/dirty markers ---
     # A live path's durable bytes are a *checkpoint* that may lag the open Y.Doc.
@@ -1207,14 +1317,54 @@ class Workspace:
     # Each suggestion dict carries a `kind`: `"bytes"` (a whole file body, whose
     # `base_hash` gates the accept) or `"crdt"` (a Yjs update, which merges). A
     # stale byte proposal is retired as `"superseded"` rather than left pending.
-    async def suggest(self, ctx: WriteCtx, path: str, data: bytes, summary: Optional[str] = None) -> int: ...
-    async def suggest_delete(self, ctx: WriteCtx, path: str, summary: Optional[str] = None) -> int: ...
+    # `replaces` names a *pending* proposal of your own **on this path** to retire
+    # as this one is created — how you revise a proposal (#164). Without it a
+    # revision is a sibling: two pending drafts on one base, which origofs resolves
+    # correctly on accept and incorrectly on reject, where the abandoned earlier
+    # draft stays pending with a current base and still accepts cleanly. Opt-in,
+    # because two drafts a reviewer chooses between is a real workflow origofs
+    # cannot tell apart from a revision. Find your prior id with
+    # `list_suggestions("pending", path)`.
+    async def suggest(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        data: bytes,
+        summary: Optional[str] = None,
+        replaces: Optional[int] = None,
+    ) -> int: ...
+    async def suggest_delete(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        summary: Optional[str] = None,
+        replaces: Optional[int] = None,
+    ) -> int: ...
     async def list_suggestions(self, status: Optional[str] = None, path: Optional[str] = None) -> list[SuggestionRecord]: ...
     async def get_suggestion(self, id: int) -> Optional[SuggestionRecord]: ...
     async def suggestion_diff(self, id: int) -> str: ...
+    # The two bodies, as text. To ask whether the proposal is still *appliable*,
+    # compare `get_suggestion(id)["base_hash"]` with `stat(path)["content"]` --
+    # that is exactly the staleness check `accept_suggestion` makes, so there is no
+    # need to diff the bodies. Note neither is `content_hash(body)`: see there.
     async def suggestion_content(self, id: int) -> SuggestionContent: ...
-    async def accept_suggestion(self, id: int, approver: WriteCtx) -> None: ...
+    # Returns the content address now at the path -- `None` for an accepted
+    # deletion -- so a caller can confirm what landed without a second read (#163).
+    # Not `content_hash(body)`: it is the file's chunk-manifest address, the same
+    # value `stat(path)["content"]` carries. Raises `StaleBaseError` if the base
+    # moved, which also marks the row `superseded`.
+    async def accept_suggestion(self, id: int, approver: WriteCtx) -> Optional[str]: ...
     async def reject_suggestion(self, id: int, approver: WriteCtx) -> None: ...
+    # Withdraw a pending draft its author abandoned, without applying or rejecting
+    # it (#164) — the standalone form of `suggest(..., replaces=)`, for a draft
+    # retired with *nothing taking its place*. Where a replacement is proposed in
+    # the same breath, prefer `replaces`: every propose call takes it, byte and
+    # CRDT alike, and then the two cannot come apart. Distinct from
+    # `reject_suggestion`, which records that a reviewer declined. The author may
+    # always retire their own; anyone else needs WRITE at its path.
+    async def supersede_suggestion(
+        self, id: int, ctx: WriteCtx, reason: Optional[str] = None
+    ) -> None: ...
 
     # --- mounting / serving (Unix only) ---
     # FUSE/NFS are Unix-only (`#[cfg(unix)]` in lib.rs); off Unix both always
@@ -1235,7 +1385,11 @@ class Workspace:
     # `create_branch` above are exempt by construction and record no blame — use
     # them only where there is genuinely no actor.
     async def remove_or_propose(
-        self, ctx: WriteCtx, path: str, summary: Optional[str] = None
+        self,
+        ctx: WriteCtx,
+        path: str,
+        summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> WriteOutcome: ...
     async def rename_as(self, ctx: WriteCtx, from_: str, to: str) -> None: ...
     async def mkdir_as(self, ctx: WriteCtx, path: str) -> None: ...
@@ -1287,6 +1441,11 @@ class Workspace:
     # actors, and uncommitted edits live only there. This is the thing to back up.
     async def backup_metadata(self, dest: str) -> str: ...
     async def reap_presence(self, grace_secs: int) -> int: ...
+    # "Stale" means the *base moved on*, and only that (#164) -- not "everything
+    # obsolete". Two pending proposals from one actor on one unchanged base are
+    # siblings, both current by this measure, so this returns 0 for them. Retiring
+    # a draft its own author abandoned is `supersede_suggestion`, or `replaces` on
+    # `suggest`.
     async def supersede_stale_suggestions(self, path: str) -> int: ...
     # {ready, metadata, content} — each store None when healthy. Mirrors /readyz.
     async def ready(self) -> ReadyReport: ...
@@ -1490,9 +1649,9 @@ class Workspace:
     async def ensure_may_read_at(self, ctx: WriteCtx, op: str, path: str) -> None: ...
     async def read_as(self, ctx: WriteCtx, path: str) -> bytes: ...
     async def read_range_as(self, ctx: WriteCtx, path: str, off: int, len: int) -> bytes: ...
-    async def stat_as(self, ctx: WriteCtx, path: str) -> Inode: ...
+    async def stat_as(self, ctx: WriteCtx, path: str) -> StatResult: ...
     async def readlink_as(self, ctx: WriteCtx, path: str) -> str: ...
-    async def blame_as(self, ctx: WriteCtx, path: str) -> list[BlameRange]: ...
+    async def blame_as(self, ctx: WriteCtx, path: str) -> list[BlameSpan]: ...
     async def log_path_as(
         self, ctx: WriteCtx, path: str, limit: Optional[int] = ...
     ) -> list[PathRevision]: ...
@@ -1609,7 +1768,14 @@ class Workspace:
 def content_hash(data: bytes) -> str:
     """The origofs content address (BLAKE3, hex) of ``data`` — the same hash a
     passage carries, so a Python pipeline can key derived/converted content by the
-    same scheme."""
+    same scheme.
+
+    **Not comparable to** ``stat(path)["content"]``. That is a chunk-*manifest*
+    address — the hash of the list of chunk hashes a file was split into — while
+    this is the BLAKE3 of the bytes themselves. Both are called a hash and only one
+    is the file's address, so they differ for the same content and comparing them
+    always reports "changed". To check a file against bytes you hold, write them
+    and compare the addresses, or compare against ``read(path)``."""
     ...
 
 def fuse_mountable() -> bool:

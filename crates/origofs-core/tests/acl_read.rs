@@ -62,7 +62,7 @@ async fn reads_are_open_until_a_workspace_opts_in() {
     // ...and writing is still refused, so this is enforcement being off rather
     // than the fixture granting something by accident.
     assert!(
-        fs.write_or_propose(ctx, "/doc.md", b"x", None)
+        fs.write_or_propose(ctx, "/doc.md", b"x", None, None)
             .await
             .is_err()
     );
@@ -161,7 +161,7 @@ async fn a_read_grant_admits_every_attributed_read() {
 
     // READ alone is not WRITE.
     assert!(
-        fs.write_or_propose(ctx, "/doc.md", b"x", None)
+        fs.write_or_propose(ctx, "/doc.md", b"x", None, None)
             .await
             .is_err()
     );
@@ -221,7 +221,7 @@ async fn a_write_only_grant_does_not_imply_read() {
     let ctx = WriteCtx::actor(bob);
 
     assert!(
-        fs.write_or_propose(ctx, "/doc.md", b"x", None)
+        fs.write_or_propose(ctx, "/doc.md", b"x", None, None)
             .await
             .is_ok()
     );

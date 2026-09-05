@@ -61,7 +61,9 @@ async fn follows_the_file_across_a_rename() {
 async fn a_deleted_file_still_answers_from_its_recorded_path() {
     let (fs, ctx) = fixture().await;
     fs.write_as(ctx, "/gone.txt", b"one\n").await.unwrap();
-    fs.remove_or_propose(ctx, "/gone.txt", None).await.unwrap();
+    fs.remove_or_propose(ctx, "/gone.txt", None, None)
+        .await
+        .unwrap();
 
     // The inode is gone, so there is nothing to resolve; the delete is exactly the
     // row somebody asking about a vanished file wants, and it is still here.

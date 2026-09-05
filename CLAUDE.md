@@ -164,6 +164,43 @@ write path enforces this and you must not weaken it:
   only on `accept`, and `accept` lands the edit **attributed to the original
   author** while recording the approver (and refuses a stale base). Reviewer must
   differ from author.
+  - **A revision is not a second proposal (#164).** `write_or_propose` had no
+    update-in-place, so an actor told "revise your proposal" could only propose
+    again — stacking a *sibling* on the same base. Accept handled that correctly by
+    accident (landing either moves the file, so the other goes stale); **reject did
+    not**, leaving the abandoned draft `pending` with a base that still matched the
+    file, so it accepted cleanly and landed text the author had replaced and the
+    reviewer never chose. `replaces: Option<i64>` on `suggest`/`suggest_delete`/
+    `write_or_propose`/`remove_or_propose` retires that draft as the new one is
+    created; `supersede_suggestion` is the standalone form.
+  - **Opt-in, not a default.** Two drafts a reviewer chooses between is a real
+    workflow and origofs cannot tell it from a revision, so retiring the earlier
+    one automatically would silently discard the alternative — the same class of
+    unasked-for outcome as #158, in the other direction.
+  - **"Stale" is not "obsolete".** `supersede_stale_byte_suggestions` retires
+    proposals whose *base moved on*, and an author revising a draft has changed no
+    bytes, so it returns `0` for siblings. That is a different relation, not a gap
+    in it — which is why #164 needed a new operation rather than a fix there.
+  - **Retiring is ordered before creating**, so the guarantee is the one a caller
+    relies on: if the propose returns `Ok`, `replaces` is superseded. The opposite
+    order leaves both pending when the second half fails, which is the bug. The
+    cost is the reverse window (retired, no replacement), and that one is
+    survivable — the row and its bytes are still there. The propose check runs
+    first so a refusal cannot retire a draft for nothing.
+  - **Disposing of a draft is authorized like rejecting one**: the author may
+    always retire their own, anyone else needs `WRITE` at its path — otherwise one
+    propose-only agent clears another's work out of the queue. **Every** propose
+    call carries `replaces`, the CRDT pair included: stacked CRDT drafts are less
+    dangerous (a CRDT proposal never goes stale, and applying an author's earlier
+    state after their later one merges a subset), but "the proposal I meant is no
+    longer this one" is the same relation on either shape.
+  - **"Already accepted" is a conflict, not a bad request (#164).**
+    `OrigoFSError::AlreadyResolved` (`already_resolved`, `409`,
+    `AlreadyResolvedError` in Python) replaced the `InvalidArgument` every
+    resolve path returned for a settled row — which said the *request* was
+    malformed when it was well-formed and merely out of date. It is the third thing
+    a reviewing caller handles beside `StaleBase` and the raced-CAS `Conflict`, and
+    unlike either it is terminal: read the row's status, there is nothing to retry.
 - **The write policy and the ACLs are enforced in the engine, not per surface.**
   Every *attributed* mutation on `Fs` — `write_or_propose`, `remove_or_propose`,
   `rename_as`, `mkdir_as`, `symlink_as`, `commit_as`, `checkout_as`,
@@ -226,11 +263,11 @@ write path enforces this and you must not weaken it:
     that names what a `stat` would refuse is the existence oracle the refusal
     exists to prevent. The filtered listing pages internally, because a page that
     filters to empty would otherwise read as end-of-directory and truncate.
-- **A checkpoint never overwrites a file that changed underneath it.** Both shapes
-  compare the file against the live marker's coherence hash. The tree shape
-  refuses (`refuse_out_of_band`) — origofs cannot parse bytes back into nodes. The
-  flat shape folds the foreign write in (`reconcile_out_of_band`, replaying the
-  CRDT sidecar), and **refuses when it cannot** — a missing or unreadable sidecar,
+- **A checkpoint never overwrites a file that changed underneath it.** The tree
+  shape refuses (`ensure_tree_coherent`) — origofs cannot parse bytes back into
+  nodes. The flat shape folds the foreign write in (`reconcile_out_of_band`,
+  replaying the CRDT sidecar, comparing against the live marker's coherence hash),
+  and **refuses when it cannot** — a missing or unreadable sidecar,
   a removed file, bytes that are no longer UTF-8. Those arms used to
   `return Ok(())`, which the caller read as "nothing to reconcile" before
   overwriting. **A branch checkout is the case that makes it bite:** `checkout`
@@ -244,7 +281,32 @@ write path enforces this and you must not weaken it:
   with no editor attached (a "Save" button) goes through `load_coedit_tree_as` —
   the write check, no live marker. `open_coedit_tree` there leaked a permanent
   marker, because the matching `end_coedit` lives on the socket disconnect path
-  that flow never reaches. Same rule as `load_coedit_as` on the flat side.
+  that flow never reaches. Same rule as `load_coedit_as` on the flat side. Note
+  `_as` here is **not** the propose form (that is `load_coedit_tree_to_propose`),
+  which is why both docstrings spell the distinction out rather than leaving it to
+  the name.
+- **The tree checkpoint's guard is on the document, not on the live marker
+  (#158, #161).** `CoeditTreeDoc::base_hash` is the BLAKE3 of the body the document
+  is *coherent with* — what it resumed from, was told about via `seeded_from`, or
+  last crystallized — and `ensure_tree_coherent` compares that against the file,
+  with the persisted sidecar as a cross-worker second opinion (that is what keeps a
+  second worker's replica entitled to checkpoint after the first landed a body).
+  The marker was the wrong home for it in two ways, both measured: **opening** a
+  room refreshes the marker's `content_hash` from the file, so a stateless handler
+  that re-opened before each checkpoint reset the guard to whatever a foreign write
+  had just produced; and a socket-less checkpoint leaves no marker at all, so it was
+  never guarded. Both look identical to the working case from the call site.
+  - **An unseeded document over a non-empty file is refused too.** It is *empty*, so
+    landing it is the data loss rather than a step towards it. `seeded_from(body)` is
+    how a host that parsed the file into the tree says so — and, from the file's
+    current bytes, is also the deliberate-overwrite escape hatch, written down
+    rather than assumed. Over HTTP that is `"seeded_from_file": true` on the
+    checkpoint route.
+  - **`persist_coedit_tree` frames the sidecar against the document's base, never
+    the file's current bytes.** Framing against the file laundered a foreign write
+    into "coherent" (the next open resumed and checkpointed straight over it) and
+    handed an unseeded document a claim it had not earned, re-arming the overwrite
+    through the sweeper's timer instead of through the caller.
 - **A co-editing socket is a write channel, and takes the write check to open.**
   `open_coedit`/`open_coedit_tree` require `WRITE` at the path, not merely a
   valid credential — the WebSocket upgrade authenticates but does not authorize,
@@ -397,6 +459,22 @@ write path enforces this and you must not weaken it:
   so in its output, because the raw forms exist for the first grant in a fresh
   workspace and not for a caller who forgot the flag. `acl show` and `acl check`
   answer the question an ACL bug is actually asking. Issue #124.
+- **A FastAPI route group is a capability, and it is split where a host needs to
+  draw the line (#153, #160).** `origofs.fastapi._ROUTE_GROUPS` names every route
+  by what it lets a caller *do*, and `include=`/`exclude=` mount by those names —
+  for the host that stores bodies in origofs but owns its access model, and would
+  otherwise have a route a caller satisfying `authn` can reach past its own checks.
+  `coedit` was one group covering both sockets *and* the mutating tree-checkpoint
+  route; `coedit-ws` and `coedit-checkpoint` split them, with `coedit` kept as an
+  **alias** for both so every existing `include`/`exclude` still means what it
+  meant. The bundling rationale ("a tree socket cannot work without a checkpoint")
+  was true of the capability, not of *this route*: a host with its own save path
+  needs origofs not to mount a second write path to the same bytes, gated
+  differently. Note `authn` cannot express this — sockets and checkpoint are all
+  mutating, so no strictness ordering separates them; route selection is the only
+  lever. Aliases are expanded before the set arithmetic, so an `exclude` drops
+  every half. `test_every_route_belongs_to_exactly_one_group` keeps the table
+  honest: an unclassified route ships on every filtered router by accident.
 - **`effective_perms` is cached, and the cache is exact rather than fresh-ish.**
   It was up to three round trips — `list_acl` returns *every* grant the actor
   holds — with a linear prefix match over the result: 16% of a read at one grant,
@@ -499,6 +577,19 @@ compiling at all until #107.
   deliberately asymmetric** and keeps a `.origofs` it finds: an incoming repo's
   directory of that name is somebody else's content, and the export filter exists
   to keep origofs's state out of what it publishes, not to reserve the name.
+- **`handle_sync` speaks the y-websocket envelope, and says so when a frame does
+  not (#162).** Frames carry an outer message tag (`messageSync` = 0) wrapping the
+  y-sync payload. A client written against y-sync *directly* sends a bare update,
+  which starts with `messageYjsUpdate` = 2 — `messageAuth` in the envelope — so it
+  decodes cleanly and does nothing. The socket then connects, handshakes, reports
+  the right peer count and never converges, with nothing anywhere to attribute it
+  to; "no error" reads as "my frames are fine, the problem is elsewhere".
+  `drive_sync` now counts every outer tag it has no handler for into
+  `SyncReply::unhandled` and logs it at `warn`. Deliberately **not** an error:
+  `messageAuth` is a real y-protocol message, and refusing a whole payload for one
+  would break a conforming client to diagnose a non-conforming one. Awareness is
+  *handled* (relayed) so it is not counted — every Yjs client emits it constantly,
+  and a warning per heartbeat would bury the signal.
 - **`yrs` is pinned at 0.23.5 on purpose, and the co-editing socket is exposed
   because of it (#144).** A malformed y-sync update reaches
   `from_utf8_unchecked` (`encoding/read.rs`, `updates/decoder.rs`) and is then
@@ -662,6 +753,17 @@ compiling at all until #107.
   errors also carry a machine `code()` + `retryable()`/`class()` (`error.rs`) instead
   of a flat string, and `/readyz` (distinct from liveness `/health`) probes the
   stores via `MetadataStore::ping`/`ContentStore::ping`.
+  **A conflict that needs its own recovery gets its own variant** (#159).
+  `Conflict` covered both "your proposal's base moved" and "somebody wrote around
+  your live document", which ask for *opposite* recoveries, so callers were reduced
+  to substring-matching the message — and then breaking on any rewording.
+  `StaleBase` and `ForeignWrite` split those out (`stale_base`/`foreign_write`
+  codes; `StaleBaseError`/`ForeignWriteError` subclassing `ConflictError` in
+  Python, so `except ConflictError` and the 409 mapping are unchanged). The
+  consequence for the tree: **use `is_conflict()`, never a bare `Conflict(_)`
+  pattern** — every site that meant "any conflict" was a 409 or a "the caller must
+  re-read" decision that still applies to all three, and a narrowed match is a
+  silent behaviour change.
   **Metrics work the same way** (`metrics` feature, default-off and deliberately
   *not* in `full`): `origofs-core::metrics` records through the `metrics` facade —
   the recording bodies are `#[cfg]`-gated, so call sites are unconditional and
@@ -673,6 +775,20 @@ compiling at all until #107.
   endpoint). It sits outside `/v1`, ungated like `/readyz` — safe only because
   every metric label is a closed set (never a path, actor, or hash). **Keep it
   that way when adding a metric.**
+- **`origofs/__init__.pyi` is hand-maintained, and it fails open** — so it gets
+  structural tests of its own, in `tests/test_stub_records.py`. Nothing checks a
+  stub against reality by default: mypy silences errors inside site-packages, so a
+  host running plain `mypy` sees neither the error nor the types. Two undefined
+  names (`Inode`, `BlameRange` — the records are `StatResult` and `BlameSpan`)
+  quietly degraded `stat_as`/`blame_as` to `Any`, i.e. exactly the attributed,
+  ACL-checked variants a multi-tenant host is told to prefer; and
+  `SuggestionContent` declared `bytes` where the extension returns `str`, so
+  anything typed against it was wrong at runtime (#163). Three checks now hold the
+  line: the record-key comparison against a real workspace, an `ast` pass that
+  every name used in an annotation is declared, and — for `WorkspaceProtocol`
+  (`python/origofs/protocol.py`, the structural type a host or test double depends
+  on, since `Workspace` is concrete) — that it names only methods `Workspace`
+  actually has.
 - Integration tests live in each crate's `tests/` and are the clearest executable
   spec of behavior (e.g. `origofs-core/tests/{merge,attribution,recover,durability,
   integrity}.rs`). Mirror their style when adding coverage.

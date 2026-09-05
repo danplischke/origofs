@@ -11,6 +11,10 @@
 //! CRDT sidecar (it lives in the working tree), while the live marker is metadata
 //! and survives — so the one input reconciliation needs is missing exactly when it
 //! is needed.
+//!
+//! The refusal is `ForeignWrite` rather than a bare `Conflict` since #159: a caller
+//! recovers from it by reseeding its document, which is the opposite of what a
+//! `StaleBase` — the other thing that used to arrive as `Conflict` — asks for.
 #![cfg(feature = "coedit")]
 
 use origofs_sdk::{OrigoFSError, TreeSpan, Workspace, WriteCtx};
@@ -51,7 +55,7 @@ async fn a_checkout_does_not_let_a_room_clobber_the_other_branch() {
     // The room checkpoints — on its idle timer, or on the last socket leaving.
     let r = w.checkpoint_coedit(ctx, "/n.md", &doc).await;
     assert!(
-        matches!(r, Err(OrigoFSError::Conflict(_))),
+        matches!(r, Err(OrigoFSError::ForeignWrite(_))),
         "a room opened on another branch must not land here: {r:?}"
     );
     assert_eq!(
@@ -86,7 +90,7 @@ async fn a_checkout_refuses_even_after_the_room_checkpointed_once() {
     w.checkout_as(ctx, "main").await.unwrap();
     doc.insert(ctx, 0, "MORE\n");
     let r = w.checkpoint_coedit(ctx, "/n.md", &doc).await;
-    assert!(matches!(r, Err(OrigoFSError::Conflict(_))), "{r:?}");
+    assert!(matches!(r, Err(OrigoFSError::ForeignWrite(_))), "{r:?}");
     assert_eq!(w.read("/n.md").await.unwrap().as_ref(), b"main content\n");
 }
 
@@ -141,10 +145,10 @@ async fn a_removed_file_is_not_resurrected_by_a_stale_room() {
     let doc = w.open_coedit(ctx, "/n.md").await.unwrap();
     w.checkpoint_coedit(ctx, "/n.md", &doc).await.unwrap();
 
-    w.remove_or_propose(ctx, "/n.md", None).await.unwrap();
+    w.remove_or_propose(ctx, "/n.md", None, None).await.unwrap();
     doc.insert(ctx, 0, "typed\n");
     let r = w.checkpoint_coedit(ctx, "/n.md", &doc).await;
-    assert!(matches!(r, Err(OrigoFSError::Conflict(_))), "{r:?}");
+    assert!(matches!(r, Err(OrigoFSError::ForeignWrite(_))), "{r:?}");
 }
 
 /// A socket-less tree checkpoint — a "Save" with no editor attached — must not

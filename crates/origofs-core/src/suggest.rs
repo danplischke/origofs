@@ -279,6 +279,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         ctx: WriteCtx,
         path: &str,
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<WriteOutcome> {
         // Path-scoped since #123, exactly as `write_or_propose` is — a deletion is
         // the same destruction one call further along, so the two must not be able
@@ -290,7 +291,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 Ok(WriteOutcome::Wrote)
             }
             p if p.contains(crate::acl::Perms::PROPOSE) => {
-                let id = self.suggest_delete(ctx, path, summary).await?;
+                let id = self.suggest_delete(ctx, path, summary, replaces).await?;
                 Ok(WriteOutcome::Proposed(id))
             }
             p => Err(OrigoFSError::Denied(format!(
@@ -316,6 +317,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         path: &str,
         data: &[u8],
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<WriteOutcome> {
         // Path-scoped since #123. `effective_perms` resolves the longest grant
         // covering this path and falls back to the actor's whole-workspace
@@ -338,7 +340,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 Ok(WriteOutcome::Wrote)
             }
             p if p.contains(crate::acl::Perms::PROPOSE) => {
-                let id = self.suggest(ctx, path, data, summary).await?;
+                let id = self.suggest(ctx, path, data, summary, replaces).await?;
                 Ok(WriteOutcome::Proposed(id))
             }
             // Neither write nor propose. Only reachable via an explicit grant of
@@ -358,12 +360,35 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     /// the CAS now; the working tree is untouched until the suggestion is
     /// accepted. Returns the new suggestion id. `data` empty with the intent to
     /// delete is expressed by [`Self::suggest_delete`].
+    ///
+    /// # Revising a proposal (`replaces`, #164)
+    ///
+    /// Pass the id of your own pending draft to **retire it as this one is
+    /// created**. Without it a revision is a *sibling*: two pending proposals on
+    /// one base, which origofs happens to resolve correctly on accept (landing
+    /// either moves the file, so the other goes stale) and **incorrectly** on
+    /// reject — the abandoned earlier draft stays pending with a current base and
+    /// accepts cleanly, landing text the author already replaced and the reviewer
+    /// never chose.
+    ///
+    /// It is deliberately opt-in rather than the default for a second proposal by
+    /// the same actor on the same path: two drafts a reviewer is meant to choose
+    /// between is a real workflow, and origofs cannot tell it from a revision.
+    /// Making it the default would silently retire the alternative; making it
+    /// explicit costs one argument and never guesses. A stateless caller that does
+    /// not know its prior id finds it with `list_suggestions(Pending, path)`.
+    ///
+    /// `replaces` must name a **pending** suggestion **on the same path** that
+    /// this actor authored (or that it holds `WRITE` over) — see
+    /// [`supersede_suggestion`](Self::supersede_suggestion) for the standalone
+    /// form and the full rules.
     pub async fn suggest(
         &self,
         ctx: WriteCtx,
         path: &str,
         data: &[u8],
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         let base_hash = self.current_content_hex(path).await?;
         let (mhash, _size) = self.store_body(data).await?;
@@ -385,26 +410,43 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             proposed_hash,
             summary,
             SuggestionKind::Bytes,
+            replaces,
         )
         .await
     }
 
     /// Propose deleting `path` (a suggestion with no proposed content).
+    ///
+    /// `replaces` retires an earlier pending draft of this actor's as this one is
+    /// created — see [`suggest`](Self::suggest).
     pub async fn suggest_delete(
         &self,
         ctx: WriteCtx,
         path: &str,
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         // Existence is a namespace question, not "has content": an empty file
         // exists but has no content hash. `resolve` errors `NotFound` if the
         // path genuinely doesn't exist.
         self.resolve(path).await?;
         let base_hash = self.current_content_hex(path).await?;
-        self.record_suggestion(ctx, path, base_hash, None, summary, SuggestionKind::Bytes)
-            .await
+        self.record_suggestion(
+            ctx,
+            path,
+            base_hash,
+            None,
+            summary,
+            SuggestionKind::Bytes,
+            replaces,
+        )
+        .await
     }
 
+    // Eight, and each one is a distinct fact about the row being created — packing
+    // them into a struct would move the same list one indirection away without
+    // making any call site clearer, since every caller fills in a different subset.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_suggestion(
         &self,
         ctx: WriteCtx,
@@ -413,6 +455,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         proposed_hash: Option<String>,
         summary: Option<&str>,
         kind: SuggestionKind,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         // Every suggestion funnels through here — bytes, deletion, and CRDT — so
         // this is the one place the propose right has to be checked. It was
@@ -423,6 +466,23 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         // `Perms::NONE` there should not be able to create.
         self.ensure_may_propose_at(ctx, "propose changes to", path)
             .await?;
+        // Retire the draft *before* creating its replacement, so the guarantee is
+        // the one a caller can rely on: if this returns `Ok`, `replaces` is
+        // superseded. The other order leaves both pending when the second half
+        // fails, which is precisely the state #164 is about. The cost is the
+        // opposite window — retired with no replacement — and that one is
+        // survivable: the row and its proposed bytes are still there to re-read,
+        // and the author simply proposes again. The propose check above runs first
+        // so a refusal cannot retire a draft for nothing.
+        if let Some(old) = replaces {
+            let s = self.replaceable_suggestion(old, ctx, path).await?;
+            if !self.supersede_row(&s).await? {
+                return Err(OrigoFSError::Conflict(format!(
+                    "suggestion #{old} was resolved by someone else while it was \
+                     being replaced; nothing was proposed — re-read it and decide"
+                )));
+            }
+        }
         let branch = self.current_branch().await.ok().flatten();
         let id = self
             .meta
@@ -445,11 +505,147 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             session_id: ctx.session,
             kind: "suggest".to_string(),
             path: path.to_string(),
-            detail: Some(format!("suggestion #{id}")),
-            branch,
+            detail: Some(match replaces {
+                Some(old) => format!("suggestion #{id} (replacing #{old})"),
+                None => format!("suggestion #{id}"),
+            }),
+            branch: branch.clone(),
         })
         .await?;
+        // Recorded after the create so the trail names *both* rows: a reviewer
+        // looking at the retired draft needs to know what took its place, and the
+        // replacement's id does not exist until here.
+        if let Some(old) = replaces {
+            self.record_supersede_event(
+                old,
+                path,
+                ctx.actor,
+                ctx.session,
+                &format!("replaced by #{id}"),
+            )
+            .await?;
+        }
         Ok(id)
+    }
+
+    /// Retire a **pending** suggestion the author has abandoned, without applying
+    /// or rejecting it (#164).
+    ///
+    /// The relation this expresses is "the proposal I meant is no longer this
+    /// one", which is not the same as either of the two states that already
+    /// existed. [`reject_suggestion`](Self::reject_suggestion) says a reviewer
+    /// looked and declined; [`supersede_stale_byte_suggestions`](Self::supersede_stale_byte_suggestions)
+    /// retires proposals whose *base* moved on, and returns nothing at all while
+    /// the base is unchanged — which is exactly the case here, since an author
+    /// revising a draft has changed no bytes. Nothing expressed "abandoned by its
+    /// own author", so a revised proposal left its earlier draft `pending`,
+    /// `base_is_current`, and fully accept-ready: reject the revision and the
+    /// superseded text a reviewer never chose lands cleanly.
+    ///
+    /// Prefer `replaces` on [`suggest`](Self::suggest) /
+    /// [`write_or_propose`](Self::write_or_propose) when you are proposing the
+    /// replacement in the same breath — it does this as part of that call, so the
+    /// two cannot come apart. This is for retiring a draft with nothing taking its
+    /// place.
+    ///
+    /// Authorized like rejecting: the **author** may always retire their own, and
+    /// anyone else needs `WRITE` at the path, because disposing of somebody's
+    /// proposal is a review action over that path.
+    pub async fn supersede_suggestion(
+        &self,
+        id: i64,
+        ctx: WriteCtx,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let s = self.replaceable_suggestion_anywhere(id, ctx).await?;
+        if !self.supersede_row(&s).await? {
+            return Err(OrigoFSError::Conflict(format!(
+                "suggestion #{id} was resolved by someone else while it was being \
+                 superseded — re-read it and decide"
+            )));
+        }
+        self.record_supersede_event(
+            id,
+            &s.path,
+            ctx.actor,
+            ctx.session,
+            reason.unwrap_or("withdrawn by its author"),
+        )
+        .await
+    }
+
+    /// Fetch `id` and check it may be retired by `ctx` — pending, and either the
+    /// caller's own or a path the caller may write.
+    async fn replaceable_suggestion_anywhere(&self, id: i64, ctx: WriteCtx) -> Result<Suggestion> {
+        let s = self
+            .meta
+            .get_suggestion(id)
+            .await?
+            .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
+        if s.status != SuggestionStatus::Pending {
+            return Err(OrigoFSError::AlreadyResolved(format!(
+                "suggestion #{id} is already {}",
+                s.status.as_str()
+            )));
+        }
+        // Same rule `reject_suggestion` applies, and for the same reason: an actor
+        // that cannot write cannot dispose of *someone else's* proposal, or one
+        // propose-only agent quietly clears another's work out of the queue.
+        if ctx.actor != s.actor_id {
+            self.ensure_may_write_at(ctx, "retire others' suggestions for", &s.path)
+                .await?;
+        }
+        Ok(s)
+    }
+
+    /// [`replaceable_suggestion_anywhere`](Self::replaceable_suggestion_anywhere),
+    /// plus the constraint that it is a draft of `path`.
+    ///
+    /// A `replaces` naming a proposal on a *different* path is a caller bug that
+    /// would silently retire unrelated work, so it is refused rather than honoured.
+    async fn replaceable_suggestion(
+        &self,
+        id: i64,
+        ctx: WriteCtx,
+        path: &str,
+    ) -> Result<Suggestion> {
+        let s = self.replaceable_suggestion_anywhere(id, ctx).await?;
+        if s.path != path {
+            return Err(OrigoFSError::InvalidArgument(format!(
+                "suggestion #{id} proposes a change to {}, not to {path}; a \
+                 replacement must be for the same path",
+                s.path
+            )));
+        }
+        Ok(s)
+    }
+
+    /// The compare-and-set that retires one pending row. `false` means it was
+    /// resolved by somebody else first.
+    async fn supersede_row(&self, s: &Suggestion) -> Result<bool> {
+        self.meta
+            .resolve_suggestion(s.id, SuggestionStatus::Superseded, None, self.now_secs())
+            .await
+    }
+
+    async fn record_supersede_event(
+        &self,
+        id: i64,
+        path: &str,
+        actor: i64,
+        session: Option<i64>,
+        detail: &str,
+    ) -> Result<()> {
+        self.record_event(EventInit {
+            actor_id: Some(actor),
+            session_id: session,
+            kind: "supersede".to_string(),
+            path: path.to_string(),
+            detail: Some(format!("suggestion #{id}: {detail}")),
+            branch: self.current_branch().await.ok().flatten(),
+        })
+        .await?;
+        Ok(())
     }
 
     /// The current content hash of `path` in hex, or `None` if it doesn't exist.
@@ -565,6 +761,11 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     /// while `approver` is recorded as who accepted it — and must be a different
     /// actor.
     ///
+    /// Returns the **content address now at the path**, so a caller can confirm
+    /// what landed without a second read — `None` for an accepted deletion, where
+    /// there is no longer a file to address. It returned `()` until #163, which
+    /// left "what did that actually do?" answerable only by re-reading.
+    ///
     /// **Staleness depends on the kind** ([`SuggestionKind`]).
     ///
     /// * A [`Bytes`](SuggestionKind::Bytes) suggestion replaces the whole file, so
@@ -578,14 +779,14 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     ///   conflict. Applying it can therefore never discard anything, so it is
     ///   **not** subject to the staleness guard — that guard false-rejected every
     ///   concurrent edit over an always-mergeable document.
-    pub async fn accept_suggestion(&self, id: i64, approver: WriteCtx) -> Result<()> {
+    pub async fn accept_suggestion(&self, id: i64, approver: WriteCtx) -> Result<Option<String>> {
         let s = self
             .meta
             .get_suggestion(id)
             .await?
             .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
         if s.status != SuggestionStatus::Pending {
-            return Err(OrigoFSError::InvalidArgument(format!(
+            return Err(OrigoFSError::AlreadyResolved(format!(
                 "suggestion #{id} is already {}",
                 s.status.as_str()
             )));
@@ -680,7 +881,12 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         // discover one failed accept at a time.
         self.supersede_stale_byte_suggestions(&s.path, Some(id))
             .await?;
-        Ok(())
+        // The address the acceptance landed, so a caller can confirm what is now at
+        // the path without a second round trip -- and reconcile after a conflict
+        // without re-reading (#163). `None` for an accepted *deletion*: there is no
+        // longer a file to address, which is the honest answer rather than an empty
+        // hash.
+        self.current_content_hex(&s.path).await
     }
 
     /// Apply a whole-file byte suggestion, guarding the base it was proposed
@@ -713,8 +919,11 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 {
                     Ok(()) => Ok(()),
                     // Lost the race in the window between the check and the write:
-                    // same situation, same terminal state.
-                    Err(OrigoFSError::Conflict(_)) => Err(self.mark_superseded(s).await),
+                    // same situation, same terminal state. `is_conflict`, not a
+                    // `Conflict(_)` pattern — the family grew in #159 and a
+                    // narrowed match here would let a lost CAS escape as itself
+                    // instead of superseding the row.
+                    Err(e) if e.is_conflict() => Err(self.mark_superseded(s).await),
                     Err(e) => Err(e),
                 }
             }
@@ -753,7 +962,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 branch: self.current_branch().await.ok().flatten(),
             })
             .await;
-        OrigoFSError::Conflict(format!(
+        OrigoFSError::StaleBase(format!(
             "suggestion #{}: {} changed since it was proposed; marked superseded — re-diff and re-suggest",
             s.id, s.path
         ))
@@ -764,6 +973,14 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     /// `except`. CRDT suggestions are deliberately untouched: they merge into
     /// whatever the document has become, so a moved file does not invalidate them.
     /// Returns how many were retired.
+    ///
+    /// **"Stale" means the base moved on, and only that** (#164). It is *not*
+    /// "everything obsolete": two pending proposals from one actor on one
+    /// unchanged base are siblings, both current by this measure, and this returns
+    /// `0` for them. Retiring a draft its own author abandoned is a different
+    /// relation with no bearing on content — see
+    /// [`supersede_suggestion`](Self::supersede_suggestion), or `replaces` on
+    /// [`suggest`](Self::suggest) to do it as the replacement is proposed.
     pub async fn supersede_stale_byte_suggestions(
         &self,
         path: &str,
@@ -808,7 +1025,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             .await?
             .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
         if s.status != SuggestionStatus::Pending {
-            return Err(OrigoFSError::InvalidArgument(format!(
+            return Err(OrigoFSError::AlreadyResolved(format!(
                 "suggestion #{id} is already {}",
                 s.status.as_str()
             )));

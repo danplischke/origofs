@@ -187,6 +187,7 @@ async fn suggestions_are_workspace_isolated() {
             "/x.txt",
             b"proposed",
             Some("add x"),
+            None,
         )
         .await
         .unwrap();
@@ -709,6 +710,7 @@ async fn gc_preserves_other_workspaces_pending_suggestions() {
             "/x.txt",
             b"proposed body",
             Some("x"),
+            None,
         )
         .await
         .unwrap();

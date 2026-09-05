@@ -43,6 +43,18 @@ use std::sync::Arc;
 
 create_exception!(origofs, OrigoFSError, pyo3::exceptions::PyException);
 create_exception!(origofs, ConflictError, OrigoFSError);
+// #159: `ConflictError` covered at least two conditions that demand *opposite*
+// recoveries — re-diff-and-re-suggest vs. reseed-and-checkpoint — and the only way
+// to tell them apart was a substring match on the message, which then breaks on
+// any rewording. Both subclass `ConflictError`, so `except ConflictError` and the
+// FastAPI 409 mapping keep working unchanged.
+create_exception!(origofs, StaleBaseError, ConflictError);
+create_exception!(origofs, ForeignWriteError, ConflictError);
+// #164: "suggestion #N is already accepted" was a `ValueError` — saying the
+// *request* was malformed when it was well-formed and merely out of date. It is
+// the third outcome a reviewing caller has to handle beside the two above, and
+// unlike either it is terminal: read the row's status, there is nothing to retry.
+create_exception!(origofs, AlreadyResolvedError, ConflictError);
 
 /// Map an origofs error onto the closest Python exception.
 fn to_pyerr(e: origofs_sdk::OrigoFSError) -> PyErr {
@@ -56,6 +68,9 @@ fn to_pyerr(e: origofs_sdk::OrigoFSError) -> PyErr {
         DirectoryNotEmpty(_) => PyOSError::new_err(msg),
         InvalidArgument(_) | InvalidPath(_) => PyValueError::new_err(msg),
         Conflict(_) => ConflictError::new_err(msg),
+        StaleBase(_) => StaleBaseError::new_err(msg),
+        ForeignWrite(_) => ForeignWriteError::new_err(msg),
+        AlreadyResolved(_) => AlreadyResolvedError::new_err(msg),
         // The actor's write policy forbids it — the closest built-in is
         // `PermissionError`, which is what a caller would `except` on.
         Denied(_) => PyPermissionError::new_err(msg),
@@ -1155,6 +1170,7 @@ struct CoeditSyncReply {
     reply: Vec<u8>,
     broadcast: Vec<u8>,
     content_changed: bool,
+    unhandled: Vec<u8>,
 }
 
 #[pymethods]
@@ -1180,12 +1196,27 @@ impl CoeditSyncReply {
         self.content_changed
     }
 
+    /// Outer y-websocket message tags in this payload that carried no effect —
+    /// empty for every well-framed payload (#162).
+    ///
+    /// A non-empty value almost always means the client is sending **bare y-sync**
+    /// frames instead of the y-websocket envelope this server speaks: a bare
+    /// ``messageYjsUpdate`` is tag 2, which is ``messageAuth`` in the envelope, so
+    /// it decodes cleanly and is dropped. The socket then connects, handshakes,
+    /// reports the right peer count -- and never converges. Surface this to the
+    /// client or log it; the server also logs it at ``warn``.
+    #[getter]
+    fn unhandled<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.unhandled)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "CoeditSyncReply(reply={} bytes, broadcast={} bytes, content_changed={})",
+            "CoeditSyncReply(reply={} bytes, broadcast={} bytes, content_changed={}, unhandled={:?})",
             self.reply.len(),
             self.broadcast.len(),
-            self.content_changed
+            self.content_changed,
+            self.unhandled
         )
     }
 }
@@ -1338,6 +1369,7 @@ impl CoeditDoc {
                         reply: out.reply,
                         broadcast: out.broadcast,
                         content_changed: out.content_changed,
+                        unhandled: out.unhandled,
                     },
                 )
             })
@@ -1502,6 +1534,7 @@ impl CoeditTreeDoc {
                         reply: out.reply,
                         broadcast: out.broadcast,
                         content_changed: out.content_changed,
+                        unhandled: out.unhandled,
                     },
                 )
             })
@@ -1544,10 +1577,56 @@ impl CoeditTreeDoc {
     /// **Check this before binding an editor.** origofs cannot rebuild a *tree*
     /// from a flat file — that needs your schema — so a document whose sidecar is
     /// missing or stale opens empty, and checkpointing it would write an empty body
-    /// over a file with content. Seed it from ``await ws.read(path)`` first.
+    /// over a file with content. Seed it from ``await ws.read(path)`` first, then
+    /// declare that with ``seeded_from``.
+    ///
+    /// Since #158 forgetting to is an error rather than data loss: a checkpoint from
+    /// an unseeded document over a non-empty file raises ``ForeignWriteError``.
     fn resumed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move { Ok(inner.lock().await.resumed()) })
+    }
+
+    /// Declare that this document now represents ``body`` — the seeding handshake
+    /// (#158).
+    ///
+    /// origofs cannot parse bytes back into tree nodes (that needs your schema), so
+    /// a document that could not resume opens **empty** and checkpointing it would
+    /// replace the file's content with nothing. That is refused until you say the
+    /// document accounts for those bytes: when ``resumed()`` is false, read the
+    /// file, parse it into the tree with your own parser, and pass the same bytes
+    /// here.
+    ///
+    /// Seeding from the file's current bytes *without* parsing them is the
+    /// deliberate-overwrite escape hatch: it says "I have looked at what is there
+    /// and I am replacing it", which is a thing a host may legitimately mean — and
+    /// which now has to be written down rather than being the default.
+    fn seeded_from<'py>(&self, py: Python<'py>, body: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.lock().await.seeded_from(&body);
+            Ok(())
+        })
+    }
+
+    /// Hex BLAKE3 of the body this document is **coherent with** — what it resumed
+    /// from, was seeded from, or last crystallized — or ``None`` when it has no
+    /// established relationship to any file.
+    ///
+    /// This is what ``checkpoint_coedit_tree`` compares the file against. Note it
+    /// is a BLAKE3 of the bytes, *not* the chunk-manifest address ``stat()`` returns
+    /// — the two are different hashes of the same content and never compare equal.
+    fn base_hash<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            Ok(inner.lock().await.base_hash().map(|h| {
+                h.iter().fold(String::with_capacity(64), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                })
+            }))
+        })
     }
 
     /// Whether the tree has no nodes at all.
@@ -2273,7 +2352,7 @@ impl Workspace {
     /// suggestion for review. Returns a `WriteOutcome`. The entry point an untrusted
     /// surface routes writes through so a propose-only actor can't land an
     /// unreviewed edit.
-    #[pyo3(signature = (ctx, path, data, summary=None))]
+    #[pyo3(signature = (ctx, path, data, summary=None, replaces=None))]
     fn write_or_propose<'py>(
         &self,
         py: Python<'py>,
@@ -2281,12 +2360,13 @@ impl Workspace {
         path: String,
         data: Vec<u8>,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         future_into_py(py, async move {
             let outcome = ws
-                .write_or_propose(c, &path, &data, summary.as_deref())
+                .write_or_propose(c, &path, &data, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
             let (wrote, suggestion_id) = match outcome {
@@ -2838,7 +2918,10 @@ impl Workspace {
     /// `XmlFragment` counterpart of `suggest_coedit` — and the shape a rich-text
     /// editor actually uses. Without it a propose-only agent had no way to
     /// propose against such a document at all.
-    #[pyo3(signature = (ctx, path, doc, summary=None))]
+    ///
+    /// ``replaces`` retires an earlier pending draft of this actor's as this one is
+    /// created — see ``suggest``.
+    #[pyo3(signature = (ctx, path, doc, summary=None, replaces=None))]
     fn suggest_coedit_tree<'py>(
         &self,
         py: Python<'py>,
@@ -2846,13 +2929,14 @@ impl Workspace {
         path: String,
         doc: Py<CoeditTreeDoc>,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         let inner = doc.borrow(py).inner.clone();
         future_into_py(py, async move {
             let guard = inner.lock().await;
-            ws.suggest_coedit_tree(c, &path, &guard, summary.as_deref())
+            ws.suggest_coedit_tree(c, &path, &guard, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)
         })
@@ -2861,7 +2945,14 @@ impl Workspace {
     /// The primitive behind `suggest_coedit_tree`, for a client that already
     /// holds the two Yjs blobs (a browser editor sends `encodeStateVector` +
     /// `encodeStateAsUpdate`).
-    #[pyo3(signature = (ctx, path, base_sv, update, summary=None))]
+    ///
+    /// ``replaces`` retires an earlier pending draft of this actor's as this one is
+    /// created — see ``suggest``.
+    #[pyo3(signature = (ctx, path, base_sv, update, summary=None, replaces=None))]
+    // A pyo3 binding mirrors the SDK signature it forwards to, plus `py`. Packing
+    // them into a struct would change the *Python* call shape for no gain — the
+    // keyword arguments are the API.
+    #[allow(clippy::too_many_arguments)]
     fn suggest_coedit_tree_update<'py>(
         &self,
         py: Python<'py>,
@@ -2870,11 +2961,12 @@ impl Workspace {
         base_sv: Vec<u8>,
         update: Vec<u8>,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         future_into_py(py, async move {
-            ws.suggest_coedit_tree_update(c, &path, &base_sv, &update, summary.as_deref())
+            ws.suggest_coedit_tree_update(c, &path, &base_sv, &update, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)
         })
@@ -3278,7 +3370,10 @@ impl Workspace {
     /// Accepting it merges (``applyUpdate``) instead of overwriting, so a
     /// concurrent disjoint edit is neither clobbered nor false-rejected as stale.
     /// Returns the suggestion id.
-    #[pyo3(signature = (ctx, path, doc, summary=None))]
+    ///
+    /// ``replaces`` retires an earlier pending draft of this actor's as this one is
+    /// created — see ``suggest``.
+    #[pyo3(signature = (ctx, path, doc, summary=None, replaces=None))]
     fn suggest_coedit<'py>(
         &self,
         py: Python<'py>,
@@ -3286,6 +3381,7 @@ impl Workspace {
         path: String,
         doc: Py<CoeditDoc>,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
@@ -3293,7 +3389,7 @@ impl Workspace {
         future_into_py(py, async move {
             let guard = inner.lock().await;
             let id = ws
-                .suggest_coedit(c, &path, &guard, summary.as_deref())
+                .suggest_coedit(c, &path, &guard, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
             Ok(id)
@@ -3303,7 +3399,14 @@ impl Workspace {
     /// The primitive behind `suggest_coedit`, for a client that already holds the
     /// two Yjs blobs — a browser editor proposes with ``encodeStateVector(doc)`` as
     /// `base_sv` and ``encodeStateAsUpdate(doc)`` as `update`.
-    #[pyo3(signature = (ctx, path, base_sv, update, summary=None))]
+    ///
+    /// ``replaces`` retires an earlier pending draft of this actor's as this one is
+    /// created — see ``suggest``.
+    #[pyo3(signature = (ctx, path, base_sv, update, summary=None, replaces=None))]
+    // A pyo3 binding mirrors the SDK signature it forwards to, plus `py`. Packing
+    // them into a struct would change the *Python* call shape for no gain — the
+    // keyword arguments are the API.
+    #[allow(clippy::too_many_arguments)]
     fn suggest_coedit_update<'py>(
         &self,
         py: Python<'py>,
@@ -3312,12 +3415,13 @@ impl Workspace {
         base_sv: Vec<u8>,
         update: Vec<u8>,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         future_into_py(py, async move {
             let id = ws
-                .suggest_coedit_update(c, &path, &base_sv, &update, summary.as_deref())
+                .suggest_coedit_update(c, &path, &base_sv, &update, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
             Ok(id)
@@ -3576,7 +3680,18 @@ impl Workspace {
     // --- agent-suggestion review queue --------------------------------------
 
     /// Propose an edit to `path` for review (does not touch the working tree).
-    #[pyo3(signature = (ctx, path, data, summary=None))]
+    ///
+    /// ``replaces`` names a pending proposal of your own on this path to retire as
+    /// this one is created — how you **revise** a proposal (#164). Without it a
+    /// revision is a *sibling*: two pending drafts on one base, which origofs
+    /// resolves correctly on accept and incorrectly on reject, where the abandoned
+    /// earlier draft stays pending with a current base and still accepts cleanly.
+    ///
+    /// Opt-in rather than the default for a second proposal on the same path,
+    /// because two drafts a reviewer chooses between is a real workflow and origofs
+    /// cannot tell it from a revision. A caller that does not know its prior id
+    /// finds it with ``list_suggestions("pending", path)``.
+    #[pyo3(signature = (ctx, path, data, summary=None, replaces=None))]
     fn suggest<'py>(
         &self,
         py: Python<'py>,
@@ -3584,35 +3699,67 @@ impl Workspace {
         path: String,
         data: Vec<u8>,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         future_into_py(py, async move {
             let id = ws
-                .suggest(c, &path, &data, summary.as_deref())
+                .suggest(c, &path, &data, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
             Ok(id)
         })
     }
 
-    /// Propose deleting `path`.
-    #[pyo3(signature = (ctx, path, summary=None))]
+    /// Propose deleting `path`. ``replaces`` retires an earlier draft — see
+    /// ``suggest``.
+    #[pyo3(signature = (ctx, path, summary=None, replaces=None))]
     fn suggest_delete<'py>(
         &self,
         py: Python<'py>,
         ctx: WriteCtx,
         path: String,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         future_into_py(py, async move {
             let id = ws
-                .suggest_delete(c, &path, summary.as_deref())
+                .suggest_delete(c, &path, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
             Ok(id)
+        })
+    }
+
+    /// Withdraw a pending suggestion its author has abandoned, without applying or
+    /// rejecting it (#164).
+    ///
+    /// The standalone form of ``suggest(..., replaces=)``: use it when a draft is
+    /// being retired with **nothing taking its place**. Where a replacement is
+    /// being proposed in the same breath, prefer ``replaces`` — every propose call
+    /// takes it, byte and CRDT alike, and then the two cannot come apart. Distinct
+    /// from ``reject_suggestion``, which records that a reviewer looked and
+    /// declined.
+    ///
+    /// The author may always retire their own; anyone else needs ``WRITE`` at its
+    /// path, exactly as rejecting somebody else's proposal does.
+    #[pyo3(signature = (id, ctx, reason=None))]
+    fn supersede_suggestion<'py>(
+        &self,
+        py: Python<'py>,
+        id: i64,
+        ctx: WriteCtx,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.supersede_suggestion(id, c, reason.as_deref())
+                .await
+                .map_err(to_pyerr)
         })
     }
 
@@ -3693,8 +3840,9 @@ impl Workspace {
         let ws = self.inner.clone();
         let c = approver.inner;
         future_into_py(py, async move {
-            ws.accept_suggestion(id, c).await.map_err(to_pyerr)?;
-            Ok(())
+            // The address now at the path (`None` for an accepted deletion), so a
+            // caller can confirm what landed without re-reading (#163).
+            ws.accept_suggestion(id, c).await.map_err(to_pyerr)
         })
     }
 
@@ -3903,19 +4051,20 @@ impl Workspace {
     /// Remove `path`, attributed to `ctx` and governed by its write policy: a
     /// `Direct` actor removes it; a propose-only actor's removal is queued for
     /// review. Returns a [`WriteOutcome`].
-    #[pyo3(signature = (ctx, path, summary = None))]
+    #[pyo3(signature = (ctx, path, summary = None, replaces = None))]
     fn remove_or_propose<'py>(
         &self,
         py: Python<'py>,
         ctx: WriteCtx,
         path: String,
         summary: Option<String>,
+        replaces: Option<i64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         let c = ctx.inner;
         future_into_py(py, async move {
             let outcome = ws
-                .remove_or_propose(c, &path, summary.as_deref())
+                .remove_or_propose(c, &path, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
             let (wrote, suggestion_id) = match outcome {
@@ -4312,6 +4461,13 @@ impl Workspace {
     /// Retire pending suggestions for `path` whose base content has already moved
     /// on, returning how many were superseded. Without this they sit in the review
     /// queue looking actionable and fail on accept.
+    ///
+    /// **"Stale" means the base moved on, and only that** (#164) — not "everything
+    /// obsolete". Two pending proposals from one actor on one unchanged base are
+    /// siblings, both current by this measure, and this returns ``0`` for them.
+    /// Retiring a draft its own author abandoned is a different relation: use
+    /// ``supersede_suggestion(id, ctx)``, or ``replaces`` on ``suggest`` to do it
+    /// as the replacement is proposed.
     fn supersede_stale_suggestions<'py>(
         &self,
         py: Python<'py>,
@@ -5959,6 +6115,12 @@ fn _origofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(content_hash, m)?)?;
     m.add("OrigoFSError", m.py().get_type::<OrigoFSError>())?;
     m.add("ConflictError", m.py().get_type::<ConflictError>())?;
+    m.add("StaleBaseError", m.py().get_type::<StaleBaseError>())?;
+    m.add("ForeignWriteError", m.py().get_type::<ForeignWriteError>())?;
+    m.add(
+        "AlreadyResolvedError",
+        m.py().get_type::<AlreadyResolvedError>(),
+    )?;
     // `origofs.__version__`, single-sourced from `[workspace.package].version`:
     // `CARGO_PKG_VERSION` is the same value maturin stamps the wheel with, so the
     // string a caller reads and the version `pip` resolved cannot disagree.

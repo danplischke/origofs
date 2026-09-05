@@ -548,19 +548,37 @@ consequences follow, and all three are deliberate:
   and it validates that a node id is one it issued — but it cannot check that the host mapped the right bytes to
   the right node, because it cannot read the host's serializer. That is the price of not owning the schema, and
   it belongs in the docs rather than in a discovery.
-- **A stale sidecar opens an *empty* tree.** `open_coedit` rebuilds a flat document from the file's text plus its
-  blame; the tree cannot be rebuilt that way, because parsing bytes back into nodes needs the schema. So
-  `open_coedit_tree` reports `resumed()`, and a host that ignores it will checkpoint an empty body over a real
-  file.
+- **A stale sidecar opens an *empty* tree — and an empty tree may not overwrite a full file.** `open_coedit`
+  rebuilds a flat document from the file's text plus its blame; the tree cannot be rebuilt that way, because
+  parsing bytes back into nodes needs the schema. So `open_coedit_tree` reports `resumed()` — and a host that
+  ignored it used to checkpoint an empty body over a real file, silently, with nothing failing at any earlier
+  point. That is now refused (#158): the host seeds the tree from `read(path)` and declares it with
+  `seeded_from(body)`, which is also the deliberate-overwrite escape hatch when seeded from the file's current
+  bytes. An unrecoverable outcome reachable through the *obvious* API sequence, avoidable only via a docstring
+  sentence, is a design defect however correct the docstring.
 - **An out-of-band write is refused, not reconciled.** The flat path folds a foreign write in by replaying it as
   attributed CRDT operations (`reconcile_with`); a tree has no such replay. Since clobbering silently is the one
-  outcome worse than an error, `checkpoint_coedit_tree` returns `Conflict` and the host re-seeds.
+  outcome worse than an error, `checkpoint_coedit_tree` returns `ForeignWrite` and the host re-seeds.
+- **The coherence base belongs to the *document*, not to the live marker (#161).** `CoeditTreeDoc::base_hash` is
+  the BLAKE3 of the body the document resumed from, was seeded from, or last crystallized, and that is what the
+  checkpoint compares the file against; the persisted sidecar is a cross-worker second opinion, so a second
+  replica stays entitled to checkpoint after the first landed a body. Hanging the guard off the marker made it
+  both absent and bypassable, and the two failing shapes are the two a stateless request handler naturally
+  produces: a socket-less checkpoint leaves no marker at all, so nothing was compared; and *opening* a room
+  refreshes the marker's `content_hash` from the file, so re-opening before each checkpoint reset the guard to
+  whatever a foreign write had just produced. A value the caller can refresh by re-reading the file is not a
+  guard against the file having changed.
 
 **Durability splits with the schema.** Only the host can produce a tree's bytes, so only the host can crystallize
 the file — but the CRDT is fully known server-side. `persist_coedit_tree` therefore writes the ydoc sidecar
 *alone*, with no body, and the room sweeper calls it on the same tick a flat room checkpoints on. A crash then
 costs no editing history even though the file has not moved; and because the file has not moved, it deliberately
 does **not** stamp `checkpointed_at` — saying otherwise would tell a reader its bytes are fresher than they are.
+It frames the sidecar against the *document's* base rather than the file's current bytes, for the same reason the
+guard above lives on the document: framing against the file would launder a foreign write into "coherent", so the
+next open would resume this document and checkpoint straight over the write it never saw — and it would hand an
+unseeded document a coherence claim it had not earned, re-arming the overwrite through a timer instead of through
+a caller.
 
 **The live/dirty marker (ruling).** While a path is promoted to a CRDT document, its durable bytes are the last
 **checkpoint** — a real, fully attributed state, but possibly behind the `Y.Doc` people are typing into. A
@@ -781,6 +799,15 @@ each write is, and a storage engine that agents point at untrusted code and untr
   `Superseded` instead of lingering pending forever, as are the other pending byte proposals a successful accept
   strands; a `crdt` suggestion merges and so is never stale, §6); ref-mirror generations advance with an
   atomic `bump_counter` instead of a read-modify-write.
+- **A revision is not a second proposal (#164).** There was no update-in-place, so revising meant proposing again
+  — a *sibling* on the same base. `accept` handled that by accident: landing either moves the file, which stales
+  the other. `reject` did not, and that is the one the workflow actually hits — the reviewer declines the
+  revision and the abandoned draft is still `pending`, still on a base matching the file, and still accepts
+  cleanly. `replaces` on the propose calls retires the named draft as the new one is created, and
+  `supersede_suggestion` is the standalone form. It is opt-in because two drafts a reviewer is meant to choose
+  between is a real workflow that origofs cannot distinguish from a revision, and retiring one automatically
+  would discard an alternative nobody asked it to. The retirement is ordered **before** the create, so a caller
+  can rely on "if this returned, the old one is gone"; the reverse window costs nothing recoverable.
 - **Encryption key & nonce discipline:** convergent encryption keeps dedup (identical plaintext → identical
   ciphertext, which the shared content address already revealed — a documented, accepted trade-off), but the AEAD
   fails closed everywhere else: `put_keyed` refuses any non-content-addressed key, so a mutable-value keyed store

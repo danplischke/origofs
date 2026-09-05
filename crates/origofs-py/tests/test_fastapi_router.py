@@ -1166,8 +1166,8 @@ def test_include_mounts_only_the_named_groups():
 
     assert (None, "/coedit/{path:path}") in only
     assert (None, "/coedit-tree/{path:path}") in only
-    # The checkpoint route comes with the tree socket, because origofs cannot
-    # serialize a tree — mounting the socket alone gives a room nobody can save.
+    # `coedit` is an alias for both halves since #160, so it still means what it
+    # meant: sockets *and* the checkpoint route.
     assert ("POST", "/coedit-tree-checkpoint/{path:path}") in only
     assert only < full
 
@@ -1279,6 +1279,65 @@ def test_a_filtered_router_still_serves_the_routes_it_kept():
     assert client.put(
         "/v1/files/a.txt", content=b"x", headers={"x-actor-id": "1"}
     ).status_code == 404
+
+
+# --- the coedit split (#160) ------------------------------------------------
+
+
+def test_the_sockets_can_be_mounted_without_the_checkpoint_route():
+    """`coedit` was one all-or-nothing group, so "the sockets, without the mutating
+    REST checkpoint" could not be expressed.
+
+    That shape matters: `/coedit-tree-checkpoint` is a mutating body write, and a
+    host enforcing its own authorization on body writes needs exactly one such
+    path, its own. Mounting origofs's alongside adds a second write path to the
+    same bytes, gated differently -- the class of bypass `include` exists to close.
+    Note `authn` cannot express it: sockets and checkpoint are all mutating, so
+    they all sit behind `authn` and no strictness ordering separates them.
+    """
+    sockets = _paths(build_router(FakeWs(), authn=header_authn, include=["coedit-ws"]))
+    assert (None, "/coedit/{path:path}") in sockets
+    assert (None, "/coedit-tree/{path:path}") in sockets
+    # Undo is a live-room operation, not a durable write, so it stays with them.
+    assert ("POST", "/coedit-undo/{path:path}") in sockets
+    assert ("POST", "/coedit-tree-checkpoint/{path:path}") not in sockets
+
+    checkpoint = _paths(
+        build_router(FakeWs(), authn=header_authn, include=["coedit-checkpoint"])
+    )
+    assert checkpoint == {("POST", "/coedit-tree-checkpoint/{path:path}")}
+
+
+def test_build_coedit_router_can_drop_the_checkpoint_route():
+    from origofs.fastapi import build_coedit_router
+
+    both = _paths(build_coedit_router(FakeWs(), authn=header_authn))
+    sockets = _paths(
+        build_coedit_router(FakeWs(), authn=header_authn, checkpoint_route=False)
+    )
+    assert ("POST", "/coedit-tree-checkpoint/{path:path}") in both
+    assert sockets == both - {("POST", "/coedit-tree-checkpoint/{path:path}")}
+
+
+def test_coedit_stays_an_alias_for_both_halves():
+    """Splitting a group must not change what an existing call mounts."""
+    from origofs.fastapi import ROUTE_GROUP_ALIASES
+
+    assert ROUTE_GROUP_ALIASES["coedit"] == {"coedit-ws", "coedit-checkpoint"}
+
+    alias = _paths(build_router(FakeWs(), authn=header_authn, include=["coedit"]))
+    halves = _paths(
+        build_router(
+            FakeWs(), authn=header_authn, include=["coedit-ws", "coedit-checkpoint"]
+        )
+    )
+    assert alias == halves
+
+    # And on the denylist side, where getting it wrong leaves a mutating route
+    # mounted on a router whose author asked for it to be gone.
+    full = _paths(build_router(FakeWs(), authn=header_authn))
+    without = _paths(build_router(FakeWs(), authn=header_authn, exclude=["coedit"]))
+    assert without == full - alias
 
 
 # `/log/{path}` is the per-path history view. Unlike `/log` it names a path, so it

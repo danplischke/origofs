@@ -123,8 +123,8 @@ use crate::error::{OrigoFSError, Result};
 use crate::format;
 use crate::metadata::MetadataStore;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use yrs::types::Attrs;
 use yrs::types::text::YChange;
 use yrs::types::xml::{Xml, XmlElementRef, XmlFragment, XmlFragmentRef, XmlOut, XmlTextRef};
@@ -209,10 +209,37 @@ pub struct CoeditTreeDoc {
     /// for block ids.
     next_node: AtomicU64,
     resumed: bool,
+    /// The body this document is **coherent with** — the bytes it either resumed
+    /// from, was seeded from, or last crystallized. `None` means the document has
+    /// no established relationship to any file, which
+    /// [`checkpoint_coedit_tree`](Fs::checkpoint_coedit_tree) treats as a refusal
+    /// to overwrite a non-empty file (#158). Interior mutability because a
+    /// checkpoint advances it and every room shares one document behind a lock.
+    base: Mutex<Option<TreeBase>>,
     /// Per-actor undo stacks (#146). See
     /// [`UndoStacks`](crate::coedit::UndoStacks) — the machinery and the rulings
     /// are shared with the flat shape.
     undo: UndoStacks,
+}
+
+/// What a [`CoeditTreeDoc`] is coherent with: the hash of a body, plus — when it
+/// is known — the file address that body was at.
+#[derive(Clone, Debug)]
+struct TreeBase {
+    /// BLAKE3 of the body. The authority, and the same hash the sidecar frames
+    /// against, so the two can be compared across a restart or another worker.
+    body: [u8; TREE_SIDECAR_HASH_LEN],
+    /// The file's content address when this base was established, if it was
+    /// established from a file at all.
+    ///
+    /// Purely a fast path: `body` is a hash of the *bytes*, so checking it means
+    /// reading and re-hashing the whole file, while an unchanged content address
+    /// proves the bytes are unchanged from one metadata lookup — which is what the
+    /// old marker-scoped guard cost, and what the ordinary "nobody wrote around
+    /// us" checkpoint should keep costing. `None` (a
+    /// [`seeded_from`](CoeditTreeDoc::seeded_from) with no file involved, or an
+    /// absent file) only means falling through to the read.
+    addr: Option<String>,
 }
 
 // A live-editing room shares one document across every connected socket's task
@@ -241,6 +268,7 @@ impl CoeditTreeDoc {
             frag,
             next_node: AtomicU64::new(0),
             resumed: false,
+            base: Mutex::new(None),
             undo: UndoStacks::default(),
         }
     }
@@ -331,6 +359,65 @@ impl CoeditTreeDoc {
     /// a file with content.
     pub fn resumed(&self) -> bool {
         self.resumed
+    }
+
+    /// BLAKE3 of the body this document is **coherent with** — the bytes it
+    /// resumed from, was [seeded from](Self::seeded_from), or last crystallized —
+    /// or `None` when it has no established relationship to any file.
+    ///
+    /// This is what [`checkpoint_coedit_tree`](Fs::checkpoint_coedit_tree) compares
+    /// the file against, and it lives on the document rather than in the live
+    /// marker deliberately: the marker is refreshed by *opening* a room, so a
+    /// stateless request handler that re-opened before each checkpoint refreshed
+    /// the very value the guard was supposed to be measuring against, and a
+    /// socket-less checkpoint (no marker at all) had no guard whatsoever (#161).
+    pub fn base_hash(&self) -> Option<[u8; TREE_SIDECAR_HASH_LEN]> {
+        self.base
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|b| b.body)
+    }
+
+    /// The whole base, including the file address fast path
+    /// ([`TreeBase::addr`](TreeBase)).
+    fn base(&self) -> Option<TreeBase> {
+        self.base.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Declare that this document now represents `body` — the seeding handshake.
+    ///
+    /// origofs cannot rebuild a tree from a flat file (that needs the host's
+    /// schema), so a document opened over a file it cannot resume from starts
+    /// **empty** and checkpointing it would replace the file's content with
+    /// nothing. Since #158 that is refused rather than performed. Call this after
+    /// you have parsed `body` into the tree — through
+    /// [`apply_update_as`](Self::apply_update_as) from a client, or
+    /// [`fragment`](Self::fragment) in process — to state that the document
+    /// accounts for those bytes:
+    ///
+    /// ```ignore
+    /// let doc = fs.open_coedit_tree(ctx, path, "content").await?;
+    /// if !doc.resumed() {
+    ///     let body = fs.read(path).await?;
+    ///     my_parser::seed(&doc, &body);   // your schema, your parser
+    ///     doc.seeded_from(&body);         // ...and now origofs knows
+    /// }
+    /// ```
+    ///
+    /// It is also the deliberate-overwrite escape hatch: seeding from the file's
+    /// *current* bytes without parsing them says "I have looked at what is there
+    /// and I am replacing it", which is a thing a host may legitimately mean — and
+    /// which now has to be written down rather than being the default.
+    pub fn seeded_from(&self, body: &[u8]) {
+        // No `addr`: the caller handed over bytes, not a claim about the file. The
+        // checkpoint then reads and hashes once to establish coherence, and carries
+        // the address forward from there.
+        self.set_base(*blake3::hash(body).as_bytes(), None);
+    }
+
+    pub(crate) fn set_base(&self, hash: [u8; TREE_SIDECAR_HASH_LEN], addr: Option<String>) {
+        *self.base.lock().unwrap_or_else(|e| e.into_inner()) = Some(TreeBase { body: hash, addr });
     }
 
     /// Whether the tree has no nodes at all.
@@ -465,6 +552,10 @@ impl CoeditTreeDoc {
     /// Drive one inbound y-sync payload from a connection authenticated as `ctx`.
     /// Content the client contributes is attributed to `ctx` by
     /// [`apply_update_as`](Self::apply_update_as).
+    ///
+    /// Same framing requirement as the flat shape — the **y-websocket** envelope,
+    /// not a bare y-sync frame — and the same reporting of what was ignored. See
+    /// [`CoeditDoc::handle_sync`](crate::coedit::CoeditDoc::handle_sync).
     pub fn handle_sync(&self, ctx: WriteCtx, data: &[u8]) -> Result<SyncReply> {
         drive_sync(&self.doc, data, |update| self.apply_update_as(ctx, update))
     }
@@ -789,7 +880,16 @@ pub fn coedit_tree_sidecar_path(path: &str) -> String {
 ///
 /// It carries the root name because a tree resumed under a different root would
 /// silently be a different (empty) document.
-fn frame_tree_sidecar(root: &str, body: &[u8], state: &[u8]) -> Result<Vec<u8>> {
+///
+/// `body_hash` is passed in rather than hashed here because the body it refers to
+/// is not always at hand: the sweeper persists a document whose bytes only the host
+/// can produce, and framing that against whatever the file currently holds is
+/// exactly the laundering `write_tree_sidecar` exists to avoid.
+fn frame_tree_sidecar(
+    root: &str,
+    body_hash: &[u8; TREE_SIDECAR_HASH_LEN],
+    state: &[u8],
+) -> Result<Vec<u8>> {
     let root = root.as_bytes();
     let len = u8::try_from(root.len()).map_err(|_| {
         OrigoFSError::InvalidArgument("co-edit tree root name must be at most 255 bytes".into())
@@ -800,7 +900,7 @@ fn frame_tree_sidecar(root: &str, body: &[u8], state: &[u8]) -> Result<Vec<u8>> 
     blob.extend_from_slice(&format::COEDIT_TREE_SIDECAR.header());
     blob.push(len);
     blob.extend_from_slice(root);
-    blob.extend_from_slice(blake3::hash(body).as_bytes());
+    blob.extend_from_slice(body_hash);
     blob.extend_from_slice(state);
     Ok(blob)
 }
@@ -867,8 +967,26 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Otherwise — no sidecar, a stale one, or one written under a different root —
     /// returns an **empty** document with [`resumed`](CoeditTreeDoc::resumed) false,
     /// because reconstructing a tree from flat bytes would need the host's schema.
-    /// Seed it before binding an editor; see
-    /// [`resumed`](CoeditTreeDoc::resumed).
+    ///
+    /// # Seeding an unresumed document
+    ///
+    /// Parse the file into the tree yourself and then call
+    /// [`seeded_from`](CoeditTreeDoc::seeded_from) with the bytes you parsed. Until
+    /// you do, a checkpoint over a **non-empty** file is refused with
+    /// [`ForeignWrite`](OrigoFSError::ForeignWrite) rather than performed (#158) —
+    /// it would land an empty body over real content, which is what happened
+    /// silently before, at whatever the file was worth.
+    ///
+    /// # Marker lifecycle (#161)
+    ///
+    /// This claims a **live marker** on `path`, and only
+    /// [`end_coedit`](Fs::end_coedit) clears it. That is right for a socket, whose
+    /// disconnect calls it. Calling this from a request handler with no socket to
+    /// tear down leaks one marker per call, telling every reader the durable bytes
+    /// may lag an editor that is not there — use
+    /// [`load_coedit_tree_as`](Self::load_coedit_tree_as) there instead. The choice
+    /// no longer affects the *safety* of a checkpoint: the coherence guard reads the
+    /// document's own base, not the marker.
     pub async fn open_coedit_tree(
         &self,
         ctx: WriteCtx,
@@ -893,6 +1011,17 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// the matching `end_coedit` lives on the socket's disconnect path that this
     /// flow never reaches: every socket-less checkpoint leaked a permanent marker
     /// telling readers the durable bytes may lag an editor that is not there.
+    ///
+    /// Note the `_as` here is **not** the propose form — that is
+    /// [`load_coedit_tree_to_propose`](Self::load_coedit_tree_to_propose). The
+    /// suffix reads as "attributed variant" everywhere else in this API, so the
+    /// distinction is spelled out in both docstrings rather than left to the name.
+    ///
+    /// Resumes on exactly the same terms as
+    /// [`open_coedit_tree`](Self::open_coedit_tree), including the seeding rule:
+    /// a document that could not resume must be seeded and declared with
+    /// [`seeded_from`](CoeditTreeDoc::seeded_from) before it may checkpoint over a
+    /// non-empty file.
     pub async fn load_coedit_tree_as(
         &self,
         ctx: WriteCtx,
@@ -927,7 +1056,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         if blake3::hash(&current).as_bytes().as_slice() != sidecar.body_hash {
             return Ok(CoeditTreeDoc::new(root)); // the file moved under us
         }
-        CoeditTreeDoc::load(root, sidecar.state)
+        let doc = CoeditTreeDoc::load(root, sidecar.state)?;
+        // Resumed *from these bytes*, so the document accounts for them: it may
+        // checkpoint over the file. The unresumed returns above deliberately leave
+        // the base unset — that is the state `ensure_tree_coherent` refuses to
+        // overwrite a non-empty file from.
+        doc.set_base(
+            *blake3::hash(&current).as_bytes(),
+            self.current_content_hex(path).await?,
+        );
+        Ok(doc)
     }
 
     /// Checkpoint a tree-shaped co-edited document into `path`: land the host's
@@ -942,12 +1080,22 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// # Concurrency
     ///
     /// Unlike [`checkpoint_coedit`](Self::checkpoint_coedit), an **out-of-band write
-    /// is refused rather than reconciled**, with [`OrigoFSError::Conflict`]. The flat
+    /// is refused rather than reconciled**, with
+    /// [`OrigoFSError::ForeignWrite`]. The flat
     /// path can fold a foreign write in because it can diff text into CRDT
     /// operations; parsing bytes back into *nodes* would need the schema origofs
     /// deliberately does not have. Silently clobbering is the one outcome worse than
     /// an error, so the host is told: re-read the file, reseed the tree, checkpoint
     /// again.
+    ///
+    /// The comparison is against the document's own
+    /// [`base_hash`](CoeditTreeDoc::base_hash) — the bytes it resumed from, was
+    /// seeded from, or last crystallized — with the persisted sidecar as a
+    /// cross-worker second opinion. It used to be against the live marker, which
+    /// left the guard absent for a socket-less checkpoint and *bypassable* by
+    /// re-opening the room before each one (#161). An **unseeded** document over a
+    /// non-empty file is refused by the same check (#158): it is empty, so landing
+    /// it is the data loss, not a step towards it.
     pub async fn checkpoint_coedit_tree(
         &self,
         ctx: WriteCtx,
@@ -980,10 +1128,19 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         let text = std::str::from_utf8(body).map_err(|_| {
             OrigoFSError::InvalidArgument("co-edit tree checkpoint requires UTF-8 text".into())
         })?;
-        self.refuse_out_of_band(path).await?;
+        self.ensure_tree_coherent(path, doc).await?;
         let blamed = tile_spans(text, spans, &doc.authors(), ctx)?;
         self.write_as_blamed(ctx, path, body, &blamed).await?;
-        self.write_tree_sidecar(path, doc, body).await?;
+        // The document now accounts for exactly the bytes just landed, so this is
+        // the base the *next* checkpoint is measured against — and the hash the
+        // sidecar is framed with, so a later resume agrees. The address is read
+        // back after the write so the next checkpoint's guard is one metadata
+        // lookup rather than a re-read of the whole file.
+        doc.set_base(
+            *blake3::hash(body).as_bytes(),
+            self.current_content_hex(path).await?,
+        );
+        self.write_tree_sidecar(path, doc).await?;
         // Only this call has actually crystallized the bytes, so it is the only one
         // entitled to stamp `checkpointed_at` (#97).
         if self.meta.get_live_doc(path).await?.is_some() {
@@ -998,28 +1155,151 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     ///
     /// A room can then be swept on a timer so a worker crash costs no editing
     /// history, even though the file and its blame only move when the host
-    /// checkpoints. The sidecar is framed against the file's *current* bytes, so it
-    /// stays coherent (and therefore resumable) exactly as long as nobody writes
-    /// around the document.
+    /// checkpoints. The sidecar is framed against the body the document is
+    /// *coherent* with ([`base_hash`](CoeditTreeDoc::base_hash)), so it stays
+    /// resumable exactly as long as nobody writes around the document.
+    ///
+    /// It used to frame against the file's **current** bytes, which quietly
+    /// laundered a foreign write into "coherent": the next open resumed this
+    /// document and checkpointed straight over the write it had never seen. It
+    /// also meant a sweep could hand an *unseeded* document a coherence claim it
+    /// had not earned, re-arming exactly the overwrite #158 refuses. An unseeded
+    /// document is therefore framed against no bytes at all — it resumes over an
+    /// empty file and not over a full one, which is the honest reading. Declare a
+    /// seed with [`seeded_from`](CoeditTreeDoc::seeded_from) and both work.
     ///
     /// Deliberately does not stamp `checkpointed_at`: the durable file has not
     /// moved, and saying otherwise would tell a reader its bytes are fresher than
     /// they are.
     pub async fn persist_coedit_tree(&self, path: &str, doc: &CoeditTreeDoc) -> Result<()> {
-        let body = match self.read(path).await {
+        self.write_tree_sidecar(path, doc).await
+    }
+
+    /// Write `doc`'s state as `path`'s tree sidecar, framed against the body `doc`
+    /// is coherent with.
+    ///
+    /// Framed against the **document's** base rather than the file's current bytes,
+    /// which matters on the sweeper's path: re-framing against a foreign write
+    /// would launder it into "coherent", so the next open would resume this
+    /// document and checkpoint straight over the write it never saw. Framed against
+    /// the base, a moved file simply reads as unresumable — which it is.
+    async fn write_tree_sidecar(&self, path: &str, doc: &CoeditTreeDoc) -> Result<()> {
+        self.mkdir_p(COEDIT_SIDECAR_DIR).await?;
+        // Every caller establishes a base first (a checkpoint from the body it just
+        // landed, `persist_coedit_tree` from the file), so the fallback is the hash
+        // of no bytes — the reading an unseeded document deserves.
+        let base = doc
+            .base_hash()
+            .unwrap_or_else(|| *blake3::hash(b"").as_bytes());
+        let blob = frame_tree_sidecar(doc.root(), &base, &doc.state_update())?;
+        self.write(&coedit_tree_sidecar_path(path), &blob).await
+    }
+
+    /// Refuse a checkpoint that would destroy content `doc` does not account for.
+    ///
+    /// The document is coherent with `path` when the file hashes to the body it
+    /// resumed from, was seeded from, or last crystallized
+    /// ([`base_hash`](CoeditTreeDoc::base_hash)) — or when the durable sidecar
+    /// vouches for those exact bytes, which is how a *second worker's* replica
+    /// stays entitled to checkpoint after the first one landed a body.
+    ///
+    /// # Why this is not the live marker's job (#161)
+    ///
+    /// It used to be, and the guard was bypassable by the caller pattern that most
+    /// needed it. Opening a room refreshes the marker's `content_hash` from the
+    /// file, so a stateless handler that re-opened before each checkpoint reset the
+    /// guard to whatever a foreign write had just produced and clobbered it
+    /// silently; a socket-less checkpoint left no marker at all and so was never
+    /// guarded. Both look identical to the working case from the call site. The
+    /// document's own base cannot be refreshed by looking at the file, which is the
+    /// whole point.
+    ///
+    /// # Why an unseeded document is refused too (#158)
+    ///
+    /// A document that resumed nothing is *empty*, and origofs cannot rebuild a
+    /// tree from bytes. Checkpointing it lands an empty body over whatever the file
+    /// held, and nothing failed at any earlier point — the reported cost was a
+    /// 14 KB document replaced nine seconds after the room opened. A host that
+    /// really has accounted for the content says so with
+    /// [`seeded_from`](CoeditTreeDoc::seeded_from).
+    async fn ensure_tree_coherent(&self, path: &str, doc: &CoeditTreeDoc) -> Result<()> {
+        let base = doc.base();
+        let current_addr = self.current_content_hex(path).await?;
+        // The ordinary checkpoint: nobody wrote around us, so the file is still at
+        // the address the base was taken from. Answered from metadata alone, which
+        // is what the old marker-scoped guard cost — the body hash below is the
+        // authority, but reaching for it on every save would mean re-reading and
+        // re-hashing the whole file to learn nothing.
+        if current_addr.is_some()
+            && let Some(b) = &base
+            && b.addr == current_addr
+        {
+            return Ok(());
+        }
+        let current = match self.read(path).await {
             Ok(b) => b,
             Err(OrigoFSError::NotFound(_)) => bytes::Bytes::new(),
             Err(e) => return Err(e),
         };
-        self.write_tree_sidecar(path, doc, &body).await
+        let current_hash = *blake3::hash(&current).as_bytes();
+        if base.as_ref().map(|b| b.body) == Some(current_hash) {
+            // Same bytes reached by a different route (a `seeded_from`, or a write
+            // that reproduced them) — record the address so the next checkpoint
+            // takes the fast path.
+            doc.set_base(current_hash, current_addr);
+            return Ok(());
+        }
+        // Another replica of this same document may have crystallized these very
+        // bytes — the sidecar it wrote is the cross-worker record of that, and the
+        // one thing a local `base` cannot know about.
+        if self
+            .tree_sidecar_vouches(path, doc.root(), &current_hash)
+            .await?
+        {
+            doc.set_base(current_hash, current_addr);
+            return Ok(());
+        }
+        if base.is_none() {
+            if current.is_empty() {
+                return Ok(()); // nothing to lose: an absent or empty file
+            }
+            return Err(OrigoFSError::ForeignWrite(format!(
+                "{path} holds {} bytes this co-edit document was never seeded from, so \
+                 checkpointing it would replace them with content it does not contain \
+                 (origofs cannot parse bytes back into tree nodes — that needs your \
+                 schema) — seed the document from the file, then declare it with \
+                 `seeded_from`",
+                current.len()
+            )));
+        }
+        Err(OrigoFSError::ForeignWrite(format!(
+            "{path} was written outside the co-editing session since its last \
+             checkpoint; a tree document cannot be reconciled with a foreign write \
+             (origofs cannot parse bytes back into nodes) — re-read the file, reseed \
+             the document, and checkpoint again"
+        )))
     }
 
-    /// Write `doc`'s state as `path`'s tree sidecar, framed against `body` as the
-    /// coherence marker.
-    async fn write_tree_sidecar(&self, path: &str, doc: &CoeditTreeDoc, body: &[u8]) -> Result<()> {
-        self.mkdir_p(COEDIT_SIDECAR_DIR).await?;
-        let blob = frame_tree_sidecar(doc.root(), body, &doc.state_update())?;
-        self.write(&coedit_tree_sidecar_path(path), &blob).await
+    /// Whether `path`'s persisted tree sidecar, under `root`, was framed against a
+    /// body hashing to `hash`.
+    async fn tree_sidecar_vouches(
+        &self,
+        path: &str,
+        root: &str,
+        hash: &[u8; TREE_SIDECAR_HASH_LEN],
+    ) -> Result<bool> {
+        let blob = match self.read(&coedit_tree_sidecar_path(path)).await {
+            Ok(b) => b,
+            Err(OrigoFSError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        // `?`: a sidecar this build cannot decode is an upgrade problem, and
+        // reporting it as "no record" would let a checkpoint proceed against
+        // history it merely failed to recognize.
+        let Some(sidecar) = parse_tree_sidecar(&blob)? else {
+            return Ok(false);
+        };
+        Ok(sidecar.root == root && sidecar.body_hash == hash.as_slice())
     }
 
     // --- tree-shaped suggestions (issues #75 §3.2, #92) -------------------
@@ -1061,6 +1341,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         path: &str,
         doc: &CoeditTreeDoc,
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         // Where the *workspace's* document stood when this was proposed — the
         // reviewer's "you were looking at this much of it". Not a gate: a CRDT
@@ -1069,7 +1350,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .load_coedit_tree(path, doc.root())
             .await?
             .state_vector();
-        self.suggest_coedit_tree_update(ctx, path, &base, &doc.state_update(), summary)
+        self.suggest_coedit_tree_update(ctx, path, &base, &doc.state_update(), summary, replaces)
             .await
     }
 
@@ -1084,6 +1365,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         base_sv: &[u8],
         update: &[u8],
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         if update.is_empty() {
             return Err(OrigoFSError::InvalidArgument(
@@ -1103,6 +1385,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             proposed_hash,
             summary,
             crate::suggest::SuggestionKind::CrdtTree,
+            replaces,
         )
         .await
     }
@@ -1217,7 +1500,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             )));
         }
         if s.status != crate::suggest::SuggestionStatus::Pending {
-            return Err(OrigoFSError::InvalidArgument(format!(
+            return Err(OrigoFSError::AlreadyResolved(format!(
                 "suggestion #{id} is already {}",
                 s.status.as_str()
             )));
@@ -1270,22 +1553,6 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             )));
         }
         Ok(())
-    }
-
-    /// Refuse the checkpoint if somebody wrote `path` around the live document.    /// Refuse the checkpoint if somebody wrote `path` around the live document.
-    async fn refuse_out_of_band(&self, path: &str) -> Result<()> {
-        let Some(live) = self.meta.get_live_doc(path).await? else {
-            return Ok(()); // not live: nothing claims to own these bytes
-        };
-        if self.current_content_hex(path).await? == live.content_hash {
-            return Ok(());
-        }
-        Err(OrigoFSError::Conflict(format!(
-            "{path} was written outside the co-editing session since its last \
-             checkpoint; a tree document cannot be reconciled with a foreign write \
-             (origofs cannot parse bytes back into nodes) — re-read the file, reseed \
-             the document, and checkpoint again"
-        )))
     }
 }
 
@@ -1412,7 +1679,8 @@ mod tests {
 
     #[test]
     fn a_sidecar_round_trips_its_root_and_coherence_hash() {
-        let framed = frame_tree_sidecar("content", b"body", b"state").unwrap();
+        let framed =
+            frame_tree_sidecar("content", blake3::hash(b"body").as_bytes(), b"state").unwrap();
         let parsed = parse_tree_sidecar(&framed).unwrap().unwrap();
         assert_eq!(parsed.root, "content");
         assert_eq!(parsed.body_hash, blake3::hash(b"body").as_bytes());

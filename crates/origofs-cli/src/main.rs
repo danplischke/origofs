@@ -225,6 +225,12 @@ enum Cmd {
         from: Option<PathBuf>,
         #[arg(long)]
         delete: bool,
+        /// Retire this pending suggestion of your own as the new one is created
+        /// -- how you *revise* a proposal rather than stack a second draft beside
+        /// it. Without it, rejecting the revision leaves the earlier draft
+        /// pending with a current base, so it still accepts cleanly (#164).
+        #[arg(long)]
+        replaces: Option<i64>,
     },
     /// List suggestions (filter with `--status` and/or `--path`).
     Suggestions {
@@ -264,6 +270,18 @@ enum Cmd {
         actor: i64,
         #[arg(long)]
         session: Option<i64>,
+    },
+    /// Withdraw a pending suggestion its author has abandoned, without applying
+    /// or rejecting it. Distinct from `reject`, which says a reviewer declined.
+    Supersede {
+        id: i64,
+        #[arg(long)]
+        actor: i64,
+        #[arg(long)]
+        session: Option<i64>,
+        /// Optional note for the change feed.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Create a branch at HEAD, or list branches when no name is given.
     Branch { name: Option<String> },
@@ -1678,7 +1696,7 @@ async fn main() -> Result<()> {
                             // `origofs policy <actor> propose` had no effect on
                             // `origofs write` — the CLI ignored the gate its own
                             // subcommand sets.
-                            match ws.write_or_propose(ctx, &path, &data, None).await? {
+                            match ws.write_or_propose(ctx, &path, &data, None, None).await? {
                                 origofs_sdk::WriteOutcome::Wrote => {}
                                 origofs_sdk::WriteOutcome::Proposed(suggestion_id) => {
                                     println!(
@@ -1755,7 +1773,7 @@ async fn main() -> Result<()> {
                 // is queued for review rather than refused, which is how `write`
                 // already behaves. Refusing would make the two inconsistent in the
                 // opposite direction.
-                match ws.remove_or_propose(ctx, &path, None).await? {
+                match ws.remove_or_propose(ctx, &path, None, None).await? {
                     origofs_sdk::WriteOutcome::Wrote => {}
                     origofs_sdk::WriteOutcome::Proposed(id) => {
                         println!(
@@ -1873,13 +1891,15 @@ async fn main() -> Result<()> {
             summary,
             from,
             delete,
+            replaces,
         } => {
             let ctx = match session {
                 Some(s) => WriteCtx::session(actor, s),
                 None => WriteCtx::actor(actor),
             };
             let id = if delete {
-                ws.suggest_delete(ctx, &path, summary.as_deref()).await?
+                ws.suggest_delete(ctx, &path, summary.as_deref(), replaces)
+                    .await?
             } else {
                 let data = match from {
                     Some(p) => std::fs::read(p)?,
@@ -1889,9 +1909,15 @@ async fn main() -> Result<()> {
                         buf
                     }
                 };
-                ws.suggest(ctx, &path, &data, summary.as_deref()).await?
+                ws.suggest(ctx, &path, &data, summary.as_deref(), replaces)
+                    .await?
             };
-            println!("suggestion #{id} created (pending review)");
+            match replaces {
+                Some(old) => {
+                    println!("suggestion #{id} created (pending review), superseding #{old}")
+                }
+                None => println!("suggestion #{id} created (pending review)"),
+            }
         }
         Cmd::Suggestions {
             status,
@@ -1943,8 +1969,10 @@ async fn main() -> Result<()> {
                 Some(s) => WriteCtx::session(actor, s),
                 None => WriteCtx::actor(actor),
             };
-            ws.accept_suggestion(id, ctx).await?;
-            println!("accepted suggestion #{id}");
+            match ws.accept_suggestion(id, ctx).await? {
+                Some(hash) => println!("accepted suggestion #{id} -> {hash}"),
+                None => println!("accepted suggestion #{id} (file deleted)"),
+            }
         }
         Cmd::Reject { id, actor, session } => {
             let ctx = match session {
@@ -1953,6 +1981,19 @@ async fn main() -> Result<()> {
             };
             ws.reject_suggestion(id, ctx).await?;
             println!("rejected suggestion #{id}");
+        }
+        Cmd::Supersede {
+            id,
+            actor,
+            session,
+            reason,
+        } => {
+            let ctx = match session {
+                Some(s) => WriteCtx::session(actor, s),
+                None => WriteCtx::actor(actor),
+            };
+            ws.supersede_suggestion(id, ctx, reason.as_deref()).await?;
+            println!("superseded suggestion #{id}");
         }
         Cmd::Branch { name } => match name {
             Some(name) => {

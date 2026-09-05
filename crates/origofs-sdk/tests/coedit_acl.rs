@@ -40,7 +40,7 @@ async fn coedit_refuses_an_actor_without_write_at_the_path() {
     ws.grant(bob, "/", Perms::READ, Some(owner)).await.unwrap();
 
     // The baseline: the ordinary write path refuses him.
-    let direct = ws.write_or_propose(ctx, "/doc", b"bob\n", None).await;
+    let direct = ws.write_or_propose(ctx, "/doc", b"bob\n", None, None).await;
     assert!(is_denied(&direct.unwrap_err()));
 
     // So must co-editing, at the door rather than after a session of typing.
@@ -106,18 +106,22 @@ async fn suggestions_require_the_propose_right() {
     ws.grant(bob, "/", Perms::READ, Some(owner)).await.unwrap();
 
     assert!(is_denied(
-        &ws.suggest(ctx, "/doc", b"proposed\n", None)
+        &ws.suggest(ctx, "/doc", b"proposed\n", None, None)
             .await
             .unwrap_err()
     ));
     assert!(is_denied(
-        &ws.suggest_delete(ctx, "/doc", None).await.unwrap_err()
+        &ws.suggest_delete(ctx, "/doc", None, None)
+            .await
+            .unwrap_err()
     ));
 
     let d = CoeditDoc::new();
     d.insert(ctx, 0, "proposed\n");
     assert!(is_denied(
-        &ws.suggest_coedit(ctx, "/doc", &d, None).await.unwrap_err()
+        &ws.suggest_coedit(ctx, "/doc", &d, None, None)
+            .await
+            .unwrap_err()
     ));
 
     assert!(ws.list_suggestions(None, None).await.unwrap().is_empty());
@@ -139,7 +143,11 @@ async fn a_propose_only_actor_can_still_suggest() {
         .await
         .unwrap();
 
-    assert!(ws.suggest(ctx, "/doc", b"proposed\n", None).await.is_ok());
+    assert!(
+        ws.suggest(ctx, "/doc", b"proposed\n", None, None)
+            .await
+            .is_ok()
+    );
     assert_eq!(ws.list_suggestions(None, None).await.unwrap().len(), 1);
 }
 

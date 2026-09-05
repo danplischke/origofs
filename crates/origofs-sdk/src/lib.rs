@@ -1730,24 +1730,50 @@ impl Workspace {
     /// Propose an edit to `path` for human review instead of applying it. The
     /// bytes are stored now; the working tree changes only on accept. Returns
     /// the suggestion id. (Records a `suggest` event on the feed.)
+    ///
+    /// `replaces` names your own pending draft to retire as this one is created —
+    /// the way to *revise* a proposal rather than stack a sibling beside it
+    /// (#164). See [`origofs_core::Fs::suggest`] for the rules and for why it is
+    /// opt-in.
     pub async fn suggest(
         &self,
         ctx: WriteCtx,
         path: &str,
         data: &[u8],
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
-        self.fs.suggest(ctx, path, data, summary).await
+        self.fs.suggest(ctx, path, data, summary, replaces).await
     }
 
-    /// Propose deleting `path`.
+    /// Propose deleting `path`. `replaces` retires an earlier draft — see
+    /// [`suggest`](Self::suggest).
     pub async fn suggest_delete(
         &self,
         ctx: WriteCtx,
         path: &str,
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
-        self.fs.suggest_delete(ctx, path, summary).await
+        self.fs.suggest_delete(ctx, path, summary, replaces).await
+    }
+
+    /// Retire a pending suggestion its author has abandoned, without applying or
+    /// rejecting it (#164).
+    ///
+    /// The standalone form of `replaces`: use it when a draft is being withdrawn
+    /// with **nothing taking its place**. Where a replacement is proposed in the
+    /// same breath, prefer `replaces` — every propose call takes it, byte and CRDT
+    /// alike, and then the two cannot come apart. The author may always retire
+    /// their own; anyone else needs `WRITE` at the path, exactly as rejecting
+    /// somebody else's proposal does.
+    pub async fn supersede_suggestion(
+        &self,
+        id: i64,
+        ctx: WriteCtx,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.fs.supersede_suggestion(id, ctx, reason).await
     }
 
     /// Set an actor's write policy — `Direct` (may write straight to the tree) or
@@ -1790,8 +1816,12 @@ impl Workspace {
         path: &str,
         data: &[u8],
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<WriteOutcome> {
-        let outcome = self.fs.write_or_propose(ctx, path, data, summary).await?;
+        let outcome = self
+            .fs
+            .write_or_propose(ctx, path, data, summary, replaces)
+            .await?;
         // Emit the change-feed event for a direct write, exactly as `write_as`
         // does. The propose path emits its own `suggest` event in the engine, so
         // don't double-emit here.
@@ -1814,8 +1844,12 @@ impl Workspace {
         ctx: WriteCtx,
         path: &str,
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<WriteOutcome> {
-        let outcome = self.fs.remove_or_propose(ctx, path, summary).await?;
+        let outcome = self
+            .fs
+            .remove_or_propose(ctx, path, summary, replaces)
+            .await?;
         // As in `write_or_propose`: the propose path emits its own `suggest` event
         // in the engine, so only the direct removal is emitted here.
         if matches!(outcome, WriteOutcome::Wrote) {
@@ -1909,8 +1943,13 @@ impl Workspace {
     }
 
     /// Accept a pending suggestion: apply it (attributed to the original author)
-    /// and mark it accepted. Errors if the file changed since it was proposed.
-    pub async fn accept_suggestion(&self, id: i64, approver: WriteCtx) -> Result<()> {
+    /// and mark it accepted. Errors with
+    /// [`StaleBase`](OrigoFSError::StaleBase) if the file changed since it was
+    /// proposed.
+    ///
+    /// Returns the content address now at the path — `None` for an accepted
+    /// deletion — so a caller can confirm what landed without re-reading (#163).
+    pub async fn accept_suggestion(&self, id: i64, approver: WriteCtx) -> Result<Option<String>> {
         self.fs.accept_suggestion(id, approver).await
     }
 
@@ -2194,8 +2233,11 @@ impl Workspace {
         path: &str,
         doc: &CoeditDoc,
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
-        self.fs.suggest_coedit(ctx, path, doc, summary).await
+        self.fs
+            .suggest_coedit(ctx, path, doc, summary, replaces)
+            .await
     }
 
     /// The primitive behind [`suggest_coedit`](Self::suggest_coedit), for a client
@@ -2209,9 +2251,10 @@ impl Workspace {
         base_sv: &[u8],
         update: &[u8],
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         self.fs
-            .suggest_coedit_update(ctx, path, base_sv, update, summary)
+            .suggest_coedit_update(ctx, path, base_sv, update, summary, replaces)
             .await
     }
 
@@ -2299,8 +2342,11 @@ impl Workspace {
         path: &str,
         doc: &CoeditTreeDoc,
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
-        self.fs.suggest_coedit_tree(ctx, path, doc, summary).await
+        self.fs
+            .suggest_coedit_tree(ctx, path, doc, summary, replaces)
+            .await
     }
 
     /// The primitive behind [`suggest_coedit_tree`](Self::suggest_coedit_tree),
@@ -2314,9 +2360,10 @@ impl Workspace {
         base_sv: &[u8],
         update: &[u8],
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         self.fs
-            .suggest_coedit_tree_update(ctx, path, base_sv, update, summary)
+            .suggest_coedit_tree_update(ctx, path, base_sv, update, summary, replaces)
             .await
     }
 
@@ -2466,6 +2513,14 @@ impl Workspace {
     /// [`Superseded`](SuggestionStatus::Superseded). Returns how many were retired.
     /// CRDT suggestions are untouched — they merge into whatever the document has
     /// become, so a moved file does not invalidate them.
+    ///
+    /// **"Stale" means the base moved on, and only that** (#164). It is *not*
+    /// "everything obsolete": two pending proposals from one actor on one
+    /// unchanged base are siblings, both current by this measure, and this returns
+    /// `0` for them. Retiring a draft its own author abandoned is a different
+    /// relation with no bearing on content — see
+    /// [`supersede_suggestion`](Self::supersede_suggestion), or `replaces` on
+    /// [`suggest`](Self::suggest) to do it as the replacement is proposed.
     pub async fn supersede_stale_suggestions(&self, path: &str) -> Result<usize> {
         self.fs.supersede_stale_byte_suggestions(path, None).await
     }
