@@ -25,11 +25,11 @@ pub use origofs_core::{
     AclGrant, Actor, ActorInit, ActorKind, BlameRange, CacheLimits, CommitInfo, Conflict,
     DEFAULT_GC_GRACE_SECS, DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event,
     EventInit, FileKind, FsStat, GcStats, Hash, Inode, LiveDoc, LoadReport, MemStore, MergeOutcome,
-    OrigoFSError, Owner, PackStore, Passage, PassageOptions, Perms, Presence, Quota, RebuildReport,
-    ResyncOutcome, ResyncReport, Scope, ScopeError, Segmentation, Suggestion, SuggestionContent,
-    SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats,
-    TrashEntry, Usage, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
-    latest_schema_version,
+    OrigoFSError, Owner, PackStore, Passage, PassageOptions, PathRevision, Perms, Presence, Quota,
+    RebuildReport, ResyncOutcome, ResyncReport, Scope, ScopeError, Segmentation, Suggestion,
+    SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit,
+    TransferStats, TrashEntry, Usage, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome,
+    WritePolicy, latest_schema_version,
 };
 // Backend-specific re-exports, gated to match `origofs-core`'s own features.
 #[cfg(feature = "coedit")]
@@ -850,6 +850,19 @@ impl Workspace {
         self.fs.log().await
     }
 
+    /// The revisions of one `path`, newest first: every commit whose content
+    /// there differs from its first parent's.
+    ///
+    /// Resolves the path by descending each commit's tree rather than flattening
+    /// it, so the cost is `commits x depth` and flat in the size of the
+    /// repository — asking [`diff`](Self::diff) per commit pair instead costs
+    /// `commits x files`. `limit` caps the revisions returned. The walk reads no
+    /// file bodies; fetch a revision's patch with
+    /// [`diff_file`](Self::diff_file) against its first parent.
+    pub async fn log_path(&self, path: &str, limit: Option<usize>) -> Result<Vec<PathRevision>> {
+        self.fs.log_path(path, limit).await
+    }
+
     /// Working-tree changes relative to HEAD.
     pub async fn status(&self) -> Result<Vec<DiffEntry>> {
         self.fs.status().await
@@ -1243,6 +1256,30 @@ impl Workspace {
         path: &str,
     ) -> Result<String> {
         self.fs.diff_file_as(ctx, from, to, path).await
+    }
+
+    /// [`log_path`](Self::log_path), checked against `READ` at the path — a
+    /// file's history says when it changed, which is a description of its content
+    /// over time. Checked before the walk, so a refusal does not reveal whether
+    /// the path was ever committed.
+    pub async fn log_path_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<PathRevision>> {
+        self.fs.log_path_as(ctx, path, limit).await
+    }
+
+    /// [`edit_ops_at`](Self::edit_ops_at), checked against `READ` at the path —
+    /// the op-log for a file says who changed which bytes of it and when.
+    pub async fn edit_ops_at_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<EditOp>> {
+        self.fs.edit_ops_at_as(ctx, path, limit).await
     }
 
     /// [`presence`](Self::presence), with sessions at unreadable paths removed —
@@ -1899,6 +1936,22 @@ impl Workspace {
     /// The edit-op log for an actor (optionally one session).
     pub async fn edit_ops(&self, actor_id: i64, session_id: Option<i64>) -> Result<Vec<EditOp>> {
         self.fs.edit_ops(actor_id, session_id).await
+    }
+
+    /// The edit-op log for one **file**, newest first: every attributed mutation
+    /// against it, with the actor, session, byte range and the content addresses
+    /// either side. Follows the file across renames (it reads by inode when the
+    /// path is live), and falls back to the recorded path once the inode is gone,
+    /// which is when the deletion is the row being looked for.
+    ///
+    /// Finer than [`log_path`](Self::log_path) — individual writes, including
+    /// uncommitted ones — but weaker: `pre_hash`/`post_hash` are not GC roots, so
+    /// after a `gc` the row still says who changed which bytes and when while the
+    /// content it names may be gone. It is a record of changes, not a way to
+    /// recover old versions. Unattributed writes (plain `write`, and everything
+    /// through a mount) record nothing at all.
+    pub async fn edit_ops_at(&self, path: &str, limit: Option<usize>) -> Result<Vec<EditOp>> {
+        self.fs.edit_ops_at(path, limit).await
     }
 
     /// Revert every line an actor wrote in a session. Returns the changed paths.

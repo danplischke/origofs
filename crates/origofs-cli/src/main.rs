@@ -176,8 +176,24 @@ enum Cmd {
         #[arg(long)]
         actor: Option<i64>,
     },
-    /// Show commit history (HEAD, first-parent).
-    Log,
+    /// Show commit history (HEAD, first-parent). With a PATH, show only the
+    /// commits that changed that path — `origofs log /src/main.rs`.
+    Log {
+        /// Limit the history to the commits that changed this path. Resolves the
+        /// path per commit by descending the tree, so it costs the same whether
+        /// the repository holds ten files or ten thousand.
+        path: Option<String>,
+        /// Stop after this many revisions. Caps what is returned, not what is
+        /// walked: a path that was never touched still walks the whole history.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Show working-tree changes relative to HEAD.
     Status,
     /// Compare two refs/commits: changed paths, or one file's line diff with
@@ -411,6 +427,25 @@ enum Cmd {
     /// Show per-line authorship (blame) for a file.
     Blame {
         path: String,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
+    /// The attributed writes recorded against one file, newest first: who, when,
+    /// which byte range, and the content addresses either side.
+    ///
+    /// Finer than `log` — individual writes, including ones never committed — but
+    /// it records changes rather than preserving them: the content those hashes
+    /// name is not a GC root, so after `origofs gc` a row can name bytes that are
+    /// gone. Unattributed writes (and everything through a mount) record nothing.
+    Edits {
+        path: String,
+        /// Stop after this many ops.
+        #[arg(long)]
+        limit: Option<usize>,
         /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
         /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
         /// unattributed and open, which is what an unenforced workspace does
@@ -1762,16 +1797,36 @@ async fn main() -> Result<()> {
             let branch = ws.current_branch().await?.unwrap_or_else(|| "?".into());
             println!("[{branch} {}] {message}", &hash.to_hex()[..12]);
         }
-        Cmd::Log => {
-            for ci in ws.log().await? {
-                println!(
-                    "{} {}  {}",
-                    &ci.hash.to_hex()[..12],
-                    ci.commit.author,
-                    ci.commit.message
-                );
+        Cmd::Log { path, limit, actor } => match path {
+            None => {
+                for ci in ws.log().await? {
+                    println!(
+                        "{} {}  {}",
+                        &ci.hash.to_hex()[..12],
+                        ci.commit.author,
+                        ci.commit.message
+                    );
+                }
             }
-        }
+            Some(p) => {
+                let revs = match read_ctx(actor)? {
+                    Some(ctx) => ws.log_path_as(ctx, &p, limit).await?,
+                    None => ws.log_path(&p, limit).await?,
+                };
+                if revs.is_empty() {
+                    println!("{p}: no committed history");
+                }
+                for r in revs {
+                    println!(
+                        "{} {} {}  {}",
+                        r.status.sigil(),
+                        &r.commit.hash.to_hex()[..12],
+                        r.commit.commit.author,
+                        r.commit.commit.message
+                    );
+                }
+            }
+        },
         Cmd::Status => {
             let changes = ws.status().await?;
             if changes.is_empty() {
@@ -2293,6 +2348,30 @@ async fn main() -> Result<()> {
                         println!("posix-locks is {}", if on { "on" } else { "off" });
                     }
                 }
+            }
+        }
+        Cmd::Edits { path, limit, actor } => {
+            let ops = match read_ctx(actor)? {
+                Some(ctx) => ws.edit_ops_at_as(ctx, &path, limit).await?,
+                None => ws.edit_ops_at(&path, limit).await?,
+            };
+            if ops.is_empty() {
+                println!("{path}: no attributed writes recorded");
+            }
+            for o in ops {
+                let who = ws
+                    .get_actor(o.actor_id)
+                    .await?
+                    .map(|a| a.display_name)
+                    .unwrap_or_else(|| format!("actor:{}", o.actor_id));
+                // The recorded path, not the one asked about: for a file that has
+                // been renamed they differ, and the row's own path is what says
+                // when that happened.
+                let range = match o.op.as_str() {
+                    "write" => format!(" [{}..{}]", o.byte_start, o.byte_start + o.byte_len),
+                    _ => String::new(),
+                };
+                println!("{} {:<6} {who}{range} {}", o.ts, o.op, o.path);
             }
         }
         Cmd::Blame { path, actor } => {

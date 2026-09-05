@@ -399,6 +399,35 @@ fn dir_entry_dict(py: Python<'_>, e: &DirEntry) -> PyResult<Py<PyAny>> {
     Ok(d.into_any().unbind())
 }
 
+/// One revision of a single path: the commit that made it, plus how.
+fn path_revision_dict(py: Python<'_>, r: &origofs_sdk::PathRevision) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("commit", r.commit.hash.to_hex())?;
+    d.set_item("author", &r.commit.commit.author)?;
+    d.set_item("message", &r.commit.commit.message)?;
+    d.set_item("timestamp", r.commit.commit.timestamp)?;
+    d.set_item("status", r.status.sigil().to_string())?;
+    d.set_item("hash", r.hash.map(|h| h.to_hex()))?;
+    Ok(d.into_any().unbind())
+}
+
+/// One `edit_op` row. Shared by the actor-keyed and path-keyed bindings so the
+/// two cannot disagree about the shape of a record the stub declares once.
+fn edit_op_dict(py: Python<'_>, o: origofs_sdk::EditOp) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("id", o.id)?;
+    d.set_item("actor_id", o.actor_id)?;
+    d.set_item("session_id", o.session_id)?;
+    d.set_item("path", o.path)?;
+    d.set_item("op", o.op)?;
+    d.set_item("byte_start", o.byte_start)?;
+    d.set_item("byte_len", o.byte_len)?;
+    d.set_item("pre_hash", o.pre_hash)?;
+    d.set_item("post_hash", o.post_hash)?;
+    d.set_item("ts", o.ts)?;
+    Ok(d.into_any().unbind())
+}
+
 fn commit_dict(py: Python<'_>, c: &CommitInfo) -> PyResult<Py<PyAny>> {
     let d = PyDict::new(py);
     d.set_item("hash", c.hash.to_hex())?;
@@ -2361,6 +2390,31 @@ impl Workspace {
             Python::attach(|py| {
                 log.iter()
                     .map(|c| commit_dict(py, c))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// The commits that changed one path, newest first, as dicts
+    /// `{commit, author, message, timestamp, status, hash}`.
+    ///
+    /// Resolves the path by descending each commit's tree, so the cost is flat in
+    /// the size of the repository — unlike asking `diff` per commit pair. `limit`
+    /// caps the revisions returned, not the commits walked. Reads no file bodies;
+    /// use `diff_file` against a revision's first parent for the patch.
+    #[pyo3(signature = (path, limit=None))]
+    fn log_path<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let revs = ws.log_path(&path, limit).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                revs.iter()
+                    .map(|r| path_revision_dict(py, r))
                     .collect::<PyResult<Vec<_>>>()
             })
         })
@@ -4583,20 +4637,54 @@ impl Workspace {
             let ops = ws.edit_ops(actor_id, session_id).await.map_err(to_pyerr)?;
             Python::attach(|py| {
                 ops.into_iter()
-                    .map(|o| {
-                        let d = PyDict::new(py);
-                        d.set_item("id", o.id)?;
-                        d.set_item("actor_id", o.actor_id)?;
-                        d.set_item("session_id", o.session_id)?;
-                        d.set_item("path", o.path)?;
-                        d.set_item("op", o.op)?;
-                        d.set_item("byte_start", o.byte_start)?;
-                        d.set_item("byte_len", o.byte_len)?;
-                        d.set_item("pre_hash", o.pre_hash)?;
-                        d.set_item("post_hash", o.post_hash)?;
-                        d.set_item("ts", o.ts)?;
-                        Ok(d.unbind())
-                    })
+                    .map(|o| edit_op_dict(py, o))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// The attributed writes recorded against one file, newest first.
+    ///
+    /// Follows the file across renames (it reads by inode while the path is live)
+    /// and falls back to the recorded path once the inode is gone, which is when
+    /// the deletion is the row being looked for. Finer than `log_path` -- it
+    /// includes writes that were never committed -- but weaker: the content
+    /// addresses on each row are not GC roots, so a row can outlive the bytes it
+    /// names. It records changes; it does not preserve them.
+    #[pyo3(signature = (path, limit=None))]
+    fn edit_ops_at<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let ops = ws.edit_ops_at(&path, limit).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                ops.into_iter()
+                    .map(|o| edit_op_dict(py, o))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// `edit_ops_at`, checked against `read` at the path.
+    #[pyo3(signature = (ctx, path, limit=None))]
+    fn edit_ops_at_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let ops = ws.edit_ops_at_as(c, &path, limit).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                ops.into_iter()
+                    .map(|o| edit_op_dict(py, o))
                     .collect::<PyResult<Vec<_>>>()
             })
         })
@@ -5231,6 +5319,29 @@ impl Workspace {
         future_into_py(py, async move {
             let bytes = ws.read_as(c, &path).await.map_err(to_pyerr)?;
             Python::attach(|py| Ok(PyBytes::new(py, &bytes).into_any().unbind()))
+        })
+    }
+
+    /// `log_path`, checked against `read` at the path — a file's history says
+    /// when it changed, which describes its content over time. Checked before the
+    /// walk, so a refusal does not reveal whether the path was ever committed.
+    #[pyo3(signature = (ctx, path, limit=None))]
+    fn log_path_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let revs = ws.log_path_as(c, &path, limit).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                revs.iter()
+                    .map(|r| path_revision_dict(py, r))
+                    .collect::<PyResult<Vec<_>>>()
+            })
         })
     }
 

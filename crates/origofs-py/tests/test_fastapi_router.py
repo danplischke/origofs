@@ -1279,3 +1279,117 @@ def test_a_filtered_router_still_serves_the_routes_it_kept():
     assert client.put(
         "/v1/files/a.txt", content=b"x", headers={"x-actor-id": "1"}
     ).status_code == 404
+
+
+# `/log/{path}` is the per-path history view. Unlike `/log` it names a path, so it
+# is scoped and read-checked -- the two properties the group table and the read
+# gate depend on, and neither is visible from the route's shape alone.
+def test_log_path_returns_only_the_commits_that_touched_the_path():
+    d = tempfile.mkdtemp()
+
+    async def _setup():
+        ws = await origofs.Workspace.open_local(
+            os.path.join(d, "meta.db"), os.path.join(d, "cas")
+        )
+        dan = await ws.create_human("dan", None)
+        sess = await ws.create_session(dan, "fastapi")
+        return ws, dan, sess
+
+    ws, dan, sess = asyncio.run(_setup())
+    c = _client(ws)
+    hdr = {"X-Actor-Id": str(dan), "X-Session-Id": str(sess)}
+
+    c.put("/files/tracked.txt", content=b"one\n", headers=hdr)
+    c.put("/files/other.txt", content=b"one\n", headers=hdr)
+    c.post("/commit", json={"author": "dan", "message": "seed"}, headers=hdr)
+    # Two commits that rewrite the root tree without touching the tracked file.
+    for i in range(2):
+        c.put("/files/other.txt", content=f"{i}\n".encode(), headers=hdr)
+        c.post("/commit", json={"author": "dan", "message": f"noise {i}"}, headers=hdr)
+    c.put("/files/tracked.txt", content=b"two\n", headers=hdr)
+    c.post("/commit", json={"author": "dan", "message": "edit"}, headers=hdr)
+
+    revs = c.get("/log/tracked.txt").json()
+    assert [(r["status"], r["message"]) for r in revs] == [
+        ("M", "edit"),
+        ("A", "seed"),
+    ], revs
+    # The whole commit list is longer, which is the point of the per-path view.
+    assert len(c.get("/log").json()) == 4
+
+    # `limit` caps what comes back, newest first.
+    assert [r["message"] for r in c.get("/log/tracked.txt?limit=1").json()] == ["edit"]
+    # A deletion has no content address; a live revision does.
+    assert revs[0]["hash"] is not None
+    assert c.get("/log/never-existed.txt").json() == []
+
+
+# A scoped router must not answer for a path outside its root, and history is a
+# read that names a path -- so it resolves under the root like every other one.
+def test_log_path_is_scoped_to_the_router_root():
+    d = tempfile.mkdtemp()
+
+    async def _setup():
+        ws = await origofs.Workspace.open_local(
+            os.path.join(d, "meta.db"), os.path.join(d, "cas")
+        )
+        dan = await ws.create_human("dan", None)
+        sess = await ws.create_session(dan, "fastapi")
+        ctx = origofs.WriteCtx.session(dan, sess)
+        await ws.mkdir_as(ctx, "/tenant-a")
+        await ws.write_as(ctx, "/tenant-a/f.txt", b"a\n")
+        await ws.write_as(ctx, "/secret.txt", b"s\n")
+        await ws.commit_as(ctx, "dan", "seed")
+        return ws, dan, sess
+
+    ws, dan, sess = asyncio.run(_setup())
+    c = _client(ws, root="/tenant-a")
+
+    assert [r["status"] for r in c.get("/log/f.txt").json()] == ["A"]
+    # `/secret.txt` resolves under the root, so it is a path that does not exist
+    # rather than one the caller is told about.
+    assert c.get("/log/secret.txt").json() == []
+
+
+# `/edits/{path}` is the op-log read about a file. It sits in the `blame` group
+# because it answers the same question at write granularity, and a host granting
+# one almost always means to grant the other.
+def test_edits_follows_the_file_and_is_grouped_with_blame():
+    from origofs.fastapi import ROUTE_GROUPS
+
+    assert "blame" in ROUTE_GROUPS
+    d = tempfile.mkdtemp()
+
+    async def _setup():
+        ws = await origofs.Workspace.open_local(
+            os.path.join(d, "meta.db"), os.path.join(d, "cas")
+        )
+        dan = await ws.create_human("dan", None)
+        sess = await ws.create_session(dan, "fastapi")
+        return ws, dan, sess
+
+    ws, dan, sess = asyncio.run(_setup())
+    c = _client(ws)
+    hdr = {"X-Actor-Id": str(dan), "X-Session-Id": str(sess)}
+
+    c.put("/files/a.txt", content=b"one\n", headers=hdr)
+    c.put("/files/a.txt", content=b"two\n", headers=hdr)
+    c.post("/rename", json={"from": "a.txt", "to": "b.txt"}, headers=hdr)
+
+    ops = c.get("/edits/b.txt").json()
+    # The two writes were recorded under the old name; reading by path alone would
+    # lose them, which is why the engine keys on the inode while it exists.
+    assert [(o["op"], o["path"]) for o in ops] == [
+        ("rename", "/b.txt"),
+        ("write", "/a.txt"),
+        ("write", "/a.txt"),
+    ], ops
+    assert all(o["actor_id"] == dan for o in ops)
+    assert [o["op"] for o in c.get("/edits/b.txt?limit=1").json()] == ["rename"]
+
+    # A router excluding the `blame` group serves neither route.
+    app = FastAPI()
+    app.include_router(build_router(ws, authn=header_authn, exclude=["blame"]))
+    limited = TestClient(app)
+    assert limited.get("/edits/b.txt").status_code == 404
+    assert limited.get("/blame/b.txt").status_code == 404

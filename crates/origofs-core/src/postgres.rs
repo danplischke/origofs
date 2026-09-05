@@ -2166,23 +2166,35 @@ impl MetadataStore for PostgresMetadataStore {
                 &[&self.workspace_id, &actor_id, &session_id],
             )
             .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| EditOp {
-                id: r.get(0),
-                session_id: r.get(1),
-                actor_id: r.get(2),
-                tool_call_id: r.get(3),
-                ino: r.get(4),
-                path: r.get(5),
-                op: r.get(6),
-                byte_start: r.get(7),
-                byte_len: r.get(8),
-                pre_hash: r.get(9),
-                post_hash: r.get(10),
-                ts: r.get(11),
-            })
-            .collect())
+        Ok(rows.iter().map(edit_op_from_row).collect())
+    }
+
+    async fn list_edit_ops_for_ino(&self, ino: Ino, limit: Option<usize>) -> Result<Vec<EditOp>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts FROM edit_op \
+                 WHERE workspace_id = $1 AND ino = $2 ORDER BY id DESC LIMIT $3",
+                &[&self.workspace_id, &ino, &pg_limit(limit)],
+            )
+            .await?;
+        Ok(rows.iter().map(edit_op_from_row).collect())
+    }
+
+    async fn list_edit_ops_for_path(
+        &self,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<EditOp>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts FROM edit_op \
+                 WHERE workspace_id = $1 AND path = $2 ORDER BY id DESC LIMIT $3",
+                &[&self.workspace_id, &path, &pg_limit(limit)],
+            )
+            .await?;
+        Ok(rows.iter().map(edit_op_from_row).collect())
     }
 
     async fn set_blob_blame(&self, content: &Hash, runs: &str) -> Result<()> {
@@ -3003,6 +3015,32 @@ impl PostgresMetadataStore {
             )
             .await?;
         Ok(row.get(0))
+    }
+}
+
+/// Postgres has no "-1 means unlimited", so an absent cap becomes `NULL`, which
+/// `LIMIT` reads as no limit.
+fn pg_limit(limit: Option<usize>) -> Option<i64> {
+    limit.map(|n| n as i64)
+}
+
+/// One `edit_op` row. Shared so every op-log query decodes the same projection in
+/// the same order — a column list that drifts between two queries is a silently
+/// wrong field, not a compile error.
+fn edit_op_from_row(r: &tokio_postgres::Row) -> EditOp {
+    EditOp {
+        id: r.get(0),
+        session_id: r.get(1),
+        actor_id: r.get(2),
+        tool_call_id: r.get(3),
+        ino: r.get(4),
+        path: r.get(5),
+        op: r.get(6),
+        byte_start: r.get(7),
+        byte_len: r.get(8),
+        pre_hash: r.get(9),
+        post_hash: r.get(10),
+        ts: r.get(11),
     }
 }
 
