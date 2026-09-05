@@ -495,6 +495,67 @@ proxy logs by default. Each connection is bound to a **session**, opened for it
 if the credential didn't name one, so a sitting's live edits can be undone as a
 unit with `revert_session`.
 
+#### Ctrl+Z — `POST /coedit-undo/{path}`
+
+Undo pops **one actor's own** most recent action, never a collaborator's
+paragraph and never an edit that arrived from another worker. Send
+`{"redo": true}` for the other direction:
+
+```js
+await fetch(`/v1/coedit-undo/notes.md`, {
+  method: "POST",
+  headers: { authorization: `Bearer ${token}` },
+  body: JSON.stringify({ redo: false }),
+})
+```
+
+It is a request *beside* the socket rather than a message on it, because the
+result already travels the room's y-sync fan-out — only the request needed a
+channel, and a new message tag would break the unmodified Yjs clients the socket
+exists to serve. The response says `changed`, distinguishing "undone" from
+"nothing to undo" so you can grey the button out, and `available` (see below).
+
+Four things to know before building on it:
+
+- **An undo is a write**, so it takes `WRITE` at the path exactly as opening the
+  document does. A propose-only actor is refused (`403`), not silently ignored —
+  there is no such thing as a proposed undo.
+- **Undo does not rewrite authorship.** Undoing a deletion gives the text back to
+  *its* author, not to whoever pressed the key, and the op-log keeps every edit
+  that happened. An undo that erased evidence would be a way to launder an
+  agent's edits out of the audit trail, which is the opposite of the point.
+- **A stack does not outlive the room.** Undo is an editor affordance, not
+  history: it does not survive a reconnect, a `checkout`, or a worker restart,
+  and your stack goes when your last socket on that document closes. Two tabs
+  share one stack. For anything durable, reach for `revert_session` (a whole
+  sitting), the trash (a delete), or `checkout` (a commit).
+- **Both shapes work.** A tree document names its `XmlFragment` root in the
+  request (`{"redo": false, "root": "content"}`) — the same `root` its socket was
+  opened with. Both shapes can hold one path at once, so the root is what picks
+  the room, and a request without one addresses the flat shape. The tree's *file*
+  still moves only when your next `coedit-tree-checkpoint` lands bytes, because
+  origofs cannot serialize a tree; the live document moves immediately.
+
+**Across workers, exactly one holds an actor's stack.** A room lives in one
+process's memory and so does its undo stack, so behind a load balancer one
+person with two tabs can land on two workers. Letting both keep a stack is not
+safe: origofs's author stamp is written in the same undo step as the insert it
+describes, so one worker's undo can strip a stamp the other's restore needs, and
+the restored text comes back **unattributed** for the next checkpoint to credit
+to whoever triggered it.
+
+So a worker **claims** `(path, actor)` before it starts recording undo, and only
+one can hold it. The response says `available` alongside `changed`, and they are
+different answers: `available: false` means the actor's history exists but lives
+on another worker — show "undo is active in another window", not "nothing to
+undo". The claim carries a 60-second lease a live worker renews, so a crashed one
+frees the actor rather than denying them undo forever, and it is released as soon
+as the holding worker's last socket for that actor closes. Nothing changes for a
+single-worker deployment: two tabs there are the same holder and share one stack.
+
+You can avoid ever seeing `available: false` by routing an actor's sockets for
+one path to one worker (sticky sessions on actor+path).
+
 While a document is open, its stored bytes are the last **checkpoint** — real,
 fully attributed, but possibly behind what people are typing. origofs records that
 as a per-path **live marker**, and the rule is to *surface* the staleness, never to
@@ -829,7 +890,8 @@ blame, commit/log/status, diff, branches/checkout, the suggestion review queue,
 the change feed, presence, actors/sessions, and the
 [co-editing](#live-co-editing-crdt) WebSockets at `/coedit/{path}` and
 `/coedit-tree/{path}` with its `/coedit-tree-checkpoint/{path}` (long-lived rooms
-are created once per router, not per request).
+are created once per router, not per request), and per-actor
+[undo/redo](#ctrlz--post-coedit-undopath) at `/coedit-undo/{path}`.
 
 One workspace can hold many tenants under scoped paths. Pass `root=` — fixed, or
 a dependency resolving it per request — and the router scopes itself:

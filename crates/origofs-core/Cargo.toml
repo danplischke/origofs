@@ -84,7 +84,15 @@ tokio-postgres = { version = "0.7", optional = true }
 # identically and 0.27.4 (latest) has the same `from_utf8_unchecked` sites and
 # does not build on stable Rust. Before moving this, run the ignored reproducer:
 # `cargo test -p origofs-core --features coedit --test coedit_malformed_update -- --ignored`
-yrs = { version = "0.23", optional = true }
+#
+# `sync` is required, not a preference: without it `yrs`'s observer callbacks are
+# not `Send + Sync`, which makes `UndoManager` neither — and a co-editing room
+# shares one `CoeditDoc` across socket tasks, so the per-actor undo stacks (#146)
+# could not be held in it at all. `CoeditDoc` pins its own `Send + Sync` at
+# compile time, so dropping this feature fails there rather than somewhere in a
+# transport crate. It only adds bounds to callback registration, and origofs
+# registers none of its own.
+yrs = { version = "0.23", optional = true, features = ["sync"] }
 
 [features]
 # Everything on by default, so nothing changes for an existing consumer — but each

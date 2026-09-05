@@ -726,6 +726,29 @@ class CoeditDoc:
     async def remove(self, index: int, length: int) -> None:
         """Remove ``length`` bytes starting at ``index`` (UTF-8 byte offsets)."""
         ...
+    async def track_undo(self, ctx: WriteCtx) -> None:
+        """Start tracking ``ctx``'s edits so its actor can undo them.
+
+        **Call this when a socket joins, not when somebody presses Ctrl+Z.** The
+        undo manager captures changes by observing transactions as they commit, so
+        one created after an edit sees an empty stack however recent that edit was
+        — tracking lazily on the first request silently means there was never
+        anything to undo.
+
+        Idempotent per session: calling it again for the same actor adds that
+        session's origin to the stack the actor already has, so a second browser
+        tab shares one stack rather than starting a rival."""
+        ...
+    async def untrack_undo(self, actor: int) -> None:
+        """Drop ``actor``'s undo stack, at their last socket's disconnect. Undo is
+        an editor affordance, not history: a stack does not outlive the room."""
+        ...
+    async def can_undo(self, actor: int) -> bool:
+        """Whether ``actor`` has anything to undo — for greying out the button."""
+        ...
+    async def can_redo(self, actor: int) -> bool:
+        """Whether ``actor`` has anything to redo."""
+        ...
     async def sync_start(self) -> bytes:
         """The y-sync ``SyncStep1`` frame to greet a new client with."""
         ...
@@ -769,6 +792,29 @@ class CoeditTreeDoc:
         analogue of ``CoeditDoc.insert``, and just as narrow: for an in-process
         agent or a test client, not for a real editor (which drives arbitrary tree
         edits over y-sync)."""
+        ...
+    async def track_undo(self, ctx: WriteCtx) -> None:
+        """Start tracking ``ctx``'s edits so its actor can undo them.
+
+        **Call this when a socket joins, not when somebody presses Ctrl+Z.** The
+        undo manager captures changes by observing transactions as they commit, so
+        one created after an edit sees an empty stack however recent that edit was
+        — tracking lazily on the first request silently means there was never
+        anything to undo.
+
+        Idempotent per session: calling it again for the same actor adds that
+        session's origin to the stack the actor already has, so a second browser
+        tab shares one stack rather than starting a rival."""
+        ...
+    async def untrack_undo(self, actor: int) -> None:
+        """Drop ``actor``'s undo stack, at their last socket's disconnect. Undo is
+        an editor affordance, not history: a stack does not outlive the room."""
+        ...
+    async def can_undo(self, actor: int) -> bool:
+        """Whether ``actor`` has anything to undo — for greying out the button."""
+        ...
+    async def can_redo(self, actor: int) -> bool:
+        """Whether ``actor`` has anything to redo."""
         ...
     async def sync_start(self) -> bytes:
         """The y-sync ``SyncStep1`` frame to greet a new client with."""
@@ -997,6 +1043,37 @@ class Workspace:
     # the path live. `open_coedit` is a co-editing session and takes the write check.
     async def load_coedit_as(self, ctx: WriteCtx, path: str) -> CoeditDoc: ...
     async def checkpoint_coedit(self, ctx: WriteCtx, path: str, doc: CoeditDoc) -> None: ...
+    # Undo/redo (#146). Scoped to `ctx`'s own edits, so it can never reach a
+    # collaborator's work or anything relayed from another worker. An undo is a
+    # write: takes WRITE at the path like `open_coedit`, raising PermissionError
+    # otherwise. Returns the y-sync frame to fan out, empty if nothing was popped.
+    # The actor must have been tracked (`doc.track_undo(ctx)`) before the edits
+    # this would pop — in a server, at socket join.
+    async def undo_coedit(
+        self, ctx: WriteCtx, path: str, doc: CoeditDoc, redo: bool = False
+    ) -> bytes: ...
+    async def undo_coedit_tree(
+        self, ctx: WriteCtx, path: str, doc: CoeditTreeDoc, redo: bool = False
+    ) -> bytes: ...
+    # The WRITE check on its own, for a surface that must authorize before looking
+    # up whether a room is open or who holds its stack -- both are facts about the
+    # document a refused actor must not learn. Raises PermissionError.
+    async def ensure_may_undo(
+        self, ctx: WriteCtx, path: str, redo: bool = False
+    ) -> None: ...
+    # At most one worker may hold an actor's undo stack for a document (#146): two
+    # independent stacks can strip an author stamp between them, leaving restored
+    # text unattributed for the next checkpoint to credit to the checkpointer. A
+    # worker must hold the claim before calling `doc.track_undo`. Single-worker
+    # deployments are unaffected -- two tabs are the same holder.
+    async def claim_undo_stack(
+        self, path: str, actor_id: int, holder: str, root: Optional[str] = None
+    ) -> bool: ...
+    async def release_undo_stack(
+        self, path: str, actor_id: int, holder: str, root: Optional[str] = None
+    ) -> bool: ...
+    async def release_undo_claims_for_holder(self, holder: str) -> int: ...
+    async def renew_undo_claims(self, holder: str) -> int: ...
     # The tree shape (#92): a Y.XmlFragment a rich-text editor binds to natively.
     # origofs does not own the document schema, so the *host* serializes and says
     # which byte ranges came from which co-edit node; origofs resolves each node to

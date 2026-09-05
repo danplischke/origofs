@@ -2034,6 +2034,100 @@ impl Workspace {
         self.fs.checkpoint_coedit(ctx, path, doc).await
     }
 
+    /// Undo (or, with `redo`, redo) `ctx`'s actor's most recent action on the
+    /// live document at `path`, returning the y-sync update to fan out to the
+    /// room — empty when there was nothing to pop.
+    ///
+    /// Scoped to that actor's own edits, so it can never reach a collaborator's
+    /// work or anything that arrived over the cross-worker relay. Takes `WRITE`
+    /// at the path, like opening the document does — see
+    /// [`Fs::undo_coedit`](origofs_core::Fs::undo_coedit). Requires the `coedit`
+    /// feature.
+    #[cfg(feature = "coedit")]
+    pub async fn undo_coedit(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditDoc,
+        redo: bool,
+    ) -> Result<Vec<u8>> {
+        self.fs.undo_coedit(ctx, path, doc, redo).await
+    }
+
+    /// The `WRITE` check an undo takes, on its own — for a surface that must
+    /// authorize *before* looking up whether a room is open or who holds its undo
+    /// stack, since both are facts about the document a refused actor must not
+    /// learn. [`undo_coedit`](Self::undo_coedit) re-runs it as a backstop.
+    /// Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn ensure_may_undo(&self, ctx: WriteCtx, path: &str, redo: bool) -> Result<()> {
+        self.fs.ensure_may_undo_at(ctx, path, redo).await
+    }
+
+    /// Claim the undo stack for the document `(path, root)` on behalf of `holder`
+    /// (this worker), or renew a claim it already has. `root` is empty for the
+    /// flat shape. Returns whether it now owns it.
+    ///
+    /// A worker must hold this before tracking an actor's edits for undo: at most
+    /// one may, because two independent stacks popping overlapping items can
+    /// strip an author stamp between them and leave restored text unattributed.
+    /// Single-worker deployments are unaffected — two tabs are the same holder.
+    /// Requires the `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn claim_undo_stack(
+        &self,
+        path: &str,
+        root: &str,
+        actor_id: i64,
+        holder: &str,
+    ) -> Result<bool> {
+        self.fs.claim_undo_stack(path, root, actor_id, holder).await
+    }
+
+    /// Drop `holder`'s claim on the document `(path, root)`. `root` is empty for
+    /// the flat shape; a document is `(path, shape)`, not a path.
+    #[cfg(feature = "coedit")]
+    pub async fn release_undo_stack(
+        &self,
+        path: &str,
+        root: &str,
+        actor_id: i64,
+        holder: &str,
+    ) -> Result<bool> {
+        self.fs
+            .release_undo_stack(path, root, actor_id, holder)
+            .await
+    }
+
+    /// Drop every undo claim `holder` has — a clean shutdown.
+    #[cfg(feature = "coedit")]
+    pub async fn release_undo_claims_for_holder(&self, holder: &str) -> Result<u64> {
+        self.fs.release_undo_claims_for_holder(holder).await
+    }
+
+    /// Push out the lease on every undo claim `holder` has.
+    #[cfg(feature = "coedit")]
+    pub async fn renew_undo_claims(&self, holder: &str) -> Result<u64> {
+        self.fs.renew_undo_claims(holder).await
+    }
+
+    /// [`undo_coedit`](Self::undo_coedit) for a tree-shaped document (#92).
+    ///
+    /// The live document moves immediately; the *file* moves when the host next
+    /// calls [`checkpoint_coedit_tree`](Self::checkpoint_coedit_tree) with its own
+    /// serialized bytes, because origofs does not own the schema. Requires the
+    /// `coedit` feature.
+    #[cfg(feature = "coedit")]
+    pub async fn undo_coedit_tree(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        doc: &CoeditTreeDoc,
+        redo: bool,
+    ) -> Result<Vec<u8>> {
+        self.fs.undo_coedit_tree(ctx, path, doc, redo).await
+    }
+
     /// Propose a change to a co-edited `path` as a **CRDT merge** rather than a
     /// whole file body (issue #75 §3.2): the review row records the document's Yjs
     /// state vector as its base and `doc`'s opaque `encodeStateAsUpdate` blob as the

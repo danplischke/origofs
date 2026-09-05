@@ -58,6 +58,16 @@ const FANOUT_CAPACITY: usize = 256;
 #[cfg(feature = "postgres")]
 const RELAY_ORIGIN: u64 = u64::MAX;
 
+/// The fan-out origin tag for a frame produced by an undo/redo request rather
+/// than by a socket, so every local socket receives it.
+///
+/// Distinct from a connection id for the reason the relay's is: a socket skips
+/// frames it originated because it has already applied that edit locally, and
+/// the socket whose user pressed Ctrl+Z has *not* — the pop happened on the
+/// server. Reusing the requester's connection id would leave exactly the one
+/// client that asked for the undo showing the un-undone document.
+const UNDO_ORIGIN: u64 = u64::MAX - 1;
+
 /// Which document shape a room holds: the flat `Y.Text` every source file uses, or
 /// the `Y.XmlFragment` tree a rich-text editor binds to (#92).
 ///
@@ -92,6 +102,22 @@ impl RoomDoc {
         match self {
             Self::Flat(d) => d.handle_sync(ctx, data),
             Self::Tree(d) => d.handle_sync(ctx, data),
+        }
+    }
+
+    /// Start tracking `ctx`'s edits for undo, at the moment a socket joins.
+    fn track_undo(&self, ctx: WriteCtx) {
+        match self {
+            Self::Flat(d) => d.track_undo(ctx),
+            Self::Tree(d) => d.track_undo(ctx),
+        }
+    }
+
+    /// Drop `actor`'s undo stack, when their last socket on this room leaves.
+    fn untrack_undo(&self, actor: i64) {
+        match self {
+            Self::Flat(d) => d.untrack_undo(actor),
+            Self::Tree(d) => d.untrack_undo(actor),
         }
     }
 
@@ -245,6 +271,21 @@ impl RoomKey {
         }
     }
 
+    /// The `XmlFragment` root, or `""` for the flat shape — the second half of a
+    /// document's identity, alongside its path.
+    ///
+    /// An undo claim is keyed on both. One path may legitimately be open in both
+    /// shapes at once (this registry keys on the shape for exactly that reason),
+    /// and they are two documents with two independent stacks; a claim on the
+    /// path alone let one shape's release free a claim the other still had a
+    /// live stack under.
+    fn claim_root(&self) -> &str {
+        match self {
+            Self::Flat(_) => "",
+            Self::Tree { root, .. } => root,
+        }
+    }
+
     /// The routing key peers publish and subscribe under.
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     fn relay_key(&self) -> String {
@@ -260,6 +301,21 @@ impl RoomKey {
 struct RoomSlot {
     room: Arc<Room>,
     conns: usize,
+    /// Sockets attached per actor, so an actor's undo stack is dropped when
+    /// *their* last socket leaves rather than when the room empties.
+    ///
+    /// `conns` cannot answer this: one person closing a tab while a colleague
+    /// keeps the room open must lose their stack, and the room stays alive. The
+    /// stack is per-actor state, so its lifetime is the actor's presence in the
+    /// room, not the room's.
+    actors: HashMap<i64, usize>,
+    /// The actors whose undo stack **this worker holds the claim for** (#146).
+    ///
+    /// At most one worker may keep an actor's stack for a document, so a joiner
+    /// whose claim is held elsewhere is tracked in `actors` (it has a socket
+    /// here) but not here — and its undo requests answer "not available"
+    /// rather than silently doing something to a stack that is not authoritative.
+    undo_held: std::collections::HashSet<i64>,
     /// The most recent joiner's context. A periodic checkpoint has no connection
     /// of its own to borrow an identity from, and this is the same one the final
     /// checkpoint on last leave would have used. It only ever names the op-log
@@ -275,9 +331,9 @@ pub struct Coordinator {
     ws: Arc<Workspace>,
     rooms: Arc<Mutex<HashMap<RoomKey, RoomSlot>>>,
     next_conn: Arc<AtomicU64>,
-    /// This worker's unique id, tagged on every published op so the relay drain
-    /// can skip our own echo. Only meaningful with the relay, i.e. on Postgres.
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    /// This worker's unique id. Tagged on every published op so the relay drain
+    /// can skip our own echo (Postgres only), and — on every backend — the
+    /// `holder` of this worker's undo-stack claims (#146).
     origin: Arc<str>,
     /// Whether the cross-worker relay is available (Postgres-backed workspace).
     relay: bool,
@@ -287,6 +343,8 @@ pub struct Coordinator {
     policy: CheckpointPolicy,
     /// Guards one-time spawn of the checkpoint sweeper.
     sweeper_started: Arc<AtomicBool>,
+    /// Guards one-time spawn of the undo-claim lease renewer (#146).
+    undo_renewer_started: Arc<AtomicBool>,
     /// The monotonic origin every room's timestamps are measured against.
     epoch: Instant,
 }
@@ -309,6 +367,7 @@ impl Coordinator {
             relay_started: Arc::new(AtomicBool::new(false)),
             policy: CheckpointPolicy::default(),
             sweeper_started: Arc::new(AtomicBool::new(false)),
+            undo_renewer_started: Arc::new(AtomicBool::new(false)),
             epoch: Instant::now(),
         }
     }
@@ -396,6 +455,118 @@ impl Coordinator {
         }
     }
 
+    /// Undo (or, with `redo`, redo) `ctx`'s actor's most recent action on the
+    /// live document at `path`, fanning the result out to the room.
+    ///
+    /// Returns `(changed, available)`. `changed` says whether anything was
+    /// actually popped, so a client drawing a Ctrl+Z affordance can tell "undone"
+    /// from "nothing to undo" and grey the button out. It means "an update was
+    /// produced", which is *almost* but not exactly "the text moved": a client
+    /// that only synced can leave a formatting-level step of its own on its
+    /// stack, and popping that yields an update a reader sees no difference
+    /// from. Harmless — the authorship reconcile is idempotent and re-derives on
+    /// the next apply, so neither the file nor its blame moves — but it is not a
+    /// promise the document looks different. `available` is false when
+    /// this worker does **not** hold the actor's stack — another worker does, or
+    /// no room is open — which is a third answer, not a flavour of the second: a
+    /// client should say "undo is active in another window" rather than "nothing
+    /// to undo", because the actor's history exists and is simply not here.
+    ///
+    /// # Why this is a request beside the socket rather than a frame on it
+    ///
+    /// The result travels the room's existing fan-out, so only the *request*
+    /// needed a channel. Putting it on the y-sync stream would mean a new message
+    /// tag, and this endpoint deliberately serves unmodified Yjs clients — that
+    /// is the contract `apply_update_as` exists to keep — so a tag they do not
+    /// know is a risk taken for nothing. A separate request also inherits the
+    /// authenticated principal and the ACL check without re-deriving either.
+    pub(crate) async fn undo(
+        &self,
+        path: &str,
+        ctx: WriteCtx,
+        redo: bool,
+        root: Option<&str>,
+    ) -> Result<(bool, bool), OrigoFSError> {
+        // `root` picks the shape, exactly as it does on the socket: a tree room is
+        // keyed by its `XmlFragment` root, and the two shapes can hold the same
+        // path at once. Guessing from the flat key alone would have made undo
+        // silently unavailable to every rich-text editor, which is the shape it
+        // matters most on.
+        let key = match root {
+            Some(root) => RoomKey::Tree {
+                root: root.to_string(),
+                path: path.to_string(),
+            },
+            None => RoomKey::Flat(path.to_string()),
+        };
+        // **Authorize before looking anything up.** Whether a room is open, and
+        // whether this worker holds the actor's stack, are facts about the
+        // document — an actor with no write right here must be refused rather
+        // than told either, which is the same ordering every other check in the
+        // engine takes. The engine re-runs this inside `undo_coedit`; running it
+        // here as well is what keeps the ordering, not a duplicate.
+        self.ws.ensure_may_undo(ctx, path, redo).await?;
+
+        let (room, held) = {
+            let mut rooms = self.rooms.lock().await;
+            match rooms.get_mut(&key) {
+                Some(slot) => {
+                    // Retry the claim here, not only at join. A worker refused at
+                    // join stays refused for the life of the connection otherwise
+                    // — so a person whose other tab has since closed would have to
+                    // reload to get undo back, for no reason: the claim is free.
+                    // An undo request is exactly the moment the answer matters.
+                    let held = self.hold_undo(&key, slot, ctx).await;
+                    if held {
+                        slot.room.doc.lock().await.track_undo(ctx);
+                    }
+                    (Some(slot.room.clone()), held)
+                }
+                None => (None, false),
+            }
+        };
+        let Some(room) = room else {
+            // An undo stack is the room's, and a room exists only while somebody
+            // has the document open. With nothing open there is nothing to undo —
+            // not an error, and deliberately not an implicit `open_coedit` either:
+            // opening here would leave the path marked live with no socket whose
+            // disconnect ever clears it, the same leak `checkpoint_tree` avoids.
+            return Ok((false, false));
+        };
+        if !held {
+            // This actor has a socket here but their stack is another worker's
+            // (#146). Saying so beats popping nothing and calling it "nothing to
+            // undo", and beats keeping a rival stack, which is what would strip an
+            // author stamp between the two.
+            return Ok((false, false));
+        }
+        // Newly claimed here, the stack is empty — this worker was not capturing
+        // while another held it. `available: true, changed: false` is the honest
+        // pair: undo works from here on, and there is nothing recorded yet.
+
+        // The ACL check lives in the engine (`Fs::undo_coedit`/`_tree`), not here,
+        // so a second surface cannot forget it.
+        let frame = {
+            let doc = room.doc.lock().await;
+            match &*doc {
+                RoomDoc::Flat(d) => self.ws.undo_coedit(ctx, path, d, redo).await?,
+                RoomDoc::Tree(d) => self.ws.undo_coedit_tree(ctx, path, d, redo).await?,
+            }
+        };
+        if frame.is_empty() {
+            return Ok((false, true));
+        }
+
+        room.touch_edit(self.epoch);
+        let frame = Bytes::from(frame);
+        // `UNDO_ORIGIN` matches no connection id, so *every* local socket gets it
+        // — including the one whose user pressed the key, which unlike a socket's
+        // own edit has not applied this locally.
+        let _ = room.tx.send((UNDO_ORIGIN, frame.clone()));
+        self.relay_publish(&key, frame);
+        Ok((true, true))
+    }
+
     /// Spawn the relay drain task once, on the first socket (we're in an async
     /// context by then). A no-op without the relay, or after the first call.
     fn ensure_relay(&self) {
@@ -410,6 +581,69 @@ impl Coordinator {
         ));
     }
 
+    /// Whether this worker holds `ctx`'s actor's undo-stack claim for this room,
+    /// taking it if it does not already (#146).
+    ///
+    /// At most one worker may keep an actor's stack for a document. Two
+    /// independent stacks can pop items that touch the same content, and because
+    /// origofs's author stamp is written in the same undo step as the insert it
+    /// describes, one worker's undo can strip a stamp the other's restore then
+    /// needs — leaving text present but unattributed, which the next checkpoint
+    /// credits to the checkpointer. The claim removes that precondition instead
+    /// of patching the symptom.
+    ///
+    /// A failure to reach the store is treated as **not held**, so a metadata
+    /// blip costs an actor their undo rather than risking a second live stack.
+    /// Undo is an affordance; attribution is the product.
+    async fn hold_undo(&self, key: &RoomKey, slot: &mut RoomSlot, ctx: WriteCtx) -> bool {
+        if slot.undo_held.contains(&ctx.actor) {
+            return true; // already ours; the lease renewer keeps it
+        }
+        let held = self
+            .ws
+            .claim_undo_stack(key.path(), key.claim_root(), ctx.actor, &self.origin)
+            .await
+            .unwrap_or(false);
+        if held {
+            slot.undo_held.insert(ctx.actor);
+            self.ensure_undo_renewer();
+        } else {
+            tracing::info!(
+                path = key.path(),
+                actor = ctx.actor,
+                "coedit: undo stack for this actor is held by another worker; this \
+                 connection gets no undo. Route an actor's sockets for one path to \
+                 one worker to avoid it."
+            );
+        }
+        held
+    }
+
+    /// Push the lease out on this worker's undo claims, on a timer.
+    ///
+    /// Spawned once, on the first claim rather than at construction: a deployment
+    /// that never opens a co-editing socket should not run a timer writing to the
+    /// metadata store forever.
+    fn ensure_undo_renewer(&self) {
+        if self.undo_renewer_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let ws = self.ws.clone();
+        let holder = self.origin.clone();
+        tokio::spawn(async move {
+            let every = std::time::Duration::from_secs(
+                (origofs_core::coedit::UNDO_CLAIM_LEASE_SECS as u64 / 3).max(1),
+            );
+            loop {
+                tokio::time::sleep(every).await;
+                // A failed renewal is not fatal: the lease still has time on it and
+                // the next tick tries again. Losing the store outright surfaces on
+                // the operations a user actually issued.
+                let _ = ws.renew_undo_claims(&holder).await;
+            }
+        });
+    }
+
     /// Attach to the room for `path`, creating it (opening the document, attributed
     /// to `ctx` for any promotion of existing file text) on the first join. A freshly
     /// created room replays recent relayed ops so it catches up to peers on other
@@ -418,9 +652,18 @@ impl Coordinator {
         let mut rooms = self.rooms.lock().await;
         if let Some(slot) = rooms.get_mut(key) {
             slot.conns += 1;
+            *slot.actors.entry(ctx.actor).or_insert(0) += 1;
             // The newest joiner is who a background checkpoint runs as, matching
             // what the final checkpoint on last leave would have used.
             slot.ctx = ctx;
+            if self.hold_undo(key, &mut *slot, ctx).await {
+                // Start capturing this actor's edits *now*. A `yrs` undo manager
+                // only sees transactions that commit after it exists, so this
+                // cannot wait until the first Ctrl+Z — by then everything typed is
+                // unreachable. Idempotent per session: a second tab joins the
+                // stack the actor already has rather than starting a rival one.
+                slot.room.doc.lock().await.track_undo(ctx);
+            }
             return Ok(slot.room.clone());
         }
         let doc = match key {
@@ -455,14 +698,19 @@ impl Coordinator {
             last_checkpoint_ms: AtomicU64::new(now),
             dirty: AtomicBool::new(false),
         });
-        rooms.insert(
-            key.clone(),
-            RoomSlot {
-                room: room.clone(),
-                conns: 1,
-                ctx,
-            },
-        );
+        let mut slot = RoomSlot {
+            room: room.clone(),
+            conns: 1,
+            actors: HashMap::from([(ctx.actor, 1)]),
+            undo_held: std::collections::HashSet::new(),
+            ctx,
+        };
+        // Before the first socket syncs, so nothing the joiner types escapes the
+        // stack — see the note in the rejoin path above.
+        if self.hold_undo(key, &mut slot, ctx).await {
+            room.doc.lock().await.track_undo(ctx);
+        }
+        rooms.insert(key.clone(), slot);
         Ok(room)
     }
 
@@ -548,6 +796,33 @@ impl Coordinator {
         let evict = match rooms.get_mut(key) {
             Some(slot) => {
                 slot.conns = slot.conns.saturating_sub(1);
+                // This actor's undo stack lives exactly as long as they have a
+                // socket here. Dropping it on *their* last leave rather than on
+                // the room's keeps one person closing a tab from holding a stack
+                // open for as long as a colleague keeps typing — and dropping it
+                // at all is the deliberate ruling that undo is an editor
+                // affordance, not history: it does not survive a reconnect.
+                if let Some(n) = slot.actors.get_mut(&ctx.actor) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        slot.actors.remove(&ctx.actor);
+                        slot.room.doc.lock().await.untrack_undo(ctx.actor);
+                        // Release the cross-worker claim with the stack it guards,
+                        // so another worker can serve this actor immediately rather
+                        // than waiting out a lease nobody is renewing for them.
+                        if slot.undo_held.remove(&ctx.actor) {
+                            let _ = self
+                                .ws
+                                .release_undo_stack(
+                                    key.path(),
+                                    key.claim_root(),
+                                    ctx.actor,
+                                    &self.origin,
+                                )
+                                .await;
+                        }
+                    }
+                }
                 slot.conns == 0
             }
             None => return,
@@ -853,6 +1128,79 @@ pub(crate) async fn coedit_tree_checkpoint(
             "path": path,
             "bytes": req.body.len(),
             "spans": spans.len(),
+        }))
+        .into_response(),
+        Err(e) => super::ApiError::OrigoFS(e).into_response(),
+    }
+}
+
+/// The body of an undo/redo request. Deliberately empty of identity: like every
+/// other mutation here, the actor is resolved server-side from the credential and
+/// the request never names one.
+#[derive(serde::Deserialize)]
+pub(crate) struct UndoReq {
+    /// Redo instead of undo. One route rather than two because the request,
+    /// the authorization and the fan-out are identical and only the direction
+    /// differs.
+    #[serde(default)]
+    redo: bool,
+    /// The `XmlFragment` root, for a tree-shaped document — the same `root` the
+    /// tree socket was opened with. Absent means the flat shape.
+    ///
+    /// Required rather than inferred because both shapes can hold the same path
+    /// at once, so there is genuinely no way to guess: defaulting to flat would
+    /// make undo silently unavailable to every rich-text editor, which is the
+    /// shape it matters most on.
+    #[serde(default)]
+    root: Option<String>,
+}
+
+/// Undo (or redo) the authenticated actor's most recent edit to a live co-edited
+/// document (#146).
+///
+/// A request beside the socket rather than a frame on it: the *result* already
+/// travels the room's y-sync fan-out, so only the request needed a channel, and
+/// putting it on the stream would mean a message tag the unmodified Yjs clients
+/// this endpoint serves do not know. It also means undo inherits the ordinary
+/// authenticated principal and the engine's `WRITE` check instead of re-deriving
+/// either — an undo is a write, and the socket authenticates without authorizing.
+pub(crate) async fn coedit_undo(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<UndoReq>,
+) -> Response {
+    let Some(principal) = state.auth.authenticate(&headers).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated: a valid credential is required",
+        )
+            .into_response();
+    };
+    let ctx = match session_bound_ctx(&state, &principal).await {
+        Ok(ctx) => ctx,
+        Err(e) => return super::ApiError::OrigoFS(e).into_response(),
+    };
+    let path = match scope_path(&state.scope, &path) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    match state
+        .coedit
+        .undo(&path, ctx, req.redo, req.root.as_deref())
+        .await
+    {
+        // Three answers, not two. `changed` distinguishes "undone" from "nothing
+        // to undo", which a client needs in order to grey the button out; and
+        // `available` false says this worker does not hold the actor's stack — no
+        // room open here, or another worker has it (#146) — so a client can say
+        // "undo is active in another window" instead of claiming there is nothing
+        // to undo. All are successes; only one moved the document.
+        Ok((changed, available)) => axum::Json(serde_json::json!({
+            "path": path,
+            "redo": req.redo,
+            "changed": changed,
+            "available": available,
         }))
         .into_response(),
         Err(e) => super::ApiError::OrigoFS(e).into_response(),

@@ -281,6 +281,41 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V21,
         postgres: V21,
     },
+    // V22 — one co-editing undo stack per (path, actor) across workers, issue #146.
+    //
+    // An undo stack is per-worker in-memory state, so behind a load balancer one
+    // actor with two tabs can hold two. Measured, most of that is benign: the stacks
+    // are disjoint (a relayed frame carries no transaction origin, so it is never
+    // captured on the receiving worker), each pops only what was typed through it,
+    // and the replicas converge.
+    //
+    // One interleaving is not benign, and this table exists for it. origofs's author
+    // stamp is a formatting attribute written in the *same transaction* as the insert
+    // it describes, so it lives in the same undo step. If an actor deletes their own
+    // text through one worker and undoes the original insert through the other, the
+    // first worker's undo removes a stamp the second worker's restore then needs —
+    // and the content comes back **unattributed**. `checkpoint_coedit` resolves an
+    // unattributed span to the checkpointer, so the next checkpoint credits those
+    // bytes to whoever triggered it. In a filesystem whose premise is per-actor
+    // attribution that is the harm class that counts, however rare the path.
+    //
+    // A claim removes the precondition rather than patching the symptom: at most one
+    // worker holds an actor's stack for a path, so two independent stacks popping
+    // overlapping items cannot arise. Nothing changes for a single-worker deployment
+    // — two tabs there are the same holder and share one stack, exactly as before.
+    //
+    // Durable rather than in-process for the same reason `posix_lock` is: the thing
+    // being coordinated spans workers, so it has to live where both can see it. And
+    // it carries the same two columns for the same reason — `holder` (the worker, so
+    // a clean shutdown drops its claims at once) and `expires_at` (a lease the holder
+    // renews), because a worker that is OOM-killed cannot release anything and
+    // without a lease its claim would deny that actor undo until somebody edited the
+    // database by hand.
+    Migration {
+        version: 22,
+        sqlite: V22,
+        postgres: V22,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -850,6 +885,37 @@ CREATE TABLE IF NOT EXISTS symlink(
     ino    BIGINT PRIMARY KEY,
     target TEXT NOT NULL
 );
+";
+
+// V22 — the co-editing undo-stack claim (see the migration entry above).
+//
+// Keyed by `(workspace, path, root, actor)`. Two parts of that are easy to get
+// wrong, and one of them was:
+//
+// **`actor`**, because two *different* actors in the same room hold independent
+// stacks and always could — the unit is one actor's stack, not the room.
+//
+// **`root`**, because a document is `(path, shape)` and not a path. One path may
+// legitimately be open in both shapes at once — a terminal editor on the flat
+// `Y.Text`, a browser on the `Y.XmlFragment` — which is exactly why the room
+// registry keys on the shape too. Keyed on `path` alone, the two shapes shared
+// one claim: closing the flat editor deleted the row while the tree room still
+// held a live stack under it, and another worker could then claim it. That is
+// the two-stack condition the claim exists to prevent, reintroduced by the
+// prevention. `root` is the empty string for the flat shape, which has none.
+const V22: &str = "
+CREATE TABLE IF NOT EXISTS coedit_undo_claim(
+    workspace_id BIGINT NOT NULL,
+    path         TEXT   NOT NULL,
+    root         TEXT   NOT NULL,
+    actor_id     BIGINT NOT NULL,
+    holder       TEXT   NOT NULL,
+    claimed_at   BIGINT NOT NULL,
+    expires_at   BIGINT NOT NULL,
+    PRIMARY KEY (workspace_id, path, root, actor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_coedit_undo_claim_holder ON coedit_undo_claim(holder);
+CREATE INDEX IF NOT EXISTS idx_coedit_undo_claim_expiry ON coedit_undo_claim(expires_at);
 ";
 
 #[cfg(test)]

@@ -1919,6 +1919,89 @@ impl MetadataStore for PostgresMetadataStore {
         Ok(n)
     }
 
+    async fn claim_undo_stack(
+        &self,
+        path: &str,
+        root: &str,
+        actor_id: i64,
+        holder: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool> {
+        let c = self.client().await?;
+        // One statement, so read-decide-write is atomic: `ON CONFLICT` takes the
+        // row lock, and the `WHERE` on the update arm refuses a live claim held by
+        // a different worker. Unlike the `posix_lock` resolver this needs no
+        // advisory lock, because the row it contends on always exists by the time
+        // two workers are racing for it — the conflict target *is* the mutual
+        // exclusion.
+        let n = c
+            .execute(
+                "INSERT INTO coedit_undo_claim \
+                   (workspace_id, path, root, actor_id, holder, claimed_at, expires_at) \
+                 VALUES ($1, $2, $7, $3, $4, $6, $5) \
+                 ON CONFLICT (workspace_id, path, root, actor_id) DO UPDATE SET \
+                   holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at \
+                 WHERE coedit_undo_claim.holder = EXCLUDED.holder \
+                    OR coedit_undo_claim.expires_at <= $6",
+                &[
+                    &self.workspace_id,
+                    &path,
+                    &actor_id,
+                    &holder,
+                    &expires_at,
+                    &now,
+                    &root,
+                ],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn release_undo_stack(
+        &self,
+        path: &str,
+        root: &str,
+        actor_id: i64,
+        holder: &str,
+    ) -> Result<bool> {
+        let c = self.client().await?;
+        // Scoped to `holder`: a claim since taken over by another worker (this
+        // one's lease expired) is not ours to drop.
+        let n = c
+            .execute(
+                "DELETE FROM coedit_undo_claim \
+                 WHERE workspace_id = $1 AND path = $2 AND root = $5 \
+                   AND actor_id = $3 AND holder = $4",
+                &[&self.workspace_id, &path, &actor_id, &holder, &root],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn release_undo_claims_for_holder(&self, holder: &str) -> Result<u64> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM coedit_undo_claim WHERE workspace_id = $1 AND holder = $2",
+                &[&self.workspace_id, &holder],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    async fn renew_undo_claims(&self, holder: &str, expires_at: i64) -> Result<u64> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "UPDATE coedit_undo_claim SET expires_at = $3 \
+                 WHERE workspace_id = $1 AND holder = $2",
+                &[&self.workspace_id, &holder, &expires_at],
+            )
+            .await?;
+        Ok(n)
+    }
+
     async fn create_actor(&self, init: ActorInit) -> Result<i64> {
         let c = self.client().await?;
         let kind = init.kind.unwrap_or(ActorKind::System).as_str();

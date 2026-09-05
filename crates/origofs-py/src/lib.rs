@@ -1217,6 +1217,48 @@ impl CoeditDoc {
         })
     }
 
+    /// Start tracking `ctx`'s edits so its actor can undo them, and **call this
+    /// when a socket joins, not when somebody presses Ctrl+Z**.
+    ///
+    /// A `yrs` undo manager captures changes by observing transactions as they
+    /// commit, so one created after an edit sees an empty stack however recent
+    /// that edit was. Tracking lazily on the first undo request would silently
+    /// mean there was never anything to undo.
+    ///
+    /// Idempotent per session: calling it again for the same actor adds that
+    /// session's origin to the stack the actor already has, so a second browser
+    /// tab shares one stack rather than starting a rival.
+    fn track_undo<'py>(&self, py: Python<'py>, ctx: WriteCtx) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            inner.lock().await.track_undo(c);
+            Ok(())
+        })
+    }
+
+    /// Drop `actor`'s undo stack, at their last socket's disconnect. Undo is an
+    /// editor affordance, not history: a stack does not outlive the room.
+    fn untrack_undo<'py>(&self, py: Python<'py>, actor: i64) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.lock().await.untrack_undo(actor);
+            Ok(())
+        })
+    }
+
+    /// Whether `actor` has anything to undo — for greying out the affordance.
+    fn can_undo<'py>(&self, py: Python<'py>, actor: i64) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move { Ok(inner.lock().await.can_undo(actor)) })
+    }
+
+    /// Whether `actor` has anything to redo.
+    fn can_redo<'py>(&self, py: Python<'py>, actor: i64) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move { Ok(inner.lock().await.can_redo(actor)) })
+    }
+
     /// The y-sync frame to greet a freshly-connected client with (a `SyncStep1`
     /// carrying our state vector). Send it as the first message on a new socket.
     fn sync_start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -1350,6 +1392,38 @@ impl CoeditTreeDoc {
         future_into_py(py, async move {
             Ok(inner.lock().await.append_text(c, &tag, &text))
         })
+    }
+
+    /// Start tracking `ctx`'s edits for undo — at socket join, for the reason
+    /// spelled out on `CoeditDoc.track_undo`.
+    fn track_undo<'py>(&self, py: Python<'py>, ctx: WriteCtx) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            inner.lock().await.track_undo(c);
+            Ok(())
+        })
+    }
+
+    /// Drop `actor`'s undo stack, at their last socket's disconnect.
+    fn untrack_undo<'py>(&self, py: Python<'py>, actor: i64) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.lock().await.untrack_undo(actor);
+            Ok(())
+        })
+    }
+
+    /// Whether `actor` has anything to undo.
+    fn can_undo<'py>(&self, py: Python<'py>, actor: i64) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move { Ok(inner.lock().await.can_undo(actor)) })
+    }
+
+    /// Whether `actor` has anything to redo.
+    fn can_redo<'py>(&self, py: Python<'py>, actor: i64) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move { Ok(inner.lock().await.can_redo(actor)) })
     }
 
     /// The y-sync frame to greet a freshly-connected client with.
@@ -2884,6 +2958,168 @@ impl Workspace {
                 .await
                 .map_err(to_pyerr)?;
             Ok(())
+        })
+    }
+
+    /// Undo (or, with ``redo=True``, redo) `ctx`'s actor's most recent action on
+    /// the live flat `doc`, returning the y-sync frame to fan out to the room —
+    /// empty bytes when there was nothing to undo.
+    ///
+    /// Scoped to that actor's own edits, so it can never reach a collaborator's
+    /// work or anything that arrived over the cross-worker relay. **An undo is a
+    /// write**, so it takes ``WRITE`` at `path` exactly as ``open_coedit`` does
+    /// and raises ``PermissionError`` otherwise — a propose-only actor is refused
+    /// rather than silently no-op'd, because there is no such thing as a proposed
+    /// undo.
+    ///
+    /// The actor must have been tracked (``doc.track_undo(ctx)``) before the edits
+    /// this would pop, which in a server means at socket join.
+    #[pyo3(signature = (ctx, path, doc, redo=false))]
+    fn undo_coedit<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        doc: Py<CoeditDoc>,
+        redo: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        let inner = doc.borrow(py).inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let frame = ws
+                .undo_coedit(c, &path, &guard, redo)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Ok(PyBytes::new(py, &frame).unbind()))
+        })
+    }
+
+    /// Claim the undo stack for the document ``(path, root)`` on behalf of
+    /// ``holder`` (this worker), or renew a claim it already has. ``root`` is the
+    /// ``XmlFragment`` root of a tree document and defaults to the flat shape's
+    /// empty string — a *document* is ``(path, shape)``, not a path, and one path
+    /// may be open in both at once. Returns whether it now owns it.
+    ///
+    /// **A worker must hold this before calling ``doc.track_undo``.** At most one
+    /// may keep an actor's stack for a document: two independent stacks can pop
+    /// items touching the same content, and because origofs's author stamp is
+    /// written in the same undo step as the insert it describes, one worker's
+    /// undo can strip a stamp the other's restore needs — leaving text present
+    /// but unattributed, which the next checkpoint credits to the checkpointer.
+    ///
+    /// Single-worker deployments are unaffected: two tabs are the same holder, so
+    /// both claims succeed and they share one stack.
+    #[pyo3(signature = (path, actor_id, holder, root=None))]
+    fn claim_undo_stack<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        actor_id: i64,
+        holder: String,
+        root: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let root = root.unwrap_or_default();
+        future_into_py(py, async move {
+            ws.claim_undo_stack(&path, &root, actor_id, &holder)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Drop ``holder``'s claim on the document ``(path, root)`` — the actor's
+    /// last socket on this worker leaving, so another worker can serve them
+    /// immediately rather than waiting out a lease.
+    #[pyo3(signature = (path, actor_id, holder, root=None))]
+    fn release_undo_stack<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        actor_id: i64,
+        holder: String,
+        root: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let root = root.unwrap_or_default();
+        future_into_py(py, async move {
+            ws.release_undo_stack(&path, &root, actor_id, &holder)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Drop every undo claim ``holder`` has — a clean shutdown.
+    fn release_undo_claims_for_holder<'py>(
+        &self,
+        py: Python<'py>,
+        holder: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.release_undo_claims_for_holder(&holder)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Push out the lease on every undo claim ``holder`` has. A live worker calls
+    /// this on a timer at well under the lease (60s).
+    fn renew_undo_claims<'py>(
+        &self,
+        py: Python<'py>,
+        holder: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            ws.renew_undo_claims(&holder).await.map_err(to_pyerr)
+        })
+    }
+
+    /// The ``WRITE`` check an undo takes, on its own — for a surface that must
+    /// authorize *before* looking up whether a room is open or who holds its undo
+    /// stack, since both are facts about the document a refused actor must not
+    /// learn. Raises ``PermissionError`` when the actor may not write at `path`.
+    #[pyo3(signature = (ctx, path, redo=false))]
+    fn ensure_may_undo<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        redo: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.ensure_may_undo(c, &path, redo).await.map_err(to_pyerr)
+        })
+    }
+
+    /// ``undo_coedit`` for a **tree-shaped** document (issue #92).
+    ///
+    /// The live document moves immediately; the *file* moves when you next call
+    /// ``checkpoint_coedit_tree`` with your own serialized bytes, because origofs
+    /// does not own the schema.
+    #[pyo3(signature = (ctx, path, doc, redo=false))]
+    fn undo_coedit_tree<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        doc: Py<CoeditTreeDoc>,
+        redo: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        let inner = doc.borrow(py).inner.clone();
+        future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let frame = ws
+                .undo_coedit_tree(c, &path, &guard, redo)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| Ok(PyBytes::new(py, &frame).unbind()))
         })
     }
 

@@ -113,9 +113,9 @@
 
 use crate::attribution::WriteCtx;
 use crate::coedit::{
-    AUTHOR_KEY, COEDIT_SIDECAR_DIR, SyncReply, attr_or_null, author_attrs, author_value,
-    diverging_runs, doc_range, drive_sync, intended_stamps, parse_author, raw_attr, raw_author,
-    scan_runs, stamp_tiling,
+    AUTHOR_KEY, COEDIT_SIDECAR_DIR, SyncReply, UndoStacks, attr_or_null, author_attrs,
+    author_origin, author_value, diverging_runs, doc_range, drive_sync, intended_stamps,
+    parse_author, raw_attr, raw_author, scan_runs, stamp_tiling,
 };
 use crate::content::ContentStore;
 use crate::engine::Fs;
@@ -209,6 +209,10 @@ pub struct CoeditTreeDoc {
     /// for block ids.
     next_node: AtomicU64,
     resumed: bool,
+    /// Per-actor undo stacks (#146). See
+    /// [`UndoStacks`](crate::coedit::UndoStacks) — the machinery and the rulings
+    /// are shared with the flat shape.
+    undo: UndoStacks,
 }
 
 // A live-editing room shares one document across every connected socket's task
@@ -237,6 +241,7 @@ impl CoeditTreeDoc {
             frag,
             next_node: AtomicU64::new(0),
             resumed: false,
+            undo: UndoStacks::default(),
         }
     }
 
@@ -247,6 +252,66 @@ impl CoeditTreeDoc {
         this.apply_update(update)?;
         this.resumed = true;
         Ok(this)
+    }
+
+    // --- undo / redo (#146) ---------------------------------------------
+    //
+    // Same machinery and same rulings as the flat shape — see
+    // [`UndoStacks`](crate::coedit::UndoStacks). The scope is the `XmlFragment`
+    // root rather than a `Y.Text`, and that is the whole difference: `yrs` tracks
+    // per shared type, so a manager here covers every node under the root.
+    //
+    // Verified rather than assumed: undoing a deletion on this shape restores the
+    // nodes carrying **both** their `a` (author) and `n` (node id) stamps, so
+    // `checkpoint_coedit_tree` still resolves each span to the author origofs
+    // stamped when it was typed. That matters more here than on the flat shape,
+    // because the host's span map cites those very node ids — an undo that
+    // restored content with fresh ids would produce a checkpoint whose spans name
+    // nodes nobody issued, and every one of them would resolve to nobody.
+
+    /// Start tracking `ctx`'s edits so its actor can undo them.
+    ///
+    /// **Must be called before the edits it should cover** — see
+    /// [`UndoStacks::track`](crate::coedit::UndoStacks::track).
+    pub fn track_undo(&self, ctx: WriteCtx) {
+        self.undo.track(&self.doc, &self.frag, ctx);
+    }
+
+    /// Drop `actor`'s undo stack — at their last socket's disconnect.
+    pub fn untrack_undo(&self, actor: i64) {
+        self.undo.untrack(actor);
+    }
+
+    /// Whether `actor` has anything to undo.
+    pub fn can_undo(&self, actor: i64) -> bool {
+        self.undo.can(actor, false)
+    }
+
+    /// Whether `actor` has anything to redo.
+    pub fn can_redo(&self, actor: i64) -> bool {
+        self.undo.can(actor, true)
+    }
+
+    /// Undo `ctx`'s actor's most recent action, returning the y-sync frame to fan
+    /// out to the room — or an empty vector if there was nothing to undo.
+    ///
+    /// # The durable side lags, and that is the host's business
+    ///
+    /// An undo here changes the **live document** only. Unlike the flat shape,
+    /// origofs cannot serialize a tree — the schema is the host's — so the file on
+    /// disk moves when the host next calls
+    /// [`checkpoint_coedit_tree`](Fs::checkpoint_coedit_tree) with its own bytes,
+    /// exactly as for any other edit. The live marker already tells byte readers
+    /// the durable blob may lag; an undo is not a special case of that, it is an
+    /// ordinary instance.
+    pub fn undo_as(&self, ctx: WriteCtx) -> Result<Vec<u8>> {
+        self.undo.pop(&self.doc, ctx, false)
+    }
+
+    /// Redo the action `ctx`'s actor most recently undid. Same return shape as
+    /// [`undo_as`](Self::undo_as).
+    pub fn redo_as(&self, ctx: WriteCtx) -> Result<Vec<u8>> {
+        self.undo.pop(&self.doc, ctx, true)
     }
 
     /// The `XmlFragment` root name this document is bound to.
@@ -291,7 +356,7 @@ impl CoeditTreeDoc {
     /// y-sync, where [`apply_update_as`](Self::apply_update_as) attributes them.
     pub fn append_text(&self, ctx: WriteCtx, tag: &str, text: &str) -> String {
         let node = self.fresh_node_id();
-        let mut txn = self.doc.transact_mut();
+        let mut txn = self.doc.transact_mut_with(author_origin(ctx));
         let el = self
             .frag
             .push_back(&mut txn, yrs::types::xml::XmlElementPrelim::empty(tag));
@@ -326,6 +391,9 @@ impl CoeditTreeDoc {
     /// Merge a peer's update into this document (idempotent and commutative),
     /// **without** attribution. Client input must go through
     /// [`handle_sync`](Self::handle_sync) instead.
+    ///
+    /// Unattributed, so **deliberately origin-less** and invisible to every
+    /// per-actor undo stack — see [`author_origin`](crate::coedit::author_origin).
     pub fn apply_update(&self, update: &[u8]) -> Result<()> {
         let update = Update::decode_v1(update)
             .map_err(|e| OrigoFSError::InvalidArgument(format!("bad co-edit update: {e}")))?;
@@ -361,8 +429,17 @@ impl CoeditTreeDoc {
         let before = self.scan();
         let sv_before = self.doc.transact().state_vector();
 
+        // Both transactions carry `ctx`'s origin (#146), so a per-actor
+        // `UndoManager` sees this client's work and not the relay's — see
+        // [`author_origin`](crate::coedit::author_origin).
+        //
+        // Unlike the flat shape, this is genuinely **two** transactions: the walk
+        // in `reconcile` borrows a read transaction and cannot be folded into the
+        // write one. Sharing the origin is what keeps them one undoable action —
+        // `yrs` merges consecutive same-origin transactions into a single stack
+        // item inside its capture window, and both of these land in the same tick.
         self.doc
-            .transact_mut()
+            .transact_mut_with(author_origin(ctx))
             .apply_update(update)
             .map_err(|e| OrigoFSError::InvalidArgument(format!("apply co-edit update: {e}")))?;
 
@@ -632,7 +709,9 @@ impl CoeditTreeDoc {
         if text_fixes.is_empty() && element_fixes.is_empty() {
             return; // authorship already agrees — the common case, writes nothing
         }
-        let mut txn = self.doc.transact_mut();
+        // Same origin as the apply this repairs, so the two are one undoable
+        // action rather than an edit whose author stamp cannot be undone with it.
+        let mut txn = self.doc.transact_mut_with(author_origin(ctx));
         for (text, fixes) in text_fixes {
             for (index, len, (author, node)) in fixes {
                 let attrs = Attrs::from([
