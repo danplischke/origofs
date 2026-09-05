@@ -8,6 +8,27 @@
 //!
 //! See `docs/DESIGN.md` for the full architecture and the milestone roadmap.
 
+// A library that panics takes the embedder's process down with it, so the
+// library target may not `unwrap`, `expect`, `unreachable!` or panic out of a
+// function that returns `Result`. The handful of genuinely infallible sites
+// carry `#[expect(..., reason = "...")]`, which is itself checked: if the site
+// stops being infallible the expectation goes stale and the build fails.
+//
+// Declared here rather than in the workspace `[lints]` table because a Cargo
+// lints table applies to *every* target in the package, and an integration test
+// that cannot `.unwrap()` is an integration test nobody writes. `not(test)`
+// leaves the in-crate `#[cfg(test)]` modules alone; the `tests/` directory is a
+// separate crate and never sees this attribute at all.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::panic_in_result_fn
+    )
+)]
+
 pub mod acl;
 pub mod attribution;
 pub mod chunk;
@@ -126,7 +147,14 @@ pub use trash::{DEFAULT_TRASH_RETENTION_SECS, TrashEntry, TrashInit};
 pub const MAX_XATTR_LEN: usize = 64 * 1024;
 pub use gc::{DEFAULT_GC_GRACE_SECS, GcStats};
 pub use merge::{Conflict, MergeOutcome};
-pub use metadata::{MetaTxn, MetadataStore};
+// The metadata backend, as its twelve concern-scoped parts plus the sum of them.
+// Depend on `MetadataStore` where you need the whole store; name a part where you
+// do not, which is most places.
+pub use metadata::{
+    AclStore, AttributionStore, CollabStore, ConfigStore, LockStore, MetaTxn, MetadataStore,
+    NamespaceStore, PortableStore, RefStore, StoreLifecycle, SuggestionStore, TrashStore,
+    WorkspaceRegistry,
+};
 pub use metrics::OpTimer;
 pub use migrations::latest_schema_version;
 pub use objectgraph::{

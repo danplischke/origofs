@@ -88,3 +88,20 @@ path = "fuzz_targets/posix_lock_resolve.rs"
 test = false
 doc = false
 bench = false
+
+# The pack format: an index entry and a whole pack's trailer. Both are decoded
+# from bytes fetched back out of an object store, and both were unfuzzed while
+# every other self-describing format here had a target.
+[[bin]]
+name = "pack_index_decode"
+path = "fuzz_targets/pack_index_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack_trailer_decode"
+path = "fuzz_targets/pack_trailer_decode.rs"
+test = false
+doc = false
+bench = false

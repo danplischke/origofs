@@ -11,7 +11,8 @@
 //! and Postgres (column collation) legitimately differ on non-ASCII names.
 
 use origofs_core::{
-    FileKind, Fs, INO_ROOT, Ino, InodeInit, MemStore, MetadataStore, SqliteMetadataStore,
+    FileKind, Fs, INO_ROOT, Ino, InodeInit, MemStore, MetadataStore, NamespaceStore,
+    SqliteMetadataStore,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -74,9 +75,10 @@ async fn pages_cover_every_entry_exactly_once() {
         .map(|i| format!("f{:03}", (i * 97) % 250))
         .collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    seed(&fs.meta, INO_ROOT, &refs).await;
+    seed(fs.backends().meta, INO_ROOT, &refs).await;
 
     let full: Vec<String> = fs
+        .backends()
         .meta
         .list_dir(INO_ROOT)
         .await
@@ -89,7 +91,7 @@ async fn pages_cover_every_entry_exactly_once() {
     // Every page size — including ones that do and do not divide the directory
     // evenly, and one larger than the whole thing — reproduces the full listing.
     for page_size in [1, 2, 7, 50, 249, 250, 251, 1000] {
-        let paged = walk(&fs.meta, INO_ROOT, page_size).await;
+        let paged = walk(fs.backends().meta, INO_ROOT, page_size).await;
         assert_eq!(paged, full, "page size {page_size} diverged from list_dir");
         let unique: HashSet<&String> = paged.iter().collect();
         assert_eq!(
@@ -129,9 +131,10 @@ async fn page_boundaries_advance_on_tricky_names() {
         "🙂",
         "🙂🙂",
     ];
-    seed(&fs.meta, INO_ROOT, &names).await;
+    seed(fs.backends().meta, INO_ROOT, &names).await;
 
     let full: Vec<String> = fs
+        .backends()
         .meta
         .list_dir(INO_ROOT)
         .await
@@ -143,7 +146,7 @@ async fn page_boundaries_advance_on_tricky_names() {
 
     // A page size of 1 makes *every* adjacent pair a boundary.
     for page_size in [1, 2, 3, 5] {
-        let paged = walk(&fs.meta, INO_ROOT, page_size).await;
+        let paged = walk(fs.backends().meta, INO_ROOT, page_size).await;
         assert_eq!(paged, full, "page size {page_size} diverged from list_dir");
     }
 
@@ -151,6 +154,7 @@ async fn page_boundaries_advance_on_tricky_names() {
     // property that makes the cursor safe to hand to a client.
     for (i, name) in full.iter().enumerate() {
         let rest = fs
+            .backends()
             .meta
             .list_dir_page(INO_ROOT, Some(name), 100)
             .await
@@ -163,14 +167,20 @@ async fn page_boundaries_advance_on_tricky_names() {
 #[tokio::test]
 async fn limit_is_respected() {
     let fs = fixture().await;
-    seed(&fs.meta, INO_ROOT, &["a", "b", "c", "d", "e"]).await;
+    seed(fs.backends().meta, INO_ROOT, &["a", "b", "c", "d", "e"]).await;
 
     for limit in 0..=7usize {
-        let page = fs.meta.list_dir_page(INO_ROOT, None, limit).await.unwrap();
+        let page = fs
+            .backends()
+            .meta
+            .list_dir_page(INO_ROOT, None, limit)
+            .await
+            .unwrap();
         assert_eq!(page.len(), limit.min(5), "limit {limit}");
     }
     // A limit applies to the tail after the cursor too, not to the directory.
     let page = fs
+        .backends()
         .meta
         .list_dir_page(INO_ROOT, Some("c"), 10)
         .await
@@ -180,7 +190,8 @@ async fn limit_is_respected() {
     // A cursor past every name yields an empty page (end of directory), not an
     // error and not a wrap-around.
     assert!(
-        fs.meta
+        fs.backends()
+            .meta
             .list_dir_page(INO_ROOT, Some("zzz"), 10)
             .await
             .unwrap()
@@ -188,12 +199,14 @@ async fn limit_is_respected() {
     );
     // A page in a directory that has none.
     let empty = fs
+        .backends()
         .meta
         .create_inode(InodeInit::new(FileKind::Dir, 0o040755))
         .await
         .unwrap();
     assert!(
-        fs.meta
+        fs.backends()
+            .meta
             .list_dir_page(empty, None, 10)
             .await
             .unwrap()
@@ -204,7 +217,7 @@ async fn limit_is_respected() {
 #[tokio::test]
 async fn batched_get_inodes_matches_get_inode() {
     let fs = fixture().await;
-    let by_name = seed(&fs.meta, INO_ROOT, &["a", "b", "c", "d"]).await;
+    let by_name = seed(fs.backends().meta, INO_ROOT, &["a", "b", "c", "d"]).await;
     // Give the inodes distinguishable attributes so an accidental row/parameter
     // misalignment can't pass by returning the right *count* of identical rows.
     for (i, name) in ["a", "b", "c", "d"].iter().enumerate() {
@@ -217,7 +230,7 @@ async fn batched_get_inodes_matches_get_inode() {
     inos.sort_unstable();
 
     // An empty request is a no-op, not a malformed `IN ()`.
-    assert!(fs.meta.get_inodes(&[]).await.unwrap().is_empty());
+    assert!(fs.backends().meta.get_inodes(&[]).await.unwrap().is_empty());
 
     // A missing ino is simply absent and a duplicate is coalesced — the batch
     // must not error or return placeholder rows.
@@ -227,13 +240,19 @@ async fn batched_get_inodes_matches_get_inode() {
     asked.push(inos[0]);
     asked.push(inos[0]);
 
-    let batched = fs.meta.get_inodes(&asked).await.unwrap();
+    let batched = fs.backends().meta.get_inodes(&asked).await.unwrap();
     assert_eq!(batched.len(), inos.len(), "duplicates must coalesce");
     let by_ino: HashMap<Ino, _> = batched.into_iter().map(|i| (i.ino, i)).collect();
     assert!(!by_ino.contains_key(&missing));
 
     for ino in &inos {
-        let one = fs.meta.get_inode(*ino).await.unwrap().expect("inode");
+        let one = fs
+            .backends()
+            .meta
+            .get_inode(*ino)
+            .await
+            .unwrap()
+            .expect("inode");
         let many = by_ino.get(ino).expect("batched inode");
         assert_eq!(one.ino, many.ino);
         assert_eq!(one.kind, many.kind);
@@ -257,11 +276,11 @@ async fn batched_get_inodes_spans_many_chunks() {
     let fs = fixture().await;
     let names: Vec<String> = (0..1200).map(|i| format!("n{i:04}")).collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let by_name = seed(&fs.meta, INO_ROOT, &refs).await;
+    let by_name = seed(fs.backends().meta, INO_ROOT, &refs).await;
 
     let mut inos: Vec<Ino> = by_name.values().copied().collect();
     inos.sort_unstable();
-    let got = fs.meta.get_inodes(&inos).await.unwrap();
+    let got = fs.backends().meta.get_inodes(&inos).await.unwrap();
     assert_eq!(got.len(), inos.len());
     let mut got_inos: Vec<Ino> = got.into_iter().map(|i| i.ino).collect();
     got_inos.sort_unstable();
@@ -279,19 +298,19 @@ async fn readdir_page_with_attrs_matches_per_entry_getattr() {
     fs.mkdir_p("/sub").await.unwrap();
     fs.symlink("/f00", "/link").await.unwrap();
 
-    let full = fs.vfs_readdir(INO_ROOT).await.unwrap();
+    let full = fs.vfs_readdir_unchecked(INO_ROOT).await.unwrap();
 
     let mut cursor: Option<String> = None;
     let mut seen = Vec::new();
     loop {
         let page = fs
-            .vfs_readdir_page_with_attrs(INO_ROOT, cursor.as_deref(), 4)
+            .vfs_readdir_page_with_attrs_unchecked(INO_ROOT, cursor.as_deref(), 4)
             .await
             .unwrap();
         for e in &page.entries {
             // The batched attrs are the same attrs a per-entry getattr returns —
             // the N+1 that item M16 removes.
-            let one = fs.vfs_getattr(e.entry.ino).await.unwrap();
+            let one = fs.vfs_getattr_unchecked(e.entry.ino).await.unwrap();
             assert_eq!(one.ino, e.inode.ino);
             assert_eq!(one.kind, e.inode.kind);
             assert_eq!(one.size, e.inode.size);
@@ -321,24 +340,38 @@ async fn dentry_name_bridges_an_ino_cookie_back_to_a_name() {
     // the translation, and it must reject a cookie that isn't a child.
     let fs = fixture().await;
     fs.mkdir_p("/d").await.unwrap();
-    let d = fs.vfs_lookup(INO_ROOT, "d").await.unwrap().unwrap().ino;
-    let by_name = seed(&fs.meta, d, &["one", "two", "three"]).await;
+    let d = fs
+        .vfs_lookup_unchecked(INO_ROOT, "d")
+        .await
+        .unwrap()
+        .unwrap()
+        .ino;
+    let by_name = seed(fs.backends().meta, d, &["one", "two", "three"]).await;
 
     for (name, ino) in &by_name {
         assert_eq!(
-            fs.vfs_dentry_name(d, *ino).await.unwrap().as_deref(),
+            fs.vfs_dentry_name_unchecked(d, *ino)
+                .await
+                .unwrap()
+                .as_deref(),
             Some(name.as_str())
         );
         // Right ino, wrong parent.
-        assert_eq!(fs.vfs_dentry_name(INO_ROOT, *ino).await.unwrap(), None);
+        assert_eq!(
+            fs.vfs_dentry_name_unchecked(INO_ROOT, *ino).await.unwrap(),
+            None
+        );
     }
     // An ino that doesn't exist at all is `None`, not an error — that is what
     // lets the NFS surface answer BAD_COOKIE.
-    assert_eq!(fs.vfs_dentry_name(d, 999_999).await.unwrap(), None);
+    assert_eq!(
+        fs.vfs_dentry_name_unchecked(d, 999_999).await.unwrap(),
+        None
+    );
 
     // Round-trip: every cookie resumes the page immediately after its own entry.
     let all: Vec<String> = fs
-        .vfs_readdir(d)
+        .vfs_readdir_unchecked(d)
         .await
         .unwrap()
         .into_iter()
@@ -346,9 +379,9 @@ async fn dentry_name_bridges_an_ino_cookie_back_to_a_name() {
         .collect();
     for (i, name) in all.iter().enumerate() {
         let ino = by_name[name];
-        let cursor = fs.vfs_dentry_name(d, ino).await.unwrap().unwrap();
+        let cursor = fs.vfs_dentry_name_unchecked(d, ino).await.unwrap().unwrap();
         let rest: Vec<String> = fs
-            .vfs_readdir_page(d, Some(&cursor), 10)
+            .vfs_readdir_page_unchecked(d, Some(&cursor), 10)
             .await
             .unwrap()
             .into_iter()
@@ -363,16 +396,26 @@ async fn a_page_is_stable_across_edits_before_the_cursor() {
     // The reason the cursor is a name and not an offset: deleting an entry the
     // scan already passed must not shift the remaining pages.
     let fs = fixture().await;
-    seed(&fs.meta, INO_ROOT, &["a", "b", "c", "d", "e"]).await;
+    seed(fs.backends().meta, INO_ROOT, &["a", "b", "c", "d", "e"]).await;
 
-    let page1 = fs.vfs_readdir_page(INO_ROOT, None, 2).await.unwrap();
+    let page1 = fs
+        .vfs_readdir_page_unchecked(INO_ROOT, None, 2)
+        .await
+        .unwrap();
     let got: Vec<&str> = page1.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(got, ["a", "b"]);
 
     // Remove an already-returned entry, then resume. An OFFSET-based pager would
     // now skip "c"; the keyset cursor cannot.
-    fs.meta.remove_dentry(INO_ROOT, "a").await.unwrap();
-    let page2 = fs.vfs_readdir_page(INO_ROOT, Some("b"), 2).await.unwrap();
+    fs.backends()
+        .meta
+        .remove_dentry(INO_ROOT, "a")
+        .await
+        .unwrap();
+    let page2 = fs
+        .vfs_readdir_page_unchecked(INO_ROOT, Some("b"), 2)
+        .await
+        .unwrap();
     let got: Vec<&str> = page2.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(got, ["c", "d"]);
 }

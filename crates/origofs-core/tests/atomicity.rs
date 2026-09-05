@@ -21,7 +21,7 @@
 //! matching `tests/postgres.rs`.
 
 use origofs_core::{
-    Commit, ContentStore, Fs, Hash, MemStore, MetadataStore, PostgresMetadataStore,
+    Commit, ContentStore, Fs, Hash, MemStore, MetadataStore, PostgresMetadataStore, RefStore,
     SqliteMetadataStore, SuggestionStatus, Tree, TreeEntry, TreeKind, WriteCtx,
 };
 use std::sync::Arc;
@@ -100,7 +100,12 @@ async fn commit_with_missing_content(fs: &AnyFs, parents: Vec<Hash>) -> Hash {
             hash: Hash::of(b"a manifest that was never stored"),
         }],
     };
-    let tree_hash = fs.content.put(&tree.encode().unwrap()).await.unwrap();
+    let tree_hash = fs
+        .backends()
+        .content
+        .put(&tree.encode().unwrap())
+        .await
+        .unwrap();
     let commit = Commit {
         tree: tree_hash,
         parents,
@@ -108,7 +113,11 @@ async fn commit_with_missing_content(fs: &AnyFs, parents: Vec<Hash>) -> Hash {
         message: "unmaterializable".to_string(),
         timestamp: 0,
     };
-    fs.content.put(&commit.encode().unwrap()).await.unwrap()
+    fs.backends()
+        .content
+        .put(&commit.encode().unwrap())
+        .await
+        .unwrap()
 }
 
 /// A fast-forward that fails while materializing must not leave the branch
@@ -170,7 +179,11 @@ async fn a_failed_three_way_merge_does_not_advance_the_branch() {
             fs.write("/f.txt", b"ours\n").await.unwrap();
             let ours = fs.commit("dan", "ours").await.unwrap();
             let theirs = commit_with_missing_content(&fs, vec![base]).await;
-            fs.meta.set_ref("dev", &theirs.to_hex()).await.unwrap();
+            fs.backends()
+                .meta
+                .set_ref("dev", &theirs.to_hex())
+                .await
+                .unwrap();
 
             assert!(fs.merge(theirs, "dan", "merge").await.is_err());
             assert_eq!(
@@ -227,7 +240,7 @@ async fn a_conflicted_merge_records_all_of_its_state() {
                 "conflicts must be recorded"
             );
             assert_eq!(
-                fs.meta.get_ref("MERGE_HEAD").await.unwrap(),
+                fs.backends().meta.get_ref("MERGE_HEAD").await.unwrap(),
                 Some(theirs.to_hex()),
                 "MERGE_HEAD must record what is being merged"
             );
@@ -238,9 +251,16 @@ async fn a_conflicted_merge_records_all_of_its_state() {
             // result is a real two-parent merge commit.
             fs.write("/f.txt", b"one\nRESOLVED\nthree\n").await.unwrap();
             let merged = fs.commit("dan", "resolved").await.unwrap();
-            assert!(fs.meta.get_ref("MERGE_HEAD").await.unwrap().is_none());
+            assert!(
+                fs.backends()
+                    .meta
+                    .get_ref("MERGE_HEAD")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert!(fs.conflicts().await.unwrap().is_empty());
-            let c = Commit::decode(&fs.content.get(&merged).await.unwrap()).unwrap();
+            let c = Commit::decode(&fs.backends().content.get(&merged).await.unwrap()).unwrap();
             assert_eq!(c.parents.len(), 2, "the merge must keep both parents");
         },
     )

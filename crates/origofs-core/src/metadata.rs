@@ -11,11 +11,31 @@ use crate::types::{DirEntry, Hash, Ino, Inode, InodeInit};
 use async_trait::async_trait;
 use std::sync::Arc;
 
-/// Abstracts the metadata backend so the same engine runs on SQLite (M0) or
-/// Postgres (M2). The trait is intentionally intent-level; SQL dialects stay
-/// behind the implementation.
+// The metadata backend, as twelve concern-scoped traits.
+//
+// This was **one trait with 93 methods**. It named the whole of the metadata
+// side of the system — the POSIX namespace, refs, config, workspaces, ACLs,
+// trash, three unrelated kinds of lock, attribution, the change feed, the
+// suggestion queue and the portable dump format — so "pluggable metadata
+// database" cost 93 methods and a third hand-written SQL dialect to make good
+// on, and every feature widened a surface that `sqlite.rs` (2.7k lines) and
+// `postgres.rs` (3.1k lines) had to move in lockstep.
+//
+// The concerns were already known: the trait carried section comments for
+// exactly these groups. They are types now, so a subsystem can name the part of
+// the store it actually touches, a reviewer can see the blast radius of a
+// change from its signature, and the sections cannot drift from the code they
+// label.
+//
+// [`MetadataStore`] remains as the sum of all twelve, with a blanket impl, so
+// nothing that wants the whole store has to name them individually — and since
+// they are supertraits, every method is still callable straight off a
+// `dyn MetadataStore`.
+
+/// Opening, probing, backing up and closing the store, plus the transaction
+/// handle every multi-step write goes through.
 #[async_trait]
-pub trait MetadataStore: Send + Sync {
+pub trait StoreLifecycle: Send + Sync {
     /// Create the schema (idempotent) and ensure the root directory (`INO_ROOT`).
     async fn init(&self) -> Result<()>;
 
@@ -97,7 +117,13 @@ pub trait MetadataStore: Send + Sync {
     /// SQLite uses `BEGIN IMMEDIATE` (one writer at a time); Postgres pins a
     /// pooled connection for the `BEGIN…COMMIT`.
     async fn begin(&self) -> Result<Box<dyn MetaTxn>>;
+}
 
+/// The POSIX namespace: inodes, dentries, symlinks, extended attributes and the
+/// usage rollups over them. The largest concern by far, and the one every other
+/// trait here is separate *from*.
+#[async_trait]
+pub trait NamespaceStore: Send + Sync {
     /// Fetch an inode by number.
     async fn get_inode(&self, ino: Ino) -> Result<Option<Inode>>;
 
@@ -249,38 +275,85 @@ pub trait MetadataStore: Send + Sync {
 
     // --- portable dump/load (issue #117) ----------------------------------
 
-    /// Every row of `table`, as backend-neutral cells.
-    ///
-    /// `table` **must** be one of [`DUMP_TABLES`](crate::portable::DUMP_TABLES);
-    /// implementations reject anything else. That allowlist is what keeps a
-    /// name-taking method from being an arbitrary-SQL hole.
-    ///
-    /// Rows are returned untyped rather than as structs so a dump survives being
-    /// read by a build that is not this one — see `portable.rs` on why.
-    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>>;
+    /// Set (or replace) the target of a symlink inode.
+    async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()>;
 
-    /// Insert `rows` into `table`, preserving their explicit primary keys.
-    ///
-    /// Only ever called after [`reset_for_load`](Self::reset_for_load) has emptied
-    /// the dumpable tables, so it inserts rather than upserting: a conflict here
-    /// means that reset did not happen, and failing loudly beats silently merging
-    /// two id spaces.
-    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()>;
+    /// Fetch a symlink target, or `None` if `ino` is not a symlink.
+    async fn get_symlink(&self, ino: Ino) -> Result<Option<String>>;
 
-    /// Empty every table a dump restores, in reverse dependency order.
-    ///
-    /// A dump is **whole-store**, and a load is a restore into a pristine store —
-    /// so the rows `init` itself created (the `default` workspace, the root inode,
-    /// the default config) are exactly what has to go before the dumped ones can
-    /// take their place. Without this, a load collides on `workspace.id` before it
-    /// reaches anything interesting.
-    ///
-    /// `Fs::load` verifies the store is pristine before calling this. It is
-    /// destructive by construction, so nothing else should.
-    async fn reset_for_load(&self) -> Result<()>;
+    // --- refs (branches / tags / HEAD) -----------------------------------
 
-    // --- path-scoped ACLs (issue #123) ------------------------------------
+    /// Clear the entire working tree (all dentries, symlinks, and inodes except
+    /// the root) — used by `checkout` before materializing a commit.
+    async fn truncate_tree(&self) -> Result<()>;
 
+    // --- merge: conflicts + locks ----------------------------------------
+}
+
+/// Branches, tags and `HEAD` — the mutable pointers into the immutable commit DAG.
+#[async_trait]
+pub trait RefStore: Send + Sync {
+    /// Read a ref's value (a commit hex, or a symbolic `ref:<name>`).
+    async fn get_ref(&self, name: &str) -> Result<Option<String>>;
+
+    /// Set (upsert) a ref.
+    async fn set_ref(&self, name: &str, value: &str) -> Result<()>;
+
+    /// Compare-and-swap a ref: succeed only if its current value equals `expect`
+    /// (`None` meaning "must not exist"). Returns whether the swap happened.
+    async fn cas_ref(&self, name: &str, expect: Option<&str>, new: &str) -> Result<bool>;
+
+    /// Delete a ref (no-op if absent).
+    async fn delete_ref(&self, name: &str) -> Result<()>;
+
+    /// List all refs as `(name, value)` pairs.
+    async fn list_refs(&self) -> Result<Vec<(String, String)>>;
+
+    // --- workspace config ------------------------------------------------
+}
+
+/// Per-workspace settings and monotonic counters (the ACL generation, the ref
+/// mirror generation).
+#[async_trait]
+pub trait ConfigStore: Send + Sync {
+    async fn get_config(&self, key: &str) -> Result<Option<String>>;
+    async fn set_config(&self, key: &str, value: &str) -> Result<()>;
+    /// Atomically increment the integer config counter at `key` (creating it at
+    /// `1`) and return the new value. A single statement, so concurrent callers
+    /// each get a distinct, strictly increasing value — unlike a read-then-write.
+    async fn bump_counter(&self, key: &str) -> Result<i64>;
+
+    // --- workspaces (multi-workspace in one store) -----------------------
+}
+
+/// Many workspaces in one store: the registry and the re-scoping that binds a
+/// handle to one of them (`docs/MULTI_TENANCY.md`).
+#[async_trait]
+pub trait WorkspaceRegistry: Send + Sync {
+    /// Return a handle to this same store bound to `workspace_id`, sharing the
+    /// underlying connection/pool. The workspace-scoped ops — inodes, the working
+    /// tree, refs, config, conflicts, and locks — then apply to that workspace;
+    /// the registry ops below and the shared tables (actors, sessions, blame,
+    /// audit, events) are store-wide regardless. A freshly opened store is bound
+    /// to the `default` workspace (id 1). See `docs/MULTI_TENANCY.md`.
+    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore>;
+
+    /// Create a workspace named `name` with its own fresh root directory inode,
+    /// returning `(id, root_ino)`. Errors with `AlreadyExists` if the name exists.
+    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)>;
+
+    /// Resolve a workspace by name to `(id, root_ino)`, or `None` if absent.
+    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>>;
+
+    /// Every workspace as `(id, name, root_ino)`, oldest first.
+    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>>;
+
+    // --- working tree ----------------------------------------------------
+}
+
+/// Path-scoped grants, `(actor, path prefix) -> perms` (issue #123).
+#[async_trait]
+pub trait AclStore: Send + Sync {
     /// Upsert a prefix grant. `path_prefix` is normalized (absolute, no trailing
     /// slash; `""` is the workspace root).
     async fn set_acl(
@@ -299,7 +372,12 @@ pub trait MetadataStore: Send + Sync {
     async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>>;
 
     // --- trash (issue #115) ----------------------------------------------
+}
 
+/// Recoverable deletion of *uncommitted* files, which history cannot restore
+/// (issue #115).
+#[async_trait]
+pub trait TrashStore: Send + Sync {
     /// Record a deleted entry, returning its trash id.
     async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64>;
 
@@ -322,68 +400,15 @@ pub trait MetadataStore: Send + Sync {
     /// Store-wide rather than workspace-scoped at the call site — `gc` marks from
     /// every workspace, since content is shared across all of them.
     async fn trash_content_hashes(&self) -> Result<Vec<Hash>>;
+}
 
-    /// Set (or replace) the target of a symlink inode.
-    async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()>;
-
-    /// Fetch a symlink target, or `None` if `ino` is not a symlink.
-    async fn get_symlink(&self, ino: Ino) -> Result<Option<String>>;
-
-    // --- refs (branches / tags / HEAD) -----------------------------------
-
-    /// Read a ref's value (a commit hex, or a symbolic `ref:<name>`).
-    async fn get_ref(&self, name: &str) -> Result<Option<String>>;
-
-    /// Set (upsert) a ref.
-    async fn set_ref(&self, name: &str, value: &str) -> Result<()>;
-
-    /// Compare-and-swap a ref: succeed only if its current value equals `expect`
-    /// (`None` meaning "must not exist"). Returns whether the swap happened.
-    async fn cas_ref(&self, name: &str, expect: Option<&str>, new: &str) -> Result<bool>;
-
-    /// Delete a ref (no-op if absent).
-    async fn delete_ref(&self, name: &str) -> Result<()>;
-
-    /// List all refs as `(name, value)` pairs.
-    async fn list_refs(&self) -> Result<Vec<(String, String)>>;
-
-    // --- workspace config ------------------------------------------------
-
-    async fn get_config(&self, key: &str) -> Result<Option<String>>;
-    async fn set_config(&self, key: &str, value: &str) -> Result<()>;
-    /// Atomically increment the integer config counter at `key` (creating it at
-    /// `1`) and return the new value. A single statement, so concurrent callers
-    /// each get a distinct, strictly increasing value — unlike a read-then-write.
-    async fn bump_counter(&self, key: &str) -> Result<i64>;
-
-    // --- workspaces (multi-workspace in one store) -----------------------
-
-    /// Return a handle to this same store bound to `workspace_id`, sharing the
-    /// underlying connection/pool. The workspace-scoped ops — inodes, the working
-    /// tree, refs, config, conflicts, and locks — then apply to that workspace;
-    /// the registry ops below and the shared tables (actors, sessions, blame,
-    /// audit, events) are store-wide regardless. A freshly opened store is bound
-    /// to the `default` workspace (id 1). See `docs/MULTI_TENANCY.md`.
-    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore>;
-
-    /// Create a workspace named `name` with its own fresh root directory inode,
-    /// returning `(id, root_ino)`. Errors with `AlreadyExists` if the name exists.
-    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)>;
-
-    /// Resolve a workspace by name to `(id, root_ino)`, or `None` if absent.
-    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>>;
-
-    /// Every workspace as `(id, name, root_ino)`, oldest first.
-    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>>;
-
-    // --- working tree ----------------------------------------------------
-
-    /// Clear the entire working tree (all dentries, symlinks, and inodes except
-    /// the root) — used by `checkout` before materializing a commit.
-    async fn truncate_tree(&self) -> Result<()>;
-
-    // --- merge: conflicts + locks ----------------------------------------
-
+/// The three unrelated things this system calls a lock, kept together because
+/// they are all coordination state with a holder and a lifetime, and apart from
+/// everything else because none of them is namespace data: merge conflicts and
+/// the durable git-LFS-style path claims, POSIX advisory byte-range locks on an
+/// inode (issue #119), and the co-editing undo-stack claims (#146).
+#[async_trait]
+pub trait LockStore: Send + Sync {
     /// Record (upsert) an unresolved merge conflict at `path`.
     async fn set_conflict(&self, path: &str, kind: &str) -> Result<()>;
 
@@ -480,7 +505,13 @@ pub trait MetadataStore: Send + Sync {
     async fn renew_undo_claims(&self, holder: &str, expires_at: i64) -> Result<u64>;
 
     // --- attribution -----------------------------------------------------
+}
 
+/// Who wrote what: actors, sessions, the append-only edit-op log that is the
+/// ground truth, and the materialized blame index over it. The reason origofs
+/// exists, and the one thing the content store cannot rebuild.
+#[async_trait]
+pub trait AttributionStore: Send + Sync {
     async fn create_actor(&self, init: ActorInit) -> Result<i64>;
     async fn get_actor(&self, id: i64) -> Result<Option<Actor>>;
     /// Set an actor's write policy (direct vs. propose-only). Actor-agnostic — the
@@ -525,7 +556,12 @@ pub trait MetadataStore: Send + Sync {
     async fn get_blob_blame(&self, content: &Hash) -> Result<Option<String>>;
 
     // --- collaboration: change feed + presence ---------------------------
+}
 
+/// Live collaboration state: the change feed, presence, and the live-CRDT-
+/// document markers.
+#[async_trait]
+pub trait CollabStore: Send + Sync {
     /// Append an event to the change feed, returning its monotonic `seq`.
     async fn append_event(&self, ev: EventInit, ts: i64) -> Result<i64>;
     /// Events strictly after `after_seq`, oldest first, capped at `limit`.
@@ -577,7 +613,12 @@ pub trait MetadataStore: Send + Sync {
     async fn clear_live_doc(&self, path: &str) -> Result<()>;
 
     // --- agent-suggestion review queue -----------------------------------
+}
 
+/// The propose-and-review queue (§6): proposed edits awaiting an approver who
+/// is not their author.
+#[async_trait]
+pub trait SuggestionStore: Send + Sync {
     /// Record a new (pending) suggestion, returning its id.
     async fn create_suggestion(&self, init: SuggestionInit, ts: i64) -> Result<i64>;
     /// Fetch a suggestion by id.
@@ -597,6 +638,88 @@ pub trait MetadataStore: Send + Sync {
         resolved_by: Option<i64>,
         ts: i64,
     ) -> Result<bool>;
+}
+
+/// The backend-independent dump/load format (issue #117), which is how a
+/// workspace moves between SQLite and Postgres.
+#[async_trait]
+pub trait PortableStore: Send + Sync {
+    /// Every row of `table`, as backend-neutral cells.
+    ///
+    /// `table` **must** be one of [`DUMP_TABLES`](crate::portable::DUMP_TABLES);
+    /// implementations reject anything else. That allowlist is what keeps a
+    /// name-taking method from being an arbitrary-SQL hole.
+    ///
+    /// Rows are returned untyped rather than as structs so a dump survives being
+    /// read by a build that is not this one — see `portable.rs` on why.
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>>;
+
+    /// Insert `rows` into `table`, preserving their explicit primary keys.
+    ///
+    /// Only ever called after [`reset_for_load`](Self::reset_for_load) has emptied
+    /// the dumpable tables, so it inserts rather than upserting: a conflict here
+    /// means that reset did not happen, and failing loudly beats silently merging
+    /// two id spaces.
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()>;
+
+    /// Empty every table a dump restores, in reverse dependency order.
+    ///
+    /// A dump is **whole-store**, and a load is a restore into a pristine store —
+    /// so the rows `init` itself created (the `default` workspace, the root inode,
+    /// the default config) are exactly what has to go before the dumped ones can
+    /// take their place. Without this, a load collides on `workspace.id` before it
+    /// reaches anything interesting.
+    ///
+    /// `Fs::load` verifies the store is pristine before calling this. It is
+    /// destructive by construction, so nothing else should.
+    async fn reset_for_load(&self) -> Result<()>;
+
+    // --- path-scoped ACLs (issue #123) ------------------------------------
+}
+
+/// Everything a metadata backend must provide: the sum of the twelve concerns
+/// above.
+///
+/// A marker with a blanket impl, so a backend gets it by implementing the parts
+/// and no method lives here to drift. Because the parts are *supertraits*, a
+/// `dyn MetadataStore` still resolves every one of the 93 methods directly —
+/// splitting the trait changed what a caller may ask for, not what it can do.
+///
+/// Depend on this where you genuinely need the whole store (the engine, the
+/// workspace façade). Depend on one of the parts where you do not: the point of
+/// the split is that most code does not.
+pub trait MetadataStore:
+    StoreLifecycle
+    + NamespaceStore
+    + RefStore
+    + ConfigStore
+    + WorkspaceRegistry
+    + AclStore
+    + TrashStore
+    + LockStore
+    + AttributionStore
+    + CollabStore
+    + SuggestionStore
+    + PortableStore
+{
+}
+
+/// Every type implementing all twelve parts is a [`MetadataStore`].
+impl<T> MetadataStore for T where
+    T: ?Sized
+        + StoreLifecycle
+        + NamespaceStore
+        + RefStore
+        + ConfigStore
+        + WorkspaceRegistry
+        + AclStore
+        + TrashStore
+        + LockStore
+        + AttributionStore
+        + CollabStore
+        + SuggestionStore
+        + PortableStore
+{
 }
 
 /// An in-progress atomic write, returned by [`MetadataStore::begin`].
@@ -758,8 +881,13 @@ pub trait MetaTxn: Send {
 
 /// Delegating impl so `Arc<dyn MetadataStore>` (and `Arc<ConcreteStore>`) is
 /// itself a [`MetadataStore`]. This lets a workspace pick its backend at runtime.
+/// Delegating impls so `Arc<dyn MetadataStore>` (and `Arc<ConcreteStore>`) is
+/// itself a metadata store, which is what lets a workspace pick its backend at
+/// runtime. One per concern, mirroring the trait split; a type that implements
+/// all twelve picks up `MetadataStore` from the blanket impl above.
+
 #[async_trait]
-impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
+impl<T: MetadataStore + ?Sized> StoreLifecycle for Arc<T> {
     async fn init(&self) -> Result<()> {
         (**self).init().await
     }
@@ -778,6 +906,10 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     async fn begin(&self) -> Result<Box<dyn MetaTxn>> {
         (**self).begin().await
     }
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> NamespaceStore for Arc<T> {
     async fn get_inode(&self, ino: Ino) -> Result<Option<Inode>> {
         (**self).get_inode(ino).await
     }
@@ -798,69 +930,6 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
         (**self).set_owner(ino, uid, gid).await
-    }
-    async fn workspace_usage(&self) -> Result<(u64, u64)> {
-        (**self).workspace_usage().await
-    }
-    async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
-        (**self).subtree_usage(ino).await
-    }
-    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
-        (**self).export_table(table).await
-    }
-    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
-        (**self).import_table(table, rows).await
-    }
-    async fn reset_for_load(&self) -> Result<()> {
-        (**self).reset_for_load().await
-    }
-    async fn set_acl(
-        &self,
-        actor_id: i64,
-        path_prefix: &str,
-        perms: u32,
-        granted_at: i64,
-        granted_by: Option<i64>,
-    ) -> Result<()> {
-        (**self)
-            .set_acl(actor_id, path_prefix, perms, granted_at, granted_by)
-            .await
-    }
-    async fn remove_acl(&self, actor_id: i64, path_prefix: &str) -> Result<bool> {
-        (**self).remove_acl(actor_id, path_prefix).await
-    }
-    async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>> {
-        (**self).list_acl(actor_id).await
-    }
-    async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
-        (**self).push_trash(init).await
-    }
-    async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>> {
-        (**self).get_trash(id).await
-    }
-    async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>> {
-        (**self).list_trash().await
-    }
-    async fn delete_trash(&self, id: i64) -> Result<bool> {
-        (**self).delete_trash(id).await
-    }
-    async fn purge_trash_before(&self, cutoff: i64) -> Result<usize> {
-        (**self).purge_trash_before(cutoff).await
-    }
-    async fn trash_content_hashes(&self) -> Result<Vec<Hash>> {
-        (**self).trash_content_hashes().await
-    }
-    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
-        (**self).get_xattr(ino, name).await
-    }
-    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
-        (**self).set_xattr(ino, name, value).await
-    }
-    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
-        (**self).remove_xattr(ino, name).await
-    }
-    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
-        (**self).list_xattrs(ino).await
     }
     async fn delete_inode(&self, ino: Ino) -> Result<()> {
         (**self).delete_inode(ino).await
@@ -894,12 +963,37 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     async fn child_count(&self, parent: Ino) -> Result<usize> {
         (**self).child_count(parent).await
     }
+    async fn workspace_usage(&self) -> Result<(u64, u64)> {
+        (**self).workspace_usage().await
+    }
+    async fn subtree_usage(&self, ino: Ino) -> Result<(u64, u64)> {
+        (**self).subtree_usage(ino).await
+    }
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        (**self).get_xattr(ino, name).await
+    }
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        (**self).set_xattr(ino, name, value).await
+    }
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
+        (**self).remove_xattr(ino, name).await
+    }
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        (**self).list_xattrs(ino).await
+    }
     async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()> {
         (**self).set_symlink(ino, target).await
     }
     async fn get_symlink(&self, ino: Ino) -> Result<Option<String>> {
         (**self).get_symlink(ino).await
     }
+    async fn truncate_tree(&self) -> Result<()> {
+        (**self).truncate_tree().await
+    }
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> RefStore for Arc<T> {
     async fn get_ref(&self, name: &str) -> Result<Option<String>> {
         (**self).get_ref(name).await
     }
@@ -915,6 +1009,10 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     async fn list_refs(&self) -> Result<Vec<(String, String)>> {
         (**self).list_refs().await
     }
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> ConfigStore for Arc<T> {
     async fn get_config(&self, key: &str) -> Result<Option<String>> {
         (**self).get_config(key).await
     }
@@ -924,6 +1022,10 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     async fn bump_counter(&self, key: &str) -> Result<i64> {
         (**self).bump_counter(key).await
     }
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> WorkspaceRegistry for Arc<T> {
     fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore> {
         (**self).with_workspace(workspace_id)
     }
@@ -936,9 +1038,54 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>> {
         (**self).list_workspaces().await
     }
-    async fn truncate_tree(&self) -> Result<()> {
-        (**self).truncate_tree().await
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> AclStore for Arc<T> {
+    async fn set_acl(
+        &self,
+        actor_id: i64,
+        path_prefix: &str,
+        perms: u32,
+        granted_at: i64,
+        granted_by: Option<i64>,
+    ) -> Result<()> {
+        (**self)
+            .set_acl(actor_id, path_prefix, perms, granted_at, granted_by)
+            .await
     }
+    async fn remove_acl(&self, actor_id: i64, path_prefix: &str) -> Result<bool> {
+        (**self).remove_acl(actor_id, path_prefix).await
+    }
+    async fn list_acl(&self, actor_id: Option<i64>) -> Result<Vec<crate::acl::AclGrant>> {
+        (**self).list_acl(actor_id).await
+    }
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> TrashStore for Arc<T> {
+    async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
+        (**self).push_trash(init).await
+    }
+    async fn get_trash(&self, id: i64) -> Result<Option<crate::trash::TrashEntry>> {
+        (**self).get_trash(id).await
+    }
+    async fn list_trash(&self) -> Result<Vec<crate::trash::TrashEntry>> {
+        (**self).list_trash().await
+    }
+    async fn delete_trash(&self, id: i64) -> Result<bool> {
+        (**self).delete_trash(id).await
+    }
+    async fn purge_trash_before(&self, cutoff: i64) -> Result<usize> {
+        (**self).purge_trash_before(cutoff).await
+    }
+    async fn trash_content_hashes(&self) -> Result<Vec<Hash>> {
+        (**self).trash_content_hashes().await
+    }
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> LockStore for Arc<T> {
     async fn set_conflict(&self, path: &str, kind: &str) -> Result<()> {
         (**self).set_conflict(path, kind).await
     }
@@ -1005,6 +1152,10 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     async fn renew_undo_claims(&self, holder: &str, expires_at: i64) -> Result<u64> {
         (**self).renew_undo_claims(holder, expires_at).await
     }
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> AttributionStore for Arc<T> {
     async fn create_actor(&self, init: ActorInit) -> Result<i64> {
         (**self).create_actor(init).await
     }
@@ -1053,6 +1204,10 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     async fn get_blob_blame(&self, content: &Hash) -> Result<Option<String>> {
         (**self).get_blob_blame(content).await
     }
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> CollabStore for Arc<T> {
     async fn append_event(&self, ev: EventInit, ts: i64) -> Result<i64> {
         (**self).append_event(ev, ts).await
     }
@@ -1105,6 +1260,10 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     async fn clear_live_doc(&self, path: &str) -> Result<()> {
         (**self).clear_live_doc(path).await
     }
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> SuggestionStore for Arc<T> {
     async fn create_suggestion(&self, init: SuggestionInit, ts: i64) -> Result<i64> {
         (**self).create_suggestion(init, ts).await
     }
@@ -1128,6 +1287,19 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
         (**self)
             .resolve_suggestion(id, status, resolved_by, ts)
             .await
+    }
+}
+
+#[async_trait]
+impl<T: MetadataStore + ?Sized> PortableStore for Arc<T> {
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
+        (**self).export_table(table).await
+    }
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
+        (**self).import_table(table, rows).await
+    }
+    async fn reset_for_load(&self) -> Result<()> {
+        (**self).reset_for_load().await
     }
 }
 

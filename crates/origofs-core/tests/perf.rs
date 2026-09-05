@@ -184,7 +184,14 @@ async fn an_empty_file_reports_no_manifest_and_no_chunks() {
     assert_eq!(info.smallest, None);
     assert_eq!(info.median, None);
     assert_eq!(info.mean(), None);
-    assert_eq!(info.self_dedup(), 1.0, "no body is not infinite dedup");
+    // Compared with a tolerance rather than `==`: the assertion is about the
+    // reported ratio being one, not about which of the two `1.0`s the float unit
+    // produced.
+    assert!(
+        (info.self_dedup() - 1.0).abs() < f64::EPSILON,
+        "no body is not infinite dedup, got {}",
+        info.self_dedup()
+    );
 }
 
 /// `info` must fail exactly where a read would: the report is a diagnosis of the

@@ -268,8 +268,23 @@ fn owned_chunk_stream<S: ContentStore + 'static>(
 /// A filesystem over a metadata store and a content store.
 #[derive(Clone)]
 pub struct Fs<M: MetadataStore, C: ContentStore> {
-    pub meta: M,
-    pub content: C,
+    /// The metadata backend.
+    ///
+    /// **Private, and that is the point.** Every ACL check, quota check,
+    /// attribution record and `/.origofs` guard in this engine is a method on
+    /// `Fs`; a caller holding the backend runs none of them. While these fields
+    /// were `pub`, "checked in the engine, so a caller cannot forget it" was true
+    /// of each method and false of the type — `ws.fs().meta.add_dentry(..)` was a
+    /// complete bypass of the whole authorization surface, and the SDK itself
+    /// reached past `Fs` fourteen times.
+    ///
+    /// The operations that legitimately need a backend are administrative
+    /// (lifecycle, migration, backup, workspace binding) and are now methods
+    /// below. Tests reach the raw backends through
+    /// [`backends`](Self::backends), which exists only under `test-support`.
+    pub(crate) meta: M,
+    /// The content backend. Private for the same reason as [`Self::meta`].
+    pub(crate) content: C,
     /// The time source for engine-layer timestamps (commits, edit-ops, events,
     /// presence, locks, sessions). Injectable so a deterministic simulation can
     /// reproduce every timestamp — and thus every commit hash — from a seed.
@@ -325,6 +340,103 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             clock: self.clock.clone(),
             root_ino,
             acl_cache: Default::default(),
+        }
+    }
+
+    // --- administration -------------------------------------------------
+    //
+    // The operations a workspace-level caller genuinely needs a backend for.
+    // They are here rather than reached for through a public field because none
+    // of them is a *filesystem* operation: they touch lifecycle, schema, durable
+    // buffering and workspace binding, never a path, so there is no guard for
+    // them to skip. Anything that does touch a path is a method above and stays
+    // there.
+
+    /// Seal any buffered content writes to durable storage.
+    ///
+    /// A no-op unless the content backend batches (a [`PackStore`](crate::PackStore)
+    /// does). `commit` flushes automatically.
+    pub async fn flush_content(&self) -> Result<()> {
+        self.content.flush().await
+    }
+
+    /// Compact the content store, reclaiming space held by deleted objects, and
+    /// return the bytes reclaimed. Meaningful for a packed store; run after `gc`.
+    /// A no-op for in-place backends.
+    pub async fn repack_content(&self) -> Result<u64> {
+        self.content.repack().await
+    }
+
+    /// Release both backends' resources and make this handle unusable.
+    ///
+    /// Flushes first — sealing a pack needs the content store still open, and on
+    /// a packed remote store it needs the metadata store's sibling index too.
+    /// Both stores are then closed **even if the flush failed**: a workspace that
+    /// could not seal its buffer is in worse shape, not better, for also leaking
+    /// its connections. The flush error is the one returned, because it is the
+    /// one that means data did not land.
+    pub async fn close(&self) -> Result<()> {
+        let flushed = self.content.flush().await;
+        let content = self.content.close().await;
+        let meta = self.meta.close().await;
+        flushed.and(meta).and(content)
+    }
+
+    /// Snapshot the metadata database to `dest`, returning a human-readable note
+    /// about what was written.
+    ///
+    /// The metadata DB is the one thing the content store cannot rebuild — blame,
+    /// the audit log, actors and uncommitted edits live only here — so this is
+    /// what actually needs backing up.
+    pub async fn backup_metadata_to(&self, dest: &std::path::Path) -> Result<String> {
+        self.meta.backup_to(dest).await
+    }
+
+    /// The migration version currently applied to this workspace's metadata DB.
+    pub async fn schema_version(&self) -> Result<i64> {
+        self.meta.schema_version().await
+    }
+
+    /// Apply any pending metadata migrations, returning `(from, to)` versions.
+    ///
+    /// Idempotent and forward-only. [`MetadataStore::init`] *is* the migration
+    /// runner: it applies unrecorded steps and touches nothing else (no ref or
+    /// HEAD reset), which is why a normal open already migrates.
+    pub async fn migrate(&self) -> Result<(i64, i64)> {
+        let before = self.meta.schema_version().await?;
+        self.meta.init().await?;
+        let after = self.meta.schema_version().await?;
+        Ok((before, after))
+    }
+
+    /// Every workspace name in this store — `default` plus any opened via
+    /// [`open_workspace`](Self::open_workspace) — oldest first.
+    pub async fn workspace_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .meta
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .map(|(_id, name, _root)| name)
+            .collect())
+    }
+
+    /// The raw backends, bypassing every check this engine performs.
+    ///
+    /// Available only under the `test-support` feature, which nothing in a
+    /// dependency graph turns on for a consumer. This crate's integration suites
+    /// legitimately need to seed a dentry the engine would refuse to create, or
+    /// read a content object back by hash to assert what a write actually
+    /// stored — they are testing the engine, so reaching around it is the point.
+    ///
+    /// One named, greppable escape hatch rather than a pair of public fields,
+    /// precisely so that "what bypasses the ACLs" is a question with a short and
+    /// checkable answer.
+    #[cfg(feature = "test-support")]
+    pub fn backends(&self) -> Backends<'_, M, C> {
+        Backends {
+            meta: &self.meta,
+            content: &self.content,
         }
     }
 
@@ -1845,5 +1957,61 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             .get_symlink(ino)
             .await?
             .ok_or_else(|| OrigoFSError::InvalidArgument(format!("{path} is not a symlink")))
+    }
+}
+
+/// Borrowed handles to an [`Fs`]'s two backends, from [`Fs::backends`].
+///
+/// A struct rather than a tuple so a call site reads `…backends().meta` and says
+/// which store it is reaching for. Everything reachable through it skips the
+/// engine's ACL, quota, attribution and internal-path guards.
+#[cfg(feature = "test-support")]
+pub struct Backends<'a, M: MetadataStore, C: ContentStore> {
+    /// The metadata store, unguarded.
+    pub meta: &'a M,
+    /// The content store, unguarded.
+    pub content: &'a C,
+}
+
+/// Workspace binding, which only a `dyn`-shaped metadata handle can do.
+///
+/// [`MetadataStore::with_workspace`] returns `Arc<dyn MetadataStore>` — re-scoping
+/// erases the concrete backend by construction — so this cannot live in the
+/// generic `impl` above. It is the one piece of `Fs`'s administrative surface
+/// with that constraint, and every production `Workspace` is built on exactly
+/// this pairing.
+impl<C: ContentStore + Clone> Fs<Arc<dyn MetadataStore>, C> {
+    /// Look up the workspace named `name`, creating it if absent, and return an
+    /// [`Fs`] bound to it plus its workspace id.
+    ///
+    /// Adopts the winner of a concurrent first-time create race rather than
+    /// surfacing `AlreadyExists`, matching how `mkdir_p`/`write` resolve the same
+    /// race — `UNIQUE(name)` guarantees there is exactly one row to find. The id
+    /// comes back because a caller holding a backend-specific side channel (the
+    /// Postgres push feed) has to re-scope it to the same workspace.
+    ///
+    /// The name is validated as a single path component so a workspace can never
+    /// be empty or path-shaped, the same rule every stored name goes through.
+    pub async fn open_workspace(&self, name: &str) -> Result<(i64, Self)> {
+        validate_component(name).map_err(|_| {
+            OrigoFSError::InvalidArgument(format!("invalid workspace name: {name:?}"))
+        })?;
+        let (id, root) = match self.meta.lookup_workspace(name).await? {
+            Some(existing) => existing,
+            None => match self.meta.create_workspace(name).await {
+                Ok(created) => created,
+                Err(OrigoFSError::AlreadyExists(_)) => self
+                    .meta
+                    .lookup_workspace(name)
+                    .await?
+                    .ok_or_else(|| OrigoFSError::AlreadyExists(format!("workspace {name}")))?,
+                Err(e) => return Err(e),
+            },
+        };
+        let fs = self.rebind(self.meta.with_workspace(id), root);
+        // Give a freshly created workspace its versioning refs/config; idempotent
+        // for one that already exists.
+        fs.init().await?;
+        Ok((id, fs))
     }
 }

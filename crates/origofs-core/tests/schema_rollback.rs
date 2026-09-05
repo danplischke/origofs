@@ -24,7 +24,7 @@
 //! content store needs no rollback — the old binary reads the objects a newer one
 //! wrote, unless the store descriptor says otherwise.
 
-use origofs_core::{Fs, MemStore, MetadataStore, SqliteMetadataStore, latest_schema_version};
+use origofs_core::{Fs, MemStore, SqliteMetadataStore, StoreLifecycle, latest_schema_version};
 use std::sync::Arc;
 
 /// A SQLite store migrated to `latest`, then stamped with one more version than

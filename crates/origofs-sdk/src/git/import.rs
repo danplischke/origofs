@@ -140,9 +140,16 @@ impl Importer<'_> {
 
         let mut head = None;
         for oid in order {
-            let c = parsed
-                .remove(&oid)
-                .expect("every emitted commit was parsed on the way down");
+            // The post-order walk pushes an oid onto `order` only after
+            // parsing it, so this is present. Surfaced as an error rather than a
+            // panic because this is the import path for objects that came from
+            // outside: a malformed repository must fail the import, not the
+            // process.
+            let Some(c) = parsed.remove(&oid) else {
+                return Err(OrigoFSError::Corrupt(format!(
+                    "git import: commit {oid} was ordered for import but never parsed"
+                )));
+            };
             let parents = c
                 .parents
                 .iter()

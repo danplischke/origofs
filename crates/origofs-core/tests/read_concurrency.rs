@@ -249,7 +249,7 @@ async fn a_mount_read_fetches_concurrently() {
     // ~64 KiB average chunk size that is ~16 chunks, i.e. ~16 serial round trips
     // before this change.
     let t0 = Instant::now();
-    let got = fs.vfs_read(ino, 0, 1024 * 1024).await.unwrap();
+    let got = fs.vfs_read_unchecked(ino, 0, 1024 * 1024).await.unwrap();
     let elapsed = t0.elapsed();
 
     let peak = store.peak();

@@ -1,123 +1,73 @@
 //! The mounts reach the engine only through the ACL-checked inode ops (#141).
 //!
 //! The surface half of `origofs-core/tests/vfs_acl.rs`. That one proves the
-//! checked ops refuse; this one proves FUSE and NFS actually call them, which is
-//! the part no behavioural test can see: a new `Filesystem` callback wired to the
-//! *unchecked* `vfs_*` op behaves perfectly in every test anyone would write for
-//! it, and is a silent hole in the ACLs.
+//! checked ops refuse; this one is about surfaces calling them — which is the
+//! part no behavioural test can see, because a `Filesystem` callback wired to the
+//! *unchecked* op behaves perfectly in every test anyone would write for it.
 //!
-//! It reads the source rather than running a mount, for the same reason
-//! `api_read_acl.rs` does: mounting needs a kernel, a mountpoint and privileges
-//! that CI does not have on every leg — and the property is about which function
-//! the code names, which is a fact about the text.
+//! **This used to be a substring scan of `fuse.rs` and `nfs.rs` for `.vfs_`.** It
+//! is now a fact the compiler enforces: the unchecked `vfs_*` primitives are
+//! `pub(crate)` in origofs-core, so outside that crate only the `_as` forms
+//! exist. A mount that called the wrong one would not build.
 //!
-//! Deliberately **not** feature- or platform-gated. The files exist on disk
-//! whatever this build compiles, so the guard also runs on the Windows leg, where
-//! neither module is built and a regression would otherwise sail through.
+//! The scan is gone for cause, not for tidiness. It could not see a rename, a
+//! macro, a helper that forwarded the call, a trait method, or a file it was not
+//! pointed at — and it was pointed at two. Seven unchecked calls in the SDK façade
+//! (`chmod`, `chown`, `link`, and the four xattr methods) and seven more in the
+//! Python bindings sat outside its view the whole time, running no authorization
+//! at all. Making the ops `pub(crate)` surfaced all fourteen as build errors in
+//! one pass.
+//!
+//! What remains here is the part that is still a choice rather than a type: which
+//! `_as` calls pass the mount's actor rather than `None`, since `None` is the
+//! anonymous mount and legitimately bypasses.
 
-/// Ops a mount may call unchecked, each entry a claim about why.
-const UNCHECKED_OK: &[(&str, &str)] = &[(
-    "vfs_dentry_name",
-    "NFSv3 resumes a readdir by inode number; this turns that cookie back into \
-     the name cursor the paged listing takes. It reveals only whether an inode is \
-     a child of a directory the caller is already listing, and that listing goes \
-     through the gated, per-entry-filtered `vfs_readdir_page_with_attrs_as`.",
-)];
+use std::path::Path;
 
-fn scan(file: &str) -> Vec<(usize, String)> {
-    let src = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join(file),
-    )
-    .unwrap_or_else(|e| panic!("cannot read src/{file}: {e}"));
+fn source(file: &str) -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file))
+        .unwrap_or_else(|e| panic!("cannot read src/{file}: {e}"))
+}
 
-    let mut found = Vec::new();
-    for (i, line) in src.lines().enumerate() {
-        let mut from = 0usize;
-        while let Some(at) = line[from..].find(".vfs_") {
-            let start = from + at + 1;
-            let name: String = line[start..]
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            from = start;
-            // `.vfs_x` only counts as a call when it is one.
-            if line[start + name.len()..].starts_with('(') {
-                found.push((i + 1, name));
+/// A mount holds one actor for its lifetime and must pass it to every checked op.
+///
+/// Passing a literal `None` compiles and silently reverts that mount to the
+/// anonymous, unchecked behaviour the `_as` forms exist to replace — the one
+/// remaining way to lose the check without the compiler noticing.
+#[test]
+fn the_mounts_pass_their_actor_rather_than_none() {
+    let mut bad = Vec::new();
+    for file in ["fuse.rs", "nfs.rs"] {
+        for (i, line) in source(file).lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.contains("_as(None") || trimmed.contains("_as(\n") {
+                continue;
+            }
+            if trimmed.contains("vfs_") && trimmed.contains("(None,") {
+                bad.push(format!("{file}:{}: {trimmed}", i + 1));
             }
         }
     }
-    found
-}
-
-#[test]
-fn the_mount_surfaces_call_only_acl_checked_inode_ops() {
-    let mut calls = Vec::new();
-    for file in ["fuse.rs", "nfs.rs"] {
-        for (line, name) in scan(file) {
-            calls.push((file, line, name));
-        }
-    }
-
-    // A scan that stopped matching would pass while checking nothing.
-    assert!(
-        calls.len() >= 30,
-        "the source scan found only {} `vfs_*` call sites across the mounts — \
-         the scan is broken, not the surfaces",
-        calls.len()
-    );
-
-    let bad: Vec<String> = calls
-        .iter()
-        .filter(|(_, _, name)| {
-            !name.ends_with("_as") && !UNCHECKED_OK.iter().any(|(ok, _)| ok == name)
-        })
-        .map(|(file, line, name)| format!("{file}:{line} calls {name}"))
-        .collect();
-
     assert!(
         bad.is_empty(),
-        "a mount surface reaches the engine through an unchecked inode op, so the \
-         path-scoped ACLs do not apply to it:\n  {}\n\nCall the `_as` form and pass \
-         the mount's `self.ctx` (see the guards at the bottom of \
-         origofs-core/src/vfs.rs), or add the op to UNCHECKED_OK with a reason a \
-         mount cannot use it to reach a path the actor may not touch.",
+        "a mount passes `None` to a checked inode op, which is the anonymous \
+         mount: the ACL check is skipped even though the mount was given an \
+         actor.\n  {}\n\nPass `self.ctx` (see `fuse::spawn_as` / `nfs::serve_as`).",
         bad.join("\n  ")
     );
-
-    // A stale exemption is a claim nobody is checking any more.
-    for (name, _) in UNCHECKED_OK {
-        assert!(
-            calls.iter().any(|(_, _, n)| n == name),
-            "UNCHECKED_OK names `{name}`, which no mount calls any more"
-        );
-    }
 }
 
-/// Both mounts must keep a way to be started *with* an actor, and a way to be
-/// started without one.
-///
-/// The engine guards are inert unless something supplies a `WriteCtx`, so
-/// deleting these entry points would leave every check in place and never firing.
+/// The mounts hold an actor at all. If this field disappears there is nothing to
+/// pass, and every `_as` call degenerates to the anonymous form.
 #[test]
-fn both_mounts_expose_an_actor_bound_entry_point() {
-    for (file, needles) in [
-        ("fuse.rs", ["pub fn spawn_as(", "pub fn spawn("]),
-        ("nfs.rs", ["pub async fn serve_as(", "pub async fn serve("]),
-    ] {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .join(file),
-        )
-        .unwrap();
-        for needle in needles {
-            assert!(
-                src.contains(needle),
-                "src/{file} no longer defines `{needle}` — a mount that cannot be \
-                 given an actor cannot be governed by the ACLs"
-            );
-        }
+fn both_mounts_carry_a_write_context() {
+    for file in ["fuse.rs", "nfs.rs"] {
+        let src = source(file);
+        assert!(
+            src.contains("ctx: Option<WriteCtx>")
+                || src.contains("ctx: Option<origofs_core::WriteCtx>"),
+            "src/{file} no longer holds a `WriteCtx` for the mount's lifetime, so \
+             the ACL-checked inode ops have no actor to check against"
+        );
     }
 }

@@ -91,7 +91,26 @@ cross-check catches every `cfg`-shaped break, and only linking differs.
   **it must never hold large file bytes.**
 
 Both traits live in `origofs-core` (`content.rs`, `metadata.rs`) and both are used
-as `Arc<dyn …>`, so a workspace picks its backends at runtime. The mutable POSIX
+as `Arc<dyn …>`, so a workspace picks its backends at runtime.
+
+**`MetadataStore` is twelve traits, not one.** It was a single trait with 93
+methods covering the POSIX namespace, refs, config, workspaces, ACLs, trash,
+three unrelated kinds of lock, attribution, the change feed, the suggestion queue
+and the portable dump format — so "pluggable metadata database" cost 93 methods
+and a third hand-written SQL dialect to make good on. The concerns were already
+known (the trait carried section comments for exactly these groups); they are
+types now: `StoreLifecycle`, `NamespaceStore`, `RefStore`, `ConfigStore`,
+`WorkspaceRegistry`, `AclStore`, `TrashStore`, `LockStore`, `AttributionStore`,
+`CollabStore`, `SuggestionStore`, `PortableStore`.
+
+`MetadataStore` remains as the sum, a marker with a blanket impl, so a backend
+gets it by implementing the parts and no method lives on it to drift. They are
+supertraits, so a `dyn MetadataStore` still resolves all 93 methods directly.
+**Depend on `MetadataStore` only where you genuinely need the whole store** (the
+engine, the `Workspace` façade); name the part everywhere else — that is the
+point of the split. The cost, which is real: a caller has to import each part
+whose methods it calls, because Rust resolves a method only through a trait in
+scope. The mutable POSIX
 working tree (inode/dentry rows) is an **overlay whose base is a commit tree** —
 exactly git's index idea. Reads fall through the working tree to the base tree
 to content chunks; writes copy-up. Committing crystallizes the working tree into

@@ -17,13 +17,14 @@ Two things drift, and both are checked:
     wheel `pip` read as 0.0.0. That is the bug the comment on `Cargo.toml:6`
     records, and it is invisible to every test in the repo.
   * **An intra-workspace dependency requirement** (`origofs-sdk = { version =
-    "0.0.3", path = "../origofs-sdk" }`) left behind by a bump. There are six of
-    them against one authoritative version, so a hand-edited bump is a
-    seven-place edit. Cargo does eventually reject the mismatch itself, but as a
+    "0.0.3", path = "../origofs-sdk" }`) left behind by a bump. There are seven of
+    them against one authoritative version — including origofs-core's
+    dev-dependency on itself, which exists only to turn on `test-support` for its
+    own test targets — so a hand-edited bump is an eight-place edit. Cargo does eventually reject the mismatch itself, but as a
     resolution error partway through a five-platform release matrix rather than
     as a sentence naming the file to fix.
 
-Bump all seven together with `cargo set-version --workspace <version>`
+Bump them all together with `cargo set-version --workspace <version>`
 (cargo-edit), which rewrites the dep requirements and `Cargo.lock` too — the
 lockfile is tracked and ci.yml's `msrv` job runs `cargo check --locked`, so a
 stale lockfile is its own failure.

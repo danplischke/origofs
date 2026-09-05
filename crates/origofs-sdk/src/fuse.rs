@@ -1159,6 +1159,9 @@ fn split_parent(path: &str) -> Option<(&str, &str)> {
 
 /// Whether a FUSE mount is possible here (root + an openable `/dev/fuse`).
 pub fn mountable() -> bool {
+    // SAFETY: `geteuid` takes no arguments, reads only the calling process's
+    // credentials, cannot fail, and has no preconditions. It is `unsafe` solely
+    // because it is an `extern "C"` call.
     let is_root = unsafe { libc::geteuid() == 0 };
     is_root
         && std::fs::OpenOptions::new()

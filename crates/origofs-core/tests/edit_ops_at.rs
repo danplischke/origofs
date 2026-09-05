@@ -14,11 +14,19 @@ type TestFs = Fs<Arc<dyn MetadataStore>, Arc<MemStore>>;
 use std::sync::Arc;
 
 async fn fixture() -> (TestFs, WriteCtx) {
+    let (fs, ctx, _) = fixture_with_meta().await;
+    (fs, ctx)
+}
+
+/// The same fixture, handing back the metadata store too. `Fs::meta` is private
+/// (#167), so a test that needs a second workspace holds its own handle rather
+/// than reaching through the engine — the idiom `coedit_live.rs` already uses.
+async fn fixture_with_meta() -> (TestFs, WriteCtx, Arc<dyn MetadataStore>) {
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
-    let fs = Fs::new(meta, Arc::new(MemStore::new()));
+    let fs = Fs::new(meta.clone(), Arc::new(MemStore::new()));
     fs.init().await.unwrap();
     let actor = fs.create_agent("agent", "opus", None).await.unwrap();
-    (fs, WriteCtx::actor(actor))
+    (fs, WriteCtx::actor(actor), meta)
 }
 
 fn ops(v: &[origofs_core::EditOp]) -> Vec<(String, String)> {
@@ -147,10 +155,10 @@ async fn a_path_with_no_ops_is_empty_and_a_bad_path_is_an_error() {
 /// Ops are per workspace, like every other row in this table.
 #[tokio::test]
 async fn one_workspace_does_not_see_another_s_ops() {
-    let (fs, ctx) = fixture().await;
+    let (fs, ctx, meta) = fixture_with_meta().await;
     fs.write_as(ctx, "/f.txt", b"one\n").await.unwrap();
-    let (id, root) = fs.meta.create_workspace("other").await.unwrap();
-    let other = fs.rebind(fs.meta.with_workspace(id), root);
+    let (id, root) = meta.create_workspace("other").await.unwrap();
+    let other = fs.rebind(meta.with_workspace(id), root);
     other.init().await.unwrap();
     other.write_as(ctx, "/f.txt", b"theirs\n").await.unwrap();
     // Same path, same actor, a different workspace: the V23 indexes lead with

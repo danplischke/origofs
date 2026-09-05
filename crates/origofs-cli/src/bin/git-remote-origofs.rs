@@ -79,6 +79,10 @@ fn read_command() -> Option<String> {
     let mut line = Vec::new();
     loop {
         let mut b = [0u8; 1];
+        // SAFETY: `b` is a live, uniquely-borrowed 1-byte buffer and the count
+        // passed is exactly its length, so `read(2)` cannot write out of bounds.
+        // fd 0 is always open for this helper (git wires it up), and a closed or
+        // invalid fd is reported as a negative return rather than being undefined.
         let n = unsafe { libc::read(0, b.as_mut_ptr() as *mut libc::c_void, 1) };
         if n <= 0 {
             return (!line.is_empty()).then(|| String::from_utf8_lossy(&line).into_owned());

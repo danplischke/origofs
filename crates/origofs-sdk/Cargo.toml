@@ -17,6 +17,9 @@ readme = "../../README.md"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # `default-features = false` here, with the backends re-exposed as sdk features
 # below, so a consumer can build a SQLite-only workspace without linking the

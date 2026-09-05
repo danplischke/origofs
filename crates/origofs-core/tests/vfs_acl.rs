@@ -291,9 +291,11 @@ async fn an_unreachable_inode_is_refused_rather_than_allowed() {
 /// knows to call it. This is the moment someone has to think about it — either
 /// they add the guard, or they write down why the op does not need one.
 ///
-/// This is the engine half. `origofs-sdk/tests/mount_acl.rs` is the surface half:
-/// having a checked counterpart is worth nothing if a mount calls the unchecked
-/// one.
+/// This is the engine half, and it is the half that still needs a test. The
+/// surface half — "a mount must not call the unchecked op" — used to be a
+/// substring scan of `fuse.rs`/`nfs.rs` in `origofs-sdk/tests/mount_acl.rs`; the
+/// unchecked primitives are `pub(crate)` now, so outside origofs-core only the
+/// `_as` forms exist and a mount naming the wrong one does not compile.
 #[test]
 fn every_inode_op_has_a_checked_counterpart() {
     /// Ops with no `_as` form, each entry a claim that it needs no check.
@@ -304,13 +306,6 @@ fn every_inode_op_has_a_checked_counterpart() {
              and the ones that filter. Left unchecked deliberately: giving it a \
              guard would imply it is a mount entry point, and the fix if a mount \
              ever calls it is to move that mount onto the paged form.",
-        ),
-        (
-            "vfs_dentry_name",
-            "Translates an NFSv3 readdir resume cookie (an inode number) into the \
-             name cursor the paged listing takes. It answers only about a child of \
-             a directory the caller is already listing, and that listing is \
-             gated and filtered by `vfs_readdir_page_as`.",
         ),
         (
             "vfs_path_of",
@@ -325,17 +320,29 @@ fn every_inode_op_has_a_checked_counterpart() {
     )
     .unwrap();
 
+    // The unchecked primitives are `pub(crate)` and the checked forms are `pub`,
+    // so both prefixes have to be scanned. That split is the surface half of this
+    // property, and it is the compiler's job now rather than a test's: outside
+    // origofs-core only the `_as` forms exist, so a mount cannot name the
+    // unchecked one at all.
     let mut ops: Vec<String> = Vec::new();
-    let needle = "pub async fn vfs_";
-    let mut from = 0usize;
-    while let Some(at) = src[from..].find(needle) {
-        let start = from + at + "pub async fn ".len();
-        let name: String = src[start..]
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        from = start;
-        ops.push(name);
+    for needle in ["pub(crate) async fn vfs_", "pub async fn vfs_"] {
+        let prefix_len = needle.len() - "vfs_".len();
+        let mut from = 0usize;
+        while let Some(at) = src[from..].find(needle) {
+            let start = from + at + prefix_len;
+            let name: String = src[start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            from = start;
+            // The `_unchecked` forwarders exist only under `test-support` and
+            // are this crate's own suites reaching around the guard on purpose;
+            // they are not primitives and must not be counted as ops needing one.
+            if !name.ends_with("_unchecked") {
+                ops.push(name);
+            }
+        }
     }
     ops.sort();
     ops.dedup();
@@ -376,4 +383,149 @@ fn every_inode_op_has_a_checked_counterpart() {
             "NO_CHECK_NEEDED names `{name}`, which no longer exists"
         );
     }
+}
+
+/// The path-addressed metadata ops are checked, and were not.
+///
+/// `chmod`, `chown`, `link`, `getxattr`, `setxattr`, `removexattr` and
+/// `listxattr` were reachable from the SDK façade and the Python bindings, and
+/// every one of them resolved a path to an inode and then called the *unchecked*
+/// inode primitive. Four of the seven mutate. None ran any authorization, and no
+/// attributed form existed for a caller who wanted one.
+///
+/// The surface scan in `origofs-sdk/tests/mount_acl.rs` could not see this: it
+/// was pointed at `fuse.rs` and `nfs.rs`, and these calls were in `lib.rs` and in
+/// another crate entirely.
+#[tokio::test]
+async fn the_path_addressed_metadata_ops_are_refused_without_a_grant() {
+    let (fs, ctx, _src, _docs) = fixture().await;
+
+    macro_rules! refused {
+        ($what:expr, $call:expr) => {
+            match $call.await {
+                Err(e) if denied(&e) => {}
+                Err(e) => panic!("{}: expected Denied, got {e:?}", $what),
+                Ok(_) => panic!("{}: succeeded without WRITE at the path", $what),
+            }
+        };
+    }
+
+    refused!("chmod_as", fs.chmod_as(ctx, "/src/secret.rs", 0o100600));
+    refused!(
+        "chown_as",
+        fs.chown_as(ctx, "/src/secret.rs", Some(1), None)
+    );
+    refused!(
+        "setxattr_as",
+        fs.setxattr_as(ctx, "/src/secret.rs", "user.x", b"v")
+    );
+    refused!(
+        "removexattr_as",
+        fs.removexattr_as(ctx, "/src/secret.rs", "user.x")
+    );
+    // A hard link is checked at the name being *created*, not at the target.
+    refused!("link_as", fs.link_as(ctx, "/docs/ok.md", "/src/copy.md"));
+}
+
+/// The same ops succeed where the actor does hold the grant, so the refusals
+/// above are the ACL and not a blanket failure.
+#[tokio::test]
+async fn the_path_addressed_metadata_ops_are_allowed_where_granted() {
+    let (fs, ctx, _src, _docs) = fixture().await;
+
+    fs.chmod_as(ctx, "/docs/ok.md", 0o100600).await.unwrap();
+    fs.chown_as(ctx, "/docs/ok.md", Some(7), Some(7))
+        .await
+        .unwrap();
+    fs.setxattr_as(ctx, "/docs/ok.md", "user.x", b"v")
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.getxattr_as(ctx, "/docs/ok.md", "user.x").await.unwrap(),
+        Some(b"v".to_vec())
+    );
+    assert_eq!(
+        fs.listxattr_as(ctx, "/docs/ok.md").await.unwrap(),
+        vec!["user.x".to_string()]
+    );
+    assert!(
+        fs.removexattr_as(ctx, "/docs/ok.md", "user.x")
+            .await
+            .unwrap()
+    );
+    fs.link_as(ctx, "/docs/ok.md", "/docs/also.md")
+        .await
+        .unwrap();
+}
+
+/// The reads among them follow the same opt-in as every other read: open until
+/// the workspace turns `acl_enforce_reads` on.
+#[tokio::test]
+async fn the_metadata_reads_are_open_until_the_workspace_enforces_them() {
+    let (fs, ctx, _src, _docs) = fixture().await;
+    fs.setxattr("/src/secret.rs", "user.x", b"v").await.unwrap();
+
+    // Enforcement is off in the fixture, so a read outside the grant is served.
+    assert_eq!(
+        fs.getxattr_as(ctx, "/src/secret.rs", "user.x")
+            .await
+            .unwrap(),
+        Some(b"v".to_vec())
+    );
+    assert_eq!(
+        fs.listxattr_as(ctx, "/src/secret.rs").await.unwrap(),
+        vec!["user.x".to_string()]
+    );
+
+    fs.set_acl_enforce_reads(true).await.unwrap();
+    assert!(denied(
+        &fs.getxattr_as(ctx, "/src/secret.rs", "user.x")
+            .await
+            .unwrap_err()
+    ));
+    assert!(denied(
+        &fs.listxattr_as(ctx, "/src/secret.rs").await.unwrap_err()
+    ));
+}
+
+/// The NFS readdir-cursor translation is checked against the parent directory.
+///
+/// `vfs_dentry_name` was the one inode op a mount could call unchecked, on the
+/// argument that it only answers about a child of a directory the caller is
+/// already listing — and that listing is gated and per-entry filtered. The
+/// argument held, but it was a claim in an exemption list rather than a check, so
+/// `vfs_dentry_name_as` guards the parent. This is the test that claim never had.
+#[tokio::test]
+async fn resuming_a_listing_is_checked_against_the_directory() {
+    let (fs, ctx, src, docs) = fixture().await;
+    let secret = fs.stat("/src/secret.rs").await.unwrap().ino;
+    let ok = fs.stat("/docs/ok.md").await.unwrap().ino;
+
+    // Reads are not enforced in the fixture, so the cursor is served either way —
+    // the same opt-in every other read follows.
+    assert_eq!(
+        fs.vfs_dentry_name_as(Some(ctx), src, secret).await.unwrap(),
+        Some("secret.rs".to_string())
+    );
+
+    fs.set_acl_enforce_reads(true).await.unwrap();
+
+    // `/src` is outside the grant: refused, so a mount cannot turn an inode
+    // number into a name in a directory the actor may not list.
+    match fs.vfs_dentry_name_as(Some(ctx), src, secret).await {
+        Err(e) if denied(&e) => {}
+        other => panic!("expected Denied for /src, got {other:?}"),
+    }
+
+    // `/docs` is granted: still served, so the guard did not break NFS's resume.
+    assert_eq!(
+        fs.vfs_dentry_name_as(Some(ctx), docs, ok).await.unwrap(),
+        Some("ok.md".to_string())
+    );
+
+    // An anonymous mount still bypasses, like every other `_as` op.
+    assert_eq!(
+        fs.vfs_dentry_name_as(None, src, secret).await.unwrap(),
+        Some("secret.rs".to_string())
+    );
 }

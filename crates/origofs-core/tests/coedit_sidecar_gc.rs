@@ -40,8 +40,9 @@ async fn sidecar_objects<M: MetadataStore, C: ContentStore>(
 ) -> Vec<Hash> {
     let inode = fs.stat(&coedit_sidecar_path(path)).await.unwrap();
     let mhash = inode.content.expect("a checkpointed sidecar has content");
-    let manifest = origofs_core::Manifest::decode(&fs.content.get(&mhash).await.unwrap())
-        .expect("sidecar manifest decodes");
+    let manifest =
+        origofs_core::Manifest::decode(&fs.backends().content.get(&mhash).await.unwrap())
+            .expect("sidecar manifest decodes");
     let mut out = vec![mhash];
     out.extend(manifest.chunks.iter().map(|c| c.hash));
     out
