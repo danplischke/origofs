@@ -587,6 +587,35 @@ impl PackStore {
     }
 }
 
+/// [`PackLoc::decode`] and [`parse_trailer`], for `cargo fuzz` only.
+///
+/// The pack format is the one self-describing decoder the fuzz crate did not
+/// reach: `PackLoc::decode` reads an index entry and `parse_trailer` reads a
+/// pack's footer, both from bytes fetched back out of an object store, and both
+/// doing length-checked window arithmetic — the same shape as the manifest, tree
+/// and commit decoders that have had targets since #70.
+///
+/// Not a supported interface: hidden from the docs, and free to change or vanish.
+#[doc(hidden)]
+pub mod fuzz_entry {
+    use crate::error::Result;
+    use crate::types::Hash;
+
+    /// One index entry: `ORGI ‖ version ‖ pack(32) ‖ offset(4) ‖ len(4) ‖ …`.
+    ///
+    /// Returns the decoded `(pack, offset, len)` so a target can assert about it
+    /// without `PackLoc` being public.
+    pub fn decode_index_entry(b: &[u8]) -> Result<(Hash, u32, u32)> {
+        let loc = super::PackLoc::decode(b)?;
+        Ok((loc.pack, loc.offset, loc.len))
+    }
+
+    /// A whole pack's trailer, as `(chunk_hash, offset, len)` in stored order.
+    pub fn decode_trailer(pack: &[u8]) -> Result<Vec<(Hash, u32, u32)>> {
+        super::parse_trailer(pack)
+    }
+}
+
 /// Parse a pack's trailer into `(chunk_hash, offset, len)` in stored order.
 ///
 /// The footer is `trailer_len(u32) ‖ ORGP ‖ version` — see the module docs for why

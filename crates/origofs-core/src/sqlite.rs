@@ -94,6 +94,11 @@ pub struct SqliteMetadataStore {
     /// Round-robin cursor into `readers`, so concurrent readers spread across the
     /// pool instead of all queueing on the first one.
     next_reader: Arc<std::sync::atomic::AtomicUsize>,
+    /// Holds the temporary directory alive when `open_in_memory` was redirected
+    /// to disk by `ORIGOFS_SQLITE_TEST_ON_DISK`. `Arc` so a `with_workspace`
+    /// clone keeps the database from being deleted underneath it.
+    #[cfg(feature = "test-support")]
+    on_disk_tempdir: Option<Arc<tempfile::TempDir>>,
     /// The workspace this handle is bound to (default = 1). Workspace-scoped
     /// statements stamp/filter by it; [`SqliteMetadataStore::with_workspace`]
     /// rebinds a handle that shares this connection (`docs/MULTI_TENANCY.md`).
@@ -139,12 +144,34 @@ impl SqliteMetadataStore {
             conn: Arc::new(Mutex::new(conn)),
             readers: Arc::new(readers),
             next_reader: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(feature = "test-support")]
+            on_disk_tempdir: None,
             workspace_id: DEFAULT_WORKSPACE,
         })
     }
 
     /// Open a private in-memory database (handy for tests).
+    ///
+    /// Under `test-support`, `ORIGOFS_SQLITE_TEST_ON_DISK=1` makes this open a
+    /// private *file* instead. That exists because the read pool's safety
+    /// interlock — `PRAGMA query_only=ON` on every reader — only arms on a
+    /// file-backed store, and almost every suite in this crate is in-memory: the
+    /// read/write classification of ~90 methods would otherwise be covered by one
+    /// hand-written on-disk test rather than by the whole suite. Flipping this
+    /// runs all of it against a real pool, so a method in the wrong bucket fails
+    /// wherever it is exercised.
+    ///
+    /// The variable is read per call, not cached, so a single CI invocation flips
+    /// the whole suite; and it is behind `test-support`, so a production build
+    /// cannot take this path however the environment is set.
     pub fn open_in_memory() -> Result<Self> {
+        #[cfg(feature = "test-support")]
+        if std::env::var("ORIGOFS_SQLITE_TEST_ON_DISK").is_ok_and(|v| v != "0") {
+            let dir = tempfile::tempdir()?;
+            let mut store = Self::open(dir.path().join("meta.db"))?;
+            store.on_disk_tempdir = Some(Arc::new(dir));
+            return Ok(store);
+        }
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         Ok(Self {
@@ -155,6 +182,8 @@ impl SqliteMetadataStore {
             // writer, which is the pre-pool behaviour and correct here.
             readers: Arc::new(Vec::new()),
             next_reader: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(feature = "test-support")]
+            on_disk_tempdir: None,
             workspace_id: DEFAULT_WORKSPACE,
         })
     }
@@ -1160,6 +1189,8 @@ impl WorkspaceRegistry for SqliteMetadataStore {
             conn: self.conn.clone(),
             readers: self.readers.clone(),
             next_reader: self.next_reader.clone(),
+            #[cfg(feature = "test-support")]
+            on_disk_tempdir: self.on_disk_tempdir.clone(),
             workspace_id,
         })
     }

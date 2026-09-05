@@ -487,3 +487,45 @@ async fn the_metadata_reads_are_open_until_the_workspace_enforces_them() {
         &fs.listxattr_as(ctx, "/src/secret.rs").await.unwrap_err()
     ));
 }
+
+/// The NFS readdir-cursor translation is checked against the parent directory.
+///
+/// `vfs_dentry_name` was the one inode op a mount could call unchecked, on the
+/// argument that it only answers about a child of a directory the caller is
+/// already listing — and that listing is gated and per-entry filtered. The
+/// argument held, but it was a claim in an exemption list rather than a check, so
+/// `vfs_dentry_name_as` guards the parent. This is the test that claim never had.
+#[tokio::test]
+async fn resuming_a_listing_is_checked_against_the_directory() {
+    let (fs, ctx, src, docs) = fixture().await;
+    let secret = fs.stat("/src/secret.rs").await.unwrap().ino;
+    let ok = fs.stat("/docs/ok.md").await.unwrap().ino;
+
+    // Reads are not enforced in the fixture, so the cursor is served either way —
+    // the same opt-in every other read follows.
+    assert_eq!(
+        fs.vfs_dentry_name_as(Some(ctx), src, secret).await.unwrap(),
+        Some("secret.rs".to_string())
+    );
+
+    fs.set_acl_enforce_reads(true).await.unwrap();
+
+    // `/src` is outside the grant: refused, so a mount cannot turn an inode
+    // number into a name in a directory the actor may not list.
+    match fs.vfs_dentry_name_as(Some(ctx), src, secret).await {
+        Err(e) if denied(&e) => {}
+        other => panic!("expected Denied for /src, got {other:?}"),
+    }
+
+    // `/docs` is granted: still served, so the guard did not break NFS's resume.
+    assert_eq!(
+        fs.vfs_dentry_name_as(Some(ctx), docs, ok).await.unwrap(),
+        Some("ok.md".to_string())
+    );
+
+    // An anonymous mount still bypasses, like every other `_as` op.
+    assert_eq!(
+        fs.vfs_dentry_name_as(None, src, secret).await.unwrap(),
+        Some("secret.rs".to_string())
+    );
+}
