@@ -57,7 +57,7 @@ async def test_replaces_retires_the_draft_it_revises():
     # The reviewer said no to the proposal, and nothing is quietly waiting to be
     # said yes to.
     assert await ws.list_suggestions("pending", "/n.md") == []
-    with pytest.raises(ValueError):
+    with pytest.raises(origofs.AlreadyResolvedError):
         await ws.accept_suggestion(v1, h)
     assert await ws.read("/n.md") == b"base\n"
 
@@ -157,3 +157,52 @@ def test_the_route_takes_replaces_and_offers_a_standalone_supersede():
         r = tc.post(f"/suggestions/{v3}/supersede?token=a&reason=changed+my+mind")
         assert r.status_code == 200, r.text
         assert tc.get(f"/suggestions/{v3}?token=h").json()["status"] == "superseded"
+
+
+@asyncio_test
+async def test_a_settled_suggestion_is_a_conflict_not_a_value_error():
+    """A row that is already accepted/rejected/superseded was a `ValueError`, i.e.
+    a `400` -- saying the *request* was malformed when it was well-formed and
+    merely out of date (#164)."""
+    ws, h, a = await _fixture()
+    sid = await ws.suggest(a, "/n.md", b"once\n", None)
+    await ws.accept_suggestion(sid, h)
+
+    for call in (
+        ws.accept_suggestion(sid, h),
+        ws.reject_suggestion(sid, h),
+        ws.supersede_suggestion(sid, a),
+    ):
+        with pytest.raises(origofs.AlreadyResolvedError):
+            await call
+    # Still a ConflictError, so a host catching the family is unaffected -- and
+    # still not a ValueError, which is the point.
+    assert issubclass(origofs.AlreadyResolvedError, origofs.ConflictError)
+    assert not issubclass(origofs.AlreadyResolvedError, ValueError)
+
+
+@asyncio_test
+async def test_a_crdt_proposal_carries_replaces_too():
+    ws, _h, a = await _fixture()
+    # `load_coedit_as`, not `open_coedit`: the agent is propose-only, and the
+    # socket-opening form takes the *write* check by design.
+    doc = await ws.load_coedit_as(a, "/n.md")
+    await doc.insert(a, 0, "v1 ")
+    v1 = await ws.suggest_coedit(a, "/n.md", doc, None)
+    await doc.insert(a, 0, "v2 ")
+    v2 = await ws.suggest_coedit(a, "/n.md", doc, None, replaces=v1)
+    assert await _status(ws, v1) == "superseded"
+    assert await _status(ws, v2) == "pending"
+
+
+def test_a_settled_suggestion_is_409_over_http():
+    app, ws, h = _app()
+    _run(lambda: ws.write_as(h, "/n.md", b"base\n"))
+    with TestClient(app) as tc:
+        sid = tc.post("/suggestions?path=/n.md&token=a", content=b"v1\n").json()["id"]
+        assert tc.post(f"/suggestions/{sid}/accept?token=h").status_code == 200
+        # Was a 400 before #164: the request is fine, the row is just settled.
+        r = tc.post(f"/suggestions/{sid}/accept?token=h")
+        assert r.status_code == 409, r.text
+        assert tc.post(f"/suggestions/{sid}/reject?token=h").status_code == 409
+        assert tc.post(f"/suggestions/{sid}/supersede?token=a").status_code == 409

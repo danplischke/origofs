@@ -302,6 +302,7 @@ impl McpServer {
                 let old = args.get("old").and_then(Value::as_str).unwrap_or("");
                 let new = args.get("new").and_then(Value::as_str).unwrap_or("");
                 let summary = args.get("summary").and_then(Value::as_str);
+                let replaces = args.get("replaces").and_then(Value::as_i64);
                 if old.is_empty() {
                     return Err(OrigoFSError::InvalidArgument(
                         "suggest_coedit: `old` must be non-empty (a CRDT proposal is an edit to \
@@ -345,10 +346,19 @@ impl McpServer {
                 let index = text.find(old).unwrap_or(0) as u32;
                 doc.remove(index, old.len() as u32);
                 doc.insert(self.ctx(), index, new);
-                let id = self.ws.suggest_coedit(self.ctx(), p, &doc, summary).await?;
-                Ok(format!(
-                    "proposed co-edit suggestion #{id} for {p} (a CRDT merge, pending review)"
-                ))
+                let id = self
+                    .ws
+                    .suggest_coedit(self.ctx(), p, &doc, summary, replaces)
+                    .await?;
+                Ok(match replaces {
+                    Some(old) => format!(
+                        "proposed co-edit suggestion #{id} for {p} (a CRDT merge, pending \
+                         review), superseding #{old}"
+                    ),
+                    None => format!(
+                        "proposed co-edit suggestion #{id} for {p} (a CRDT merge, pending review)"
+                    ),
+                })
             }
             "origofs_live" => match args.get("path").and_then(Value::as_str) {
                 Some(p) if !p.is_empty() => {
@@ -799,12 +809,18 @@ fn tool_defs() -> Vec<Value> {
          proposal there goes stale on somebody else's keystroke, and accepting it \
          replaces the whole body; this one merges, so a concurrent disjoint edit \
          survives. The document changes only when a different actor accepts, and the \
-         merged text is credited to this agent.",
+         merged text is credited to this agent. To *revise* a proposal you already \
+         made, pass `replaces` with its id (origofs_suggestions lists yours) — otherwise \
+         the earlier draft stays pending beside the new one.",
         json!({
             "path": { "type": "string" },
             "old": { "type": "string", "description": "exact text to replace; must be unique in the document" },
             "new": { "type": "string", "description": "replacement text" },
             "summary": { "type": "string", "description": "optional note for the reviewer" },
+            "replaces": {
+                "type": "integer",
+                "description": "id of your own pending suggestion on this path to retire as this one is created",
+            },
         }),
         &["path", "old", "new"],
     ));

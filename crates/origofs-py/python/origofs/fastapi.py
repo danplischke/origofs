@@ -2250,15 +2250,26 @@ def build_router(
         on write would refuse exactly the callers it exists for.
 
         Body: ``{"base_sv": <bytes|list[int]>, "update": <bytes|list[int]>,
-        "summary": "..."}`` — a browser sends ``encodeStateVector(doc)`` and
-        ``encodeStateAsUpdate(doc)``. Returns the suggestion id.
+        "summary": "...", "replaces": <int|null>}`` — a browser sends
+        ``encodeStateVector(doc)`` and ``encodeStateAsUpdate(doc)``. Returns the
+        suggestion id.
+
+        `replaces` retires a pending draft of this actor's on this path as the new
+        one is created -- how a client *revises* a proposal rather than leaving the
+        earlier one in the queue beside it (#164).
         """
         p = _scoped(root, path)
         base_sv = _as_bytes(payload.get("base_sv", b""))
         update = _as_bytes(payload.get("update", b""))
+        replaces = payload.get("replaces")
         sid = await _run(
             ws.suggest_coedit_tree_update(
-                ctx, p, base_sv, update, payload.get("summary")
+                ctx,
+                p,
+                base_sv,
+                update,
+                payload.get("summary"),
+                int(replaces) if replaces is not None else None,
             )
         )
         return {"id": sid, "path": p}

@@ -108,12 +108,16 @@ async fn stale_accept_supersedes<M: MetadataStore>(fs: Fs<M, Arc<MemStore>>) {
         1
     );
 
-    // A second accept reports it as already resolved, not as a fresh conflict.
+    // A second accept reports it as already resolved, not as a fresh stale base --
+    // and as a *conflict*, not a bad request (#164). The row is settled, so the
+    // recovery is "read its status", which is neither of the other two conflicts'.
     let err = fs.accept_suggestion(id, r).await.unwrap_err();
     assert!(
-        matches!(&err, OrigoFSError::InvalidArgument(m) if m.contains("superseded")),
+        matches!(&err, OrigoFSError::AlreadyResolved(m) if m.contains("superseded")),
         "{err:?}"
     );
+    assert_eq!(err.code(), "already_resolved");
+    assert!(err.is_conflict());
 }
 
 #[tokio::test]

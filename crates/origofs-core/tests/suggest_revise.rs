@@ -130,7 +130,8 @@ async fn siblings_stay_legal_when_nobody_asked_for_a_replacement() {
 }
 
 /// A standalone withdrawal, for the draft that is retired with nothing taking its
-/// place — and for the CRDT shapes, whose propose calls carry no `replaces`.
+/// place. Where a replacement is proposed in the same breath, `replaces` does both
+/// halves at once and the two cannot come apart.
 #[tokio::test]
 async fn an_author_may_withdraw_its_own_draft() {
     let fs = fixture().await;
@@ -307,4 +308,81 @@ async fn the_trail_names_the_replacement() {
             .contains(&format!("replacing #{v1}")),
         "{proposed:?}"
     );
+}
+
+/// A CRDT proposal carries `replaces` too. Stacking is less dangerous there — a
+/// CRDT proposal never goes stale, and applying an author's earlier state after
+/// their later one merges a subset — but "the proposal I meant is no longer this
+/// one" is the same relation on either shape, and a queue with three abandoned
+/// drafts in it is still a queue nobody can read.
+#[cfg(feature = "coedit")]
+#[tokio::test]
+async fn a_crdt_proposal_can_be_revised_too() {
+    use origofs_core::CoeditDoc;
+    let fs = fixture().await;
+    let human = fs.create_human("h", None).await.unwrap();
+    let agent = fs.create_agent("a", "m", Some(human)).await.unwrap();
+    let (h, a) = (WriteCtx::actor(human), WriteCtx::actor(agent));
+    fs.write_as(h, "/n.md", b"base\n").await.unwrap();
+
+    let draft = |text: &str| {
+        let d = CoeditDoc::new();
+        d.insert(a, 0, text);
+        d
+    };
+    let v1 = fs
+        .suggest_coedit(a, "/n.md", &draft("v1\n"), None, None)
+        .await
+        .unwrap();
+    let v2 = fs
+        .suggest_coedit(a, "/n.md", &draft("v2\n"), None, Some(v1))
+        .await
+        .unwrap();
+
+    assert_eq!(status(&fs, v1).await, SuggestionStatus::Superseded);
+    assert_eq!(status(&fs, v2).await, SuggestionStatus::Pending);
+    // ...and a CRDT proposal on another path is refused as a replacement, exactly
+    // as a byte one is: the check is on the relation, not on the kind.
+    let elsewhere = fs
+        .suggest_coedit(a, "/other.md", &draft("x\n"), None, None)
+        .await
+        .unwrap();
+    assert!(
+        fs.suggest_coedit(a, "/n.md", &draft("v3\n"), None, Some(elsewhere))
+            .await
+            .is_err()
+    );
+    assert_eq!(status(&fs, elsewhere).await, SuggestionStatus::Pending);
+}
+
+/// A settled row is a **conflict**, not a bad request (#164).
+///
+/// Every resolve path used to answer `InvalidArgument` — a `400` on HTTP and a
+/// `ValueError` in Python — for a suggestion that was simply already accepted,
+/// rejected or superseded. That says the *request* was malformed when it was
+/// well-formed and merely out of date. `AlreadyResolved` is the third thing a
+/// reviewing caller handles beside `StaleBase` and the raced-CAS `Conflict`, and
+/// unlike either it is terminal.
+#[tokio::test]
+async fn a_settled_suggestion_reports_a_conflict_on_every_resolve_path() {
+    use origofs_core::OrigoFSError;
+    let fs = fixture().await;
+    let human = fs.create_human("h", None).await.unwrap();
+    let agent = fs.create_agent("a", "m", Some(human)).await.unwrap();
+    let (h, a) = (WriteCtx::actor(human), WriteCtx::actor(agent));
+    fs.write_as(h, "/n.md", b"base\n").await.unwrap();
+
+    let id = fs.suggest(a, "/n.md", b"once\n", None, None).await.unwrap();
+    fs.accept_suggestion(id, h).await.unwrap();
+
+    for err in [
+        fs.accept_suggestion(id, h).await.unwrap_err(),
+        fs.reject_suggestion(id, h).await.unwrap_err(),
+        fs.supersede_suggestion(id, a, None).await.unwrap_err(),
+    ] {
+        assert!(matches!(err, OrigoFSError::AlreadyResolved(_)), "{err:?}");
+        assert_eq!(err.code(), "already_resolved");
+        assert!(err.is_conflict(), "so every surface maps it to 409");
+        assert!(!err.retryable(), "terminal: read the row, do not replay");
+    }
 }

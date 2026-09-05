@@ -243,9 +243,12 @@ revision leaves the earlier draft `pending` on a base that still matches the fil
 chose. It is opt-in rather than automatic because two drafts a reviewer is meant
 to choose between is a real workflow, and origofs cannot tell it from a revision.
 
+Every propose call takes it — `suggest`, `suggest_delete`, `write_or_propose`,
+`remove_or_propose`, and the CRDT `suggest_coedit` / `suggest_coedit_tree` pair —
+so revising is the same one-call shape whichever kind of proposal you make.
+
 `supersede` is the standalone form, for retiring a draft with nothing taking its
-place — and for revising a `crdt` proposal, whose propose calls carry no
-`replaces`. It is distinct from `reject`, which records that a *reviewer* looked
+place. It is distinct from `reject`, which records that a *reviewer* looked
 and declined; an author may always withdraw their own, while retiring somebody
 else's needs `WRITE` at its path, exactly as rejecting it does. Note that
 `supersede-stale-suggestions` is a different thing again: it retires proposals

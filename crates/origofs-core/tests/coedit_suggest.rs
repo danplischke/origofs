@@ -78,7 +78,7 @@ async fn disjoint_concurrent_edit_still_merges<M: MetadataStore>(fs: Fs<M, Arc<M
     let fork = fs.open_coedit(a, "/notes.md").await.unwrap();
     fork.insert(a, 6, "gamma\n");
     let id = fs
-        .suggest_coedit(a, "/notes.md", &fork, Some("append gamma"))
+        .suggest_coedit(a, "/notes.md", &fork, Some("append gamma"), None)
         .await
         .unwrap();
     let s = fs.get_suggestion(id).await.unwrap().unwrap();
@@ -210,7 +210,10 @@ async fn crdt_suggestion_keeps_the_review_gate_and_reattributes() {
     // The agent proposes text its blob *claims* mallory wrote.
     let fork = fs.open_coedit(a, "/doc.md").await.unwrap();
     fork.insert(WriteCtx::actor(mallory), 6, "forged\n");
-    let id = fs.suggest_coedit(a, "/doc.md", &fork, None).await.unwrap();
+    let id = fs
+        .suggest_coedit(a, "/doc.md", &fork, None, None)
+        .await
+        .unwrap();
 
     // Its own author cannot accept it.
     let err = fs.accept_suggestion(id, a).await.unwrap_err();
@@ -258,18 +261,32 @@ async fn crdt_suggestion_from_raw_blobs_validates_its_update() {
 
     // An empty or malformed update is refused at propose time, not at review time.
     let err = fs
-        .suggest_coedit_update(a, "/raw.md", &base_sv, b"", None)
+        .suggest_coedit_update(a, "/raw.md", &base_sv, b"", None, None)
         .await
         .unwrap_err();
     assert!(matches!(err, OrigoFSError::InvalidArgument(_)), "{err:?}");
     let err = fs
-        .suggest_coedit_update(a, "/raw.md", &base_sv, b"\xff\xff not a yjs update", None)
+        .suggest_coedit_update(
+            a,
+            "/raw.md",
+            &base_sv,
+            b"\xff\xff not a yjs update",
+            None,
+            None,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, OrigoFSError::InvalidArgument(_)), "{err:?}");
 
     let id = fs
-        .suggest_coedit_update(a, "/raw.md", &base_sv, &fork.state_update(), Some("raw"))
+        .suggest_coedit_update(
+            a,
+            "/raw.md",
+            &base_sv,
+            &fork.state_update(),
+            Some("raw"),
+            None,
+        )
         .await
         .unwrap();
     fs.accept_suggestion(id, h).await.unwrap();
@@ -292,7 +309,10 @@ async fn crdt_suggestions_are_never_superseded_by_a_moving_file() {
 
     let fork = fs.open_coedit(a, "/d.md").await.unwrap();
     fork.insert(a, 2, "y\n");
-    let crdt = fs.suggest_coedit(a, "/d.md", &fork, None).await.unwrap();
+    let crdt = fs
+        .suggest_coedit(a, "/d.md", &fork, None, None)
+        .await
+        .unwrap();
     let bytes = fs.suggest(a, "/d.md", b"x\nz\n", None, None).await.unwrap();
 
     // Move the file well past both proposals' bases.

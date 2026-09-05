@@ -587,6 +587,16 @@ class StaleBaseError(ConflictError):
     the current file and re-suggest. Raised by ``accept_suggestion``.
     """
 
+class AlreadyResolvedError(ConflictError):
+    """The suggestion is already accepted, rejected or superseded.
+
+    Recovery: read its ``status``; there is nothing to retry. Raised by
+    ``accept_suggestion``, ``reject_suggestion``, ``supersede_suggestion`` and
+    ``accept_coedit_tree_suggestion``. It was a ``ValueError`` (and a ``400``) until
+    #164, which said the *request* was malformed when it was well-formed and merely
+    out of date.
+    """
+
 class ForeignWriteError(ConflictError):
     """The file was written outside the co-editing session since it last agreed
     with the bytes on disk, so checkpointing would destroy that write.
@@ -1199,6 +1209,7 @@ class Workspace:
         path: str,
         doc: CoeditTreeDoc,
         summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> int: ...
     async def suggest_coedit_tree_update(
         self,
@@ -1207,6 +1218,7 @@ class Workspace:
         base_sv: bytes,
         update: bytes,
         summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> int: ...
     async def coedit_tree_suggestion_update(self, id: int) -> bytes: ...
     async def merge_coedit_tree_suggestion(
@@ -1228,8 +1240,15 @@ class Workspace:
     # body: base = the document's Yjs state vector, proposal = an
     # `encodeStateAsUpdate` blob, so `accept_suggestion` merges instead of
     # overwriting. The resulting suggestion's `kind` is `"crdt"`.
+    # `replaces` retires an earlier pending draft of this actor's as this one is
+    # created -- see `suggest` (#164).
     async def suggest_coedit(
-        self, ctx: WriteCtx, path: str, doc: CoeditDoc, summary: Optional[str] = None
+        self,
+        ctx: WriteCtx,
+        path: str,
+        doc: CoeditDoc,
+        summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> int: ...
     async def suggest_coedit_update(
         self,
@@ -1238,6 +1257,7 @@ class Workspace:
         base_sv: bytes,
         update: bytes,
         summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> int: ...
     # --- live/dirty markers ---
     # A live path's durable bytes are a *checkpoint* that may lag the open Y.Doc.
@@ -1318,10 +1338,12 @@ class Workspace:
     async def accept_suggestion(self, id: int, approver: WriteCtx) -> Optional[str]: ...
     async def reject_suggestion(self, id: int, approver: WriteCtx) -> None: ...
     # Withdraw a pending draft its author abandoned, without applying or rejecting
-    # it (#164) — the standalone form of `suggest(..., replaces=)`, and the way to
-    # revise a *CRDT* proposal, whose propose calls carry no `replaces`. Distinct
-    # from `reject_suggestion`, which records that a reviewer declined. The author
-    # may always retire their own; anyone else needs WRITE at its path.
+    # it (#164) — the standalone form of `suggest(..., replaces=)`, for a draft
+    # retired with *nothing taking its place*. Where a replacement is proposed in
+    # the same breath, prefer `replaces`: every propose call takes it, byte and
+    # CRDT alike, and then the two cannot come apart. Distinct from
+    # `reject_suggestion`, which records that a reviewer declined. The author may
+    # always retire their own; anyone else needs WRITE at its path.
     async def supersede_suggestion(
         self, id: int, ctx: WriteCtx, reason: Optional[str] = None
     ) -> None: ...

@@ -119,7 +119,9 @@ async fn suggestions_require_the_propose_right() {
     let d = CoeditDoc::new();
     d.insert(ctx, 0, "proposed\n");
     assert!(is_denied(
-        &ws.suggest_coedit(ctx, "/doc", &d, None).await.unwrap_err()
+        &ws.suggest_coedit(ctx, "/doc", &d, None, None)
+            .await
+            .unwrap_err()
     ));
 
     assert!(ws.list_suggestions(None, None).await.unwrap().is_empty());

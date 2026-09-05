@@ -1861,18 +1861,27 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// addresses, exactly as a byte suggestion does, so the metadata database still
     /// never sees document bytes and ordinary GC still reaches them through the
     /// pending-suggestion root.
+    ///
+    /// `replaces` retires an earlier pending draft of this actor's as this one is
+    /// created — see [`suggest`](Self::suggest). Stacked CRDT proposals are less
+    /// dangerous than stacked byte ones (a CRDT proposal never goes stale, and
+    /// applying an author's earlier state after their later one merges a subset),
+    /// but "the proposal I meant is no longer this one" is the same relation on
+    /// either shape, and a review queue with three abandoned drafts in it is still
+    /// a queue nobody can read.
     pub async fn suggest_coedit(
         &self,
         ctx: WriteCtx,
         path: &str,
         doc: &CoeditDoc,
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         // The base is where the *workspace's* document stood when this was
         // proposed — the reviewer's "you were looking at this much of it". It is
         // deliberately not a gate: a CRDT merge is defined against any later state.
         let base = self.load_coedit(ctx, path).await?.state_vector();
-        self.suggest_coedit_update(ctx, path, &base, &doc.state_update(), summary)
+        self.suggest_coedit_update(ctx, path, &base, &doc.state_update(), summary, replaces)
             .await
     }
 
@@ -1887,6 +1896,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         base_sv: &[u8],
         update: &[u8],
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         if update.is_empty() {
             return Err(OrigoFSError::InvalidArgument(
@@ -1906,16 +1916,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             proposed_hash,
             summary,
             crate::suggest::SuggestionKind::Crdt,
-            // No `replaces` here, and the asymmetry with the byte path is
-            // deliberate (#164). Stacked *byte* proposals are harmful because
-            // rejecting the revision leaves the abandoned draft pending with a
-            // current base, so it accepts cleanly and lands text nobody chose. A
-            // CRDT proposal has neither half of that: it never goes stale, and
-            // applying an author's earlier state after their later one merges a
-            // subset. An author revising one retires the draft explicitly with
-            // `supersede_suggestion`, rather than four more signatures carrying an
-            // argument for a case that does not bite.
-            None,
+            replaces,
         )
         .await
     }
