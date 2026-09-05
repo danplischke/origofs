@@ -164,7 +164,9 @@ async fn a_dump_round_trips_the_newer_metadata() {
 
     src.write_as(ctx, "/f.txt", b"x").await.unwrap();
     let ino = src.stat("/f.txt").await.unwrap().ino;
-    src.vfs_setxattr(ino, "user.tag", b"blue").await.unwrap();
+    src.vfs_setxattr_unchecked(ino, "user.tag", b"blue")
+        .await
+        .unwrap();
     src.write_as(ctx, "/gone.txt", b"deleted").await.unwrap();
     src.remove_as(ctx, "/gone.txt").await.unwrap();
     assert_eq!(src.list_trash().await.unwrap().len(), 1);
@@ -182,7 +184,10 @@ async fn a_dump_round_trips_the_newer_metadata() {
 
     let ino = dst.stat("/f.txt").await.unwrap().ino;
     assert_eq!(
-        dst.vfs_getxattr(ino, "user.tag").await.unwrap().as_deref(),
+        dst.vfs_getxattr_unchecked(ino, "user.tag")
+            .await
+            .unwrap()
+            .as_deref(),
         Some(&b"blue"[..]),
         "extended attributes must survive the round trip"
     );

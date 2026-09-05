@@ -22,15 +22,20 @@ async fn fixture() -> Fs<SqliteMetadataStore, Arc<MemStore>> {
 async fn oversized_truncate_and_write_are_rejected_not_panic() {
     let fs = fixture().await;
     fs.write("/f", b"hello").await.unwrap();
-    let ino = fs.vfs_lookup(INO_ROOT, "f").await.unwrap().unwrap().ino;
+    let ino = fs
+        .vfs_lookup_unchecked(INO_ROOT, "f")
+        .await
+        .unwrap()
+        .unwrap()
+        .ino;
 
     assert!(matches!(
-        fs.vfs_truncate(ino, u64::MAX).await,
+        fs.vfs_truncate_unchecked(ino, u64::MAX).await,
         Err(OrigoFSError::TooLarge(_))
     ));
     // write at an offset that would overflow / allocate absurdly
     assert!(matches!(
-        fs.vfs_write(ino, u64::MAX - 4, b"boom").await,
+        fs.vfs_write_unchecked(ino, u64::MAX - 4, b"boom").await,
         Err(OrigoFSError::TooLarge(_))
     ));
     // a normal write still works and the file is intact
@@ -154,14 +159,16 @@ async fn traversal_path_components_are_rejected_everywhere() {
     for bad in ["..", ".", "a/b", "x\0y", ""] {
         assert!(
             matches!(
-                fs.vfs_create(INO_ROOT, bad, 0o644, Owner::ROOT).await,
+                fs.vfs_create_unchecked(INO_ROOT, bad, 0o644, Owner::ROOT)
+                    .await,
                 Err(OrigoFSError::InvalidPath(_))
             ),
             "vfs_create should reject {bad:?}"
         );
         assert!(
             matches!(
-                fs.vfs_mkdir(INO_ROOT, bad, 0o755, Owner::ROOT).await,
+                fs.vfs_mkdir_unchecked(INO_ROOT, bad, 0o755, Owner::ROOT)
+                    .await,
                 Err(OrigoFSError::InvalidPath(_))
             ),
             "vfs_mkdir should reject {bad:?}"
@@ -171,7 +178,8 @@ async fn traversal_path_components_are_rejected_everywhere() {
     // rename cannot introduce a traversal destination.
     fs.write("/ok", b"hi").await.unwrap();
     assert!(matches!(
-        fs.vfs_rename(INO_ROOT, "ok", INO_ROOT, "..").await,
+        fs.vfs_rename_unchecked(INO_ROOT, "ok", INO_ROOT, "..")
+            .await,
         Err(OrigoFSError::InvalidPath(_))
     ));
 
@@ -459,7 +467,7 @@ async fn write_as_expecting_is_a_content_cas() {
 
     // the file's current content hash — what a suggestion records as its base.
     let base = fs
-        .vfs_lookup(INO_ROOT, "f.txt")
+        .vfs_lookup_unchecked(INO_ROOT, "f.txt")
         .await
         .unwrap()
         .unwrap()
@@ -542,13 +550,13 @@ async fn names_are_byte_exact_no_unicode_normalization_or_casefold() {
     assert_eq!(&fs.read(nfc).await.unwrap()[..], b"nfc-body");
     assert_eq!(&fs.read(nfd).await.unwrap()[..], b"nfd-body");
     let nfc_ino = fs
-        .vfs_lookup(INO_ROOT, "caf\u{00e9}.txt")
+        .vfs_lookup_unchecked(INO_ROOT, "caf\u{00e9}.txt")
         .await
         .unwrap()
         .unwrap()
         .ino;
     let nfd_ino = fs
-        .vfs_lookup(INO_ROOT, "cafe\u{0301}.txt")
+        .vfs_lookup_unchecked(INO_ROOT, "cafe\u{0301}.txt")
         .await
         .unwrap()
         .unwrap()
@@ -564,13 +572,13 @@ async fn names_are_byte_exact_no_unicode_normalization_or_casefold() {
     assert_eq!(&fs.read("/README").await.unwrap()[..], b"upper");
     assert_eq!(&fs.read("/readme").await.unwrap()[..], b"lower");
     let upper = fs
-        .vfs_lookup(INO_ROOT, "README")
+        .vfs_lookup_unchecked(INO_ROOT, "README")
         .await
         .unwrap()
         .unwrap()
         .ino;
     let lower = fs
-        .vfs_lookup(INO_ROOT, "readme")
+        .vfs_lookup_unchecked(INO_ROOT, "readme")
         .await
         .unwrap()
         .unwrap()
@@ -610,9 +618,14 @@ async fn rename_into_own_descendant_is_refused() {
     );
 
     // The inode surface (FUSE/NFS `mv`) reaches the same cycle.
-    let a = fs.vfs_lookup(INO_ROOT, "a").await.unwrap().unwrap().ino;
-    let b = fs.vfs_lookup(a, "b").await.unwrap().unwrap().ino;
-    let err = fs.vfs_rename(INO_ROOT, "a", b, "a2").await;
+    let a = fs
+        .vfs_lookup_unchecked(INO_ROOT, "a")
+        .await
+        .unwrap()
+        .unwrap()
+        .ino;
+    let b = fs.vfs_lookup_unchecked(a, "b").await.unwrap().unwrap().ino;
+    let err = fs.vfs_rename_unchecked(INO_ROOT, "a", b, "a2").await;
     assert!(
         matches!(err, Err(OrigoFSError::InvalidArgument(_))),
         "vfs_rename into a descendant must be refused, got {err:?}"

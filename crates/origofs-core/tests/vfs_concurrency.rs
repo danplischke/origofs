@@ -41,11 +41,11 @@ async fn concurrent_writes_to_disjoint_ranges_do_not_lose_each_other() {
 
     let a = {
         let fs = Fs::new(meta.clone(), content.clone());
-        tokio::spawn(async move { fs.vfs_write(ino, 0, &[0xAA; 4096]).await })
+        tokio::spawn(async move { fs.vfs_write_unchecked(ino, 0, &[0xAA; 4096]).await })
     };
     let b = {
         let fs = Fs::new(meta.clone(), content.clone());
-        tokio::spawn(async move { fs.vfs_write(ino, 32 * 1024, &[0xBB; 4096]).await })
+        tokio::spawn(async move { fs.vfs_write_unchecked(ino, 32 * 1024, &[0xBB; 4096]).await })
     };
 
     a.await.unwrap().unwrap();
@@ -79,7 +79,8 @@ async fn every_concurrent_writer_survives() {
     for i in 0..N {
         let fs = Fs::new(meta.clone(), content.clone());
         tasks.push(tokio::spawn(async move {
-            fs.vfs_write(ino, i as u64, &[(i + 1) as u8]).await
+            fs.vfs_write_unchecked(ino, i as u64, &[(i + 1) as u8])
+                .await
         }));
     }
     for t in tasks {
@@ -105,11 +106,11 @@ async fn truncate_and_write_do_not_interleave_destructively() {
 
     let t = {
         let fs = Fs::new(meta.clone(), content.clone());
-        tokio::spawn(async move { fs.vfs_truncate(ino, 1024).await })
+        tokio::spawn(async move { fs.vfs_truncate_unchecked(ino, 1024).await })
     };
     let w = {
         let fs = Fs::new(meta.clone(), content.clone());
-        tokio::spawn(async move { fs.vfs_write(ino, 0, &[0x11; 512]).await })
+        tokio::spawn(async move { fs.vfs_write_unchecked(ino, 0, &[0x11; 512]).await })
     };
     t.await.unwrap().unwrap();
     w.await.unwrap().unwrap();
@@ -147,7 +148,7 @@ async fn writing_to_an_unlinked_inode_is_an_error() {
     fs.remove("/doomed.txt").await.unwrap();
 
     let err = fs
-        .vfs_write(ino, 0, b"bytes with nowhere to go")
+        .vfs_write_unchecked(ino, 0, b"bytes with nowhere to go")
         .await
         .unwrap_err();
     assert!(

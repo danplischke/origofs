@@ -372,25 +372,6 @@ fn bench_report_dict(py: Python<'_>, r: &BenchReport) -> PyResult<Py<PyDict>> {
     Ok(d.unbind())
 }
 
-/// Split an absolute path into `(parent_dir, name)` for the inode-addressed
-/// engine ops (`link`). The name itself is left to the engine's
-/// `validate_component`, which is the one place that rule lives.
-fn split_parent(path: &str) -> PyResult<(String, String)> {
-    match path.trim_end_matches('/').rsplit_once('/') {
-        Some((dir, name)) if !name.is_empty() => Ok((
-            if dir.is_empty() {
-                "/".to_string()
-            } else {
-                dir.to_string()
-            },
-            name.to_string(),
-        )),
-        _ => Err(PyValueError::new_err(format!(
-            "{path:?} is not an absolute path to a name"
-        ))),
-    }
-}
-
 fn dir_entry_dict(py: Python<'_>, e: &DirEntry) -> PyResult<Py<PyAny>> {
     let d = PyDict::new(py);
     d.set_item("name", &e.name)?;
@@ -4804,8 +4785,7 @@ impl Workspace {
     fn chmod<'py>(&self, py: Python<'py>, path: String, mode: u32) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
-            let inode = ws.fs().vfs_chmod(ino, mode).await.map_err(to_pyerr)?;
+            let inode = ws.chmod(&path, mode).await.map_err(to_pyerr)?;
             Python::attach(|py| inode_dict(py, &inode))
         })
     }
@@ -4828,8 +4808,7 @@ impl Workspace {
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
-            let inode = ws.fs().vfs_chown(ino, uid, gid).await.map_err(to_pyerr)?;
+            let inode = ws.chown(&path, uid, gid).await.map_err(to_pyerr)?;
             Python::attach(|py| inode_dict(py, &inode))
         })
     }
@@ -4850,14 +4829,7 @@ impl Workspace {
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            let ino = ws.stat(&existing_path).await.map_err(to_pyerr)?.ino;
-            let (dir, name) = split_parent(&new_path)?;
-            let parent = ws.stat(&dir).await.map_err(to_pyerr)?.ino;
-            let inode = ws
-                .fs()
-                .vfs_link(ino, parent, &name)
-                .await
-                .map_err(to_pyerr)?;
+            let inode = ws.link(&existing_path, &new_path).await.map_err(to_pyerr)?;
             Python::attach(|py| inode_dict(py, &inode))
         })
     }
@@ -4871,8 +4843,7 @@ impl Workspace {
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
-            let value = ws.fs().vfs_getxattr(ino, &name).await.map_err(to_pyerr)?;
+            let value = ws.getxattr(&path, &name).await.map_err(to_pyerr)?;
             Python::attach(|py| {
                 Ok(match value {
                     Some(v) => PyBytes::new(py, &v).into_any().unbind(),
@@ -4897,11 +4868,7 @@ impl Workspace {
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
-            ws.fs()
-                .vfs_setxattr(ino, &name, &value)
-                .await
-                .map_err(to_pyerr)?;
+            ws.setxattr(&path, &name, &value).await.map_err(to_pyerr)?;
             Ok(())
         })
     }
@@ -4909,10 +4876,10 @@ impl Workspace {
     /// Every extended-attribute name on a path, in name order (issue #119).
     fn listxattr<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
-        future_into_py(py, async move {
-            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
-            ws.fs().vfs_listxattr(ino).await.map_err(to_pyerr)
-        })
+        future_into_py(
+            py,
+            async move { ws.listxattr(&path).await.map_err(to_pyerr) },
+        )
     }
 
     /// Remove one extended attribute, reporting whether it was there (issue #119).
@@ -4924,8 +4891,140 @@ impl Workspace {
     ) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();
         future_into_py(py, async move {
-            let ino = ws.stat(&path).await.map_err(to_pyerr)?.ino;
-            ws.fs().vfs_removexattr(ino, &name).await.map_err(to_pyerr)
+            ws.removexattr(&path, &name).await.map_err(to_pyerr)
+        })
+    }
+
+    // ── attributed metadata ops ─────────────────────────────────────────────
+    //
+    // The seven above resolved a path to an inode and called the *unchecked*
+    // inode primitive, so none of them ran any authorization, and there was no
+    // attributed form to reach for instead — `chmod`, `chown`, `link` and
+    // `setxattr`/`removexattr` all mutate, and were reachable from Python with no
+    // actor and no check. These are the counterparts.
+
+    /// `chmod`, requiring `ctx` to hold `WRITE` at `path`.
+    fn chmod_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        mode: u32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let inode = ws.chmod_as(c, &path, mode).await.map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// `chown`, requiring `ctx` to hold `WRITE` at `path`.
+    #[pyo3(signature = (ctx, path, uid = None, gid = None))]
+    fn chown_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let inode = ws.chown_as(c, &path, uid, gid).await.map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// `link`, requiring `ctx` to hold `WRITE` at **`new_path`** — the name being
+    /// created, not the file being pointed at.
+    fn link_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        existing_path: String,
+        new_path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let inode = ws
+                .link_as(c, &existing_path, &new_path)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| inode_dict(py, &inode))
+        })
+    }
+
+    /// `getxattr`, requiring `ctx` to hold `READ` at `path` (inert unless the
+    /// workspace has `acl_enforce_reads` on).
+    fn getxattr_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let value = ws.getxattr_as(c, &path, &name).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                Ok(match value {
+                    Some(v) => PyBytes::new(py, &v).into_any().unbind(),
+                    None => py.None(),
+                })
+            })
+        })
+    }
+
+    /// `setxattr`, requiring `ctx` to hold `WRITE` at `path`.
+    fn setxattr_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        name: String,
+        value: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.setxattr_as(c, &path, &name, &value)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// `listxattr`, requiring `ctx` to hold `READ` at `path` (inert unless the
+    /// workspace has `acl_enforce_reads` on).
+    fn listxattr_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.listxattr_as(c, &path).await.map_err(to_pyerr)
+        })
+    }
+
+    /// `removexattr`, requiring `ctx` to hold `WRITE` at `path`.
+    fn removexattr_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            ws.removexattr_as(c, &path, &name).await.map_err(to_pyerr)
         })
     }
 

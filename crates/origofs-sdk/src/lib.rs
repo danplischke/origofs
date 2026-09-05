@@ -233,22 +233,6 @@ impl CacheConfig {
     }
 }
 
-/// Split an absolute path into `(parent, name)`.
-///
-/// The façade's path-addressed wrappers over the inode-oriented engine ops need
-/// this; the engine's own `resolve_parent` is `pub(crate)`, and an inode number is
-/// a mount implementation detail no `Workspace` caller should have to hold.
-fn split_parent(path: &str) -> Result<(String, String)> {
-    let trimmed = path.trim_end_matches('/');
-    match trimmed.rsplit_once('/') {
-        Some(("", name)) if !name.is_empty() => Ok(("/".to_string(), name.to_string())),
-        Some((parent, name)) if !name.is_empty() => Ok((parent.to_string(), name.to_string())),
-        _ => Err(OrigoFSError::InvalidPath(format!(
-            "{path:?} names no parent directory"
-        ))),
-    }
-}
-
 impl Workspace {
     /// Open (creating if needed) a workspace from explicit metadata + content
     /// backends.
@@ -966,51 +950,104 @@ impl Workspace {
 
     // --- ownership, mode, links, xattrs (issues #119, #121, #122) -----------
 
-    /// Change a path's permission bits.
+    // Each of these resolved a path to an inode here and then called the
+    // *unchecked* inode primitive, so all seven ran no authorization at all — and
+    // there was no attributed form for a caller to reach for instead. They are
+    // path operations, so they belong on the engine beside `remove`/`rename`,
+    // where the check can live; the plain forms stay unattributed and open by
+    // construction like the rest of that family, and the `_as` forms are new.
+
+    /// Change a path's permission bits. Unattributed.
     pub async fn chmod(&self, path: &str, mode: u32) -> Result<Inode> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_chmod(ino, mode).await
+        self.fs.chmod(path, mode).await
+    }
+
+    /// [`chmod`](Self::chmod), requiring `ctx` to hold `WRITE` at `path`.
+    pub async fn chmod_as(&self, ctx: WriteCtx, path: &str, mode: u32) -> Result<Inode> {
+        self.fs.chmod_as(ctx, path, mode).await
     }
 
     /// Change a path's owning uid/gid. `None` leaves that half alone, as
-    /// `chown(2)`'s `-1` does.
+    /// `chown(2)`'s `-1` does. Unattributed.
     pub async fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<Inode> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_chown(ino, uid, gid).await
+        self.fs.chown(path, uid, gid).await
     }
 
-    /// Hard-link `existing` as `link_path`.
+    /// [`chown`](Self::chown), requiring `ctx` to hold `WRITE` at `path`.
+    pub async fn chown_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode> {
+        self.fs.chown_as(ctx, path, uid, gid).await
+    }
+
+    /// Hard-link `existing` as `link_path`. Unattributed.
     pub async fn link(&self, existing: &str, link_path: &str) -> Result<Inode> {
-        let ino = self.fs.stat(existing).await?.ino;
-        let (parent, name) = split_parent(link_path)?;
-        let parent_ino = self.fs.stat(&parent).await?.ino;
-        self.fs.vfs_link(ino, parent_ino, &name).await
+        self.fs.link(existing, link_path).await
     }
 
-    /// Read one extended attribute.
+    /// [`link`](Self::link), requiring `ctx` to hold `WRITE` at **`link_path`** —
+    /// the name being created, not the file being pointed at.
+    pub async fn link_as(&self, ctx: WriteCtx, existing: &str, link_path: &str) -> Result<Inode> {
+        self.fs.link_as(ctx, existing, link_path).await
+    }
+
+    /// Read one extended attribute. Unattributed.
     pub async fn getxattr(&self, path: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_getxattr(ino, name).await
+        self.fs.getxattr(path, name).await
     }
 
-    /// Set one extended attribute. Values are capped at
+    /// [`getxattr`](Self::getxattr), requiring `ctx` to hold `READ` at `path`
+    /// (inert unless the workspace has `acl_enforce_reads` on).
+    pub async fn getxattr_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.fs.getxattr_as(ctx, path, name).await
+    }
+
+    /// Set one extended attribute. Unattributed. Values are capped at
     /// [`MAX_XATTR_LEN`](origofs_core::MAX_XATTR_LEN) — an xattr lives in the
     /// metadata store, which never holds large bytes.
     pub async fn setxattr(&self, path: &str, name: &str, value: &[u8]) -> Result<()> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_setxattr(ino, name, value).await
+        self.fs.setxattr(path, name, value).await
     }
 
-    /// Remove one extended attribute, reporting whether it was set.
+    /// [`setxattr`](Self::setxattr), requiring `ctx` to hold `WRITE` at `path`.
+    pub async fn setxattr_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        self.fs.setxattr_as(ctx, path, name, value).await
+    }
+
+    /// Remove one extended attribute, reporting whether it was set. Unattributed.
     pub async fn removexattr(&self, path: &str, name: &str) -> Result<bool> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_removexattr(ino, name).await
+        self.fs.removexattr(path, name).await
     }
 
-    /// Every extended-attribute name on a path, in name order.
+    /// [`removexattr`](Self::removexattr), requiring `ctx` to hold `WRITE` at `path`.
+    pub async fn removexattr_as(&self, ctx: WriteCtx, path: &str, name: &str) -> Result<bool> {
+        self.fs.removexattr_as(ctx, path, name).await
+    }
+
+    /// Every extended-attribute name on a path, in name order. Unattributed.
     pub async fn listxattr(&self, path: &str) -> Result<Vec<String>> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_listxattr(ino).await
+        self.fs.listxattr(path).await
+    }
+
+    /// [`listxattr`](Self::listxattr), requiring `ctx` to hold `READ` at `path`
+    /// (inert unless the workspace has `acl_enforce_reads` on).
+    pub async fn listxattr_as(&self, ctx: WriteCtx, path: &str) -> Result<Vec<String>> {
+        self.fs.listxattr_as(ctx, path).await
     }
 
     // --- attribution completeness (issue #128) ------------------------------

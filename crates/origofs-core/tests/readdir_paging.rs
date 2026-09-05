@@ -297,19 +297,19 @@ async fn readdir_page_with_attrs_matches_per_entry_getattr() {
     fs.mkdir_p("/sub").await.unwrap();
     fs.symlink("/f00", "/link").await.unwrap();
 
-    let full = fs.vfs_readdir(INO_ROOT).await.unwrap();
+    let full = fs.vfs_readdir_unchecked(INO_ROOT).await.unwrap();
 
     let mut cursor: Option<String> = None;
     let mut seen = Vec::new();
     loop {
         let page = fs
-            .vfs_readdir_page_with_attrs(INO_ROOT, cursor.as_deref(), 4)
+            .vfs_readdir_page_with_attrs_unchecked(INO_ROOT, cursor.as_deref(), 4)
             .await
             .unwrap();
         for e in &page.entries {
             // The batched attrs are the same attrs a per-entry getattr returns —
             // the N+1 that item M16 removes.
-            let one = fs.vfs_getattr(e.entry.ino).await.unwrap();
+            let one = fs.vfs_getattr_unchecked(e.entry.ino).await.unwrap();
             assert_eq!(one.ino, e.inode.ino);
             assert_eq!(one.kind, e.inode.kind);
             assert_eq!(one.size, e.inode.size);
@@ -339,24 +339,38 @@ async fn dentry_name_bridges_an_ino_cookie_back_to_a_name() {
     // the translation, and it must reject a cookie that isn't a child.
     let fs = fixture().await;
     fs.mkdir_p("/d").await.unwrap();
-    let d = fs.vfs_lookup(INO_ROOT, "d").await.unwrap().unwrap().ino;
+    let d = fs
+        .vfs_lookup_unchecked(INO_ROOT, "d")
+        .await
+        .unwrap()
+        .unwrap()
+        .ino;
     let by_name = seed(fs.backends().meta, d, &["one", "two", "three"]).await;
 
     for (name, ino) in &by_name {
         assert_eq!(
-            fs.vfs_dentry_name(d, *ino).await.unwrap().as_deref(),
+            fs.vfs_dentry_name_unchecked(d, *ino)
+                .await
+                .unwrap()
+                .as_deref(),
             Some(name.as_str())
         );
         // Right ino, wrong parent.
-        assert_eq!(fs.vfs_dentry_name(INO_ROOT, *ino).await.unwrap(), None);
+        assert_eq!(
+            fs.vfs_dentry_name_unchecked(INO_ROOT, *ino).await.unwrap(),
+            None
+        );
     }
     // An ino that doesn't exist at all is `None`, not an error — that is what
     // lets the NFS surface answer BAD_COOKIE.
-    assert_eq!(fs.vfs_dentry_name(d, 999_999).await.unwrap(), None);
+    assert_eq!(
+        fs.vfs_dentry_name_unchecked(d, 999_999).await.unwrap(),
+        None
+    );
 
     // Round-trip: every cookie resumes the page immediately after its own entry.
     let all: Vec<String> = fs
-        .vfs_readdir(d)
+        .vfs_readdir_unchecked(d)
         .await
         .unwrap()
         .into_iter()
@@ -364,9 +378,9 @@ async fn dentry_name_bridges_an_ino_cookie_back_to_a_name() {
         .collect();
     for (i, name) in all.iter().enumerate() {
         let ino = by_name[name];
-        let cursor = fs.vfs_dentry_name(d, ino).await.unwrap().unwrap();
+        let cursor = fs.vfs_dentry_name_unchecked(d, ino).await.unwrap().unwrap();
         let rest: Vec<String> = fs
-            .vfs_readdir_page(d, Some(&cursor), 10)
+            .vfs_readdir_page_unchecked(d, Some(&cursor), 10)
             .await
             .unwrap()
             .into_iter()
@@ -383,7 +397,10 @@ async fn a_page_is_stable_across_edits_before_the_cursor() {
     let fs = fixture().await;
     seed(fs.backends().meta, INO_ROOT, &["a", "b", "c", "d", "e"]).await;
 
-    let page1 = fs.vfs_readdir_page(INO_ROOT, None, 2).await.unwrap();
+    let page1 = fs
+        .vfs_readdir_page_unchecked(INO_ROOT, None, 2)
+        .await
+        .unwrap();
     let got: Vec<&str> = page1.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(got, ["a", "b"]);
 
@@ -394,7 +411,10 @@ async fn a_page_is_stable_across_edits_before_the_cursor() {
         .remove_dentry(INO_ROOT, "a")
         .await
         .unwrap();
-    let page2 = fs.vfs_readdir_page(INO_ROOT, Some("b"), 2).await.unwrap();
+    let page2 = fs
+        .vfs_readdir_page_unchecked(INO_ROOT, Some("b"), 2)
+        .await
+        .unwrap();
     let got: Vec<&str> = page2.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(got, ["c", "d"]);
 }

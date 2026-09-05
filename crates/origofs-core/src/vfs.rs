@@ -40,7 +40,7 @@ const SYMLINK_MODE: u32 = 0o120777;
 
 impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// Look up `name` in directory `parent`, returning its inode.
-    pub async fn vfs_lookup(&self, parent: Ino, name: &str) -> Result<Option<Inode>> {
+    pub(crate) async fn vfs_lookup(&self, parent: Ino, name: &str) -> Result<Option<Inode>> {
         match self.meta.lookup(parent, name).await? {
             Some(ino) => self.meta.get_inode(ino).await,
             None => Ok(None),
@@ -48,7 +48,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// Inode attributes.
-    pub async fn vfs_getattr(&self, ino: Ino) -> Result<Inode> {
+    pub(crate) async fn vfs_getattr(&self, ino: Ino) -> Result<Inode> {
         self.meta
             .get_inode(ino)
             .await?
@@ -59,7 +59,10 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     ///
     /// Prefer [`vfs_readdir_page`](Self::vfs_readdir_page) on a mount surface: a
     /// large directory is materialized in full here, once per `readdir` call.
-    pub async fn vfs_readdir(&self, ino: Ino) -> Result<Vec<DirEntry>> {
+    /// Only the paged forms are used inside the crate; this whole-directory
+    /// read exists for the suites, so it is compiled where they are.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn vfs_readdir(&self, ino: Ino) -> Result<Vec<DirEntry>> {
         self.meta.list_dir(ino).await
     }
 
@@ -72,7 +75,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// `after_name`. Use this when only names/kinds are needed; use
     /// [`vfs_readdir_page_with_attrs`](Self::vfs_readdir_page_with_attrs) when the
     /// reply also carries attributes.
-    pub async fn vfs_readdir_page(
+    pub(crate) async fn vfs_readdir_page(
         &self,
         ino: Ino,
         after_name: Option<&str>,
@@ -91,7 +94,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// unlink) is dropped from [`DirPage::entries`], but
     /// [`DirPage::next_after`] still advances past it, so a resumed scan can
     /// never stall on it.
-    pub async fn vfs_readdir_page_with_attrs(
+    pub(crate) async fn vfs_readdir_page_with_attrs(
         &self,
         ino: Ino,
         after_name: Option<&str>,
@@ -125,7 +128,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// The inverse of [`vfs_lookup`](Self::vfs_lookup). A surface whose `readdir`
     /// resume cookie is an inode number (NFSv3) uses this to translate that cookie
     /// into the name cursor [`vfs_readdir_page`](Self::vfs_readdir_page) pages by.
-    pub async fn vfs_dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
+    pub(crate) async fn vfs_dentry_name(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
         self.meta.dentry_name(parent, ino).await
     }
 
@@ -140,7 +143,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// cost is the depth rather than the size of the tree. Bounded, so a cycle
     /// already present in the store surfaces as `None` instead of hanging — the
     /// same guard `ensure_not_own_descendant` uses.
-    pub async fn vfs_path_of(&self, ino: Ino) -> Result<Option<String>> {
+    pub(crate) async fn vfs_path_of(&self, ino: Ino) -> Result<Option<String>> {
         /// Deeper than any real tree; only a pre-existing cycle reaches it.
         const MAX_DEPTH: usize = 4096;
 
@@ -169,7 +172,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// Read up to `size` bytes at `offset`, fetching only the covering chunks.
-    pub async fn vfs_read(&self, ino: Ino, offset: u64, size: u32) -> Result<Bytes> {
+    pub(crate) async fn vfs_read(&self, ino: Ino, offset: u64, size: u32) -> Result<Bytes> {
         let inode = self.vfs_getattr(ino).await?;
         let Some(mhash) = inode.content else {
             return Ok(Bytes::new());
@@ -211,7 +214,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     const VFS_CAS_ATTEMPTS: usize = 16;
 
     /// Write `data` at `offset` (extending the file as needed). Returns bytes written.
-    pub async fn vfs_write(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32> {
+    pub(crate) async fn vfs_write(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32> {
         for _ in 0..Self::VFS_CAS_ATTEMPTS {
             match self.vfs_write_attempt(ino, offset, data).await? {
                 Some(n) => return Ok(n),
@@ -263,7 +266,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// Truncate/extend a file to `size` bytes.
-    pub async fn vfs_truncate(&self, ino: Ino, size: u64) -> Result<()> {
+    pub(crate) async fn vfs_truncate(&self, ino: Ino, size: u64) -> Result<()> {
         for _ in 0..Self::VFS_CAS_ATTEMPTS {
             if self.vfs_truncate_attempt(ino, size).await? {
                 return Ok(());
@@ -308,7 +311,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// The mounts pass the uid/gid of the process that issued the `create`, so a
     /// file made through a mount belongs to whoever made it rather than to root.
     /// Pass [`Owner::ROOT`] from anything without a requesting process.
-    pub async fn vfs_create(
+    pub(crate) async fn vfs_create(
         &self,
         parent: Ino,
         name: &str,
@@ -336,7 +339,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Create a directory under `parent`, owned by `owner`. See
     /// [`vfs_create`](Self::vfs_create).
-    pub async fn vfs_mkdir(
+    pub(crate) async fn vfs_mkdir(
         &self,
         parent: Ino,
         name: &str,
@@ -367,7 +370,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// `CLAUDE.md` — so the entry records no actor; that is strictly better than
     /// not capturing it, since `rm` through a mount is exactly the failure mode
     /// trash exists for.
-    pub async fn vfs_unlink(&self, parent: Ino, name: &str) -> Result<()> {
+    pub(crate) async fn vfs_unlink(&self, parent: Ino, name: &str) -> Result<()> {
         let ino = self
             .meta
             .lookup(parent, name)
@@ -407,7 +410,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// leave a count that no name backs (a leak that would keep the inode alive
     /// forever) or a name whose count was never raised (a premature delete on the
     /// next unlink).
-    pub async fn vfs_link(&self, ino: Ino, newparent: Ino, newname: &str) -> Result<Inode> {
+    pub(crate) async fn vfs_link(&self, ino: Ino, newparent: Ino, newname: &str) -> Result<Inode> {
         validate_component(newname)?;
         let inode = self.vfs_getattr(ino).await?;
         if inode.kind == FileKind::Dir {
@@ -429,7 +432,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// Remove an empty directory under `parent`.
-    pub async fn vfs_rmdir(&self, parent: Ino, name: &str) -> Result<()> {
+    pub(crate) async fn vfs_rmdir(&self, parent: Ino, name: &str) -> Result<()> {
         let ino = self
             .meta
             .lookup(parent, name)
@@ -454,7 +457,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 
     /// Rename/move `(parent, name)` to `(newparent, newname)`.
-    pub async fn vfs_rename(
+    pub(crate) async fn vfs_rename(
         &self,
         parent: Ino,
         name: &str,
@@ -514,7 +517,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Create a symlink under `parent`, owned by `owner`. See
     /// [`vfs_create`](Self::vfs_create).
-    pub async fn vfs_symlink(
+    pub(crate) async fn vfs_symlink(
         &self,
         parent: Ino,
         name: &str,
@@ -548,7 +551,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// file happened to be *created* with was the mode it carried into committed
     /// tree objects (`TreeEntry.mode`) and out through `git clone origofs://…`,
     /// with no way to correct it.
-    pub async fn vfs_chmod(&self, ino: Ino, mode: u32) -> Result<Inode> {
+    pub(crate) async fn vfs_chmod(&self, ino: Ino, mode: u32) -> Result<Inode> {
         // Confirm it exists first, so a chmod of a missing inode is NotFound
         // rather than a silently-zero-row UPDATE — the same silence this fixes.
         self.vfs_getattr(ino).await?;
@@ -565,14 +568,19 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// This is ownership, not authorization: it changes what the *kernel* evaluates
     /// its permission checks against on a mount, and nothing about what an actor may
     /// do. See `docs/PERMISSIONS.md` §2.
-    pub async fn vfs_chown(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<Inode> {
+    pub(crate) async fn vfs_chown(
+        &self,
+        ino: Ino,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode> {
         self.vfs_getattr(ino).await?;
         self.meta.set_owner(ino, uid, gid).await?;
         self.vfs_getattr(ino).await
     }
 
     /// Read one extended attribute (issue #119).
-    pub async fn vfs_getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn vfs_getxattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         self.vfs_getattr(ino).await?;
         self.meta.get_xattr(ino, name).await
     }
@@ -587,7 +595,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     /// thing the metadata/content split exists to prevent. The limit matches
     /// Linux's own per-value ceiling, so nothing that works on ext4 or XFS is
     /// refused here.
-    pub async fn vfs_setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+    pub(crate) async fn vfs_setxattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
         if name.is_empty() {
             return Err(OrigoFSError::InvalidArgument(
                 "xattr name must not be empty".into(),
@@ -609,19 +617,19 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     ///
     /// The boolean is what lets a mount answer `ENODATA` for a name that was never
     /// set, rather than reporting success for a removal that removed nothing.
-    pub async fn vfs_removexattr(&self, ino: Ino, name: &str) -> Result<bool> {
+    pub(crate) async fn vfs_removexattr(&self, ino: Ino, name: &str) -> Result<bool> {
         self.vfs_getattr(ino).await?;
         self.meta.remove_xattr(ino, name).await
     }
 
     /// Every extended-attribute name on an inode, in name order (issue #119).
-    pub async fn vfs_listxattr(&self, ino: Ino) -> Result<Vec<String>> {
+    pub(crate) async fn vfs_listxattr(&self, ino: Ino) -> Result<Vec<String>> {
         self.vfs_getattr(ino).await?;
         self.meta.list_xattrs(ino).await
     }
 
     /// Read a symlink target by inode.
-    pub async fn vfs_readlink(&self, ino: Ino) -> Result<String> {
+    pub(crate) async fn vfs_readlink(&self, ino: Ino) -> Result<String> {
         self.meta
             .get_symlink(ino)
             .await?
@@ -1035,6 +1043,29 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         }
     }
 
+    /// [`vfs_dentry_name`](Self::vfs_dentry_name), checked against `ctx`'s `READ`
+    /// on the **parent directory**.
+    ///
+    /// NFSv3 resumes a `readdir` by inode number, so this turns that cookie back
+    /// into the name cursor the paged listing takes. It was the one op a mount was
+    /// allowed to call unchecked, on the argument that it reveals only whether an
+    /// inode is a child of a directory the caller is already listing — and the
+    /// listing is gated and per-entry filtered, so the argument held.
+    ///
+    /// It is checked anyway. The reasoning was sound but it was a *claim in an
+    /// exemption list*, and guarding the parent is one `effective_perms` lookup
+    /// against a warm cache on a path the caller is already paging. An exemption
+    /// nobody has to trust is better than one that happens to be true.
+    pub async fn vfs_dentry_name_as(
+        &self,
+        ctx: Option<crate::WriteCtx>,
+        parent: Ino,
+        ino: Ino,
+    ) -> Result<Option<String>> {
+        self.guard_read(ctx, "resume a listing of", parent).await?;
+        self.vfs_dentry_name(parent, ino).await
+    }
+
     /// [`vfs_readdir_page_with_attrs`](Self::vfs_readdir_page_with_attrs), checked
     /// and filtered like [`vfs_readdir_page_as`](Self::vfs_readdir_page_as).
     ///
@@ -1333,5 +1364,351 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub async fn renew_posix_lease(&self, holder: &str) -> Result<u64> {
         let until = self.now_secs() + crate::posixlock::LEASE_SECS;
         self.meta.renew_posix_lease(holder, until).await
+    }
+}
+
+/// The inode-addressed primitives, **without** the ACL checks.
+///
+/// These forward to the crate-private `vfs_*` ops and exist only under
+/// `test-support`, which nothing in a dependency graph turns on for a consumer.
+///
+/// The inode layer is a *mount primitive*: FUSE and NFS address everything by
+/// inode number, and before #141 that layer took no actor at all, so path-scoped
+/// grants did not reach a mount — an agent refused `WRITE` under `/src` over MCP
+/// took the identical action through a mountpoint. The `_as` forms closed that,
+/// but the unchecked ops stayed `pub`, so a surface could still call the wrong
+/// one; the guarantee rested on a test that substring-scanned `fuse.rs` and
+/// `nfs.rs` for `.vfs_`.
+///
+/// A grep cannot see a rename, a macro, a helper that forwards the call, or a
+/// file it was not pointed at — and it was pointed at two, which is why seven
+/// unchecked calls in the SDK façade and seven more in the Python bindings were
+/// invisible to it. The ops are `pub(crate)` now, so the compiler answers the
+/// question instead: outside origofs-core, only the `_as` forms exist.
+///
+/// `_unchecked` is in the name because origofs-core's own suites are the one
+/// caller that should have them, and a call site that says so is the point.
+#[cfg(feature = "test-support")]
+impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
+    /// [`vfs_lookup`](Self::vfs_lookup), reachable from outside the crate.
+    pub async fn vfs_lookup_unchecked(&self, parent: Ino, name: &str) -> Result<Option<Inode>> {
+        self.vfs_lookup(parent, name).await
+    }
+
+    /// [`vfs_getattr`](Self::vfs_getattr), reachable from outside the crate.
+    pub async fn vfs_getattr_unchecked(&self, ino: Ino) -> Result<Inode> {
+        self.vfs_getattr(ino).await
+    }
+
+    /// [`vfs_readdir`](Self::vfs_readdir), reachable from outside the crate.
+    pub async fn vfs_readdir_unchecked(&self, ino: Ino) -> Result<Vec<DirEntry>> {
+        self.vfs_readdir(ino).await
+    }
+
+    /// [`vfs_readdir_page`](Self::vfs_readdir_page), reachable from outside the crate.
+    pub async fn vfs_readdir_page_unchecked(
+        &self,
+        ino: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>> {
+        self.vfs_readdir_page(ino, after_name, limit).await
+    }
+
+    /// [`vfs_readdir_page_with_attrs`](Self::vfs_readdir_page_with_attrs), reachable from outside the crate.
+    pub async fn vfs_readdir_page_with_attrs_unchecked(
+        &self,
+        ino: Ino,
+        after_name: Option<&str>,
+        limit: usize,
+    ) -> Result<DirPage> {
+        self.vfs_readdir_page_with_attrs(ino, after_name, limit)
+            .await
+    }
+
+    /// [`vfs_dentry_name`](Self::vfs_dentry_name), reachable from outside the crate.
+    pub async fn vfs_dentry_name_unchecked(&self, parent: Ino, ino: Ino) -> Result<Option<String>> {
+        self.vfs_dentry_name(parent, ino).await
+    }
+
+    /// [`vfs_path_of`](Self::vfs_path_of), reachable from outside the crate.
+    pub async fn vfs_path_of_unchecked(&self, ino: Ino) -> Result<Option<String>> {
+        self.vfs_path_of(ino).await
+    }
+
+    /// [`vfs_read`](Self::vfs_read), reachable from outside the crate.
+    pub async fn vfs_read_unchecked(&self, ino: Ino, offset: u64, size: u32) -> Result<Bytes> {
+        self.vfs_read(ino, offset, size).await
+    }
+
+    /// [`vfs_write`](Self::vfs_write), reachable from outside the crate.
+    pub async fn vfs_write_unchecked(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32> {
+        self.vfs_write(ino, offset, data).await
+    }
+
+    /// [`vfs_truncate`](Self::vfs_truncate), reachable from outside the crate.
+    pub async fn vfs_truncate_unchecked(&self, ino: Ino, size: u64) -> Result<()> {
+        self.vfs_truncate(ino, size).await
+    }
+
+    /// [`vfs_create`](Self::vfs_create), reachable from outside the crate.
+    pub async fn vfs_create_unchecked(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        owner: Owner,
+    ) -> Result<Inode> {
+        self.vfs_create(parent, name, mode, owner).await
+    }
+
+    /// [`vfs_mkdir`](Self::vfs_mkdir), reachable from outside the crate.
+    pub async fn vfs_mkdir_unchecked(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        owner: Owner,
+    ) -> Result<Inode> {
+        self.vfs_mkdir(parent, name, mode, owner).await
+    }
+
+    /// [`vfs_unlink`](Self::vfs_unlink), reachable from outside the crate.
+    pub async fn vfs_unlink_unchecked(&self, parent: Ino, name: &str) -> Result<()> {
+        self.vfs_unlink(parent, name).await
+    }
+
+    /// [`vfs_link`](Self::vfs_link), reachable from outside the crate.
+    pub async fn vfs_link_unchecked(
+        &self,
+        ino: Ino,
+        newparent: Ino,
+        newname: &str,
+    ) -> Result<Inode> {
+        self.vfs_link(ino, newparent, newname).await
+    }
+
+    /// [`vfs_rmdir`](Self::vfs_rmdir), reachable from outside the crate.
+    pub async fn vfs_rmdir_unchecked(&self, parent: Ino, name: &str) -> Result<()> {
+        self.vfs_rmdir(parent, name).await
+    }
+
+    /// [`vfs_rename`](Self::vfs_rename), reachable from outside the crate.
+    pub async fn vfs_rename_unchecked(
+        &self,
+        parent: Ino,
+        name: &str,
+        newparent: Ino,
+        newname: &str,
+    ) -> Result<()> {
+        self.vfs_rename(parent, name, newparent, newname).await
+    }
+
+    /// [`vfs_symlink`](Self::vfs_symlink), reachable from outside the crate.
+    pub async fn vfs_symlink_unchecked(
+        &self,
+        parent: Ino,
+        name: &str,
+        target: &str,
+        owner: Owner,
+    ) -> Result<Inode> {
+        self.vfs_symlink(parent, name, target, owner).await
+    }
+
+    /// [`vfs_chmod`](Self::vfs_chmod), reachable from outside the crate.
+    pub async fn vfs_chmod_unchecked(&self, ino: Ino, mode: u32) -> Result<Inode> {
+        self.vfs_chmod(ino, mode).await
+    }
+
+    /// [`vfs_chown`](Self::vfs_chown), reachable from outside the crate.
+    pub async fn vfs_chown_unchecked(
+        &self,
+        ino: Ino,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode> {
+        self.vfs_chown(ino, uid, gid).await
+    }
+
+    /// [`vfs_getxattr`](Self::vfs_getxattr), reachable from outside the crate.
+    pub async fn vfs_getxattr_unchecked(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
+        self.vfs_getxattr(ino, name).await
+    }
+
+    /// [`vfs_setxattr`](Self::vfs_setxattr), reachable from outside the crate.
+    pub async fn vfs_setxattr_unchecked(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        self.vfs_setxattr(ino, name, value).await
+    }
+
+    /// [`vfs_removexattr`](Self::vfs_removexattr), reachable from outside the crate.
+    pub async fn vfs_removexattr_unchecked(&self, ino: Ino, name: &str) -> Result<bool> {
+        self.vfs_removexattr(ino, name).await
+    }
+
+    /// [`vfs_listxattr`](Self::vfs_listxattr), reachable from outside the crate.
+    pub async fn vfs_listxattr_unchecked(&self, ino: Ino) -> Result<Vec<String>> {
+        self.vfs_listxattr(ino).await
+    }
+
+    /// [`vfs_readlink`](Self::vfs_readlink), reachable from outside the crate.
+    pub async fn vfs_readlink_unchecked(&self, ino: Ino) -> Result<String> {
+        self.vfs_readlink(ino).await
+    }
+}
+
+/// Path-addressed metadata operations: mode, ownership, hard links and extended
+/// attributes.
+///
+/// The inode-addressed `vfs_*` ops above are mount primitives — FUSE and NFS have
+/// an inode number and nothing else. Every *other* surface starts from a path,
+/// and until now had to resolve one to an inode itself and then call the
+/// unchecked primitive, which is precisely what the SDK façade and the Python
+/// bindings did for all seven of these: `chmod`, `chown`, `link`, `getxattr`,
+/// `setxattr`, `removexattr` and `listxattr` ran no authorization at all, and
+/// there was no attributed form for a caller to reach for instead.
+///
+/// Each comes in the same two shapes as the rest of the engine. The plain form is
+/// unattributed and open by construction, like `remove`/`rename`/`mkdir_p`. The
+/// `_as` form takes a `WriteCtx` and runs the ACL check — the write check for the
+/// four that mutate, the read guard (inert unless `acl_enforce_reads`) for the
+/// three that do not.
+impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
+    /// Change a path's permission bits. Unattributed.
+    pub async fn chmod(&self, path: &str, mode: u32) -> Result<Inode> {
+        let ino = self.stat(path).await?.ino;
+        self.vfs_chmod(ino, mode).await
+    }
+
+    /// [`chmod`](Self::chmod), checked against `ctx`'s `WRITE` at `path`.
+    pub async fn chmod_as(&self, ctx: crate::WriteCtx, path: &str, mode: u32) -> Result<Inode> {
+        self.ensure_may_write_at(ctx, "change the mode of", path)
+            .await?;
+        let ino = self.stat(path).await?.ino;
+        self.vfs_chmod(ino, mode).await
+    }
+
+    /// Change a path's owning uid/gid; `None` leaves that half alone, as
+    /// `chown(2)`'s `-1` does. Unattributed.
+    pub async fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<Inode> {
+        let ino = self.stat(path).await?.ino;
+        self.vfs_chown(ino, uid, gid).await
+    }
+
+    /// [`chown`](Self::chown), checked against `ctx`'s `WRITE` at `path`.
+    pub async fn chown_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode> {
+        self.ensure_may_write_at(ctx, "change the owner of", path)
+            .await?;
+        let ino = self.stat(path).await?.ino;
+        self.vfs_chown(ino, uid, gid).await
+    }
+
+    /// Hard-link `existing` as `link_path`. Unattributed.
+    pub async fn link(&self, existing: &str, link_path: &str) -> Result<Inode> {
+        let (ino, parent_ino, name) = self.resolve_link(existing, link_path).await?;
+        self.vfs_link(ino, parent_ino, &name).await
+    }
+
+    /// [`link`](Self::link), checked against `ctx`'s `WRITE` at **`link_path`** —
+    /// the name being created, not the file being pointed at. A hard link adds a
+    /// name; it is the directory gaining that name whose grant decides.
+    pub async fn link_as(
+        &self,
+        ctx: crate::WriteCtx,
+        existing: &str,
+        link_path: &str,
+    ) -> Result<Inode> {
+        self.ensure_may_write_at(ctx, "hard-link into", link_path)
+            .await?;
+        let (ino, parent_ino, name) = self.resolve_link(existing, link_path).await?;
+        self.vfs_link(ino, parent_ino, &name).await
+    }
+
+    /// Resolve the two paths a hard link needs into `(target ino, parent ino, name)`.
+    async fn resolve_link(&self, existing: &str, link_path: &str) -> Result<(Ino, Ino, String)> {
+        let ino = self.stat(existing).await?.ino;
+        let (parent, name) = self.resolve_parent(link_path).await?;
+        Ok((ino, parent, name.to_string()))
+    }
+
+    /// Read one extended attribute. Unattributed.
+    pub async fn getxattr(&self, path: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        let ino = self.stat(path).await?.ino;
+        self.vfs_getxattr(ino, name).await
+    }
+
+    /// [`getxattr`](Self::getxattr), checked against `ctx`'s `READ` at `path`
+    /// (inert unless the workspace has `acl_enforce_reads` on).
+    pub async fn getxattr_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.ensure_may_read_at(ctx, "read an extended attribute of", path)
+            .await?;
+        let ino = self.stat(path).await?.ino;
+        self.vfs_getxattr(ino, name).await
+    }
+
+    /// Set one extended attribute. Unattributed. Values are capped at
+    /// [`MAX_XATTR_LEN`](crate::MAX_XATTR_LEN) — an xattr lives in the metadata
+    /// store, which never holds large bytes.
+    pub async fn setxattr(&self, path: &str, name: &str, value: &[u8]) -> Result<()> {
+        let ino = self.stat(path).await?.ino;
+        self.vfs_setxattr(ino, name, value).await
+    }
+
+    /// [`setxattr`](Self::setxattr), checked against `ctx`'s `WRITE` at `path`.
+    pub async fn setxattr_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        self.ensure_may_write_at(ctx, "set an extended attribute on", path)
+            .await?;
+        let ino = self.stat(path).await?.ino;
+        self.vfs_setxattr(ino, name, value).await
+    }
+
+    /// Remove one extended attribute, reporting whether it was set. Unattributed.
+    pub async fn removexattr(&self, path: &str, name: &str) -> Result<bool> {
+        let ino = self.stat(path).await?.ino;
+        self.vfs_removexattr(ino, name).await
+    }
+
+    /// [`removexattr`](Self::removexattr), checked against `ctx`'s `WRITE` at `path`.
+    pub async fn removexattr_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+        name: &str,
+    ) -> Result<bool> {
+        self.ensure_may_write_at(ctx, "remove an extended attribute from", path)
+            .await?;
+        let ino = self.stat(path).await?.ino;
+        self.vfs_removexattr(ino, name).await
+    }
+
+    /// Every extended-attribute name on a path, in name order. Unattributed.
+    pub async fn listxattr(&self, path: &str) -> Result<Vec<String>> {
+        let ino = self.stat(path).await?.ino;
+        self.vfs_listxattr(ino).await
+    }
+
+    /// [`listxattr`](Self::listxattr), checked against `ctx`'s `READ` at `path`
+    /// (inert unless the workspace has `acl_enforce_reads` on).
+    pub async fn listxattr_as(&self, ctx: crate::WriteCtx, path: &str) -> Result<Vec<String>> {
+        self.ensure_may_read_at(ctx, "list the extended attributes of", path)
+            .await?;
+        let ino = self.stat(path).await?.ino;
+        self.vfs_listxattr(ino).await
     }
 }

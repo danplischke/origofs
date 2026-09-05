@@ -127,15 +127,15 @@ fn media(len: usize, seed: u64) -> Vec<u8> {
 /// `Vec` splice, which cannot be wrong.
 async fn assert_splice_matches(body: &[u8], offset: u64, patch: &[u8]) {
     let (fs, _store) = fixture().await;
-    fs.vfs_create(INO_ROOT, "f.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "f.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/f.bin").await.unwrap().ino;
     if !body.is_empty() {
-        fs.vfs_write(ino, 0, body).await.unwrap();
+        fs.vfs_write_unchecked(ino, 0, body).await.unwrap();
     }
 
-    fs.vfs_write(ino, offset, patch).await.unwrap();
+    fs.vfs_write_unchecked(ino, offset, patch).await.unwrap();
 
     // The reference: the same edit applied to a plain buffer.
     let end = offset as usize + patch.len();
@@ -160,7 +160,10 @@ async fn assert_splice_matches(body: &[u8], offset: u64, patch: &[u8]) {
         body.len()
     );
     // And the mount read path agrees with the path API.
-    let via_mount = fs.vfs_read(ino, 0, want.len() as u32).await.unwrap();
+    let via_mount = fs
+        .vfs_read_unchecked(ino, 0, want.len() as u32)
+        .await
+        .unwrap();
     assert!(via_mount[..] == want[..], "vfs_read disagrees with read");
 }
 
@@ -204,12 +207,12 @@ async fn a_write_beyond_the_end_leaves_a_zero_hole() {
 
     // Explicitly: the gap is zeroes, not garbage.
     let (fs, _s) = fixture().await;
-    fs.vfs_create(INO_ROOT, "h.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "h.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/h.bin").await.unwrap().ino;
-    fs.vfs_write(ino, 0, b"start").await.unwrap();
-    fs.vfs_write(ino, 100_000, b"end").await.unwrap();
+    fs.vfs_write_unchecked(ino, 0, b"start").await.unwrap();
+    fs.vfs_write_unchecked(ino, 100_000, b"end").await.unwrap();
     let got = fs.read("/h.bin").await.unwrap();
     assert_eq!(got.len(), 100_003);
     assert!(
@@ -245,7 +248,7 @@ async fn a_single_byte_write_is_exact() {
 #[tokio::test]
 async fn many_sequential_writes_reconstruct_the_file() {
     let (fs, _store) = fixture().await;
-    fs.vfs_create(INO_ROOT, "seq.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "seq.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/seq.bin").await.unwrap().ino;
@@ -253,7 +256,7 @@ async fn many_sequential_writes_reconstruct_the_file() {
     let body = media(1 << 20, 11);
     // 128 KiB at a time, as the kernel issues them.
     for (i, part) in body.chunks(128 * 1024).enumerate() {
-        fs.vfs_write(ino, (i * 128 * 1024) as u64, part)
+        fs.vfs_write_unchecked(ino, (i * 128 * 1024) as u64, part)
             .await
             .unwrap();
     }
@@ -269,17 +272,17 @@ async fn many_sequential_writes_reconstruct_the_file() {
 #[tokio::test]
 async fn overlapping_and_out_of_order_writes_are_exact() {
     let (fs, _store) = fixture().await;
-    fs.vfs_create(INO_ROOT, "o.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "o.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/o.bin").await.unwrap().ino;
 
     let mut want = media(400_000, 3);
-    fs.vfs_write(ino, 0, &want).await.unwrap();
+    fs.vfs_write_unchecked(ino, 0, &want).await.unwrap();
 
     for (off, seed) in [(300_000u64, 21), (50_000, 22), (299_000, 23), (0, 24)] {
         let patch = media(4000, seed);
-        fs.vfs_write(ino, off, &patch).await.unwrap();
+        fs.vfs_write_unchecked(ino, off, &patch).await.unwrap();
         want[off as usize..off as usize + patch.len()].copy_from_slice(&patch);
     }
     assert_eq!(&fs.read("/o.bin").await.unwrap()[..], &want[..]);
@@ -294,13 +297,13 @@ async fn truncate_shrinks_exactly() {
     let body = media(1 << 20, 5);
     for target in [0u64, 1, 12_345, 500_000, (1 << 20) - 1] {
         let (fs, _s) = fixture().await;
-        fs.vfs_create(INO_ROOT, "t.bin", 0o644, Owner::ROOT)
+        fs.vfs_create_unchecked(INO_ROOT, "t.bin", 0o644, Owner::ROOT)
             .await
             .unwrap();
         let ino = fs.stat("/t.bin").await.unwrap().ino;
-        fs.vfs_write(ino, 0, &body).await.unwrap();
+        fs.vfs_write_unchecked(ino, 0, &body).await.unwrap();
 
-        fs.vfs_truncate(ino, target).await.unwrap();
+        fs.vfs_truncate_unchecked(ino, target).await.unwrap();
         let got = fs.read("/t.bin").await.unwrap();
         assert_eq!(got.len() as u64, target, "truncate to {target}");
         assert!(
@@ -314,14 +317,14 @@ async fn truncate_shrinks_exactly() {
 #[tokio::test]
 async fn truncate_grows_with_zeroes() {
     let (fs, _s) = fixture().await;
-    fs.vfs_create(INO_ROOT, "g.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "g.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/g.bin").await.unwrap().ino;
     let body = media(100_000, 5);
-    fs.vfs_write(ino, 0, &body).await.unwrap();
+    fs.vfs_write_unchecked(ino, 0, &body).await.unwrap();
 
-    fs.vfs_truncate(ino, 250_000).await.unwrap();
+    fs.vfs_truncate_unchecked(ino, 250_000).await.unwrap();
     let got = fs.read("/g.bin").await.unwrap();
     assert_eq!(got.len(), 250_000);
     assert!(got[..100_000] == body[..], "the original bytes moved");
@@ -341,16 +344,18 @@ async fn truncate_grows_with_zeroes() {
 #[tokio::test]
 async fn a_small_write_to_a_large_file_touches_little_data() {
     let (fs, store) = fixture().await;
-    fs.vfs_create(INO_ROOT, "big.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "big.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/big.bin").await.unwrap().ino;
 
     const SIZE: usize = 4 << 20; // 4 MiB
-    fs.vfs_write(ino, 0, &media(SIZE, 13)).await.unwrap();
+    fs.vfs_write_unchecked(ino, 0, &media(SIZE, 13))
+        .await
+        .unwrap();
 
     store.reset();
-    fs.vfs_write(ino, SIZE as u64 / 2, &media(4096, 77))
+    fs.vfs_write_unchecked(ino, SIZE as u64 / 2, &media(4096, 77))
         .await
         .unwrap();
 
@@ -371,15 +376,17 @@ async fn a_small_write_to_a_large_file_touches_little_data() {
 #[tokio::test]
 async fn truncating_to_zero_does_not_read_the_file() {
     let (fs, store) = fixture().await;
-    fs.vfs_create(INO_ROOT, "big.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "big.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/big.bin").await.unwrap().ino;
     const SIZE: usize = 2 << 20;
-    fs.vfs_write(ino, 0, &media(SIZE, 13)).await.unwrap();
+    fs.vfs_write_unchecked(ino, 0, &media(SIZE, 13))
+        .await
+        .unwrap();
 
     store.reset();
-    fs.vfs_truncate(ino, 0).await.unwrap();
+    fs.vfs_truncate_unchecked(ino, 0).await.unwrap();
 
     let touched = store.put_bytes() + store.get_bytes();
     assert!(
@@ -398,14 +405,14 @@ async fn truncating_to_zero_does_not_read_the_file() {
 async fn a_sequential_rewrite_is_linear_not_quadratic() {
     async fn cost(size: usize) -> usize {
         let (fs, store) = fixture().await;
-        fs.vfs_create(INO_ROOT, "s.bin", 0o644, Owner::ROOT)
+        fs.vfs_create_unchecked(INO_ROOT, "s.bin", 0o644, Owner::ROOT)
             .await
             .unwrap();
         let ino = fs.stat("/s.bin").await.unwrap().ino;
         let body = media(size, 31);
         store.reset();
         for (i, part) in body.chunks(128 * 1024).enumerate() {
-            fs.vfs_write(ino, (i * 128 * 1024) as u64, part)
+            fs.vfs_write_unchecked(ino, (i * 128 * 1024) as u64, part)
                 .await
                 .unwrap();
         }
@@ -430,16 +437,16 @@ async fn a_sequential_rewrite_is_linear_not_quadratic() {
 #[tokio::test]
 async fn splicing_preserves_deduplication() {
     let (fs, store) = fixture().await;
-    fs.vfs_create(INO_ROOT, "d.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "d.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/d.bin").await.unwrap().ino;
     let body = media(1 << 20, 17);
-    fs.vfs_write(ino, 0, &body).await.unwrap();
+    fs.vfs_write_unchecked(ino, 0, &body).await.unwrap();
     let objects_before = store.inner.list().await.unwrap().len();
 
     // Rewrite a slice with exactly the bytes already there.
-    fs.vfs_write(ino, 400_000, &body[400_000..404_096])
+    fs.vfs_write_unchecked(ino, 400_000, &body[400_000..404_096])
         .await
         .unwrap();
 
@@ -470,12 +477,12 @@ async fn splicing_preserves_deduplication() {
 #[tokio::test]
 async fn a_zero_length_write_is_a_no_op_everywhere() {
     let (fs, _s) = fixture().await;
-    fs.vfs_create(INO_ROOT, "z.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "z.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/z.bin").await.unwrap().ino;
     let body = media(1 << 20, 23);
-    fs.vfs_write(ino, 0, &body).await.unwrap();
+    fs.vfs_write_unchecked(ino, 0, &body).await.unwrap();
 
     // Every interesting position: the front (the original repro), mid-chunk,
     // offsets that land on or near chunk boundaries, exactly EOF, and past EOF —
@@ -486,7 +493,7 @@ async fn a_zero_length_write_is_a_no_op_everywhere() {
         .into_iter()
         .chain([body.len() as u64, body.len() as u64 + 4096]);
     for off in offsets {
-        let n = fs.vfs_write(ino, off, &[]).await.unwrap();
+        let n = fs.vfs_write_unchecked(ino, off, &[]).await.unwrap();
         assert_eq!(n, 0, "a zero-length write at {off} reported bytes written");
         let got = fs.read("/z.bin").await.unwrap();
         assert_eq!(
@@ -505,13 +512,13 @@ async fn a_zero_length_write_is_a_no_op_everywhere() {
 #[tokio::test]
 async fn a_zero_length_write_to_an_empty_file_is_a_no_op() {
     let (fs, _s) = fixture().await;
-    fs.vfs_create(INO_ROOT, "e.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "e.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/e.bin").await.unwrap().ino;
-    assert_eq!(fs.vfs_write(ino, 0, &[]).await.unwrap(), 0);
-    assert_eq!(fs.vfs_write(ino, 4096, &[]).await.unwrap(), 0);
-    assert_eq!(fs.vfs_getattr(ino).await.unwrap().size, 0);
+    assert_eq!(fs.vfs_write_unchecked(ino, 0, &[]).await.unwrap(), 0);
+    assert_eq!(fs.vfs_write_unchecked(ino, 4096, &[]).await.unwrap(), 0);
+    assert_eq!(fs.vfs_getattr_unchecked(ino).await.unwrap().size, 0);
     assert!(fs.read("/e.bin").await.unwrap().is_empty());
 }
 
@@ -526,16 +533,16 @@ async fn a_zero_length_write_to_an_empty_file_is_a_no_op() {
 #[tokio::test]
 async fn growing_a_file_does_not_materialize_the_hole() {
     let (fs, store) = fixture().await;
-    fs.vfs_create(INO_ROOT, "h.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "h.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/h.bin").await.unwrap().ino;
     let body = media(50_000, 29);
-    fs.vfs_write(ino, 0, &body).await.unwrap();
+    fs.vfs_write_unchecked(ino, 0, &body).await.unwrap();
 
     store.reset();
     let grown = 256 << 20; // 256 MiB
-    fs.vfs_truncate(ino, grown).await.unwrap();
+    fs.vfs_truncate_unchecked(ino, grown).await.unwrap();
 
     // A hole of any size stores at most two distinct objects (one full zero chunk
     // that every whole chunk of the run shares, plus a short remainder) and the
@@ -550,15 +557,18 @@ async fn growing_a_file_does_not_materialize_the_hole() {
         "growing re-read {} bytes of the body",
         store.get_bytes()
     );
-    assert_eq!(fs.vfs_getattr(ino).await.unwrap().size, grown);
+    assert_eq!(fs.vfs_getattr_unchecked(ino).await.unwrap().size, grown);
 
     // And it still reads back correctly at both ends of the hole.
-    let head = fs.vfs_read(ino, 0, 50_000).await.unwrap();
+    let head = fs.vfs_read_unchecked(ino, 0, 50_000).await.unwrap();
     assert!(head[..] == body[..], "the original bytes moved");
-    let tail = fs.vfs_read(ino, grown - 4096, 4096).await.unwrap();
+    let tail = fs
+        .vfs_read_unchecked(ino, grown - 4096, 4096)
+        .await
+        .unwrap();
     assert_eq!(tail.len(), 4096);
     assert!(tail.iter().all(|b| *b == 0), "the hole must read as zeroes");
-    let seam = fs.vfs_read(ino, 49_990, 20).await.unwrap();
+    let seam = fs.vfs_read_unchecked(ino, 49_990, 20).await.unwrap();
     assert!(seam[..10] == body[49_990..], "the seam lost bytes");
     assert!(seam[10..].iter().all(|b| *b == 0), "the seam is not zeroed");
 }
@@ -567,28 +577,28 @@ async fn growing_a_file_does_not_materialize_the_hole() {
 #[tokio::test]
 async fn a_write_far_past_eof_does_not_materialize_the_gap() {
     let (fs, store) = fixture().await;
-    fs.vfs_create(INO_ROOT, "p.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "p.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/p.bin").await.unwrap().ino;
     let body = media(50_000, 31);
-    fs.vfs_write(ino, 0, &body).await.unwrap();
+    fs.vfs_write_unchecked(ino, 0, &body).await.unwrap();
 
     store.reset();
     let at = 256u64 << 20;
     let patch = media(10, 37);
-    fs.vfs_write(ino, at, &patch).await.unwrap();
+    fs.vfs_write_unchecked(ino, at, &patch).await.unwrap();
 
     let put = store.put_bytes();
     assert!(
         put < 8 << 20,
         "writing 10 bytes at offset {at} stored {put} bytes; the gap was materialized"
     );
-    assert_eq!(fs.vfs_getattr(ino).await.unwrap().size, at + 10);
-    assert!(fs.vfs_read(ino, 0, 50_000).await.unwrap()[..] == body[..]);
-    assert!(fs.vfs_read(ino, at, 10).await.unwrap()[..] == patch[..]);
+    assert_eq!(fs.vfs_getattr_unchecked(ino).await.unwrap().size, at + 10);
+    assert!(fs.vfs_read_unchecked(ino, 0, 50_000).await.unwrap()[..] == body[..]);
+    assert!(fs.vfs_read_unchecked(ino, at, 10).await.unwrap()[..] == patch[..]);
     assert!(
-        fs.vfs_read(ino, at - 4096, 4096)
+        fs.vfs_read_unchecked(ino, at - 4096, 4096)
             .await
             .unwrap()
             .iter()
@@ -602,14 +612,14 @@ async fn a_write_far_past_eof_does_not_materialize_the_gap() {
 #[tokio::test]
 async fn writing_into_a_hole_is_exact() {
     let (fs, _s) = fixture().await;
-    fs.vfs_create(INO_ROOT, "w.bin", 0o644, Owner::ROOT)
+    fs.vfs_create_unchecked(INO_ROOT, "w.bin", 0o644, Owner::ROOT)
         .await
         .unwrap();
     let ino = fs.stat("/w.bin").await.unwrap().ino;
-    fs.vfs_truncate(ino, 4 << 20).await.unwrap();
+    fs.vfs_truncate_unchecked(ino, 4 << 20).await.unwrap();
 
     let patch = media(5000, 41);
-    fs.vfs_write(ino, 2 << 20, &patch).await.unwrap();
+    fs.vfs_write_unchecked(ino, 2 << 20, &patch).await.unwrap();
 
     let mut want = vec![0u8; 4 << 20];
     want[2 << 20..(2 << 20) + 5000].copy_from_slice(&patch);

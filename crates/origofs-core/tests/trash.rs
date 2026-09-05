@@ -118,8 +118,10 @@ async fn a_restore_preserves_mode_and_ownership() {
     let ctx = WriteCtx::session(actor, session);
     fs.write_as(ctx, "/build.sh", b"#!/bin/sh\n").await.unwrap();
     let ino = fs.stat("/build.sh").await.unwrap().ino;
-    fs.vfs_chmod(ino, 0o755).await.unwrap();
-    fs.vfs_chown(ino, Some(1000), Some(2000)).await.unwrap();
+    fs.vfs_chmod_unchecked(ino, 0o755).await.unwrap();
+    fs.vfs_chown_unchecked(ino, Some(1000), Some(2000))
+        .await
+        .unwrap();
 
     fs.remove_as(ctx, "/build.sh").await.unwrap();
     let id = fs.list_trash().await.unwrap()[0].id;
@@ -376,7 +378,7 @@ async fn a_delete_through_the_mount_surface_is_captured() {
         .unwrap();
 
     let parent = fs.stat("/deep/nested").await.unwrap().ino;
-    fs.vfs_unlink(parent, "f.txt").await.unwrap();
+    fs.vfs_unlink_unchecked(parent, "f.txt").await.unwrap();
 
     let entries = fs.list_trash().await.unwrap();
     assert_eq!(entries.len(), 1);
@@ -404,11 +406,11 @@ async fn vfs_path_of_resolves_a_nested_inode() {
 
     let ino = fs.stat("/a/b/c.txt").await.unwrap().ino;
     assert_eq!(
-        fs.vfs_path_of(ino).await.unwrap().as_deref(),
+        fs.vfs_path_of_unchecked(ino).await.unwrap().as_deref(),
         Some("/a/b/c.txt")
     );
     assert_eq!(
-        fs.vfs_path_of(origofs_core::INO_ROOT)
+        fs.vfs_path_of_unchecked(origofs_core::INO_ROOT)
             .await
             .unwrap()
             .as_deref(),
@@ -416,5 +418,5 @@ async fn vfs_path_of_resolves_a_nested_inode() {
     );
     // An inode that never existed is not reachable, and says so rather than
     // fabricating a path.
-    assert_eq!(fs.vfs_path_of(999_999).await.unwrap(), None);
+    assert_eq!(fs.vfs_path_of_unchecked(999_999).await.unwrap(), None);
 }
