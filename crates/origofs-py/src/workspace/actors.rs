@@ -255,20 +255,54 @@ impl Workspace {
             let ops = ws.edit_ops(actor_id, session_id).await.map_err(to_pyerr)?;
             Python::attach(|py| {
                 ops.into_iter()
-                    .map(|o| {
-                        let d = PyDict::new(py);
-                        d.set_item("id", o.id)?;
-                        d.set_item("actor_id", o.actor_id)?;
-                        d.set_item("session_id", o.session_id)?;
-                        d.set_item("path", o.path)?;
-                        d.set_item("op", o.op)?;
-                        d.set_item("byte_start", o.byte_start)?;
-                        d.set_item("byte_len", o.byte_len)?;
-                        d.set_item("pre_hash", o.pre_hash)?;
-                        d.set_item("post_hash", o.post_hash)?;
-                        d.set_item("ts", o.ts)?;
-                        Ok(d.unbind())
-                    })
+                    .map(|o| edit_op_dict(py, o))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// The attributed writes recorded against one file, newest first.
+    ///
+    /// Follows the file across renames (it reads by inode while the path is live)
+    /// and falls back to the recorded path once the inode is gone, which is when
+    /// the deletion is the row being looked for. Finer than `log_path` -- it
+    /// includes writes that were never committed -- but weaker: the content
+    /// addresses on each row are not GC roots, so a row can outlive the bytes it
+    /// names. It records changes; it does not preserve them.
+    #[pyo3(signature = (path, limit=None))]
+    fn edit_ops_at<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let ops = ws.edit_ops_at(&path, limit).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                ops.into_iter()
+                    .map(|o| edit_op_dict(py, o))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// `edit_ops_at`, checked against `read` at the path.
+    #[pyo3(signature = (ctx, path, limit=None))]
+    fn edit_ops_at_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let ops = ws.edit_ops_at_as(c, &path, limit).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                ops.into_iter()
+                    .map(|o| edit_op_dict(py, o))
                     .collect::<PyResult<Vec<_>>>()
             })
         })

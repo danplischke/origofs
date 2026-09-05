@@ -31,6 +31,54 @@ impl Workspace {
         })
     }
 
+    /// The commits that changed one path, newest first, as dicts
+    /// `{commit, author, message, timestamp, status, hash}`.
+    ///
+    /// Resolves the path by descending each commit's tree, so the cost is flat in
+    /// the size of the repository — unlike asking `diff` per commit pair. `limit`
+    /// caps the revisions returned, not the commits walked. Reads no file bodies;
+    /// use `diff_file` against a revision's first parent for the patch.
+    #[pyo3(signature = (path, limit=None))]
+    fn log_path<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let revs = ws.log_path(&path, limit).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                revs.iter()
+                    .map(|r| path_revision_dict(py, r))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// `log_path`, checked against `read` at the path — a file's history says
+    /// when it changed, which describes its content over time. Checked before the
+    /// walk, so a refusal does not reveal whether the path was ever committed.
+    #[pyo3(signature = (ctx, path, limit=None))]
+    fn log_path_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        path: String,
+        limit: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        let c = ctx.inner;
+        future_into_py(py, async move {
+            let revs = ws.log_path_as(c, &path, limit).await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                revs.iter()
+                    .map(|r| path_revision_dict(py, r))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
     /// Working-tree changes relative to HEAD.
     fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let ws = self.inner.clone();

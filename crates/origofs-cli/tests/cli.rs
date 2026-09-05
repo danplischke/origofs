@@ -2322,6 +2322,7 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         ("conflicts", ReadOnly),
         ("locks", ReadOnly),
         ("blame", ReadOnly),
+        ("edits", ReadOnly),
         ("du", ReadOnly),
         ("schema-version", ReadOnly),
         ("watch", ReadOnly),
@@ -2497,6 +2498,8 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
     //    path needs no actor, and saying which it is forces the thought.
     const READS_A_PATH: &[&str] = &[
         "du",
+        "edits",
+        "log",
         "read",
         "ls",
         "stat",
@@ -2507,10 +2510,6 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         "presence",
     ];
     const READS_NO_PATH: &[(&str, &str)] = &[
-        (
-            "log",
-            "commit metadata: hash, author, message, time. `diff` is what turns a commit into paths",
-        ),
         (
             "status",
             "the working tree against HEAD; whoever runs it already holds the workspace directory",

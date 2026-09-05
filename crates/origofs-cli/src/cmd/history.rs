@@ -24,13 +24,41 @@ pub async fn commit(
     Ok(())
 }
 
-pub async fn log(ws: &Workspace) -> Result<()> {
-    for ci in ws.log().await? {
+pub async fn log(
+    ws: &Workspace,
+    path: Option<String>,
+    limit: Option<usize>,
+    actor: Option<i64>,
+) -> Result<()> {
+    // No path: commit metadata, which names no paths and so stays unattributed.
+    let Some(p) = path else {
+        for ci in ws.log().await? {
+            println!(
+                "{} {}  {}",
+                &ci.hash.to_hex()[..12],
+                ci.commit.author,
+                ci.commit.message
+            );
+        }
+        return Ok(());
+    };
+
+    // With a path it reveals one, so it takes `--actor` like every other
+    // READS_A_PATH subcommand.
+    let revs = match read_ctx(actor)? {
+        Some(ctx) => ws.log_path_as(ctx, &p, limit).await?,
+        None => ws.log_path(&p, limit).await?,
+    };
+    if revs.is_empty() {
+        println!("{p}: no committed history");
+    }
+    for r in revs {
         println!(
-            "{} {}  {}",
-            &ci.hash.to_hex()[..12],
-            ci.commit.author,
-            ci.commit.message
+            "{} {} {}  {}",
+            r.status.sigil(),
+            &r.commit.hash.to_hex()[..12],
+            r.commit.commit.author,
+            r.commit.commit.message
         );
     }
 

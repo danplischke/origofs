@@ -124,12 +124,16 @@ _ROUTE_GROUPS: "dict[str, tuple[tuple[Optional[str], str], ...]]" = {
     ),
     # Per-byte attribution. Its own group because it is the read a host is most
     # likely to want without granting the rest of `files`.
-    "blame": (("GET", "/blame/{path:path}"),),
+    "blame": (
+        ("GET", "/blame/{path:path}"),
+        ("GET", "/edits/{path:path}"),
+    ),
     # Commits, branches, checkout, and the views over them. Workspace-wide by
     # nature -- a scoped router already refuses most of these with 403.
     "history": (
         ("POST", "/commit"),
         ("GET", "/log"),
+        ("GET", "/log/{path:path}"),
         ("GET", "/status"),
         ("GET", "/diff"),
         ("GET", "/diff/file"),
@@ -1642,6 +1646,31 @@ def build_router(
             return await _run(ws.blame_as(who, p))
         return await _run(ws.blame(p))
 
+    @router.get("/edits/{path:path}", dependencies=[Depends(_read_gate)])
+    async def edits(
+        path: str,
+        limit: Optional[int] = Query(default=None),
+        root: str = Depends(_root),
+        who: Any = Depends(_read_ctx),
+    ):
+        """The attributed writes recorded against one file, newest first.
+
+        In the ``blame`` group rather than ``history`` because it is the same
+        question that group already answers -- who touched these bytes -- at write
+        granularity instead of line granularity, and a host granting one almost
+        always means to grant the other.
+
+        It records that a change happened. The content addresses on each row are
+        not GC roots, so a row can outlive the bytes it names; this is not a way to
+        read old versions back.
+        """
+        p = _scoped(root, path)
+        if limit is not None:
+            limit = max(0, min(limit, 1000))
+        if who is not None:
+            return await _run(ws.edit_ops_at_as(who, p, limit))
+        return await _run(ws.edit_ops_at(p, limit))
+
     # --- versioning ---------------------------------------------------------
 
     @router.post("/commit")
@@ -1663,10 +1692,31 @@ def build_router(
     @router.get("/log", dependencies=[Depends(_read_gate)])
     async def log(root: str = Depends(_root)):
         # A shared history: every tenant's commit messages and authors are in it,
-        # and there is no per-path view of a commit list to filter down to.
+        # and a commit list carries no path to filter it down by. The per-path
+        # view below is scopable precisely because it names one.
         if root:
             raise _unscopable("the commit log")
         return await _run(ws.log())
+
+    @router.get("/log/{path:path}", dependencies=[Depends(_read_gate)])
+    async def log_path(
+        path: str,
+        limit: Optional[int] = Query(default=None),
+        root: str = Depends(_root),
+        who: Any = Depends(_read_ctx),
+    ):
+        """The commits that changed one path, newest first.
+
+        Unlike ``/log`` this is scoped and read-checked, because it names a path.
+        It reads no file bodies -- pair it with ``/diff/file`` against a
+        revision's first parent for the patch.
+        """
+        p = _scoped(root, path)
+        if limit is not None:
+            limit = max(0, min(limit, 1000))
+        if who is not None:
+            return await _run(ws.log_path_as(who, p, limit))
+        return await _run(ws.log_path(p, limit))
 
     @router.get("/status", dependencies=[Depends(_read_gate)])
     async def status(root: str = Depends(_root)):

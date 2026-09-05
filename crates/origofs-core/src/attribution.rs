@@ -1188,6 +1188,42 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         self.meta.list_edit_ops(actor_id, session_id).await
     }
 
+    /// The edit-op log for one **file**, newest first: every attributed mutation
+    /// recorded against it, with the actor, session, byte range and the content
+    /// addresses either side.
+    ///
+    /// # This is finer than `log_path`, and weaker
+    ///
+    /// [`log_path`](Self::log_path) reports commits; this reports individual
+    /// writes, including ones never committed. But it describes them rather than
+    /// reproducing them: `pre_hash`/`post_hash` are deliberately **not** GC roots
+    /// (see [`crate::gc`]), so a superseded body is exactly what a sweep reclaims.
+    /// After a `gc` the row still says who changed which bytes and when, and the
+    /// content those hashes name may be gone. Do not present it as a way to
+    /// recover an old version.
+    ///
+    /// Unattributed writes — plain [`write`](Self::write), and everything through
+    /// a mount — record no op at all, so this is complete only for a workspace
+    /// whose writes are attributed. `require_attribution` is what makes that true.
+    ///
+    /// # Which key it uses
+    ///
+    /// A live path resolves to its inode and the log is read by inode, so the
+    /// answer follows the file across renames — a rename records the destination
+    /// path against the same inode, so reading by path alone would lose everything
+    /// the file did under an earlier name. When the path resolves to nothing the
+    /// inode is gone and the recorded path is the only handle left, which is the
+    /// case where the row somebody wants is the deletion itself.
+    pub async fn edit_ops_at(&self, path: &str, limit: Option<usize>) -> Result<Vec<EditOp>> {
+        // `resolve` validates the path components, so a malformed path is an error
+        // here rather than a query that quietly matches nothing.
+        match self.resolve(path).await {
+            Ok(ino) => self.meta.list_edit_ops_for_ino(ino, limit).await,
+            Err(OrigoFSError::NotFound(_)) => self.meta.list_edit_ops_for_path(path, limit).await,
+            Err(e) => Err(e),
+        }
+    }
+
     /// [`revert_session`](Self::revert_session), authorized against `ctx`.
     ///
     /// The **target** of a revert is not the caller — reverting is a review action

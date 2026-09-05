@@ -67,7 +67,7 @@ fn upload_concurrency() -> usize {
 ///
 /// Override with `ORIGOFS_FETCH_CONCURRENCY`; set it to 1 to recover the old
 /// strictly-sequential behaviour.
-fn fetch_concurrency() -> usize {
+pub(crate) fn fetch_concurrency() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("ORIGOFS_FETCH_CONCURRENCY")
@@ -552,7 +552,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
 
     /// Split an absolute path into its non-empty segments, rejecting any
     /// traversal component (`.`/`..`) so no path can escape the workspace root.
-    fn split(path: &str) -> Result<Vec<&str>> {
+    pub(crate) fn split(path: &str) -> Result<Vec<&str>> {
         if !path.starts_with('/') {
             return Err(OrigoFSError::InvalidPath(format!(
                 "path must be absolute: {path}"

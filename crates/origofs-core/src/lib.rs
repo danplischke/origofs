@@ -180,3 +180,4 @@ pub use suggest::{
 pub use types::{
     DirEntry, DirEntryAttr, DirPage, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit, Owner,
 };
+pub use version::PathRevision;

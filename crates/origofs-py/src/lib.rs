@@ -271,6 +271,35 @@ fn parse_perms(obj: &Bound<'_, PyAny>) -> PyResult<Perms> {
 
 /// One prefix grant. `path_prefix` is `""` for a grant over the whole workspace —
 /// the root prefix, which every more specific grant outranks.
+/// One revision of a single path: the commit that made it, plus how.
+fn path_revision_dict(py: Python<'_>, r: &origofs_sdk::PathRevision) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("commit", r.commit.hash.to_hex())?;
+    d.set_item("author", &r.commit.commit.author)?;
+    d.set_item("message", &r.commit.commit.message)?;
+    d.set_item("timestamp", r.commit.commit.timestamp)?;
+    d.set_item("status", r.status.sigil().to_string())?;
+    d.set_item("hash", r.hash.map(|h| h.to_hex()))?;
+    Ok(d.into_any().unbind())
+}
+
+/// One `edit_op` row. Shared by the actor-keyed and path-keyed bindings so the
+/// two cannot disagree about the shape of a record the stub declares once.
+fn edit_op_dict(py: Python<'_>, o: origofs_sdk::EditOp) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("id", o.id)?;
+    d.set_item("actor_id", o.actor_id)?;
+    d.set_item("session_id", o.session_id)?;
+    d.set_item("path", o.path)?;
+    d.set_item("op", o.op)?;
+    d.set_item("byte_start", o.byte_start)?;
+    d.set_item("byte_len", o.byte_len)?;
+    d.set_item("pre_hash", o.pre_hash)?;
+    d.set_item("post_hash", o.post_hash)?;
+    d.set_item("ts", o.ts)?;
+    Ok(d.into_any().unbind())
+}
+
 fn acl_grant_dict(py: Python<'_>, g: &AclGrant) -> PyResult<Py<PyAny>> {
     let d = PyDict::new(py);
     d.set_item("actor_id", g.actor_id)?;
