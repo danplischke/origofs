@@ -431,6 +431,11 @@ async fn every_mutating_mcp_tool_is_policy_classified() {
         "origofs_commit",
         "origofs_accept",
         "origofs_reject",
+        // Retiring somebody's draft is a review action over its path (#164), so
+        // it takes the same check rejecting does — an author may always withdraw
+        // their own, and anyone else needs `WRITE` there. Without that, one
+        // propose-only agent could clear another's work out of the queue.
+        "origofs_supersede",
         // A restore writes a file back into the working tree, so it is a
         // mutation like any other and takes the attributed `restore_trash`.
         "origofs_restore",

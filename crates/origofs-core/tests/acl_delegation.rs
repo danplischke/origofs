@@ -156,7 +156,7 @@ async fn alice_can_narrow_her_agent_within_her_subtree() {
     // The agent proposes rather than writing, and cannot escalate.
     let ctx = WriteCtx::actor(agent);
     assert!(matches!(
-        fs.write_or_propose(ctx, "/proj/f.md", b"x", None)
+        fs.write_or_propose(ctx, "/proj/f.md", b"x", None, None)
             .await
             .unwrap(),
         origofs_core::WriteOutcome::Proposed(_)

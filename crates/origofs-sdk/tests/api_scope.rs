@@ -231,7 +231,7 @@ async fn a_neighbours_suggestion_is_not_found_not_forbidden() {
     let ctx = origofs_sdk::WriteCtx::actor(f.actor);
     f.ws.write("/other/doc.txt", b"original").await.unwrap();
     let id =
-        f.ws.suggest(ctx, "/other/doc.txt", b"tampered", Some("nope"))
+        f.ws.suggest(ctx, "/other/doc.txt", b"tampered", Some("nope"), None)
             .await
             .unwrap();
 
@@ -276,7 +276,7 @@ async fn a_suggestion_in_scope_is_still_served() {
     let ctx = origofs_sdk::WriteCtx::actor(f.actor);
     f.ws.write("/tenant-a/doc.txt", b"original").await.unwrap();
     let id =
-        f.ws.suggest(ctx, "/tenant-a/doc.txt", b"better", Some("ok"))
+        f.ws.suggest(ctx, "/tenant-a/doc.txt", b"better", Some("ok"), None)
             .await
             .unwrap();
 
@@ -305,10 +305,10 @@ async fn workspace_wide_listings_are_filtered() {
     f.ws.write_as(ctx, "/tenant-abc/lookalike.txt", b"nope")
         .await
         .unwrap();
-    f.ws.suggest(ctx, "/other/theirs.txt", b"x", None)
+    f.ws.suggest(ctx, "/other/theirs.txt", b"x", None, None)
         .await
         .unwrap();
-    f.ws.suggest(ctx, "/tenant-a/mine.txt", b"y", None)
+    f.ws.suggest(ctx, "/tenant-a/mine.txt", b"y", None, None)
         .await
         .unwrap();
 
@@ -476,5 +476,87 @@ async fn rename_is_scoped_at_both_endpoints() {
     assert_eq!(
         &f.ws.read("/tenant-a/other/escaped.txt").await.unwrap()[..],
         b"data"
+    );
+}
+
+// --- revising a proposal over HTTP (#164) -------------------------------------
+
+/// `POST /suggestions?replaces=` retires the draft it revises, and the standalone
+/// `POST /suggestions/{id}/supersede` retires one with nothing taking its place.
+///
+/// Both go through `suggestion_in_scope`, so a scoped caller cannot reach a
+/// neighbour's queue by id — the same *not found* answer every other id-addressed
+/// suggestion route gives, rather than a `403` that would confirm the id exists.
+#[tokio::test]
+async fn a_proposal_can_be_revised_and_withdrawn_over_http() {
+    let f = fixture().await;
+    let ctx = origofs_sdk::WriteCtx::actor(f.actor);
+    f.ws.write("/tenant-a/doc.txt", b"original").await.unwrap();
+
+    let (status, body) = send(
+        &f.scoped,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/suggestions?path=/doc.txt")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from("v1"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v1 = as_json(&body)["id"].as_i64().unwrap();
+
+    let (status, body) = send(
+        &f.scoped,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/suggestions?path=/doc.txt&replaces={v1}"))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from("v2"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v2 = as_json(&body)["id"].as_i64().unwrap();
+
+    let ws = f.ws.clone();
+    let s = move |id: i64| {
+        let ws = ws.clone();
+        async move { ws.get_suggestion(id).await.unwrap().unwrap().status }
+    };
+    assert_eq!(
+        s(v1).await,
+        origofs_sdk::SuggestionStatus::Superseded,
+        "the revised draft must not still be waiting to be accepted"
+    );
+
+    let (status, _) = send(
+        &f.scoped,
+        post(&format!("/suggestions/{v2}/supersede"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(s(v2).await, origofs_sdk::SuggestionStatus::Superseded);
+    assert_eq!(
+        &f.ws.read("/tenant-a/doc.txt").await.unwrap()[..],
+        b"original"
+    );
+
+    // A neighbour's proposal is out of scope by id, exactly as accept/reject are.
+    f.ws.write("/other/doc.txt", b"original").await.unwrap();
+    let theirs =
+        f.ws.suggest(ctx, "/other/doc.txt", b"nope", None, None)
+            .await
+            .unwrap();
+    let (status, _) = send(
+        &f.scoped,
+        post(&format!("/suggestions/{theirs}/supersede"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        s(theirs).await,
+        origofs_sdk::SuggestionStatus::Pending,
+        "a scoped caller retired a proposal in a tree it cannot address"
     );
 }

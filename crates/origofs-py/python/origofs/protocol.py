@@ -85,17 +85,31 @@ class WorkspaceProtocol(Protocol):
     # same discipline the MCP and CLI classification tests enforce.
     async def write_as(self, ctx: "WriteCtx", path: str, data: bytes) -> None: ...
     async def write_or_propose(
-        self, ctx: "WriteCtx", path: str, data: bytes, note: Optional[str] = None
+        self,
+        ctx: "WriteCtx",
+        path: str,
+        data: bytes,
+        note: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> Any: ...
     async def remove_or_propose(
-        self, ctx: "WriteCtx", path: str, note: Optional[str] = None
+        self,
+        ctx: "WriteCtx",
+        path: str,
+        note: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> Any: ...
     async def rename_as(self, ctx: "WriteCtx", from_: str, to: str) -> None: ...
     async def mkdir_as(self, ctx: "WriteCtx", path: str) -> None: ...
 
     # --- the review queue ------------------------------------------------
     async def suggest(
-        self, ctx: "WriteCtx", path: str, data: bytes, note: Optional[str] = None
+        self,
+        ctx: "WriteCtx",
+        path: str,
+        data: bytes,
+        note: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> int: ...
     async def list_suggestions(
         self, status: Optional[str] = None, path: Optional[str] = None
@@ -107,6 +121,9 @@ class WorkspaceProtocol(Protocol):
         self, id: int, approver: "WriteCtx"
     ) -> Optional[str]: ...
     async def reject_suggestion(self, id: int, approver: "WriteCtx") -> None: ...
+    async def supersede_suggestion(
+        self, id: int, ctx: "WriteCtx", reason: Optional[str] = None
+    ) -> None: ...
 
     # --- identity --------------------------------------------------------
     async def create_human(

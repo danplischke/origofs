@@ -539,6 +539,7 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
         .route("/suggestions/{id}/diff", get(suggestion_diff))
         .route("/suggestions/{id}/accept", post(accept_suggestion))
         .route("/suggestions/{id}/reject", post(reject_suggestion))
+        .route("/suggestions/{id}/supersede", post(supersede_suggestion))
         .route("/actors", post(create_actor))
         .route("/trash", get(list_trash))
         .route("/trash/{id}/restore", post(restore_trash))
@@ -1243,7 +1244,7 @@ async fn write_file(
     // queued for review rather than landing directly. Missing parents are created
     // by the engine *after* that decision, so a queued suggestion leaves the
     // working tree untouched.
-    match ws.write_or_propose(ctx, &p, &body, None).await? {
+    match ws.write_or_propose(ctx, &p, &body, None, None).await? {
         WriteOutcome::Wrote => {
             origofs_core::metrics::record_write(body.len() as u64);
             Ok(Json(json!({ "path": p, "written": body.len() })))
@@ -1263,7 +1264,7 @@ async fn delete_file(
     // permission to overwrite (issue #78).
     let summary = format!("delete {p}");
     match ws
-        .remove_or_propose(principal.write_ctx(), &p, Some(&summary))
+        .remove_or_propose(principal.write_ctx(), &p, Some(&summary), None)
         .await?
     {
         WriteOutcome::Wrote => Ok(Json(json!({ "removed": p }))),
@@ -1577,11 +1578,18 @@ struct CreateSuggestQuery {
     summary: Option<String>,
     #[serde(default)]
     delete: bool,
+    /// A pending draft of this actor's to retire as this one is created (#164).
+    replaces: Option<i64>,
 }
 
-/// `POST /suggestions?path=&summary=` with the proposed bytes as the body (or
-/// `&delete=true` and an empty body to propose a deletion). The proposing actor
-/// is the authenticated principal, never a request field.
+/// `POST /suggestions?path=&summary=&replaces=` with the proposed bytes as the
+/// body (or `&delete=true` and an empty body to propose a deletion). The proposing
+/// actor is the authenticated principal, never a request field.
+///
+/// `replaces` is how a client **revises** a proposal instead of stacking a sibling
+/// beside it: without it, rejecting the revision leaves the abandoned earlier draft
+/// pending with a current base, so it accepts cleanly and lands text the author
+/// replaced and the reviewer never chose (#164).
 async fn create_suggestion(
     State(ws): State<Shared>,
     State(scope): State<Scope>,
@@ -1592,9 +1600,11 @@ async fn create_suggestion(
     let ctx = principal.write_ctx();
     let path = scope_path(&scope, &q.path)?;
     let id = if q.delete {
-        ws.suggest_delete(ctx, &path, q.summary.as_deref()).await?
+        ws.suggest_delete(ctx, &path, q.summary.as_deref(), q.replaces)
+            .await?
     } else {
-        ws.suggest(ctx, &path, &body, q.summary.as_deref()).await?
+        ws.suggest(ctx, &path, &body, q.summary.as_deref(), q.replaces)
+            .await?
     };
     Ok(Json(json!({ "id": id })))
 }
@@ -1699,6 +1709,31 @@ async fn reject_suggestion(
     suggestion_in_scope(&ws, &scope, id).await?;
     ws.reject_suggestion(id, principal.write_ctx()).await?;
     Ok(Json(json!({ "rejected": id })))
+}
+
+#[derive(Deserialize, Default)]
+struct SupersedeQuery {
+    reason: Option<String>,
+}
+
+/// `POST /suggestions/{id}/supersede?reason=` — retire a pending proposal its
+/// author has abandoned, without applying or rejecting it (#164).
+///
+/// Distinct from `reject`, which says a reviewer looked and declined. The author
+/// may always retire their own; anyone else needs `WRITE` at its path, exactly as
+/// rejecting somebody else's proposal does. Prefer `replaces` on
+/// `POST /suggestions` when the replacement is being proposed in the same breath.
+async fn supersede_suggestion(
+    State(ws): State<Shared>,
+    State(scope): State<Scope>,
+    Auth(principal): Auth,
+    Path(id): Path<i64>,
+    Query(q): Query<SupersedeQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    suggestion_in_scope(&ws, &scope, id).await?;
+    ws.supersede_suggestion(id, principal.write_ctx(), q.reason.as_deref())
+        .await?;
+    Ok(Json(json!({ "superseded": id })))
 }
 
 #[derive(Serialize)]

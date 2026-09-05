@@ -164,6 +164,35 @@ write path enforces this and you must not weaken it:
   only on `accept`, and `accept` lands the edit **attributed to the original
   author** while recording the approver (and refuses a stale base). Reviewer must
   differ from author.
+  - **A revision is not a second proposal (#164).** `write_or_propose` had no
+    update-in-place, so an actor told "revise your proposal" could only propose
+    again — stacking a *sibling* on the same base. Accept handled that correctly by
+    accident (landing either moves the file, so the other goes stale); **reject did
+    not**, leaving the abandoned draft `pending` with a base that still matched the
+    file, so it accepted cleanly and landed text the author had replaced and the
+    reviewer never chose. `replaces: Option<i64>` on `suggest`/`suggest_delete`/
+    `write_or_propose`/`remove_or_propose` retires that draft as the new one is
+    created; `supersede_suggestion` is the standalone form.
+  - **Opt-in, not a default.** Two drafts a reviewer chooses between is a real
+    workflow and origofs cannot tell it from a revision, so retiring the earlier
+    one automatically would silently discard the alternative — the same class of
+    unasked-for outcome as #158, in the other direction.
+  - **"Stale" is not "obsolete".** `supersede_stale_byte_suggestions` retires
+    proposals whose *base moved on*, and an author revising a draft has changed no
+    bytes, so it returns `0` for siblings. That is a different relation, not a gap
+    in it — which is why #164 needed a new operation rather than a fix there.
+  - **Retiring is ordered before creating**, so the guarantee is the one a caller
+    relies on: if the propose returns `Ok`, `replaces` is superseded. The opposite
+    order leaves both pending when the second half fails, which is the bug. The
+    cost is the reverse window (retired, no replacement), and that one is
+    survivable — the row and its bytes are still there. The propose check runs
+    first so a refusal cannot retire a draft for nothing.
+  - **Disposing of a draft is authorized like rejecting one**: the author may
+    always retire their own, anyone else needs `WRITE` at its path — otherwise one
+    propose-only agent clears another's work out of the queue. The **CRDT** propose
+    calls deliberately carry no `replaces`: a CRDT proposal never goes stale and
+    applying an earlier state after a later one merges a subset, so the reject
+    resurrection does not bite there. `supersede_suggestion` covers them.
 - **The write policy and the ACLs are enforced in the engine, not per surface.**
   Every *attributed* mutation on `Fs` — `write_or_propose`, `remove_or_propose`,
   `rename_as`, `mkdir_as`, `symlink_as`, `commit_as`, `checkout_as`,

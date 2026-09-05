@@ -169,6 +169,7 @@ async fn postgres_backend() {
             "/a/attr.txt",
             b"one\ntwo\nthree\n",
             Some("append a line"),
+            None,
         )
         .await
         .unwrap();

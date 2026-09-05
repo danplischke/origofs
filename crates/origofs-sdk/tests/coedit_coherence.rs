@@ -145,7 +145,7 @@ async fn a_removed_file_is_not_resurrected_by_a_stale_room() {
     let doc = w.open_coedit(ctx, "/n.md").await.unwrap();
     w.checkpoint_coedit(ctx, "/n.md", &doc).await.unwrap();
 
-    w.remove_or_propose(ctx, "/n.md", None).await.unwrap();
+    w.remove_or_propose(ctx, "/n.md", None, None).await.unwrap();
     doc.insert(ctx, 0, "typed\n");
     let r = w.checkpoint_coedit(ctx, "/n.md", &doc).await;
     assert!(matches!(r, Err(OrigoFSError::ForeignWrite(_))), "{r:?}");

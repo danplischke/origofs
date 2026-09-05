@@ -1058,8 +1058,16 @@ class Workspace:
     async def read_to_path(self, path: str, dest_path: str) -> int: ...
     # Governed by the actor's write policy: a direct actor writes; a propose-only
     # actor's edit is queued as a suggestion (`WriteOutcome.suggestion_id`).
+    # `replaces` retires a pending draft of this actor's on the same path as the
+    # new proposal is created — the way to *revise* rather than stack (#164).
+    # Ignored on the direct-write branch, since nothing is queued there.
     async def write_or_propose(
-        self, ctx: WriteCtx, path: str, data: bytes, summary: Optional[str] = None
+        self,
+        ctx: WriteCtx,
+        path: str,
+        data: bytes,
+        summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> WriteOutcome: ...
     async def set_write_policy(self, actor_id: int, policy: str) -> None: ...
     async def mkdir_p(self, path: str) -> None: ...
@@ -1271,8 +1279,29 @@ class Workspace:
     # Each suggestion dict carries a `kind`: `"bytes"` (a whole file body, whose
     # `base_hash` gates the accept) or `"crdt"` (a Yjs update, which merges). A
     # stale byte proposal is retired as `"superseded"` rather than left pending.
-    async def suggest(self, ctx: WriteCtx, path: str, data: bytes, summary: Optional[str] = None) -> int: ...
-    async def suggest_delete(self, ctx: WriteCtx, path: str, summary: Optional[str] = None) -> int: ...
+    # `replaces` names a *pending* proposal of your own **on this path** to retire
+    # as this one is created — how you revise a proposal (#164). Without it a
+    # revision is a sibling: two pending drafts on one base, which origofs resolves
+    # correctly on accept and incorrectly on reject, where the abandoned earlier
+    # draft stays pending with a current base and still accepts cleanly. Opt-in,
+    # because two drafts a reviewer chooses between is a real workflow origofs
+    # cannot tell apart from a revision. Find your prior id with
+    # `list_suggestions("pending", path)`.
+    async def suggest(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        data: bytes,
+        summary: Optional[str] = None,
+        replaces: Optional[int] = None,
+    ) -> int: ...
+    async def suggest_delete(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        summary: Optional[str] = None,
+        replaces: Optional[int] = None,
+    ) -> int: ...
     async def list_suggestions(self, status: Optional[str] = None, path: Optional[str] = None) -> list[SuggestionRecord]: ...
     async def get_suggestion(self, id: int) -> Optional[SuggestionRecord]: ...
     async def suggestion_diff(self, id: int) -> str: ...
@@ -1288,6 +1317,14 @@ class Workspace:
     # moved, which also marks the row `superseded`.
     async def accept_suggestion(self, id: int, approver: WriteCtx) -> Optional[str]: ...
     async def reject_suggestion(self, id: int, approver: WriteCtx) -> None: ...
+    # Withdraw a pending draft its author abandoned, without applying or rejecting
+    # it (#164) — the standalone form of `suggest(..., replaces=)`, and the way to
+    # revise a *CRDT* proposal, whose propose calls carry no `replaces`. Distinct
+    # from `reject_suggestion`, which records that a reviewer declined. The author
+    # may always retire their own; anyone else needs WRITE at its path.
+    async def supersede_suggestion(
+        self, id: int, ctx: WriteCtx, reason: Optional[str] = None
+    ) -> None: ...
 
     # --- mounting / serving (Unix only) ---
     # FUSE/NFS are Unix-only (`#[cfg(unix)]` in lib.rs); off Unix both always
@@ -1308,7 +1345,11 @@ class Workspace:
     # `create_branch` above are exempt by construction and record no blame — use
     # them only where there is genuinely no actor.
     async def remove_or_propose(
-        self, ctx: WriteCtx, path: str, summary: Optional[str] = None
+        self,
+        ctx: WriteCtx,
+        path: str,
+        summary: Optional[str] = None,
+        replaces: Optional[int] = None,
     ) -> WriteOutcome: ...
     async def rename_as(self, ctx: WriteCtx, from_: str, to: str) -> None: ...
     async def mkdir_as(self, ctx: WriteCtx, path: str) -> None: ...
@@ -1360,6 +1401,11 @@ class Workspace:
     # actors, and uncommitted edits live only there. This is the thing to back up.
     async def backup_metadata(self, dest: str) -> str: ...
     async def reap_presence(self, grace_secs: int) -> int: ...
+    # "Stale" means the *base moved on*, and only that (#164) -- not "everything
+    # obsolete". Two pending proposals from one actor on one unchanged base are
+    # siblings, both current by this measure, so this returns 0 for them. Retiring
+    # a draft its own author abandoned is `supersede_suggestion`, or `replaces` on
+    # `suggest`.
     async def supersede_stale_suggestions(self, path: str) -> int: ...
     # {ready, metadata, content} — each store None when healthy. Mirrors /readyz.
     async def ready(self) -> ReadyReport: ...
