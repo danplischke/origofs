@@ -920,7 +920,7 @@ async fn origofs_rm_rf(ws: &Workspace, path: &str, ctx: Option<WriteCtx>) -> Res
 async fn remove_attributed(ws: &Workspace, path: &str, ctx: Option<WriteCtx>) -> Result<()> {
     match ctx {
         Some(ctx) => {
-            ws.remove_or_propose(ctx, path, Some("removed in sandbox"))
+            ws.remove_or_propose(ctx, path, Some("removed in sandbox"), None)
                 .await?;
         }
         None => ws.remove(path).await?,

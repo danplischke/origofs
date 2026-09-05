@@ -326,7 +326,7 @@ async fn the_two_conflicts_are_distinguishable_without_reading_the_message() {
 
     w.write_as(human, "/n.md", b"base\n").await.unwrap();
     let id = w
-        .suggest(author, "/n.md", b"proposed\n", None)
+        .suggest(author, "/n.md", b"proposed\n", None, None)
         .await
         .unwrap();
     w.write_as(human, "/n.md", b"moved on\n").await.unwrap();

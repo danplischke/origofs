@@ -225,6 +225,33 @@ honest) and records the approver; it refuses if the file moved since the proposa
 pending forever. A *successful* accept does the same to the other pending
 proposals on that path whose base it just moved. `reject` discards it.
 
+#### Revising a proposal
+
+A second proposal on the same path is a **sibling**, not a replacement — so an
+author revising a draft has to say so, or the abandoned one stays in the queue and
+can still be accepted:
+
+```bash
+echo "v2" | origofs --workspace "$WS" suggest /main.rs --actor "$AGENT" --replaces 1
+origofs --workspace "$WS" supersede 1 --actor "$AGENT"    # withdraw, with no replacement
+```
+
+`--replaces` (`replaces=` in the SDK/Python/HTTP, `origofs_suggest`'s `replaces`
+over MCP) retires that draft as the new one is created. Without it, rejecting the
+revision leaves the earlier draft `pending` on a base that still matches the file
+— so it accepts cleanly and lands text the author replaced and the reviewer never
+chose. It is opt-in rather than automatic because two drafts a reviewer is meant
+to choose between is a real workflow, and origofs cannot tell it from a revision.
+
+`supersede` is the standalone form, for retiring a draft with nothing taking its
+place — and for revising a `crdt` proposal, whose propose calls carry no
+`replaces`. It is distinct from `reject`, which records that a *reviewer* looked
+and declined; an author may always withdraw their own, while retiring somebody
+else's needs `WRITE` at its path, exactly as rejecting it does. Note that
+`supersede-stale-suggestions` is a different thing again: it retires proposals
+whose **base moved on**, and returns nothing at all for siblings on an unchanged
+base.
+
 A proposal comes in two **kinds**, because "stale" means different things:
 
 | kind | base | proposal | accepting it |
@@ -836,6 +863,7 @@ await ws.write_as(ctx, "/notes.txt", b"hello")   # attributed → blame + audit
 await ws.blame("/notes.txt")   # [{"byte_start","byte_end","line_start","actor",…}, …]
 
 sid = await ws.suggest(ctx, "/main.rs", b"patched", "fix bug")   # proposed, not applied
+sid = await ws.suggest(ctx, "/main.rs", b"better", "fix bug", replaces=sid)  # revised
 await ws.accept_suggestion(sid, origofs.WriteCtx.actor(reviewer))
 ```
 

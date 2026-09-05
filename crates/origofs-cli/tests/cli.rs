@@ -2207,6 +2207,7 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         ("suggest", Attributed),
         ("accept", Attributed),
         ("reject", Attributed),
+        ("supersede", Attributed),
         ("sandbox", Attributed),
         ("overlay", Attributed),
         // --- mutations with no requesting actor ----------------------------

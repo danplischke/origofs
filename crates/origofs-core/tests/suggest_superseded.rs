@@ -60,7 +60,7 @@ async fn stale_accept_supersedes<M: MetadataStore>(fs: Fs<M, Arc<MemStore>>) {
 
     fs.write_as(r, "/notes.md", b"one\n").await.unwrap();
     let id = fs
-        .suggest(a, "/notes.md", b"one\ntwo\n", Some("add a line"))
+        .suggest(a, "/notes.md", b"one\ntwo\n", Some("add a line"), None)
         .await
         .unwrap();
     assert_eq!(
@@ -150,11 +150,20 @@ async fn accepting_one_supersedes_the_others_on_that_path() {
     );
 
     fs.write_as(c, "/doc.md", b"base\n").await.unwrap();
-    let first = fs.suggest(a, "/doc.md", b"alice\n", None).await.unwrap();
-    let second = fs.suggest(b, "/doc.md", b"bob\n", None).await.unwrap();
+    let first = fs
+        .suggest(a, "/doc.md", b"alice\n", None, None)
+        .await
+        .unwrap();
+    let second = fs
+        .suggest(b, "/doc.md", b"bob\n", None, None)
+        .await
+        .unwrap();
     // A proposal on another path is none of this path's business.
     fs.write_as(c, "/other.md", b"x\n").await.unwrap();
-    let elsewhere = fs.suggest(a, "/other.md", b"y\n", None).await.unwrap();
+    let elsewhere = fs
+        .suggest(a, "/other.md", b"y\n", None, None)
+        .await
+        .unwrap();
 
     fs.accept_suggestion(first, c).await.unwrap();
 
@@ -195,8 +204,8 @@ async fn a_still_current_proposal_survives() {
 
     fs.write_as(b, "/a.md", b"one\n").await.unwrap();
     fs.write_as(b, "/b.md", b"one\n").await.unwrap();
-    let keep = fs.suggest(a, "/b.md", b"two\n", None).await.unwrap();
-    let apply = fs.suggest(a, "/a.md", b"two\n", None).await.unwrap();
+    let keep = fs.suggest(a, "/b.md", b"two\n", None, None).await.unwrap();
+    let apply = fs.suggest(a, "/a.md", b"two\n", None, None).await.unwrap();
 
     fs.accept_suggestion(apply, b).await.unwrap();
     assert_eq!(

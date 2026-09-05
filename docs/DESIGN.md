@@ -799,6 +799,15 @@ each write is, and a storage engine that agents point at untrusted code and untr
   `Superseded` instead of lingering pending forever, as are the other pending byte proposals a successful accept
   strands; a `crdt` suggestion merges and so is never stale, §6); ref-mirror generations advance with an
   atomic `bump_counter` instead of a read-modify-write.
+- **A revision is not a second proposal (#164).** There was no update-in-place, so revising meant proposing again
+  — a *sibling* on the same base. `accept` handled that by accident: landing either moves the file, which stales
+  the other. `reject` did not, and that is the one the workflow actually hits — the reviewer declines the
+  revision and the abandoned draft is still `pending`, still on a base matching the file, and still accepts
+  cleanly. `replaces` on the propose calls retires the named draft as the new one is created, and
+  `supersede_suggestion` is the standalone form. It is opt-in because two drafts a reviewer is meant to choose
+  between is a real workflow that origofs cannot distinguish from a revision, and retiring one automatically
+  would discard an alternative nobody asked it to. The retirement is ordered **before** the create, so a caller
+  can rely on "if this returned, the old one is gone"; the reverse window costs nothing recoverable.
 - **Encryption key & nonce discipline:** convergent encryption keeps dedup (identical plaintext → identical
   ciphertext, which the shared content address already revealed — a documented, accepted trade-off), but the AEAD
   fails closed everywhere else: `put_keyed` refuses any non-content-addressed key, so a mutable-value keyed store

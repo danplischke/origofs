@@ -147,6 +147,7 @@ _ROUTE_GROUPS: "dict[str, tuple[tuple[Optional[str], str], ...]]" = {
         ("GET", "/suggestions/{sid}/diff"),
         ("POST", "/suggestions/{sid}/accept"),
         ("POST", "/suggestions/{sid}/reject"),
+        ("POST", "/suggestions/{sid}/supersede"),
         ("POST", "/coedit-tree-suggest/{path:path}"),
         ("GET", "/coedit-tree-suggestions/{sid}/update"),
         ("POST", "/coedit-tree-suggestions/{sid}/accept"),
@@ -1751,13 +1752,23 @@ def build_router(
         body: bytes = Body(default=b""),
         summary: Optional[str] = Query(default=None),
         delete: bool = Query(default=False),
+        replaces: Optional[int] = Query(default=None),
         ctx: Any = Depends(authn),
         root: str = Depends(_root),
     ):
+        """Propose an edit (or, with `delete=true`, a deletion) for review.
+
+        `replaces` names a pending proposal of this actor's **on this path** to
+        retire as the new one is created -- how a client *revises* a proposal
+        rather than stacking a sibling beside it (#164). Without it, rejecting the
+        revision leaves the abandoned earlier draft pending with a current base, so
+        it accepts cleanly and lands text the author replaced and the reviewer
+        never chose. Find the prior id with `GET /suggestions?status=pending&path=`.
+        """
         p = _scoped(root, path)
         if delete:
-            return {"id": await _run(ws.suggest_delete(ctx, p, summary))}
-        return {"id": await _run(ws.suggest(ctx, p, body, summary))}
+            return {"id": await _run(ws.suggest_delete(ctx, p, summary, replaces))}
+        return {"id": await _run(ws.suggest(ctx, p, body, summary, replaces))}
 
     @router.get("/suggestions", dependencies=[Depends(_read_gate)])
     async def list_suggestions(
@@ -1813,6 +1824,25 @@ def build_router(
         await _in_scope_suggestion(sid, root)
         await _run(ws.reject_suggestion(sid, ctx))
         return {"rejected": sid}
+
+    @router.post("/suggestions/{sid}/supersede")
+    async def supersede(
+        sid: int,
+        reason: Optional[str] = Query(default=None),
+        ctx: Any = Depends(authn),
+        root: str = Depends(_root),
+    ):
+        """Withdraw a pending proposal its author has abandoned (#164).
+
+        Distinct from `reject`, which records that a reviewer looked and declined.
+        The author may always retire their own; anyone else needs `WRITE` at its
+        path, exactly as rejecting somebody else's proposal does. Prefer
+        `replaces` on `POST /suggestions` when the replacement is being proposed in
+        the same breath -- then the two cannot come apart.
+        """
+        await _in_scope_suggestion(sid, root)
+        await _run(ws.supersede_suggestion(sid, ctx, reason))
+        return {"superseded": sid}
 
     @router.post("/revert-session")
     async def revert_session(

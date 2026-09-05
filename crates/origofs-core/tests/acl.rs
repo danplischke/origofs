@@ -59,7 +59,7 @@ async fn an_actor_with_no_grant_falls_back_to_its_write_policy() {
         .unwrap();
     // The gated front door queues it rather than writing, exactly as before.
     assert!(matches!(
-        fs.write_or_propose(ctx, "/other.txt", b"x", None)
+        fs.write_or_propose(ctx, "/other.txt", b"x", None, None)
             .await
             .unwrap(),
         WriteOutcome::Proposed(_)
@@ -91,7 +91,7 @@ async fn a_grant_makes_write_possible_only_where_it_covers() {
     fs.grant(agent, "/docs", Perms::WRITE, None).await.unwrap();
 
     assert!(matches!(
-        fs.write_or_propose(ctx, "/docs/note.md", b"allowed", None)
+        fs.write_or_propose(ctx, "/docs/note.md", b"allowed", None, None)
             .await
             .unwrap(),
         WriteOutcome::Wrote
@@ -100,7 +100,7 @@ async fn a_grant_makes_write_possible_only_where_it_covers() {
 
     assert!(
         matches!(
-            fs.write_or_propose(ctx, "/src/main.rs", b"nope", None)
+            fs.write_or_propose(ctx, "/src/main.rs", b"nope", None, None)
                 .await
                 .unwrap(),
             WriteOutcome::Proposed(_)
@@ -126,7 +126,7 @@ async fn the_longest_matching_prefix_decides() {
     fs.mkdir_as(ctx, "/ordinary").await.unwrap();
     assert!(
         matches!(
-            fs.write_or_propose(ctx, "/secrets/key.txt", b"x", None)
+            fs.write_or_propose(ctx, "/secrets/key.txt", b"x", None, None)
                 .await,
             Err(OrigoFSError::Denied(_))
         ),
@@ -138,7 +138,7 @@ async fn the_longest_matching_prefix_decides() {
         .await
         .unwrap();
     assert!(matches!(
-        fs.write_or_propose(ctx, "/secrets/public/ok.txt", b"x", None)
+        fs.write_or_propose(ctx, "/secrets/public/ok.txt", b"x", None, None)
             .await
             .unwrap(),
         WriteOutcome::Wrote
@@ -160,14 +160,14 @@ async fn a_grant_does_not_cover_a_lookalike_sibling() {
         .unwrap();
 
     assert!(matches!(
-        fs.write_or_propose(ctx, "/tenant-a/f.txt", b"mine", None)
+        fs.write_or_propose(ctx, "/tenant-a/f.txt", b"mine", None, None)
             .await
             .unwrap(),
         WriteOutcome::Wrote
     ));
     assert!(
         matches!(
-            fs.write_or_propose(ctx, "/tenant-abc/f.txt", b"theirs", None)
+            fs.write_or_propose(ctx, "/tenant-abc/f.txt", b"theirs", None, None)
                 .await
                 .unwrap(),
             WriteOutcome::Proposed(_)
@@ -251,7 +251,7 @@ async fn every_attributed_mutation_is_gated() {
     fs.grant(agent, "/", Perms::NONE, None).await.unwrap();
 
     assert!(matches!(
-        fs.write_or_propose(ctx, "/f.txt", b"y", None).await,
+        fs.write_or_propose(ctx, "/f.txt", b"y", None, None).await,
         Err(OrigoFSError::Denied(_))
     ));
     assert!(matches!(
@@ -294,14 +294,16 @@ async fn removal_and_writing_agree_about_a_path() {
 
     // Where it may write, it may delete.
     assert!(matches!(
-        fs.remove_or_propose(ctx, "/docs/f.txt", None)
+        fs.remove_or_propose(ctx, "/docs/f.txt", None, None)
             .await
             .unwrap(),
         WriteOutcome::Wrote
     ));
     // Where it may only propose, a delete is queued rather than performed.
     assert!(matches!(
-        fs.remove_or_propose(ctx, "/src/f.txt", None).await.unwrap(),
+        fs.remove_or_propose(ctx, "/src/f.txt", None, None)
+            .await
+            .unwrap(),
         WriteOutcome::Proposed(_)
     ));
     assert!(
@@ -319,11 +321,11 @@ async fn a_grant_of_no_permissions_refuses_rather_than_queueing() {
     fs.grant(agent, "/", Perms::NONE, None).await.unwrap();
 
     assert!(matches!(
-        fs.write_or_propose(ctx, "/f.txt", b"x", None).await,
+        fs.write_or_propose(ctx, "/f.txt", b"x", None, None).await,
         Err(OrigoFSError::Denied(_))
     ));
     assert!(matches!(
-        fs.remove_or_propose(ctx, "/f.txt", None).await,
+        fs.remove_or_propose(ctx, "/f.txt", None, None).await,
         Err(OrigoFSError::Denied(_))
     ));
 }
@@ -361,7 +363,7 @@ async fn deny_by_default_is_opt_in() {
     fs.set_acl_default_deny(true).await.unwrap();
     assert!(
         matches!(
-            fs.write_or_propose(ctx, "/g.txt", b"x", None).await,
+            fs.write_or_propose(ctx, "/g.txt", b"x", None, None).await,
             Err(OrigoFSError::Denied(_))
         ),
         "with deny-by-default on, an ungranted actor must be refused outright — \
@@ -373,13 +375,13 @@ async fn deny_by_default_is_opt_in() {
         .await
         .unwrap();
     assert!(matches!(
-        fs.write_or_propose(ctx, "/allowed/f.txt", b"x", None)
+        fs.write_or_propose(ctx, "/allowed/f.txt", b"x", None, None)
             .await
             .unwrap(),
         WriteOutcome::Wrote
     ));
     assert!(
-        fs.write_or_propose(ctx, "/elsewhere.txt", b"x", None)
+        fs.write_or_propose(ctx, "/elsewhere.txt", b"x", None, None)
             .await
             .is_err()
     );
@@ -440,7 +442,7 @@ async fn grants_do_not_leak_between_actors() {
 
     assert!(
         matches!(
-            fs.write_or_propose(WriteCtx::actor(bob), "/shared/f.txt", b"x", None)
+            fs.write_or_propose(WriteCtx::actor(bob), "/shared/f.txt", b"x", None, None)
                 .await
                 .unwrap(),
             WriteOutcome::Proposed(_)
@@ -528,7 +530,7 @@ async fn require_attribution_does_not_second_guess_the_write_policy() {
     // An attributed op by a `Direct` actor proceeds untouched.
     let ctx = WriteCtx::actor(agent);
     fs.mkdir_as(ctx, "/d").await.unwrap();
-    fs.write_or_propose(ctx, "/d/f.txt", b"x", None)
+    fs.write_or_propose(ctx, "/d/f.txt", b"x", None, None)
         .await
         .unwrap();
 
@@ -539,7 +541,7 @@ async fn require_attribution_does_not_second_guess_the_write_policy() {
         .unwrap();
     assert!(
         matches!(
-            fs.write_or_propose(ctx, "/d/f.txt", b"y", None).await,
+            fs.write_or_propose(ctx, "/d/f.txt", b"y", None, None).await,
             Ok(origofs_core::WriteOutcome::Proposed(_))
         ),
         "require_attribution must not turn a queued write into a refusal"
@@ -594,7 +596,7 @@ async fn workspace_wide_ops_need_permission_at_the_root() {
 
     // The write the grant *does* cover still works, so this is about scope and not
     // about the actor being broken.
-    fs.write_or_propose(ctx, "/tenant-a/f.txt", b"edit\n", None)
+    fs.write_or_propose(ctx, "/tenant-a/f.txt", b"edit\n", None, None)
         .await
         .unwrap();
 
@@ -733,7 +735,7 @@ async fn reviewing_is_checked_at_the_suggestions_path() {
         .unwrap();
 
     let in_scope = match fs
-        .write_or_propose(author_ctx, "/tenant-a/x.txt", b"a", None)
+        .write_or_propose(author_ctx, "/tenant-a/x.txt", b"a", None, None)
         .await
         .unwrap()
     {
@@ -741,7 +743,7 @@ async fn reviewing_is_checked_at_the_suggestions_path() {
         other => panic!("expected a proposal, got {other:?}"),
     };
     let out_of_scope = match fs
-        .write_or_propose(author_ctx, "/tenant-b/y.txt", b"b", None)
+        .write_or_propose(author_ctx, "/tenant-b/y.txt", b"b", None, None)
         .await
         .unwrap()
     {

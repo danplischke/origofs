@@ -102,7 +102,7 @@ async fn a_propose_only_removal_is_queued_not_refused() {
 
     // The agent asks for a deletion: queued, and the file is untouched.
     let outcome = fs
-        .remove_or_propose(agent, "/doomed.txt", Some("obsolete"))
+        .remove_or_propose(agent, "/doomed.txt", Some("obsolete"), None)
         .await
         .unwrap();
     let id = match outcome {
@@ -132,7 +132,10 @@ async fn a_direct_actors_removal_goes_straight_through() {
     let (_agent, human) = actors(&fs).await;
     fs.write("/x.txt", b"bye").await.unwrap();
 
-    let outcome = fs.remove_or_propose(human, "/x.txt", None).await.unwrap();
+    let outcome = fs
+        .remove_or_propose(human, "/x.txt", None, None)
+        .await
+        .unwrap();
     assert!(matches!(outcome, WriteOutcome::Wrote));
     assert!(fs.stat("/x.txt").await.is_err());
 }
@@ -151,7 +154,7 @@ async fn a_propose_only_actor_cannot_approve_anything() {
 
     fs.write("/shared.txt", b"base").await.unwrap();
     let id = fs
-        .suggest(agent, "/shared.txt", b"rewritten", None)
+        .suggest(agent, "/shared.txt", b"rewritten", None, None)
         .await
         .unwrap();
 
@@ -216,7 +219,10 @@ async fn internal_machinery_stays_exempt() {
     // And the accept path still lands a propose-only actor's *content* edit,
     // which internally writes as that very actor.
     fs.write("/g.txt", b"before").await.unwrap();
-    let id = fs.suggest(agent, "/g.txt", b"after", None).await.unwrap();
+    let id = fs
+        .suggest(agent, "/g.txt", b"after", None, None)
+        .await
+        .unwrap();
     fs.accept_suggestion(id, human).await.unwrap();
     assert_eq!(&fs.read("/g.txt").await.unwrap()[..], b"after");
 }

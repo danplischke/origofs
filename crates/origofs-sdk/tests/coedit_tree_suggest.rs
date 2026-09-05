@@ -324,7 +324,7 @@ async fn the_two_kinds_do_not_accept_through_each_others_calls() {
         .await
         .unwrap();
     let id =
-        f.ws.suggest(actx, "/flat.md", b"proposed flat\n", None)
+        f.ws.suggest(actx, "/flat.md", b"proposed flat\n", None, None)
             .await
             .unwrap();
 

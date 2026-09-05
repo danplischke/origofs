@@ -33,6 +33,7 @@ async fn suggest_does_not_touch_the_working_tree_until_accepted() {
             "/notes.txt",
             b"line one\nline TWO\n",
             Some("fix caps"),
+            None,
         )
         .await
         .unwrap();
@@ -90,7 +91,7 @@ async fn reject_discards_without_applying() {
     ws.write("/a.txt", b"keep me\n").await.unwrap();
 
     let id = ws
-        .suggest(agent_ctx, "/a.txt", b"clobbered\n", None)
+        .suggest(agent_ctx, "/a.txt", b"clobbered\n", None, None)
         .await
         .unwrap();
     ws.reject_suggestion(id, human_ctx).await.unwrap();
@@ -110,7 +111,7 @@ async fn accept_refuses_a_stale_base() {
     ws.write("/x.txt", b"original\n").await.unwrap();
 
     let id = ws
-        .suggest(agent_ctx, "/x.txt", b"proposed\n", None)
+        .suggest(agent_ctx, "/x.txt", b"proposed\n", None, None)
         .await
         .unwrap();
     // someone else changes the file after the suggestion was made
@@ -144,7 +145,7 @@ async fn suggest_and_accept_a_deletion() {
     ws.write("/gone.txt", b"bye\n").await.unwrap();
 
     let id = ws
-        .suggest_delete(agent_ctx, "/gone.txt", Some("remove"))
+        .suggest_delete(agent_ctx, "/gone.txt", Some("remove"), None)
         .await
         .unwrap();
     assert!(
@@ -165,7 +166,7 @@ async fn author_cannot_accept_their_own_suggestion() {
     ws.write("/self.txt", b"base\n").await.unwrap();
 
     let id = ws
-        .suggest(agent_ctx, "/self.txt", b"changed\n", None)
+        .suggest(agent_ctx, "/self.txt", b"changed\n", None, None)
         .await
         .unwrap();
 

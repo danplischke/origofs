@@ -1383,6 +1383,16 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
             proposed_hash,
             summary,
             crate::suggest::SuggestionKind::CrdtTree,
+            // No `replaces` here, and the asymmetry with the byte path is
+            // deliberate (#164). Stacked *byte* proposals are harmful because
+            // rejecting the revision leaves the abandoned draft pending with a
+            // current base, so it accepts cleanly and lands text nobody chose. A
+            // CRDT proposal has neither half of that: it never goes stale, and
+            // applying an author's earlier state after their later one merges a
+            // subset. An author revising one retires the draft explicitly with
+            // `supersede_suggestion`, rather than four more signatures carrying an
+            // argument for a case that does not bite.
+            None,
         )
         .await
     }

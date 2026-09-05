@@ -177,7 +177,7 @@ async fn a_byte_suggestion_over_the_same_edit_is_still_refused() {
     fs.checkpoint_coedit(h, "/notes.md", &doc).await.unwrap();
 
     let id = fs
-        .suggest(a, "/notes.md", b"alpha\ngamma\n", None)
+        .suggest(a, "/notes.md", b"alpha\ngamma\n", None, None)
         .await
         .unwrap();
     doc.insert(h, 0, "beta\n");
@@ -293,7 +293,7 @@ async fn crdt_suggestions_are_never_superseded_by_a_moving_file() {
     let fork = fs.open_coedit(a, "/d.md").await.unwrap();
     fork.insert(a, 2, "y\n");
     let crdt = fs.suggest_coedit(a, "/d.md", &fork, None).await.unwrap();
-    let bytes = fs.suggest(a, "/d.md", b"x\nz\n", None).await.unwrap();
+    let bytes = fs.suggest(a, "/d.md", b"x\nz\n", None, None).await.unwrap();
 
     // Move the file well past both proposals' bases.
     fs.write_as(h, "/d.md", b"x\nmoved\n").await.unwrap();
