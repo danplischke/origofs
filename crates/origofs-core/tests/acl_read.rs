@@ -121,6 +121,10 @@ async fn every_attributed_read_is_gated() {
         denied(&fs.log_path_as(ctx, "/doc.md", None).await.unwrap_err()),
         "log_path"
     );
+    assert!(
+        denied(&fs.edit_ops_at_as(ctx, "/doc.md", None).await.unwrap_err()),
+        "edit_ops_at"
+    );
 }
 
 #[tokio::test]

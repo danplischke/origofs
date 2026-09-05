@@ -1349,3 +1349,47 @@ def test_log_path_is_scoped_to_the_router_root():
     # `/secret.txt` resolves under the root, so it is a path that does not exist
     # rather than one the caller is told about.
     assert c.get("/log/secret.txt").json() == []
+
+
+# `/edits/{path}` is the op-log read about a file. It sits in the `blame` group
+# because it answers the same question at write granularity, and a host granting
+# one almost always means to grant the other.
+def test_edits_follows_the_file_and_is_grouped_with_blame():
+    from origofs.fastapi import ROUTE_GROUPS
+
+    assert "blame" in ROUTE_GROUPS
+    d = tempfile.mkdtemp()
+
+    async def _setup():
+        ws = await origofs.Workspace.open_local(
+            os.path.join(d, "meta.db"), os.path.join(d, "cas")
+        )
+        dan = await ws.create_human("dan", None)
+        sess = await ws.create_session(dan, "fastapi")
+        return ws, dan, sess
+
+    ws, dan, sess = asyncio.run(_setup())
+    c = _client(ws)
+    hdr = {"X-Actor-Id": str(dan), "X-Session-Id": str(sess)}
+
+    c.put("/files/a.txt", content=b"one\n", headers=hdr)
+    c.put("/files/a.txt", content=b"two\n", headers=hdr)
+    c.post("/rename", json={"from": "a.txt", "to": "b.txt"}, headers=hdr)
+
+    ops = c.get("/edits/b.txt").json()
+    # The two writes were recorded under the old name; reading by path alone would
+    # lose them, which is why the engine keys on the inode while it exists.
+    assert [(o["op"], o["path"]) for o in ops] == [
+        ("rename", "/b.txt"),
+        ("write", "/a.txt"),
+        ("write", "/a.txt"),
+    ], ops
+    assert all(o["actor_id"] == dan for o in ops)
+    assert [o["op"] for o in c.get("/edits/b.txt?limit=1").json()] == ["rename"]
+
+    # A router excluding the `blame` group serves neither route.
+    app = FastAPI()
+    app.include_router(build_router(ws, authn=header_authn, exclude=["blame"]))
+    limited = TestClient(app)
+    assert limited.get("/edits/b.txt").status_code == 404
+    assert limited.get("/blame/b.txt").status_code == 404

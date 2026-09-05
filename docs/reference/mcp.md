@@ -69,6 +69,9 @@ wanted.
 - **`origofs_file_history`** — The commits that changed one file, newest first, each
   marked `A`/`M`/`D`. Says *when* a file changed; `origofs_blame` says who wrote the
   bytes that are in it now.
+- **`origofs_file_edits`** — The individual attributed writes against one file,
+  uncommitted ones included, each naming an actor and session. Records that a change
+  happened; it is not a way to read the old bytes back.
 
 ### Recovery
 

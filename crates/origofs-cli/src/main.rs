@@ -434,6 +434,25 @@ enum Cmd {
         #[arg(long)]
         actor: Option<i64>,
     },
+    /// The attributed writes recorded against one file, newest first: who, when,
+    /// which byte range, and the content addresses either side.
+    ///
+    /// Finer than `log` — individual writes, including ones never committed — but
+    /// it records changes rather than preserving them: the content those hashes
+    /// name is not a GC root, so after `origofs gc` a row can name bytes that are
+    /// gone. Unattributed writes (and everything through a mount) record nothing.
+    Edits {
+        path: String,
+        /// Stop after this many ops.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Undo exactly the lines one actor authored in one session, across every file
     /// that session touched, leaving other actors' edits intact. `--by` is the
     /// actor performing the revert (must be permitted to write).
@@ -2329,6 +2348,30 @@ async fn main() -> Result<()> {
                         println!("posix-locks is {}", if on { "on" } else { "off" });
                     }
                 }
+            }
+        }
+        Cmd::Edits { path, limit, actor } => {
+            let ops = match read_ctx(actor)? {
+                Some(ctx) => ws.edit_ops_at_as(ctx, &path, limit).await?,
+                None => ws.edit_ops_at(&path, limit).await?,
+            };
+            if ops.is_empty() {
+                println!("{path}: no attributed writes recorded");
+            }
+            for o in ops {
+                let who = ws
+                    .get_actor(o.actor_id)
+                    .await?
+                    .map(|a| a.display_name)
+                    .unwrap_or_else(|| format!("actor:{}", o.actor_id));
+                // The recorded path, not the one asked about: for a file that has
+                // been renamed they differ, and the row's own path is what says
+                // when that happened.
+                let range = match o.op.as_str() {
+                    "write" => format!(" [{}..{}]", o.byte_start, o.byte_start + o.byte_len),
+                    _ => String::new(),
+                };
+                println!("{} {:<6} {who}{range} {}", o.ts, o.op, o.path);
             }
         }
         Cmd::Blame { path, actor } => {

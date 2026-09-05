@@ -118,7 +118,10 @@ _ROUTE_GROUPS: "dict[str, tuple[tuple[Optional[str], str], ...]]" = {
     ),
     # Per-byte attribution. Its own group because it is the read a host is most
     # likely to want without granting the rest of `files`.
-    "blame": (("GET", "/blame/{path:path}"),),
+    "blame": (
+        ("GET", "/blame/{path:path}"),
+        ("GET", "/edits/{path:path}"),
+    ),
     # Commits, branches, checkout, and the views over them. Workspace-wide by
     # nature -- a scoped router already refuses most of these with 403.
     "history": (
@@ -1566,6 +1569,31 @@ def build_router(
         if who is not None:
             return await _run(ws.blame_as(who, p))
         return await _run(ws.blame(p))
+
+    @router.get("/edits/{path:path}", dependencies=[Depends(_read_gate)])
+    async def edits(
+        path: str,
+        limit: Optional[int] = Query(default=None),
+        root: str = Depends(_root),
+        who: Any = Depends(_read_ctx),
+    ):
+        """The attributed writes recorded against one file, newest first.
+
+        In the ``blame`` group rather than ``history`` because it is the same
+        question that group already answers -- who touched these bytes -- at write
+        granularity instead of line granularity, and a host granting one almost
+        always means to grant the other.
+
+        It records that a change happened. The content addresses on each row are
+        not GC roots, so a row can outlive the bytes it names; this is not a way to
+        read old versions back.
+        """
+        p = _scoped(root, path)
+        if limit is not None:
+            limit = max(0, min(limit, 1000))
+        if who is not None:
+            return await _run(ws.edit_ops_at_as(who, p, limit))
+        return await _run(ws.edit_ops_at(p, limit))
 
     # --- versioning ---------------------------------------------------------
 

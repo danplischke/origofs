@@ -1106,6 +1106,24 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         self.log_path(path, limit).await
     }
 
+    /// [`edit_ops_at`](Fs::edit_ops_at), checked against [`Perms::READ`] at
+    /// `path`.
+    ///
+    /// The op-log for a file names who changed which byte ranges and when, which
+    /// is more about its content than `blame` is, not less. Checked before the
+    /// lookup for the usual reason — the resolve that picks the inode key would
+    /// otherwise answer "does this path exist" for an actor that may not ask.
+    pub async fn edit_ops_at_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<crate::attribution::EditOp>> {
+        self.ensure_may_read_at(ctx, "read the edit log of", path)
+            .await?;
+        self.edit_ops_at(path, limit).await
+    }
+
     /// [`presence`](Fs::presence), with sessions at unreadable paths removed.
     ///
     /// Presence is a live map of who is editing what, so under enforcement an

@@ -2321,6 +2321,7 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         ("conflicts", ReadOnly),
         ("locks", ReadOnly),
         ("blame", ReadOnly),
+        ("edits", ReadOnly),
         ("du", ReadOnly),
         ("schema-version", ReadOnly),
         ("watch", ReadOnly),
@@ -2496,6 +2497,7 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
     //    path needs no actor, and saying which it is forces the thought.
     const READS_A_PATH: &[&str] = &[
         "du",
+        "edits",
         "log",
         "read",
         "ls",

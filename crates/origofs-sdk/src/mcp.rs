@@ -550,6 +550,32 @@ impl McpServer {
                     .collect::<Vec<_>>()
                     .join("\n"))
             }
+            "origofs_file_edits" => {
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|n| (n as usize).min(1000));
+                let ops = self.ws.edit_ops_at_as(self.ctx(), &path()?, limit).await?;
+                if ops.is_empty() {
+                    return Ok("no attributed writes recorded for this path".into());
+                }
+                Ok(ops
+                    .iter()
+                    .map(|o| {
+                        format!(
+                            "{} {} actor:{} session:{} {}",
+                            o.ts,
+                            o.op,
+                            o.actor_id,
+                            o.session_id
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                            o.path
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
             "origofs_file_history" => {
                 let limit = args
                     .get("limit")
@@ -752,6 +778,21 @@ fn tool_defs() -> Vec<Value> {
             &["message"],
         ),
         tool("origofs_log", "Show commit history.", json!({}), &[]),
+        tool(
+            "origofs_file_edits",
+            "The individual attributed writes recorded against one file, newest \
+             first: who, when, which operation, and the name the file had at the \
+             time. Finer than origofs_file_history because it includes writes that \
+             were never committed, and because each row names one actor and \
+             session. It records that a change happened -- it is not a way to read \
+             back the old bytes, which garbage collection may already have \
+             reclaimed. A write made without an actor records nothing here at all.",
+            json!({
+                "path": { "type": "string" },
+                "limit": { "type": "integer", "description": "optional: stop after this many ops" }
+            }),
+            &["path"],
+        ),
         tool(
             "origofs_file_history",
             "The commits that changed one file, newest first, each marked A/M/D. \

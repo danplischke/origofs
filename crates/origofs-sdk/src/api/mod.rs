@@ -365,6 +365,18 @@ impl ReadAuth {
         })
     }
 
+    async fn edit_ops_at(
+        &self,
+        ws: &Workspace,
+        path: &str,
+        limit: Option<usize>,
+    ) -> ApiResult<Vec<crate::EditOp>> {
+        Ok(match self.0 {
+            Some(p) => ws.edit_ops_at_as(p.write_ctx(), path, limit).await?,
+            None => ws.edit_ops_at(path, limit).await?,
+        })
+    }
+
     async fn diff(&self, ws: &Workspace, from: &str, to: &str) -> ApiResult<Vec<crate::DiffEntry>> {
         Ok(match self.0 {
             Some(p) => ws.diff_as(p.write_ctx(), from, to).await?,
@@ -534,6 +546,7 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
         .route("/dirs/{*path}", get(list_dir).post(make_dir))
         .route("/stat/{*path}", get(stat))
         .route("/blame/{*path}", get(blame))
+        .route("/edits/{*path}", get(edits))
         .route("/rename", post(rename))
         .route("/commit", post(commit))
         .route("/log", get(log))
@@ -2010,6 +2023,58 @@ async fn log_path(
                 crate::DiffStatus::Deleted => "deleted",
             },
             hash: r.hash.map(|h| h.to_hex()),
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+#[derive(Serialize)]
+struct EditOpDto {
+    id: i64,
+    actor_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<i64>,
+    op: String,
+    /// The path recorded on the op, which is the name the file had at the time —
+    /// not necessarily the one that was asked about.
+    path: String,
+    byte_start: i64,
+    byte_len: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    post_hash: Option<String>,
+    ts: i64,
+}
+
+/// `GET /edits/{path}` — the attributed writes recorded against one file, newest
+/// first.
+///
+/// Finer than `GET /log/{path}` (individual writes, uncommitted ones included)
+/// and weaker: the content addresses it reports are not GC roots, so a row can
+/// outlive the bytes it names. It records changes; it does not preserve them.
+async fn edits(
+    State(ws): State<Shared>,
+    who: ReadAuth,
+    ScopedPath(path): ScopedPath,
+    Query(q): Query<LogPathQuery>,
+) -> ApiResult<Json<Vec<EditOpDto>>> {
+    let limit = q.limit.map(|n| n.min(1000));
+    let out = who
+        .edit_ops_at(&ws, &path, limit)
+        .await?
+        .into_iter()
+        .map(|o| EditOpDto {
+            id: o.id,
+            actor_id: o.actor_id,
+            session_id: o.session_id,
+            op: o.op,
+            path: o.path,
+            byte_start: o.byte_start,
+            byte_len: o.byte_len,
+            pre_hash: o.pre_hash,
+            post_hash: o.post_hash,
+            ts: o.ts,
         })
         .collect();
     Ok(Json(out))

@@ -67,6 +67,7 @@ All data routes are under `/v1`.
 | `GET` `POST` | `/v1/dirs/{*path}` |
 | `GET` | `/v1/stat/{*path}` |
 | `GET` | `/v1/blame/{*path}` |
+| `GET` | `/v1/edits/{*path}` — the attributed writes recorded against one file |
 | `POST` | `/v1/rename` |
 
 ### Versioning

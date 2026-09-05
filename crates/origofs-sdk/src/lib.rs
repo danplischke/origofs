@@ -1271,6 +1271,17 @@ impl Workspace {
         self.fs.log_path_as(ctx, path, limit).await
     }
 
+    /// [`edit_ops_at`](Self::edit_ops_at), checked against `READ` at the path —
+    /// the op-log for a file says who changed which bytes of it and when.
+    pub async fn edit_ops_at_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<EditOp>> {
+        self.fs.edit_ops_at_as(ctx, path, limit).await
+    }
+
     /// [`presence`](Self::presence), with sessions at unreadable paths removed —
     /// and a session that names no path removed too, because it still says a
     /// neighbour is connected. Same ruling `Scope` already makes for tenancy.
@@ -1925,6 +1936,22 @@ impl Workspace {
     /// The edit-op log for an actor (optionally one session).
     pub async fn edit_ops(&self, actor_id: i64, session_id: Option<i64>) -> Result<Vec<EditOp>> {
         self.fs.edit_ops(actor_id, session_id).await
+    }
+
+    /// The edit-op log for one **file**, newest first: every attributed mutation
+    /// against it, with the actor, session, byte range and the content addresses
+    /// either side. Follows the file across renames (it reads by inode when the
+    /// path is live), and falls back to the recorded path once the inode is gone,
+    /// which is when the deletion is the row being looked for.
+    ///
+    /// Finer than [`log_path`](Self::log_path) — individual writes, including
+    /// uncommitted ones — but weaker: `pre_hash`/`post_hash` are not GC roots, so
+    /// after a `gc` the row still says who changed which bytes and when while the
+    /// content it names may be gone. It is a record of changes, not a way to
+    /// recover old versions. Unattributed writes (plain `write`, and everything
+    /// through a mount) record nothing at all.
+    pub async fn edit_ops_at(&self, path: &str, limit: Option<usize>) -> Result<Vec<EditOp>> {
+        self.fs.edit_ops_at(path, limit).await
     }
 
     /// Revert every line an actor wrote in a session. Returns the changed paths.

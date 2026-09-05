@@ -502,6 +502,21 @@ pub trait MetadataStore: Send + Sync {
     async fn record_tool_call(&self, tc: ToolCallInit) -> Result<i64>;
     async fn append_edit_op(&self, op: EditOpInit) -> Result<i64>;
     async fn list_edit_ops(&self, actor_id: i64, session_id: Option<i64>) -> Result<Vec<EditOp>>;
+    /// The op-log for one **inode**, newest first, capped by `limit`.
+    ///
+    /// Keyed on the inode rather than the path because a rename records the
+    /// destination path against the same inode, so the path a row carries is only
+    /// the name the file had at the time. Inode ids are never reused, so this
+    /// stays unambiguous for the life of the store.
+    async fn list_edit_ops_for_ino(&self, ino: Ino, limit: Option<usize>) -> Result<Vec<EditOp>>;
+    /// The op-log rows recorded **at one path**, newest first, capped by `limit`.
+    ///
+    /// The handle for a file whose inode is gone: a delete records the path it was
+    /// deleted from, and nothing else can still name it. For a file that exists,
+    /// prefer [`list_edit_ops_for_ino`](Self::list_edit_ops_for_ino) — this one
+    /// misses whatever the file did under an earlier name.
+    async fn list_edit_ops_for_path(&self, path: &str, limit: Option<usize>)
+    -> Result<Vec<EditOp>>;
     /// Set (upsert) the line-authorship map for a *content version* (a blob's
     /// manifest hash), so blame survives checkout/merge and never desyncs from
     /// the content it describes. Empty content has no blame.
@@ -1021,6 +1036,16 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn list_edit_ops(&self, actor_id: i64, session_id: Option<i64>) -> Result<Vec<EditOp>> {
         (**self).list_edit_ops(actor_id, session_id).await
+    }
+    async fn list_edit_ops_for_ino(&self, ino: Ino, limit: Option<usize>) -> Result<Vec<EditOp>> {
+        (**self).list_edit_ops_for_ino(ino, limit).await
+    }
+    async fn list_edit_ops_for_path(
+        &self,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<EditOp>> {
+        (**self).list_edit_ops_for_path(path, limit).await
     }
     async fn set_blob_blame(&self, content: &Hash, runs: &str) -> Result<()> {
         (**self).set_blob_blame(content, runs).await
