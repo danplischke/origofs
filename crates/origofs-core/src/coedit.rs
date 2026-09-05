@@ -1225,7 +1225,21 @@ pub(crate) fn drive_sync(
     let mut broadcast = EncoderV1::new();
     let (mut has_reply, mut has_broadcast) = (false, false);
     let mut content_changed = false;
+    // *Distinct* tags, and a separate count. One frame may pack thousands of
+    // messages — a 16 MiB one (the socket's cap) can hold ~8 million — and these
+    // bytes come from a client this module explicitly does not trust. Pushing one
+    // entry per message would let a hostile frame make the server allocate half its
+    // size again and, worse, render all of it into a single `warn!` line. The
+    // diagnostic is "which tags did I not understand", which is at most 256 values
+    // and in practice one.
     let mut unhandled: Vec<u8> = Vec::new();
+    let mut unhandled_count: u64 = 0;
+    let note_unhandled = |tag: u8, seen: &mut Vec<u8>, n: &mut u64| {
+        *n += 1;
+        if !seen.contains(&tag) {
+            seen.push(tag);
+        }
+    };
 
     for msg in reader {
         let msg =
@@ -1271,8 +1285,8 @@ pub(crate) fn drive_sync(
             // neither has an effect — but *silently* having no effect is what
             // made a framing mismatch undiagnosable (#162), so both are counted
             // and reported.
-            Message::Auth(_) => unhandled.push(MSG_AUTH),
-            Message::Custom(tag, _) => unhandled.push(tag),
+            Message::Auth(_) => note_unhandled(MSG_AUTH, &mut unhandled, &mut unhandled_count),
+            Message::Custom(tag, _) => note_unhandled(tag, &mut unhandled, &mut unhandled_count),
         }
     }
 
@@ -1286,11 +1300,10 @@ pub(crate) fn drive_sync(
         // never converges, with nothing anywhere to attribute it to.
         tracing::warn!(
             tags = ?unhandled,
-            "co-edit: ignored {} y-sync message(s) this server has no handler for. \
-             Frames must carry the y-websocket envelope (outer messageSync=0, then \
-             the y-sync payload); a bare y-sync update arrives as tag 2 (messageAuth) \
-             and syncs nothing",
-            unhandled.len(),
+            "co-edit: ignored {unhandled_count} y-sync message(s) this server has no \
+             handler for. Frames must carry the y-websocket envelope (outer \
+             messageSync=0, then the y-sync payload); a bare y-sync update arrives as \
+             tag 2 (messageAuth) and syncs nothing",
         );
     }
 

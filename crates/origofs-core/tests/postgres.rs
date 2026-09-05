@@ -1103,3 +1103,76 @@ async fn postgres_undo_claim_contract_matches_sqlite() {
     assert!(before > 0);
     assert!(claim("/doc.md", 8, "worker-d").await);
 }
+
+/// The revision relation behaves identically on Postgres (#164).
+///
+/// `replaces` and `supersede_suggestion` both turn on `resolve_suggestion`, a
+/// compare-and-set on `status = 'pending'` with a separate SQL implementation per
+/// backend. The behavioural tests for #164 build a `SqliteMetadataStore`
+/// explicitly, so nothing exercised the Postgres translation of the one call the
+/// whole feature rests on — a `WHERE status = 'pending'` that matched too broadly
+/// would let a settled row be retired twice and report success both times.
+///
+/// The same shape as `postgres_undo_claim_contract_matches_sqlite`, and for the
+/// same reason: a contract asserted on one backend is asserted on one backend.
+#[tokio::test]
+async fn postgres_suggestion_replace_contract_matches_sqlite() {
+    let Some(dsn) = dsn() else {
+        eprintln!("skipping postgres suggestion replace contract: ORIGOFS_PG_TEST_URL unset");
+        return;
+    };
+    let _guard = pg_lock().lock().await;
+    reset(&dsn).await;
+
+    let fs = Fs::new(
+        PostgresMetadataStore::connect(&dsn).await.unwrap(),
+        Arc::new(MemStore::new()),
+    );
+    fs.init().await.unwrap();
+    let human = fs.create_human("h", None).await.unwrap();
+    let agent = fs.create_agent("a", "m", Some(human)).await.unwrap();
+    let (h, a) = (WriteCtx::actor(human), WriteCtx::actor(agent));
+    fs.write_as(h, "/n.md", b"base\n").await.unwrap();
+
+    let status = async |id: i64| fs.get_suggestion(id).await.unwrap().unwrap().status;
+
+    // A revision retires the draft it names, and only that one.
+    let other = fs
+        .suggest(a, "/other.md", b"x\n", None, None)
+        .await
+        .unwrap();
+    let v1 = fs.suggest(a, "/n.md", b"v1\n", None, None).await.unwrap();
+    let v2 = fs
+        .suggest(a, "/n.md", b"v2\n", None, Some(v1))
+        .await
+        .unwrap();
+    assert_eq!(status(v1).await, SuggestionStatus::Superseded);
+    assert_eq!(status(v2).await, SuggestionStatus::Pending);
+    assert_eq!(status(other).await, SuggestionStatus::Pending);
+
+    // Rejecting the revision leaves nothing accept-ready behind — the property
+    // #164 is about, checked against the real multi-writer backend.
+    fs.reject_suggestion(v2, h).await.unwrap();
+    assert!(
+        fs.list_suggestions(Some(SuggestionStatus::Pending), Some("/n.md"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // And the CAS refuses a settled row rather than resolving it a second time.
+    for e in [
+        fs.supersede_suggestion(v1, a, None).await.unwrap_err(),
+        fs.accept_suggestion(v2, h).await.unwrap_err(),
+    ] {
+        assert!(
+            matches!(e, origofs_core::OrigoFSError::AlreadyResolved(_)),
+            "{e:?}"
+        );
+    }
+    // A standalone withdrawal lands, so the write half of the CAS works too.
+    fs.supersede_suggestion(other, a, Some("withdrawn"))
+        .await
+        .unwrap();
+    assert_eq!(status(other).await, SuggestionStatus::Superseded);
+}
