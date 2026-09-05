@@ -164,7 +164,7 @@ async fn dedup_refreshes_recency_on_an_object_store() {
     // Everything is young here, so `touch` is a no-op by design — assert that,
     // because a `touch` that re-PUT on every dedup hit would silently undo the
     // entire point of deduplication against a metered object store.
-    let before = fs.content.list_with_age().await.unwrap();
+    let before = fs.backends().content.list_with_age().await.unwrap();
     assert!(!before.is_empty(), "nothing was stored");
     assert!(
         before.iter().all(|(_, age)| age.is_some()),
@@ -176,7 +176,7 @@ async fn dedup_refreshes_recency_on_an_object_store() {
     assert_eq!(fs.read("/b.txt").await.unwrap(), body);
 
     // Young content stays inside any valid grace period.
-    let after = fs.content.list_with_age().await.unwrap();
+    let after = fs.backends().content.list_with_age().await.unwrap();
     assert!(
         after
             .iter()
@@ -187,7 +187,7 @@ async fn dedup_refreshes_recency_on_an_object_store() {
     // And `touch` is callable on this backend without erroring — the path the
     // engine takes on every dedup hit against GCS or S3.
     for (hash, _) in &after {
-        fs.content.touch(hash).await.unwrap();
+        fs.backends().content.touch(hash).await.unwrap();
     }
     assert_eq!(
         fs.read("/b.txt").await.unwrap(),
@@ -239,7 +239,7 @@ async fn a_tampered_object_is_refused_not_served() {
     fs.init().await.unwrap();
 
     fs.write("/secret.txt", b"the real content").await.unwrap();
-    let hash = fs.content.list().await.unwrap();
+    let hash = fs.backends().content.list().await.unwrap();
 
     // Overwrite one object's bytes with something that does not hash to its key.
     for h in &hash {

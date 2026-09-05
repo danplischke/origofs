@@ -172,8 +172,19 @@ impl PackLoc {
         pack.copy_from_slice(&body[..32]);
         Ok(PackLoc {
             pack: Hash::from_array(pack),
-            offset: u32::from_le_bytes(body[32..36].try_into().unwrap()),
-            len: u32::from_le_bytes(body[36..40].try_into().unwrap()),
+            // `try_into` on a fixed 4-byte window of a length-checked buffer
+            // cannot fail; propagating rather than unwrapping costs nothing and
+            // keeps the decoder panic-free even if the window ever moves.
+            offset: u32::from_le_bytes(
+                body[32..36]
+                    .try_into()
+                    .map_err(|_| format::PACK_INDEX.malformed())?,
+            ),
+            len: u32::from_le_bytes(
+                body[36..40]
+                    .try_into()
+                    .map_err(|_| format::PACK_INDEX.malformed())?,
+            ),
             addressing,
         })
     }
@@ -576,6 +587,35 @@ impl PackStore {
     }
 }
 
+/// [`PackLoc::decode`] and [`parse_trailer`], for `cargo fuzz` only.
+///
+/// The pack format is the one self-describing decoder the fuzz crate did not
+/// reach: `PackLoc::decode` reads an index entry and `parse_trailer` reads a
+/// pack's footer, both from bytes fetched back out of an object store, and both
+/// doing length-checked window arithmetic — the same shape as the manifest, tree
+/// and commit decoders that have had targets since #70.
+///
+/// Not a supported interface: hidden from the docs, and free to change or vanish.
+#[doc(hidden)]
+pub mod fuzz_entry {
+    use crate::error::Result;
+    use crate::types::Hash;
+
+    /// One index entry: `ORGI ‖ version ‖ pack(32) ‖ offset(4) ‖ len(4) ‖ …`.
+    ///
+    /// Returns the decoded `(pack, offset, len)` so a target can assert about it
+    /// without `PackLoc` being public.
+    pub fn decode_index_entry(b: &[u8]) -> Result<(Hash, u32, u32)> {
+        let loc = super::PackLoc::decode(b)?;
+        Ok((loc.pack, loc.offset, loc.len))
+    }
+
+    /// A whole pack's trailer, as `(chunk_hash, offset, len)` in stored order.
+    pub fn decode_trailer(pack: &[u8]) -> Result<Vec<(Hash, u32, u32)>> {
+        super::parse_trailer(pack)
+    }
+}
+
 /// Parse a pack's trailer into `(chunk_hash, offset, len)` in stored order.
 ///
 /// The footer is `trailer_len(u32) ‖ ORGP ‖ version` — see the module docs for why
@@ -588,7 +628,7 @@ fn parse_trailer(pack: &[u8]) -> Result<Vec<(Hash, u32, u32)>> {
         1 => {}
         v => return Err(format::PACK.unsupported(v)),
     }
-    let tlen = u32::from_le_bytes(pack[len_at..len_at + 4].try_into().unwrap()) as usize;
+    let tlen = u32::from_le_bytes(pack[len_at..len_at + 4].try_into().map_err(|_| bad())?) as usize;
     let trailer_start = len_at.checked_sub(tlen).ok_or_else(bad)?;
     let trailer = &pack[trailer_start..len_at];
     if !tlen.is_multiple_of(36) {
@@ -600,7 +640,7 @@ fn parse_trailer(pack: &[u8]) -> Result<Vec<(Hash, u32, u32)>> {
     while i < trailer.len() {
         let mut h = [0u8; 32];
         h.copy_from_slice(&trailer[i..i + 32]);
-        let len = u32::from_le_bytes(trailer[i + 32..i + 36].try_into().unwrap());
+        let len = u32::from_le_bytes(trailer[i + 32..i + 36].try_into().map_err(|_| bad())?);
         out.push((Hash::from_array(h), offset, len));
         // Checked: a tampered trailer with huge lengths would otherwise overflow
         // (panic in debug / wrap in release).

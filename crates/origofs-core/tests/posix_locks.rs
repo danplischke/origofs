@@ -8,7 +8,7 @@
 
 use origofs_core::posixlock::{LOCK_EOF, LockAnswer, LockKind, LockRequest, PosixLock};
 use origofs_core::{
-    Fs, MemStore, MetadataStore, OrigoFSError, Perms, SqliteMetadataStore, WriteCtx,
+    Fs, LockStore, MemStore, MetadataStore, OrigoFSError, Perms, SqliteMetadataStore, WriteCtx,
 };
 use std::sync::Arc;
 

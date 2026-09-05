@@ -9,6 +9,9 @@ description = "Python bindings for origofs (agent filesystem)"
 keywords.workspace = true
 categories.workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 # The extension is imported as `origofs._origofs` (mixed layout: pure-Python `origofs`
 # package under python/, compiled core as its `_origofs` submodule).
@@ -24,7 +27,11 @@ origofs-core = { version = "0.0.6", path = "../origofs-core" }
 # hiding behind a Cargo feature a `pip install` couldn't select.
 origofs-sdk = { version = "0.0.6", path = "../origofs-sdk", features = ["coedit"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync"] }
-pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
+# `multiple-pymethods` lets `Workspace`'s bindings live in several `#[pymethods]`
+# blocks across topic modules instead of one 4,166-line impl. It costs a build
+# dependency on `inventory` and is unavailable on wasm, which origofs does not
+# target — the three platforms CI builds (Linux, macOS, Windows) all support it.
+pyo3 = { version = "0.29.0", features = ["abi3-py39", "multiple-pymethods"] }
 pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
 
 # NFS serving is Unix-wide; gating it here lets the extension build on Windows

@@ -10,7 +10,7 @@
 //! `ORIGOFS_PG_TLS_TEST_URL` to a DSN for it and `ORIGOFS_PG_TLS_TEST_CA` to the
 //! PEM that signed its certificate. See the `pg-tls` CI job.
 
-use origofs_core::{MetadataStore, PG_CA_FILE_ENV, PostgresMetadataStore};
+use origofs_core::{PG_CA_FILE_ENV, PostgresMetadataStore, StoreLifecycle};
 
 /// Serializes the tests, which all mutate the process-wide CA environment
 /// variable. `std::env::set_var` is unsound if another thread reads concurrently.

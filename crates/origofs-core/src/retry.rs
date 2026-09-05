@@ -83,5 +83,11 @@ where
             other => return other,
         }
     }
-    unreachable!("the loop returns on the final attempt")
+    // The loop above returns on every path of the final attempt, so control
+    // cannot arrive here. Expressed as an error rather than a panic so a future
+    // edit to the loop bounds degrades into a surfaced failure instead of taking
+    // the embedder's process down.
+    Err(crate::error::OrigoFSError::Metadata(format!(
+        "{what}: retry loop exhausted without returning"
+    )))
 }

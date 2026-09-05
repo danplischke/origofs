@@ -123,8 +123,13 @@ impl Scan {
             return None;
         }
         if self.mirrors.is_empty() {
-            let v = *self.unsupported_commits.values().max().expect("non-empty");
-            return Some(format::COMMIT.unsupported(v));
+            // `max()` on a map already known non-empty — taken as an `if let` so
+            // the emptiness check and the unwrapping are one statement rather
+            // than two that a later edit could separate.
+            if let Some(&v) = self.unsupported_commits.values().max() {
+                return Some(format::COMMIT.unsupported(v));
+            }
+            return None;
         }
         self.mirrors
             .values()
@@ -381,16 +386,21 @@ async fn recover_into<M: MetadataStore, C: ContentStore>(
         target.meta.set_ref(name, &h.to_hex()).await?;
         report.branches.push((name.clone(), h.to_hex()));
     }
-    if let Some(branch) = pick_checkout(&branches, head_target) {
+    // `pick_checkout` only ever names a branch from `branches`, and `branches`
+    // only holds tips that were scanned — so both lookups below succeed. They are
+    // resolved with `?` rather than asserted because this is the *recovery* path:
+    // a rebuild that panics on a store corrupt in some way the scan did not
+    // anticipate is the one outcome worse than a rebuild that recovers the
+    // branches and leaves nothing checked out.
+    let checkout = pick_checkout(&branches, head_target).and_then(|branch| {
         let tip = branches
             .iter()
             .find(|(n, _)| *n == branch)
-            .map(|(_, h)| *h)
-            .expect("checkout branch is one we just recovered");
-        let tree = commits
-            .get(&tip)
-            .expect("branch tip is a scanned commit")
-            .tree;
+            .map(|(_, h)| *h)?;
+        let tree = commits.get(&tip)?.tree;
+        Some((branch, tree))
+    });
+    if let Some((branch, tree)) = checkout {
         target.replace_working_tree(tree).await?;
         target.meta.set_ref(HEAD, &format!("ref:{branch}")).await?;
         target.tally_tree(tree, report).await?;

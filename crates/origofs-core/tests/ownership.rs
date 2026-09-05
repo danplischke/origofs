@@ -41,13 +41,13 @@ async fn fixture() -> Fs<Arc<dyn MetadataStore>, Arc<MemStore>> {
 async fn chmod_actually_changes_the_mode() {
     let fs = fixture().await;
     let f = fs
-        .vfs_create(INO_ROOT, "build.sh", 0o644, Owner::ROOT)
+        .vfs_create_unchecked(INO_ROOT, "build.sh", 0o644, Owner::ROOT)
         .await
         .unwrap();
     assert_eq!(f.mode & 0o7777, 0o644, "created with the requested mode");
 
     // `chmod +x`
-    let after = fs.vfs_chmod(f.ino, 0o755).await.unwrap();
+    let after = fs.vfs_chmod_unchecked(f.ino, 0o755).await.unwrap();
     assert_eq!(
         after.mode & 0o7777,
         0o755,
@@ -55,7 +55,7 @@ async fn chmod_actually_changes_the_mode() {
     );
 
     // And it is durable, not just reflected in the returned value.
-    let reread = fs.vfs_getattr(f.ino).await.unwrap();
+    let reread = fs.vfs_getattr_unchecked(f.ino).await.unwrap();
     assert_eq!(reread.mode & 0o7777, 0o755, "mode did not persist");
 }
 
@@ -66,13 +66,13 @@ async fn chmod_actually_changes_the_mode() {
 async fn chmod_cannot_rewrite_the_file_type() {
     let fs = fixture().await;
     let d = fs
-        .vfs_mkdir(INO_ROOT, "sub", 0o755, Owner::ROOT)
+        .vfs_mkdir_unchecked(INO_ROOT, "sub", 0o755, Owner::ROOT)
         .await
         .unwrap();
     let before_type = d.mode & !0o7777;
 
     // A whole mode word claiming S_IFREG. Only the low bits may land.
-    let after = fs.vfs_chmod(d.ino, 0o100600).await.unwrap();
+    let after = fs.vfs_chmod_unchecked(d.ino, 0o100600).await.unwrap();
 
     assert_eq!(
         after.mode & !0o7777,
@@ -89,10 +89,10 @@ async fn chmod_cannot_rewrite_the_file_type() {
 async fn chmod_preserves_the_high_permission_bits() {
     let fs = fixture().await;
     let f = fs
-        .vfs_create(INO_ROOT, "helper", 0o644, Owner::ROOT)
+        .vfs_create_unchecked(INO_ROOT, "helper", 0o644, Owner::ROOT)
         .await
         .unwrap();
-    let after = fs.vfs_chmod(f.ino, 0o4755).await.unwrap();
+    let after = fs.vfs_chmod_unchecked(f.ino, 0o4755).await.unwrap();
     assert_eq!(
         after.mode & 0o7777,
         0o4755,
@@ -109,11 +109,13 @@ async fn chmod_preserves_the_high_permission_bits() {
 async fn chmod_of_a_missing_inode_is_an_error() {
     let fs = fixture().await;
     assert!(
-        fs.vfs_chmod(999_999, 0o755).await.is_err(),
+        fs.vfs_chmod_unchecked(999_999, 0o755).await.is_err(),
         "chmod of a nonexistent inode must fail, not silently succeed"
     );
     assert!(
-        fs.vfs_chown(999_999, Some(1), Some(1)).await.is_err(),
+        fs.vfs_chown_unchecked(999_999, Some(1), Some(1))
+            .await
+            .is_err(),
         "chown of a nonexistent inode must fail, not silently succeed"
     );
 }
@@ -123,7 +125,7 @@ async fn chmod_of_a_missing_inode_is_an_error() {
 async fn inodes_carry_ownership() {
     let fs = fixture().await;
     let f = fs
-        .vfs_create(INO_ROOT, "owned.txt", 0o644, Owner::new(1000, 2000))
+        .vfs_create_unchecked(INO_ROOT, "owned.txt", 0o644, Owner::new(1000, 2000))
         .await
         .unwrap();
     assert_eq!(
@@ -133,7 +135,7 @@ async fn inodes_carry_ownership() {
     );
     assert_eq!(f.owner(), Owner::new(1000, 2000));
 
-    let reread = fs.vfs_getattr(f.ino).await.unwrap();
+    let reread = fs.vfs_getattr_unchecked(f.ino).await.unwrap();
     assert_eq!(
         (reread.uid, reread.gid),
         (1000, 2000),
@@ -157,7 +159,7 @@ async fn ownership_defaults_to_root() {
     );
 
     // As does the root directory itself.
-    let root = fs.vfs_getattr(INO_ROOT).await.unwrap();
+    let root = fs.vfs_getattr_unchecked(INO_ROOT).await.unwrap();
     assert_eq!((root.uid, root.gid), (0, 0));
 }
 
@@ -167,16 +169,19 @@ async fn ownership_defaults_to_root() {
 async fn chown_sets_each_half_independently() {
     let fs = fixture().await;
     let f = fs
-        .vfs_create(INO_ROOT, "f", 0o644, Owner::new(1, 2))
+        .vfs_create_unchecked(INO_ROOT, "f", 0o644, Owner::new(1, 2))
         .await
         .unwrap();
 
     // Both.
-    let a = fs.vfs_chown(f.ino, Some(10), Some(20)).await.unwrap();
+    let a = fs
+        .vfs_chown_unchecked(f.ino, Some(10), Some(20))
+        .await
+        .unwrap();
     assert_eq!((a.uid, a.gid), (10, 20));
 
     // uid only — gid must not move.
-    let b = fs.vfs_chown(f.ino, Some(11), None).await.unwrap();
+    let b = fs.vfs_chown_unchecked(f.ino, Some(11), None).await.unwrap();
     assert_eq!(
         (b.uid, b.gid),
         (11, 20),
@@ -184,7 +189,7 @@ async fn chown_sets_each_half_independently() {
     );
 
     // gid only — uid must not move (the `chgrp` case).
-    let c = fs.vfs_chown(f.ino, None, Some(21)).await.unwrap();
+    let c = fs.vfs_chown_unchecked(f.ino, None, Some(21)).await.unwrap();
     assert_eq!(
         (c.uid, c.gid),
         (11, 21),
@@ -192,7 +197,7 @@ async fn chown_sets_each_half_independently() {
     );
 
     // Neither: a no-op, not a reset to zero.
-    let d = fs.vfs_chown(f.ino, None, None).await.unwrap();
+    let d = fs.vfs_chown_unchecked(f.ino, None, None).await.unwrap();
     assert_eq!(
         (d.uid, d.gid),
         (11, 21),
@@ -207,18 +212,21 @@ async fn chown_sets_each_half_independently() {
 async fn mode_and_ownership_do_not_clobber_each_other() {
     let fs = fixture().await;
     let f = fs
-        .vfs_create(INO_ROOT, "f", 0o600, Owner::new(5, 6))
+        .vfs_create_unchecked(INO_ROOT, "f", 0o600, Owner::new(5, 6))
         .await
         .unwrap();
 
-    let after_chmod = fs.vfs_chmod(f.ino, 0o755).await.unwrap();
+    let after_chmod = fs.vfs_chmod_unchecked(f.ino, 0o755).await.unwrap();
     assert_eq!(
         (after_chmod.uid, after_chmod.gid),
         (5, 6),
         "chmod reset the ownership"
     );
 
-    let after_chown = fs.vfs_chown(f.ino, Some(7), Some(8)).await.unwrap();
+    let after_chown = fs
+        .vfs_chown_unchecked(f.ino, Some(7), Some(8))
+        .await
+        .unwrap();
     assert_eq!(after_chown.mode & 0o7777, 0o755, "chown reset the mode");
 }
 
@@ -227,22 +235,25 @@ async fn mode_and_ownership_do_not_clobber_each_other() {
 async fn ownership_and_mode_apply_to_every_kind() {
     let fs = fixture().await;
     let d = fs
-        .vfs_mkdir(INO_ROOT, "d", 0o700, Owner::new(3, 4))
+        .vfs_mkdir_unchecked(INO_ROOT, "d", 0o700, Owner::new(3, 4))
         .await
         .unwrap();
     assert_eq!((d.uid, d.gid), (3, 4), "mkdir did not record ownership");
     assert_eq!(
-        fs.vfs_chmod(d.ino, 0o750).await.unwrap().mode & 0o7777,
+        fs.vfs_chmod_unchecked(d.ino, 0o750).await.unwrap().mode & 0o7777,
         0o750
     );
 
     let l = fs
-        .vfs_symlink(INO_ROOT, "l", "/d", Owner::new(3, 4))
+        .vfs_symlink_unchecked(INO_ROOT, "l", "/d", Owner::new(3, 4))
         .await
         .unwrap();
     assert_eq!((l.uid, l.gid), (3, 4), "symlink did not record ownership");
     assert_eq!(
-        fs.vfs_chown(l.ino, Some(9), None).await.unwrap().uid,
+        fs.vfs_chown_unchecked(l.ino, Some(9), None)
+            .await
+            .unwrap()
+            .uid,
         9,
         "chown must work on a symlink inode"
     );
@@ -269,8 +280,10 @@ async fn ownership_is_not_carried_through_a_commit() {
         .unwrap();
     fs.write("/f.txt", b"x").await.unwrap();
     let ino = fs.stat("/f.txt").await.unwrap().ino;
-    fs.vfs_chown(ino, Some(1000), Some(1000)).await.unwrap();
-    fs.vfs_chmod(ino, 0o755).await.unwrap();
+    fs.vfs_chown_unchecked(ino, Some(1000), Some(1000))
+        .await
+        .unwrap();
+    fs.vfs_chmod_unchecked(ino, 0o755).await.unwrap();
     fs.commit("tester", "own it").await.unwrap();
 
     fs.create_branch("side").await.unwrap();
@@ -307,7 +320,7 @@ async fn a_mode_change_reaches_the_committed_tree() {
         .unwrap();
 
     let ino = fs.stat("/build.sh").await.unwrap().ino;
-    fs.vfs_chmod(ino, 0o755).await.unwrap();
+    fs.vfs_chmod_unchecked(ino, 0o755).await.unwrap();
     fs.commit("tester", "make it executable").await.unwrap();
 
     // Round-trip through the object graph rather than just re-reading the working

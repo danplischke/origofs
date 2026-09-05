@@ -11,7 +11,8 @@
 //! something to report, which is why the two landed together.
 
 use origofs_core::{
-    Fs, INO_ROOT, MAX_XATTR_LEN, MemStore, MetadataStore, OrigoFSError, Quota, SqliteMetadataStore,
+    Fs, INO_ROOT, MAX_XATTR_LEN, MemStore, MetadataStore, NamespaceStore, OrigoFSError, Quota,
+    SqliteMetadataStore,
 };
 use std::sync::Arc;
 
@@ -34,7 +35,10 @@ async fn a_hard_link_gives_one_inode_two_names() {
     let a = fs.stat("/a.txt").await.unwrap();
     assert_eq!(a.nlink, 1);
 
-    let linked = fs.vfs_link(a.ino, INO_ROOT, "b.txt").await.unwrap();
+    let linked = fs
+        .vfs_link_unchecked(a.ino, INO_ROOT, "b.txt")
+        .await
+        .unwrap();
     assert_eq!(linked.nlink, 2, "link must raise nlink");
 
     let b = fs.stat("/b.txt").await.unwrap();
@@ -50,9 +54,9 @@ async fn unlinking_one_name_of_a_link_keeps_the_file() {
     let fs = fixture().await;
     fs.write("/a.txt", b"shared").await.unwrap();
     let ino = fs.stat("/a.txt").await.unwrap().ino;
-    fs.vfs_link(ino, INO_ROOT, "b.txt").await.unwrap();
+    fs.vfs_link_unchecked(ino, INO_ROOT, "b.txt").await.unwrap();
 
-    fs.vfs_unlink(INO_ROOT, "a.txt").await.unwrap();
+    fs.vfs_unlink_unchecked(INO_ROOT, "a.txt").await.unwrap();
     assert!(fs.stat("/a.txt").await.is_err(), "the name is gone");
     assert_eq!(
         &fs.read("/b.txt").await.unwrap()[..],
@@ -65,9 +69,9 @@ async fn unlinking_one_name_of_a_link_keeps_the_file() {
         "nlink came back down"
     );
 
-    fs.vfs_unlink(INO_ROOT, "b.txt").await.unwrap();
+    fs.vfs_unlink_unchecked(INO_ROOT, "b.txt").await.unwrap();
     assert!(
-        fs.vfs_getattr(ino).await.is_err(),
+        fs.vfs_getattr_unchecked(ino).await.is_err(),
         "the last unlink must remove the inode"
     );
 }
@@ -79,7 +83,7 @@ async fn a_hard_link_shares_content() {
     let fs = fixture().await;
     fs.write("/a.txt", b"one").await.unwrap();
     let ino = fs.stat("/a.txt").await.unwrap().ino;
-    fs.vfs_link(ino, INO_ROOT, "b.txt").await.unwrap();
+    fs.vfs_link_unchecked(ino, INO_ROOT, "b.txt").await.unwrap();
 
     fs.write("/a.txt", b"two").await.unwrap();
     assert_eq!(
@@ -99,7 +103,7 @@ async fn hard_links_to_directories_are_refused() {
     let d = fs.stat("/d").await.unwrap();
     assert!(
         matches!(
-            fs.vfs_link(d.ino, INO_ROOT, "d2").await,
+            fs.vfs_link_unchecked(d.ino, INO_ROOT, "d2").await,
             Err(OrigoFSError::Denied(_))
         ),
         "a hard link to a directory must be refused"
@@ -117,14 +121,14 @@ async fn link_rejects_a_taken_or_poisoned_name() {
 
     assert!(
         matches!(
-            fs.vfs_link(ino, INO_ROOT, "taken.txt").await,
+            fs.vfs_link_unchecked(ino, INO_ROOT, "taken.txt").await,
             Err(OrigoFSError::AlreadyExists(_))
         ),
         "linking onto an existing name must not silently replace it"
     );
     for bad in ["..", ".", "", "a/b", "a\0b"] {
         assert!(
-            fs.vfs_link(ino, INO_ROOT, bad).await.is_err(),
+            fs.vfs_link_unchecked(ino, INO_ROOT, bad).await.is_err(),
             "vfs_link must reject the component {bad:?}"
         );
     }
@@ -139,33 +143,57 @@ async fn xattrs_round_trip() {
     fs.write("/f", b"x").await.unwrap();
     let ino = fs.stat("/f").await.unwrap().ino;
 
-    assert_eq!(fs.vfs_listxattr(ino).await.unwrap(), Vec::<String>::new());
-    assert_eq!(fs.vfs_getxattr(ino, "user.tag").await.unwrap(), None);
+    assert_eq!(
+        fs.vfs_listxattr_unchecked(ino).await.unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        fs.vfs_getxattr_unchecked(ino, "user.tag").await.unwrap(),
+        None
+    );
 
-    fs.vfs_setxattr(ino, "user.tag", b"blue").await.unwrap();
-    fs.vfs_setxattr(ino, "user.other", b"green").await.unwrap();
+    fs.vfs_setxattr_unchecked(ino, "user.tag", b"blue")
+        .await
+        .unwrap();
+    fs.vfs_setxattr_unchecked(ino, "user.other", b"green")
+        .await
+        .unwrap();
 
     assert_eq!(
-        fs.vfs_getxattr(ino, "user.tag").await.unwrap().as_deref(),
+        fs.vfs_getxattr_unchecked(ino, "user.tag")
+            .await
+            .unwrap()
+            .as_deref(),
         Some(&b"blue"[..])
     );
     // Listed in name order, so a caller's output is stable.
     assert_eq!(
-        fs.vfs_listxattr(ino).await.unwrap(),
+        fs.vfs_listxattr_unchecked(ino).await.unwrap(),
         vec!["user.other".to_string(), "user.tag".to_string()]
     );
 
     // Setting an existing name replaces rather than duplicating.
-    fs.vfs_setxattr(ino, "user.tag", b"red").await.unwrap();
+    fs.vfs_setxattr_unchecked(ino, "user.tag", b"red")
+        .await
+        .unwrap();
     assert_eq!(
-        fs.vfs_getxattr(ino, "user.tag").await.unwrap().as_deref(),
+        fs.vfs_getxattr_unchecked(ino, "user.tag")
+            .await
+            .unwrap()
+            .as_deref(),
         Some(&b"red"[..])
     );
-    assert_eq!(fs.vfs_listxattr(ino).await.unwrap().len(), 2);
+    assert_eq!(fs.vfs_listxattr_unchecked(ino).await.unwrap().len(), 2);
 
-    assert!(fs.vfs_removexattr(ino, "user.tag").await.unwrap());
-    assert_eq!(fs.vfs_getxattr(ino, "user.tag").await.unwrap(), None);
-    assert_eq!(fs.vfs_listxattr(ino).await.unwrap(), vec!["user.other"]);
+    assert!(fs.vfs_removexattr_unchecked(ino, "user.tag").await.unwrap());
+    assert_eq!(
+        fs.vfs_getxattr_unchecked(ino, "user.tag").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        fs.vfs_listxattr_unchecked(ino).await.unwrap(),
+        vec!["user.other"]
+    );
 }
 
 /// Removing a name that was never set reports `false`, which is what lets the FUSE
@@ -177,7 +205,9 @@ async fn removing_an_absent_xattr_reports_that_it_was_absent() {
     fs.write("/f", b"x").await.unwrap();
     let ino = fs.stat("/f").await.unwrap().ino;
     assert!(
-        !fs.vfs_removexattr(ino, "user.nope").await.unwrap(),
+        !fs.vfs_removexattr_unchecked(ino, "user.nope")
+            .await
+            .unwrap(),
         "removal of an unset name must be distinguishable from a real one"
     );
 }
@@ -195,9 +225,11 @@ async fn xattrs_are_per_inode_not_per_content() {
     assert_eq!(a.content, b.content, "the two files should dedup");
     assert_ne!(a.ino, b.ino);
 
-    fs.vfs_setxattr(a.ino, "user.tag", b"only-a").await.unwrap();
+    fs.vfs_setxattr_unchecked(a.ino, "user.tag", b"only-a")
+        .await
+        .unwrap();
     assert_eq!(
-        fs.vfs_getxattr(b.ino, "user.tag").await.unwrap(),
+        fs.vfs_getxattr_unchecked(b.ino, "user.tag").await.unwrap(),
         None,
         "deduplicated content must not share extended attributes"
     );
@@ -214,13 +246,16 @@ async fn an_oversized_xattr_is_refused() {
 
     // At the limit: fine.
     let ok = vec![b'a'; MAX_XATTR_LEN];
-    fs.vfs_setxattr(ino, "user.big", &ok).await.unwrap();
+    fs.vfs_setxattr_unchecked(ino, "user.big", &ok)
+        .await
+        .unwrap();
 
     // One byte over: refused, and as TooLarge rather than a backend error.
     let too_big = vec![b'a'; MAX_XATTR_LEN + 1];
     assert!(
         matches!(
-            fs.vfs_setxattr(ino, "user.toobig", &too_big).await,
+            fs.vfs_setxattr_unchecked(ino, "user.toobig", &too_big)
+                .await,
             Err(OrigoFSError::TooLarge(_))
         ),
         "an xattr past the cap must be refused; the metadata DB never holds large bytes"
@@ -239,7 +274,9 @@ async fn xattrs_are_removed_with_their_inode() {
     fs.init().await.unwrap();
     fs.write("/f", b"x").await.unwrap();
     let ino = fs.stat("/f").await.unwrap().ino;
-    fs.vfs_setxattr(ino, "user.tag", b"v").await.unwrap();
+    fs.vfs_setxattr_unchecked(ino, "user.tag", b"v")
+        .await
+        .unwrap();
 
     fs.remove("/f").await.unwrap();
 
@@ -347,7 +384,7 @@ async fn du_counts_a_hard_linked_inode_once() {
     fs.mkdir_p("/d").await.unwrap();
     fs.write("/d/a", &vec![b'x'; 5000]).await.unwrap();
     let ino = fs.stat("/d/a").await.unwrap().ino;
-    fs.vfs_link(ino, fs.stat("/d").await.unwrap().ino, "b")
+    fs.vfs_link_unchecked(ino, fs.stat("/d").await.unwrap().ino, "b")
         .await
         .unwrap();
 

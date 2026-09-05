@@ -1580,6 +1580,34 @@ class Workspace:
     async def listxattr(self, path: str) -> list[str]: ...
     async def removexattr(self, path: str, name: str) -> bool: ...
 
+    # The attributed counterparts. The seven above are unattributed and run no
+    # authorization, like ``write``/``remove``/``mkdir``; these take a ``WriteCtx``
+    # and are checked against the ACL grant covering the path — ``WRITE`` for the
+    # four that mutate, ``READ`` for the three that do not (inert unless the
+    # workspace has ``acl_enforce_reads`` on).
+    async def chmod_as(self, ctx: WriteCtx, path: str, mode: int) -> StatResult: ...
+    async def chown_as(
+        self,
+        ctx: WriteCtx,
+        path: str,
+        uid: Optional[int] = None,
+        gid: Optional[int] = None,
+    ) -> StatResult: ...
+    async def link_as(
+        self, ctx: WriteCtx, existing_path: str, new_path: str
+    ) -> StatResult:
+        """Hard-link, requiring ``WRITE`` at ``new_path`` — the name being
+        created, not the file being pointed at."""
+        ...
+    async def getxattr_as(
+        self, ctx: WriteCtx, path: str, name: str
+    ) -> Optional[bytes]: ...
+    async def setxattr_as(
+        self, ctx: WriteCtx, path: str, name: str, value: bytes
+    ) -> None: ...
+    async def listxattr_as(self, ctx: WriteCtx, path: str) -> list[str]: ...
+    async def removexattr_as(self, ctx: WriteCtx, path: str, name: str) -> bool: ...
+
     # ── path-scoped write ACLs (issue #123) ──────────────────────────────────
     # `(actor, path_prefix) -> perms`, longest matching prefix wins. Permissions
     # are named: "write", "read+write", or ["read", "propose"]. An empty list is an

@@ -7,8 +7,9 @@
 //! bugs live in the seam between two modules.
 
 use origofs_core::{
-    Commit, ContentStore, Fs, Hash, MemStore, MergeOutcome, MetadataStore, OrigoFSError,
-    SqliteMetadataStore, Tree, TreeEntry, TreeKind, WriteCtx,
+    AttributionStore, CollabStore, Commit, ConfigStore, ContentStore, Fs, Hash, MemStore,
+    MergeOutcome, NamespaceStore, OrigoFSError, RefStore, SqliteMetadataStore, StoreLifecycle,
+    Tree, TreeEntry, TreeKind, WriteCtx,
 };
 use std::sync::Arc;
 
@@ -50,14 +51,26 @@ async fn checkout_abandons_an_unresolved_merge() {
         matches!(outcome, MergeOutcome::Conflicts(_)),
         "the fixture must actually conflict, or this proves nothing"
     );
-    assert!(fs.meta.get_ref("MERGE_HEAD").await.unwrap().is_some());
+    assert!(
+        fs.backends()
+            .meta
+            .get_ref("MERGE_HEAD")
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert!(!fs.conflicts().await.unwrap().is_empty());
 
     // Walk away from the merge.
     fs.checkout("other").await.unwrap();
 
     assert!(
-        fs.meta.get_ref("MERGE_HEAD").await.unwrap().is_none(),
+        fs.backends()
+            .meta
+            .get_ref("MERGE_HEAD")
+            .await
+            .unwrap()
+            .is_none(),
         "MERGE_HEAD must not survive the checkout that abandoned its merge"
     );
     assert!(
@@ -106,7 +119,12 @@ async fn accepting_a_proposed_deletion_is_attributed() {
         .unwrap();
     assert!(fs.read("/doomed.txt").await.is_err(), "the file is gone");
 
-    let ops = fs.meta.list_edit_ops(author, Some(session)).await.unwrap();
+    let ops = fs
+        .backends()
+        .meta
+        .list_edit_ops(author, Some(session))
+        .await
+        .unwrap();
     let removal = ops
         .iter()
         .find(|o| o.op == "remove" && o.path == "/doomed.txt")

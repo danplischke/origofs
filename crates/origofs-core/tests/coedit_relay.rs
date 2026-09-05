@@ -7,7 +7,7 @@
 //! Requires the `coedit` feature.
 #![cfg(feature = "coedit")]
 
-use origofs_core::{CoeditDoc, MetadataStore, PostgresMetadataStore, WriteCtx};
+use origofs_core::{CoeditDoc, PostgresMetadataStore, StoreLifecycle, WriteCtx};
 use std::sync::OnceLock;
 use std::time::Duration;
 

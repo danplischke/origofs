@@ -30,3 +30,52 @@ debug = "line-tables-only"
 
 [profile.test]
 debug = "line-tables-only"
+
+# Lint policy lives here rather than only in `ci.yml`, so a local `cargo clippy`
+# and the CI gate agree and a contributor learns the rules from the manifest
+# instead of from a failed build. `ci.yml` still passes `-D warnings`; that is now
+# a second copy of the gate, not the only copy of the policy.
+[workspace.lints.rust]
+# The `-D warnings` CI has always run, expressed as project state.
+warnings = "deny"
+# `unsafe` appears in exactly four places (a raw `read(2)` on stdin, `geteuid`,
+# `lgetxattr`, and one content-store site). Requiring the inner block makes each
+# one a visible, greppable claim rather than an implicit property of the fn.
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# What CI enforced before this table existed. `priority = -1` so targeted lints
+# can override members of the group.
+all = { level = "deny", priority = -1 }
+# Debugging leftovers and library-hostile behaviour. These hold for every target
+# in the package, tests included, because none of them is ever right there either.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+mem_forget = "deny"
+float_cmp = "deny"
+undocumented_unsafe_blocks = "deny"
+
+# NOT enabled, deliberately, each with the reason:
+#
+# - `cast_possible_truncation` / `cast_sign_loss` / `cast_possible_wrap`: ~90 live
+#   sites across `origofs-core` and `origofs-sdk`, concentrated in the two SQL row
+#   decoders (`i64` columns back into `u32` modes and `u64` sizes) and the
+#   chunk/manifest arithmetic. This is the highest-value lint left for this
+#   codebase — `docs/LIMITS.md` records two shipped corruption bugs of exactly
+#   this class, where `Manifest::encode` and `PackLoc::encode` wrapped a bare
+#   `as u32` at *write* time and only surfaced on the next read. It is off only
+#   because turning it on is an audit of 90 sites, not a formatting pass, and
+#   doing it in the same change as the lint table would bury it. Tracked
+#   separately; do the audit, then move these three here.
+# - `indexing_slicing` / `string_slice`: ~65 sites, nearly all a bounds-checked
+#   decoder slicing right after checking the length. Forcing `.get()` there
+#   trades a readable decoder for an unreadable one and buys nothing the existing
+#   `format.rs` guards and the fuzz targets do not already cover.
+#
+# The no-panic policy for *library* code (`unwrap_used`, `expect_used`,
+# `unreachable`, `panic_in_result_fn`) is deliberately NOT here. A Cargo `[lints]`
+# table applies to every target in the package, and an integration test that
+# cannot `.unwrap()` is an integration test nobody writes. The policy is a
+# property of the library target only, so it is declared at the crate root of
+# `origofs-core` and `origofs-sdk` under `cfg_attr(not(test), ...)`.

@@ -863,9 +863,27 @@ impl Coordinator {
 }
 
 /// A fresh, practically-unique worker id (128 random bits, hex).
+///
+/// Falls back to a clock- and address-derived id if the OS RNG is unavailable
+/// rather than panicking. The id only has to be distinct from the *other*
+/// workers' ids on the relay; taking a whole co-editing server down because
+/// `getrandom` was momentarily unavailable trades a unique id for no server.
 fn new_origin() -> String {
     let mut b = [0u8; 16];
-    getrandom::getrandom(&mut b).expect("getrandom for worker id");
+    if getrandom::getrandom(&mut b).is_err() {
+        tracing::warn!("OS RNG unavailable for the co-editing worker id; deriving one instead");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        b[..16].copy_from_slice(&nanos.to_le_bytes());
+        // Mix in an address from this process's heap so two workers started in
+        // the same nanosecond on different machines still differ.
+        let here = Box::new(0u8);
+        let addr = (Box::into_raw(here) as usize).to_le_bytes();
+        for (i, x) in addr.iter().enumerate() {
+            b[i] ^= x;
+        }
+    }
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 

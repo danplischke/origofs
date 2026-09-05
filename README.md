@@ -478,7 +478,16 @@ happens to hold that id there.
 
 Opt-in (the `coedit` feature): humans, agents, and browser editors type into the
 same document **concurrently** and converge — a CRDT (`yrs`) under the hood, with
-authorship tracked per character. It speaks the standard Yjs **y-sync** protocol,
+authorship tracked per character.
+
+> [!WARNING]
+> **Do not expose the co-editing WebSocket to untrusted clients.** A malformed
+> y-sync update reaches unvalidated UTF-8 handling inside `yrs` and triggers
+> undefined behaviour — silent in release builds, and reachable in 51 bytes from
+> any connected client. Upgrading `yrs` does not fix it (0.24–0.27 reproduce it),
+> and nothing on origofs's side can contain it. This is why `coedit` is off by
+> default and not part of `full`. See
+> [SECURITY.md](SECURITY.md#live-co-editing-coedit--a-known-memory-safety-hazard-on-untrusted-input). It speaks the standard Yjs **y-sync** protocol,
 so an unmodified Yjs client connects to the co-editing WebSocket with no custom
 server code — a plain-text or Markdown editor bound to the shared text (over
 `y-websocket`) collaborates out of the box.

@@ -2,7 +2,9 @@
 //! presence with staleness, plus (against a live Postgres) the LISTEN/NOTIFY
 //! push that lets consumers skip polling.
 
-use origofs_core::{ActorInit, EventInit, MetadataStore, SqliteMetadataStore};
+use origofs_core::{
+    ActorInit, AttributionStore, CollabStore, EventInit, SqliteMetadataStore, StoreLifecycle,
+};
 
 async fn store() -> SqliteMetadataStore {
     let m = SqliteMetadataStore::open_in_memory().unwrap();

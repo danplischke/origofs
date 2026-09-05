@@ -13,7 +13,11 @@ use crate::attribution::{
 };
 use crate::collab::{EVENT_CHANNEL, Event, EventInit, LiveDoc, Presence};
 use crate::error::{OrigoFSError, Result};
-use crate::metadata::{MetaTxn, MetadataStore};
+use crate::metadata::{
+    AclStore, AttributionStore, CollabStore, ConfigStore, LockStore, MetaTxn, MetadataStore,
+    NamespaceStore, PortableStore, RefStore, StoreLifecycle, SuggestionStore, TrashStore,
+    WorkspaceRegistry,
+};
 use crate::migrations::MIGRATIONS;
 use crate::posixlock::{LockRequest, PosixLock};
 use crate::suggest::{Suggestion, SuggestionInit, SuggestionKind, SuggestionStatus};
@@ -826,24 +830,7 @@ fn posix_lock_key(workspace_id: i64, ino: Ino) -> i64 {
 }
 
 #[async_trait]
-impl MetadataStore for PostgresMetadataStore {
-    /// Close the connection pool (issue #154).
-    ///
-    /// The pool is shared by every clone of this store — `for_workspace` hands
-    /// out handles over the same one — so this closes it for all of them. That is
-    /// the point: an embedder calling it at shutdown wants the sockets gone, not
-    /// gone for one handle while a forgotten clone keeps them.
-    ///
-    /// `deadpool` closes idle connections immediately and in-flight ones as they
-    /// are returned, and every later `get()` fails with `Closed` — which reaches
-    /// a caller as a classified `Backend`/`Unavailable` error through
-    /// `From<PoolError>`, so a call after shutdown says the store is unavailable
-    /// rather than hanging on an acquisition that will never be served.
-    async fn close(&self) -> Result<()> {
-        self.pool.close();
-        Ok(())
-    }
-
+impl StoreLifecycle for PostgresMetadataStore {
     async fn init(&self) -> Result<()> {
         let mut c = self.client().await?;
         let now = now_secs();
@@ -927,6 +914,23 @@ impl MetadataStore for PostgresMetadataStore {
         }
     }
 
+    /// Close the connection pool (issue #154).
+    ///
+    /// The pool is shared by every clone of this store — `for_workspace` hands
+    /// out handles over the same one — so this closes it for all of them. That is
+    /// the point: an embedder calling it at shutdown wants the sockets gone, not
+    /// gone for one handle while a forgotten clone keeps them.
+    ///
+    /// `deadpool` closes idle connections immediately and in-flight ones as they
+    /// are returned, and every later `get()` fails with `Closed` — which reaches
+    /// a caller as a classified `Backend`/`Unavailable` error through
+    /// `From<PoolError>`, so a call after shutdown says the store is unavailable
+    /// rather than hanging on an acquisition that will never be served.
+    async fn close(&self) -> Result<()> {
+        self.pool.close();
+        Ok(())
+    }
+
     async fn begin(&self) -> Result<Box<dyn MetaTxn>> {
         // Pin one pooled connection for the whole `BEGIN … COMMIT`. All the
         // transaction's statements run on this same connection; it returns to
@@ -960,7 +964,10 @@ impl MetadataStore for PostgresMetadataStore {
             workspace_id: self.workspace_id,
         }))
     }
+}
 
+#[async_trait]
+impl NamespaceStore for PostgresMetadataStore {
     async fn get_inode(&self, ino: Ino) -> Result<Option<Inode>> {
         let c = self.client().await?;
         let row = c
@@ -1274,89 +1281,255 @@ impl MetadataStore for PostgresMetadataStore {
         ))
     }
 
-    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
-        let table = crate::sqlite::validated_dump_table(table)?;
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         let c = self.client().await?;
-        // Every column rendered as text by the server, then re-typed from the
-        // catalog below. Postgres's binary protocol would need a `FromSql` impl per
-        // column type, and the point of a *portable* dump is not to care.
-        let rows = c.query(&format!("SELECT * FROM \"{table}\""), &[]).await?;
-        let mut out = Vec::new();
-        for r in &rows {
-            let mut cells = Vec::with_capacity(r.columns().len());
-            for (i, col) in r.columns().iter().enumerate() {
-                cells.push((col.name().to_string(), pg_cell(r, i, col.type_())?));
-            }
-            out.push(crate::portable::Row(cells));
-        }
-        Ok(out)
+        let row = c
+            .query_opt(
+                "SELECT value FROM xattr WHERE ino = $1 AND name = $2",
+                &[&ino, &name],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, Vec<u8>>(0)))
     }
 
-    async fn reset_for_load(&self) -> Result<()> {
-        let mut c = self.client().await?;
-        let tx = c.transaction().await?;
-        for table in crate::portable::DUMP_TABLES.iter().rev() {
-            tx.execute(&format!("DELETE FROM \"{table}\""), &[]).await?;
-        }
-        tx.commit().await?;
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO xattr(ino, name, value) VALUES ($1, $2, $3)
+             ON CONFLICT (ino, name) DO UPDATE SET value = EXCLUDED.value",
+            &[&ino, &name, &value],
+        )
+        .await?;
         Ok(())
     }
 
-    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
-        let table = crate::sqlite::validated_dump_table(table)?;
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let mut c = self.client().await?;
-        let tx = c.transaction().await?;
-        for row in rows {
-            let quoted: Vec<String> = row.0.iter().map(|(cn, _)| format!("\"{cn}\"")).collect();
-            let placeholders: Vec<String> = (1..=row.0.len()).map(|i| format!("${i}")).collect();
-            // Cast every parameter from text and let Postgres coerce to the column
-            // type. Sending a bare text parameter into a BIGINT column is a type
-            // error; `$n` with an explicit cast is not.
-            let sql = format!(
-                "INSERT INTO \"{table}\"({}) VALUES ({})",
-                quoted.join(", "),
-                placeholders.join(", ")
-            );
-            let owned: Vec<PgParam> = row.0.iter().map(|(_, v)| PgParam::from(v)).collect();
-            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = owned
-                .iter()
-                .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-            tx.execute(&sql, &params).await?;
-        }
-        // Identity sequences were bypassed by the explicit ids above, so advance
-        // each past what was inserted -- otherwise the next natural insert collides
-        // with a restored row. Same hazard the V11 bootstrap already handles for
-        // `inode`.
-        for (t, col) in [
-            ("inode", "ino"),
-            ("actor", "id"),
-            ("session", "id"),
-            ("suggestion", "id"),
-            ("trash", "id"),
-            ("workspace", "id"),
-            ("edit_op", "id"),
-            ("tool_calls", "id"),
-        ] {
-            if t == table {
-                let _ = tx
-                    .execute(
-                        &format!(
-                            "SELECT setval(pg_get_serial_sequence('{t}', '{col}'), \
-                             GREATEST((SELECT COALESCE(MAX(\"{col}\"), 1) FROM \"{t}\"), 1))"
-                        ),
-                        &[],
-                    )
-                    .await;
-            }
-        }
-        tx.commit().await?;
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
+        let c = self.client().await?;
+        let n = c
+            .execute(
+                "DELETE FROM xattr WHERE ino = $1 AND name = $2",
+                &[&ino, &name],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT name FROM xattr WHERE ino = $1 ORDER BY name",
+                &[&ino],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO symlink(ino, target) VALUES ($1, $2)
+             ON CONFLICT (ino) DO UPDATE SET target = EXCLUDED.target",
+            &[&ino, &target],
+        )
+        .await?;
         Ok(())
     }
 
+    async fn get_symlink(&self, ino: Ino) -> Result<Option<String>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt("SELECT target FROM symlink WHERE ino = $1", &[&ino])
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    async fn truncate_tree(&self) -> Result<()> {
+        let c = self.client().await?;
+        truncate_workspace_tree_pg(&c, self.workspace_id).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RefStore for PostgresMetadataStore {
+    async fn get_ref(&self, name: &str) -> Result<Option<String>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT value FROM ref WHERE workspace_id = $1 AND name = $2",
+                &[&self.workspace_id, &name],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    async fn set_ref(&self, name: &str, value: &str) -> Result<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO ref(workspace_id, name, value) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, name) DO UPDATE SET value = EXCLUDED.value",
+            &[&self.workspace_id, &name, &value],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn cas_ref(&self, name: &str, expect: Option<&str>, new: &str) -> Result<bool> {
+        let c = self.client().await?;
+        let changed = match expect {
+            None => {
+                c.execute(
+                    "INSERT INTO ref(workspace_id, name, value) VALUES ($1, $2, $3)
+                     ON CONFLICT (workspace_id, name) DO NOTHING",
+                    &[&self.workspace_id, &name, &new],
+                )
+                .await?
+            }
+            Some(v) => {
+                c.execute(
+                    "UPDATE ref SET value = $1 WHERE workspace_id = $2 AND name = $3 AND value = $4",
+                    &[&new, &self.workspace_id, &name, &v],
+                )
+                .await?
+            }
+        };
+        Ok(changed == 1)
+    }
+
+    async fn delete_ref(&self, name: &str) -> Result<()> {
+        let c = self.client().await?;
+        c.execute(
+            "DELETE FROM ref WHERE workspace_id = $1 AND name = $2",
+            &[&self.workspace_id, &name],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn list_refs(&self) -> Result<Vec<(String, String)>> {
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT name, value FROM ref WHERE workspace_id = $1 ORDER BY name",
+                &[&self.workspace_id],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+}
+
+#[async_trait]
+impl ConfigStore for PostgresMetadataStore {
+    async fn get_config(&self, key: &str) -> Result<Option<String>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT value FROM config WHERE workspace_id = $1 AND key = $2",
+                &[&self.workspace_id, &key],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    async fn set_config(&self, key: &str, value: &str) -> Result<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO config(workspace_id, key, value) VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, key) DO UPDATE SET value = EXCLUDED.value",
+            &[&self.workspace_id, &key, &value],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn bump_counter(&self, key: &str) -> Result<i64> {
+        let c = self.client().await?;
+        // One atomic upsert: create at 1, else increment the stored integer.
+        let row = c
+            .query_one(
+                "INSERT INTO config(workspace_id, key, value) VALUES ($1, $2, '1')
+                 ON CONFLICT (workspace_id, key) DO UPDATE SET value = (config.value::bigint + 1)::text
+                 RETURNING value::bigint",
+                &[&self.workspace_id, &key],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+}
+
+#[async_trait]
+impl WorkspaceRegistry for PostgresMetadataStore {
+    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore> {
+        Arc::new(PostgresMetadataStore {
+            pool: self.pool.clone(),
+            dsn: self.dsn.clone(),
+            workspace_id,
+        })
+    }
+
+    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)> {
+        let mut c = self.client().await?;
+        let now = now_secs();
+        let tx = c.transaction().await?;
+        // Reserve the row (fails on a duplicate name), give it its own root
+        // directory inode, then point the row at that inode — all atomic.
+        let id: i64 = match tx
+            .query_one(
+                "INSERT INTO workspace(name, root_ino, created_at) VALUES ($1, 0, $2) RETURNING id",
+                &[&name, &now],
+            )
+            .await
+        {
+            Ok(row) => row.get(0),
+            Err(e) if e.code() == Some(&SqlState::UNIQUE_VIOLATION) => {
+                return Err(OrigoFSError::AlreadyExists(format!("workspace {name}")));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mode = DIR_MODE;
+        let root_ino: i64 = tx
+            .query_one(
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+                 VALUES ($1, 'dir', $2, 1, 0, NULL, $3, $3) RETURNING ino",
+                &[&id, &mode, &now],
+            )
+            .await?
+            .get(0);
+        tx.execute(
+            "UPDATE workspace SET root_ino = $1 WHERE id = $2",
+            &[&root_ino, &id],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok((id, root_ino))
+    }
+
+    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT id, root_ino FROM workspace WHERE name = $1",
+                &[&name],
+            )
+            .await?;
+        Ok(row.map(|r| (r.get(0), r.get(1))))
+    }
+
+    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>> {
+        let c = self.client().await?;
+        let rows = c
+            .query("SELECT id, name, root_ino FROM workspace ORDER BY id", &[])
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
+    }
+}
+
+#[async_trait]
+impl AclStore for PostgresMetadataStore {
     async fn set_acl(
         &self,
         actor_id: i64,
@@ -1418,7 +1591,10 @@ impl MetadataStore for PostgresMetadataStore {
             })
             .collect())
     }
+}
 
+#[async_trait]
+impl TrashStore for PostgresMetadataStore {
     async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
         let c = self.client().await?;
         let row = c
@@ -1509,244 +1685,10 @@ impl MetadataStore for PostgresMetadataStore {
             .filter_map(|r| Hash::from_hex(&r.get::<_, String>(0)))
             .collect())
     }
+}
 
-    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
-        let c = self.client().await?;
-        let row = c
-            .query_opt(
-                "SELECT value FROM xattr WHERE ino = $1 AND name = $2",
-                &[&ino, &name],
-            )
-            .await?;
-        Ok(row.map(|r| r.get::<_, Vec<u8>>(0)))
-    }
-
-    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
-        let c = self.client().await?;
-        c.execute(
-            "INSERT INTO xattr(ino, name, value) VALUES ($1, $2, $3)
-             ON CONFLICT (ino, name) DO UPDATE SET value = EXCLUDED.value",
-            &[&ino, &name, &value],
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
-        let c = self.client().await?;
-        let n = c
-            .execute(
-                "DELETE FROM xattr WHERE ino = $1 AND name = $2",
-                &[&ino, &name],
-            )
-            .await?;
-        Ok(n > 0)
-    }
-
-    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
-        let c = self.client().await?;
-        let rows = c
-            .query(
-                "SELECT name FROM xattr WHERE ino = $1 ORDER BY name",
-                &[&ino],
-            )
-            .await?;
-        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
-    }
-
-    async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()> {
-        let c = self.client().await?;
-        c.execute(
-            "INSERT INTO symlink(ino, target) VALUES ($1, $2)
-             ON CONFLICT (ino) DO UPDATE SET target = EXCLUDED.target",
-            &[&ino, &target],
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn get_symlink(&self, ino: Ino) -> Result<Option<String>> {
-        let c = self.client().await?;
-        let row = c
-            .query_opt("SELECT target FROM symlink WHERE ino = $1", &[&ino])
-            .await?;
-        Ok(row.map(|r| r.get(0)))
-    }
-
-    async fn get_ref(&self, name: &str) -> Result<Option<String>> {
-        let c = self.client().await?;
-        let row = c
-            .query_opt(
-                "SELECT value FROM ref WHERE workspace_id = $1 AND name = $2",
-                &[&self.workspace_id, &name],
-            )
-            .await?;
-        Ok(row.map(|r| r.get(0)))
-    }
-
-    async fn set_ref(&self, name: &str, value: &str) -> Result<()> {
-        let c = self.client().await?;
-        c.execute(
-            "INSERT INTO ref(workspace_id, name, value) VALUES ($1, $2, $3)
-             ON CONFLICT (workspace_id, name) DO UPDATE SET value = EXCLUDED.value",
-            &[&self.workspace_id, &name, &value],
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn cas_ref(&self, name: &str, expect: Option<&str>, new: &str) -> Result<bool> {
-        let c = self.client().await?;
-        let changed = match expect {
-            None => {
-                c.execute(
-                    "INSERT INTO ref(workspace_id, name, value) VALUES ($1, $2, $3)
-                     ON CONFLICT (workspace_id, name) DO NOTHING",
-                    &[&self.workspace_id, &name, &new],
-                )
-                .await?
-            }
-            Some(v) => {
-                c.execute(
-                    "UPDATE ref SET value = $1 WHERE workspace_id = $2 AND name = $3 AND value = $4",
-                    &[&new, &self.workspace_id, &name, &v],
-                )
-                .await?
-            }
-        };
-        Ok(changed == 1)
-    }
-
-    async fn delete_ref(&self, name: &str) -> Result<()> {
-        let c = self.client().await?;
-        c.execute(
-            "DELETE FROM ref WHERE workspace_id = $1 AND name = $2",
-            &[&self.workspace_id, &name],
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn list_refs(&self) -> Result<Vec<(String, String)>> {
-        let c = self.client().await?;
-        let rows = c
-            .query(
-                "SELECT name, value FROM ref WHERE workspace_id = $1 ORDER BY name",
-                &[&self.workspace_id],
-            )
-            .await?;
-        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
-    }
-
-    async fn get_config(&self, key: &str) -> Result<Option<String>> {
-        let c = self.client().await?;
-        let row = c
-            .query_opt(
-                "SELECT value FROM config WHERE workspace_id = $1 AND key = $2",
-                &[&self.workspace_id, &key],
-            )
-            .await?;
-        Ok(row.map(|r| r.get(0)))
-    }
-
-    async fn set_config(&self, key: &str, value: &str) -> Result<()> {
-        let c = self.client().await?;
-        c.execute(
-            "INSERT INTO config(workspace_id, key, value) VALUES ($1, $2, $3)
-             ON CONFLICT (workspace_id, key) DO UPDATE SET value = EXCLUDED.value",
-            &[&self.workspace_id, &key, &value],
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn bump_counter(&self, key: &str) -> Result<i64> {
-        let c = self.client().await?;
-        // One atomic upsert: create at 1, else increment the stored integer.
-        let row = c
-            .query_one(
-                "INSERT INTO config(workspace_id, key, value) VALUES ($1, $2, '1')
-                 ON CONFLICT (workspace_id, key) DO UPDATE SET value = (config.value::bigint + 1)::text
-                 RETURNING value::bigint",
-                &[&self.workspace_id, &key],
-            )
-            .await?;
-        Ok(row.get(0))
-    }
-
-    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore> {
-        Arc::new(PostgresMetadataStore {
-            pool: self.pool.clone(),
-            dsn: self.dsn.clone(),
-            workspace_id,
-        })
-    }
-
-    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)> {
-        let mut c = self.client().await?;
-        let now = now_secs();
-        let tx = c.transaction().await?;
-        // Reserve the row (fails on a duplicate name), give it its own root
-        // directory inode, then point the row at that inode — all atomic.
-        let id: i64 = match tx
-            .query_one(
-                "INSERT INTO workspace(name, root_ino, created_at) VALUES ($1, 0, $2) RETURNING id",
-                &[&name, &now],
-            )
-            .await
-        {
-            Ok(row) => row.get(0),
-            Err(e) if e.code() == Some(&SqlState::UNIQUE_VIOLATION) => {
-                return Err(OrigoFSError::AlreadyExists(format!("workspace {name}")));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let mode = DIR_MODE;
-        let root_ino: i64 = tx
-            .query_one(
-                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES ($1, 'dir', $2, 1, 0, NULL, $3, $3) RETURNING ino",
-                &[&id, &mode, &now],
-            )
-            .await?
-            .get(0);
-        tx.execute(
-            "UPDATE workspace SET root_ino = $1 WHERE id = $2",
-            &[&root_ino, &id],
-        )
-        .await?;
-        tx.commit().await?;
-        Ok((id, root_ino))
-    }
-
-    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>> {
-        let c = self.client().await?;
-        let row = c
-            .query_opt(
-                "SELECT id, root_ino FROM workspace WHERE name = $1",
-                &[&name],
-            )
-            .await?;
-        Ok(row.map(|r| (r.get(0), r.get(1))))
-    }
-
-    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>> {
-        let c = self.client().await?;
-        let rows = c
-            .query("SELECT id, name, root_ino FROM workspace ORDER BY id", &[])
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get(0), r.get(1), r.get(2)))
-            .collect())
-    }
-
-    async fn truncate_tree(&self) -> Result<()> {
-        let c = self.client().await?;
-        truncate_workspace_tree_pg(&c, self.workspace_id).await?;
-        Ok(())
-    }
-
+#[async_trait]
+impl LockStore for PostgresMetadataStore {
     async fn set_conflict(&self, path: &str, kind: &str) -> Result<()> {
         let c = self.client().await?;
         c.execute(
@@ -2001,7 +1943,10 @@ impl MetadataStore for PostgresMetadataStore {
             .await?;
         Ok(n)
     }
+}
 
+#[async_trait]
+impl AttributionStore for PostgresMetadataStore {
     async fn create_actor(&self, init: ActorInit) -> Result<i64> {
         let c = self.client().await?;
         let kind = init.kind.unwrap_or(ActorKind::System).as_str();
@@ -2208,7 +2153,10 @@ impl MetadataStore for PostgresMetadataStore {
             .await?;
         Ok(row.map(|r| r.get(0)))
     }
+}
 
+#[async_trait]
+impl CollabStore for PostgresMetadataStore {
     async fn append_event(&self, ev: EventInit, ts: i64) -> Result<i64> {
         let mut c = self.client().await?;
         let tx = c.transaction().await?;
@@ -2400,7 +2348,10 @@ impl MetadataStore for PostgresMetadataStore {
         .await?;
         Ok(())
     }
+}
 
+#[async_trait]
+impl SuggestionStore for PostgresMetadataStore {
     async fn create_suggestion(&self, init: SuggestionInit, ts: i64) -> Result<i64> {
         let c = self.client().await?;
         let row = c
@@ -2478,6 +2429,92 @@ impl MetadataStore for PostgresMetadataStore {
     }
 }
 
+#[async_trait]
+impl PortableStore for PostgresMetadataStore {
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
+        let table = crate::sqlite::validated_dump_table(table)?;
+        let c = self.client().await?;
+        // Every column rendered as text by the server, then re-typed from the
+        // catalog below. Postgres's binary protocol would need a `FromSql` impl per
+        // column type, and the point of a *portable* dump is not to care.
+        let rows = c.query(&format!("SELECT * FROM \"{table}\""), &[]).await?;
+        let mut out = Vec::new();
+        for r in &rows {
+            let mut cells = Vec::with_capacity(r.columns().len());
+            for (i, col) in r.columns().iter().enumerate() {
+                cells.push((col.name().to_string(), pg_cell(r, i, col.type_())?));
+            }
+            out.push(crate::portable::Row(cells));
+        }
+        Ok(out)
+    }
+
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
+        let table = crate::sqlite::validated_dump_table(table)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut c = self.client().await?;
+        let tx = c.transaction().await?;
+        for row in rows {
+            let quoted: Vec<String> = row.0.iter().map(|(cn, _)| format!("\"{cn}\"")).collect();
+            let placeholders: Vec<String> = (1..=row.0.len()).map(|i| format!("${i}")).collect();
+            // Cast every parameter from text and let Postgres coerce to the column
+            // type. Sending a bare text parameter into a BIGINT column is a type
+            // error; `$n` with an explicit cast is not.
+            let sql = format!(
+                "INSERT INTO \"{table}\"({}) VALUES ({})",
+                quoted.join(", "),
+                placeholders.join(", ")
+            );
+            let owned: Vec<PgParam> = row.0.iter().map(|(_, v)| PgParam::from(v)).collect();
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = owned
+                .iter()
+                .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            tx.execute(&sql, &params).await?;
+        }
+        // Identity sequences were bypassed by the explicit ids above, so advance
+        // each past what was inserted -- otherwise the next natural insert collides
+        // with a restored row. Same hazard the V11 bootstrap already handles for
+        // `inode`.
+        for (t, col) in [
+            ("inode", "ino"),
+            ("actor", "id"),
+            ("session", "id"),
+            ("suggestion", "id"),
+            ("trash", "id"),
+            ("workspace", "id"),
+            ("edit_op", "id"),
+            ("tool_calls", "id"),
+        ] {
+            if t == table {
+                let _ = tx
+                    .execute(
+                        &format!(
+                            "SELECT setval(pg_get_serial_sequence('{t}', '{col}'), \
+                             GREATEST((SELECT COALESCE(MAX(\"{col}\"), 1) FROM \"{t}\"), 1))"
+                        ),
+                        &[],
+                    )
+                    .await;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn reset_for_load(&self) -> Result<()> {
+        let mut c = self.client().await?;
+        let tx = c.transaction().await?;
+        for table in crate::portable::DUMP_TABLES.iter().rev() {
+            tx.execute(&format!("DELETE FROM \"{table}\""), &[]).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
 /// A Postgres metadata transaction ([`MetadataStore::begin`]). Pins one pooled
 /// connection for `BEGIN … COMMIT`. Dropped without [`commit`](MetaTxn::commit)
 /// — an error path or a panic — it rolls back before the connection returns to
@@ -2491,6 +2528,10 @@ struct PostgresTxn {
 }
 
 impl PostgresTxn {
+    #[expect(
+        clippy::expect_used,
+        reason = "`obj`/`guard` is `Some` for the whole life of the transaction: it is taken only by `commit`/`rollback`, which consume the `Box<Self>`, so no handle survives to observe the `None`. A panic here is a use-after-finish bug in this file, not a runtime condition a caller can hit."
+    )]
     fn conn(&self) -> &Object {
         self.obj.as_ref().expect("transaction already finished")
     }
@@ -2870,6 +2911,10 @@ impl MetaTxn for PostgresTxn {
         Ok(())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "`obj`/`guard` is `Some` for the whole life of the transaction: it is taken only by `commit`/`rollback`, which consume the `Box<Self>`, so no handle survives to observe the `None`. A panic here is a use-after-finish bug in this file, not a runtime condition a caller can hit."
+    )]
     async fn commit(mut self: Box<Self>) -> Result<()> {
         let obj = self.obj.take().expect("transaction already finished");
         obj.batch_execute("COMMIT").await?;
@@ -2877,6 +2922,10 @@ impl MetaTxn for PostgresTxn {
         Ok(())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "`obj`/`guard` is `Some` for the whole life of the transaction: it is taken only by `commit`/`rollback`, which consume the `Box<Self>`, so no handle survives to observe the `None`. A panic here is a use-after-finish bug in this file, not a runtime condition a caller can hit."
+    )]
     async fn rollback(mut self: Box<Self>) -> Result<()> {
         let obj = self.obj.take().expect("transaction already finished");
         // Awaited, unlike the `Drop` path: the connection is clean and back in the

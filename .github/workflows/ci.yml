@@ -103,6 +103,19 @@ jobs:
           cargo test --workspace --doc
           cargo test -p origofs-sdk --features full --doc
 
+      # The SQLite read pool's safety interlock — `PRAGMA query_only=ON` on every
+      # reader — only exists on a *file-backed* store, and nearly every suite in
+      # origofs-core is in-memory, where `read()` falls back to the writer and a
+      # method in the wrong bucket would never be caught. This flips the whole
+      # suite onto disk with the pool armed, so the read/write classification of
+      # ~90 methods is covered by all 676 tests rather than by the one hand-written
+      # on-disk file. Verified by deliberately misrouting `set_ref` onto the pool:
+      # the run fails with "attempt to write a readonly database".
+      - name: Test with the SQLite read pool armed
+        env:
+          ORIGOFS_SQLITE_TEST_ON_DISK: "1"
+        run: cargo nextest run --profile ci -p origofs-core --features test-support,coedit,metrics
+
       # The opt-in `coedit` feature (yrs-backed CRDT co-editing, roadmap M8) is
       # off by default for origofs-core and origofs-sdk, so exercise it — clippy +
       # tests — explicitly. `-p origofs-sdk --features coedit` covers coedit without
@@ -441,10 +454,20 @@ jobs:
       # promptly, -max_total_time bounds the rest, and -rss_limit_mb turns a
       # runaway allocation (a defeated anti-OOM guard) into a hard failure. A
       # crash writes a reproducer under fuzz/artifacts and fails the job.
+      # Every target except `coedit_state_decode`, which drives the pinned `yrs`
+      # UB (#144) and is *expected* to abort — running it here would fail the job
+      # on a known, documented condition rather than on a regression.
+      #
+      # This used to name only the first four. `sidecar_decode`,
+      # `tree_sidecar_decode` and `posix_lock_resolve` existed, were listed in
+      # `fuzz/Cargo.toml`, were `cargo check`ed by the clippy job — and were never
+      # actually run, so three targets were carrying no signal at all.
       - name: Fuzz each decoder (bounded)
         working-directory: crates/origofs-core
         run: |
-          for t in manifest_decode tree_decode commit_decode refsnapshot_decode; do
+          for t in manifest_decode tree_decode commit_decode refsnapshot_decode \
+                   sidecar_decode tree_sidecar_decode \
+                   pack_index_decode pack_trailer_decode posix_lock_resolve; do
             echo "::group::fuzz $t"
             cargo fuzz run "$t" -- -max_total_time=45 -runs=3000000 -rss_limit_mb=2048
             echo "::endgroup::"

@@ -450,7 +450,7 @@ impl NFSFileSystem for OrigoFSNfs {
             match self
                 .ws
                 .fs()
-                .vfs_dentry_name(dirid, start_after as i64)
+                .vfs_dentry_name_as(self.ctx, dirid, start_after as i64)
                 .await
                 .map_err(stat)?
             {

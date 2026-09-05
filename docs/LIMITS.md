@@ -154,3 +154,31 @@ per contiguous same-author span — roughly one per line for multi-author text �
 it is rewritten on every attributed write. A very large multi-author text file
 approaches the ~1 GB column limit. This is the one place file size touches the
 metadata database.
+
+## Co-editing: a decoder that is not hardened against hostile input
+
+Every limit above is a *guard* — a threshold origofs checks and refuses at. This
+one is not, and it is the reason `coedit` is off by default and excluded from
+`full`.
+
+A malformed y-sync update reaches `from_utf8_unchecked` inside `yrs`
+(`encoding/read.rs`, `updates/decoder.rs`) and is then iterated in
+`block::utf16_len`. That is undefined behaviour: it aborts under the debug UB
+checks and is silent in release. 51 bytes suffice, through the public
+`CoeditDoc::load`, and `handle_sync` feeds it bytes from clients origofs
+explicitly does not trust.
+
+There is no threshold to raise and no option to set. 0.24/0.25/0.26 reproduce it
+identically; 0.27.4 has the same two `unsafe` sites and does not build on stable.
+The abort is non-unwinding, so `catch_unwind` is no help, and pre-validating the
+bytes would mean reimplementing the decoder.
+
+**The only mitigation is deployment-shaped:** the co-editing WebSocket must be
+reachable only by clients you trust. `crates/origofs-core/tests/coedit_malformed_update.rs`
+holds the reproducer (`#[ignore]`d — it takes the suite down rather than failing
+it; run with `--ignored` when trying a candidate `yrs`), and
+`fuzz_targets/coedit_state_decode.rs` drives the same path and is expected to
+abort. See
+[SECURITY.md](https://github.com/danplischke/origofs/blob/main/SECURITY.md) —
+the security policy is a repository file rather than a page on this site, so the
+link has to leave it.

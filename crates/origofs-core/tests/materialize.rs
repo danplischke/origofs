@@ -18,7 +18,7 @@
 //! *before* `begin`, then replay it as pure metadata.
 
 use bytes::Bytes;
-use origofs_core::{ContentStore, Fs, Hash, MemStore, MetadataStore, SqliteMetadataStore};
+use origofs_core::{ContentStore, Fs, Hash, MemStore, NamespaceStore, SqliteMetadataStore};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};

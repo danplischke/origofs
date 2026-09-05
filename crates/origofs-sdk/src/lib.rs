@@ -5,6 +5,27 @@
 //! tier). Both sides are `Arc<dyn …>`, so the backend is chosen at runtime. Later
 //! milestones add commits and attribution behind the same façade.
 
+// A library that panics takes the embedder's process down with it, so the
+// library target may not `unwrap`, `expect`, `unreachable!` or panic out of a
+// function that returns `Result`. The handful of genuinely infallible sites
+// carry `#[expect(..., reason = "...")]`, which is itself checked: if the site
+// stops being infallible the expectation goes stale and the build fails.
+//
+// Declared here rather than in the workspace `[lints]` table because a Cargo
+// lints table applies to *every* target in the package, and an integration test
+// that cannot `.unwrap()` is an integration test nobody writes. `not(test)`
+// leaves the in-crate `#[cfg(test)]` modules alone; the `tests/` directory is a
+// separate crate and never sees this attribute at all.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::panic_in_result_fn
+    )
+)]
+
 use origofs_core::{Fs, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -95,20 +116,21 @@ pub async fn shutdown_signal() {
         use tokio::signal::unix::{SignalKind, signal};
         // If a handler can't be installed, wait forever rather than shutting down
         // immediately — a spurious instant shutdown is far worse than no handler.
+        // `pending::<Signal>()` types the never-completing branch as the same
+        // `Signal` the `Ok` arm yields, so the arm diverges by *never resolving*
+        // rather than by a trailing `unreachable!()` after a `pending::<()>`.
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot listen for SIGTERM; shutdown will not be graceful");
-                std::future::pending::<()>().await;
-                unreachable!()
+                std::future::pending::<tokio::signal::unix::Signal>().await
             }
         };
         let mut int = match signal(SignalKind::interrupt()) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot listen for SIGINT");
-                std::future::pending::<()>().await;
-                unreachable!()
+                std::future::pending::<tokio::signal::unix::Signal>().await
             }
         };
         tokio::select! {
@@ -208,22 +230,6 @@ impl CacheConfig {
     pub fn min_free_bytes(mut self, n: u64) -> Self {
         self.min_free_bytes = n;
         self
-    }
-}
-
-/// Split an absolute path into `(parent, name)`.
-///
-/// The façade's path-addressed wrappers over the inode-oriented engine ops need
-/// this; the engine's own `resolve_parent` is `pub(crate)`, and an inode number is
-/// a mount implementation detail no `Workspace` caller should have to hold.
-fn split_parent(path: &str) -> Result<(String, String)> {
-    let trimmed = path.trim_end_matches('/');
-    match trimmed.rsplit_once('/') {
-        Some(("", name)) if !name.is_empty() => Ok(("/".to_string(), name.to_string())),
-        Some((parent, name)) if !name.is_empty() => Ok((parent.to_string(), name.to_string())),
-        _ => Err(OrigoFSError::InvalidPath(format!(
-            "{path:?} names no parent directory"
-        ))),
     }
 }
 
@@ -617,42 +623,20 @@ impl Workspace {
     /// The metadata connection/pool, content store, and any Postgres push-feed
     /// handle are shared with `self`, so this is cheap.
     pub async fn workspace(&self, name: &str) -> Result<Self> {
-        // Validate the name at the user entry point: it becomes a registry key and
-        // the recovery mirror's tag, and surfaces in listings/URLs. Reject the same
-        // set `validate_component` rejects for path components (empty, `.`/`..`,
-        // path separators, NUL) so a workspace name can't be empty or path-like.
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.contains('/')
-            || name.contains('\0')
-        {
-            return Err(OrigoFSError::InvalidArgument(format!(
-                "invalid workspace name: {name:?}"
-            )));
-        }
-        let (id, root) =
-            match self.fs.meta.lookup_workspace(name).await? {
-                Some(existing) => existing,
-                None => match self.fs.meta.create_workspace(name).await {
-                    Ok(created) => created,
-                    // Lost a concurrent first-time create race: the other caller's row
-                    // is now committed, so adopt it instead of surfacing AlreadyExists
-                    // (matches how `mkdir_p`/`write` adopt the winner). UNIQUE(name)
-                    // guarantees there is exactly one row to find.
-                    Err(OrigoFSError::AlreadyExists(_)) => {
-                        self.fs.meta.lookup_workspace(name).await?.ok_or_else(|| {
-                            OrigoFSError::AlreadyExists(format!("workspace {name}"))
-                        })?
-                    }
-                    Err(e) => return Err(e),
-                },
-            };
-        let scoped = self.fs.meta.with_workspace(id);
-        let fs = self.fs.rebind(scoped, root);
-        // Give a freshly created workspace its versioning refs/config; idempotent
-        // for one that already exists.
-        fs.init().await?;
+        // Name validation, workspace lookup-or-create, the concurrent-create race
+        // and the versioning bootstrap all live in `Fs::open_workspace` — this
+        // used to reach past `Fs` into the metadata store for four of those five
+        // steps and duplicate the name rules for the fifth.
+        // `id` is consumed only by the Postgres push-feed re-scope below, so
+        // without that feature nothing reads it.
+        #[cfg_attr(
+            not(feature = "postgres"),
+            expect(
+                unused_variables,
+                reason = "`id` re-scopes the Postgres push feed, which this build has not got"
+            )
+        )]
+        let (id, fs) = self.fs.open_workspace(name).await?;
         Ok(Self {
             fs,
             // Re-scope the Postgres push-feed handle to this workspace, so
@@ -665,14 +649,7 @@ impl Workspace {
     /// The names of every workspace in this store — `default` plus any opened via
     /// [`Self::workspace`], oldest first.
     pub async fn workspaces(&self) -> Result<Vec<String>> {
-        Ok(self
-            .fs
-            .meta
-            .list_workspaces()
-            .await?
-            .into_iter()
-            .map(|(_id, name, _root)| name)
-            .collect())
+        self.fs.workspace_names().await
     }
 
     /// Record a collaboration event (best-effort: a feed hiccup never fails the
@@ -982,51 +959,104 @@ impl Workspace {
 
     // --- ownership, mode, links, xattrs (issues #119, #121, #122) -----------
 
-    /// Change a path's permission bits.
+    // Each of these resolved a path to an inode here and then called the
+    // *unchecked* inode primitive, so all seven ran no authorization at all — and
+    // there was no attributed form for a caller to reach for instead. They are
+    // path operations, so they belong on the engine beside `remove`/`rename`,
+    // where the check can live; the plain forms stay unattributed and open by
+    // construction like the rest of that family, and the `_as` forms are new.
+
+    /// Change a path's permission bits. Unattributed.
     pub async fn chmod(&self, path: &str, mode: u32) -> Result<Inode> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_chmod(ino, mode).await
+        self.fs.chmod(path, mode).await
+    }
+
+    /// [`chmod`](Self::chmod), requiring `ctx` to hold `WRITE` at `path`.
+    pub async fn chmod_as(&self, ctx: WriteCtx, path: &str, mode: u32) -> Result<Inode> {
+        self.fs.chmod_as(ctx, path, mode).await
     }
 
     /// Change a path's owning uid/gid. `None` leaves that half alone, as
-    /// `chown(2)`'s `-1` does.
+    /// `chown(2)`'s `-1` does. Unattributed.
     pub async fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<Inode> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_chown(ino, uid, gid).await
+        self.fs.chown(path, uid, gid).await
     }
 
-    /// Hard-link `existing` as `link_path`.
+    /// [`chown`](Self::chown), requiring `ctx` to hold `WRITE` at `path`.
+    pub async fn chown_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode> {
+        self.fs.chown_as(ctx, path, uid, gid).await
+    }
+
+    /// Hard-link `existing` as `link_path`. Unattributed.
     pub async fn link(&self, existing: &str, link_path: &str) -> Result<Inode> {
-        let ino = self.fs.stat(existing).await?.ino;
-        let (parent, name) = split_parent(link_path)?;
-        let parent_ino = self.fs.stat(&parent).await?.ino;
-        self.fs.vfs_link(ino, parent_ino, &name).await
+        self.fs.link(existing, link_path).await
     }
 
-    /// Read one extended attribute.
+    /// [`link`](Self::link), requiring `ctx` to hold `WRITE` at **`link_path`** —
+    /// the name being created, not the file being pointed at.
+    pub async fn link_as(&self, ctx: WriteCtx, existing: &str, link_path: &str) -> Result<Inode> {
+        self.fs.link_as(ctx, existing, link_path).await
+    }
+
+    /// Read one extended attribute. Unattributed.
     pub async fn getxattr(&self, path: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_getxattr(ino, name).await
+        self.fs.getxattr(path, name).await
     }
 
-    /// Set one extended attribute. Values are capped at
+    /// [`getxattr`](Self::getxattr), requiring `ctx` to hold `READ` at `path`
+    /// (inert unless the workspace has `acl_enforce_reads` on).
+    pub async fn getxattr_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.fs.getxattr_as(ctx, path, name).await
+    }
+
+    /// Set one extended attribute. Unattributed. Values are capped at
     /// [`MAX_XATTR_LEN`](origofs_core::MAX_XATTR_LEN) — an xattr lives in the
     /// metadata store, which never holds large bytes.
     pub async fn setxattr(&self, path: &str, name: &str, value: &[u8]) -> Result<()> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_setxattr(ino, name, value).await
+        self.fs.setxattr(path, name, value).await
     }
 
-    /// Remove one extended attribute, reporting whether it was set.
+    /// [`setxattr`](Self::setxattr), requiring `ctx` to hold `WRITE` at `path`.
+    pub async fn setxattr_as(
+        &self,
+        ctx: WriteCtx,
+        path: &str,
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        self.fs.setxattr_as(ctx, path, name, value).await
+    }
+
+    /// Remove one extended attribute, reporting whether it was set. Unattributed.
     pub async fn removexattr(&self, path: &str, name: &str) -> Result<bool> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_removexattr(ino, name).await
+        self.fs.removexattr(path, name).await
     }
 
-    /// Every extended-attribute name on a path, in name order.
+    /// [`removexattr`](Self::removexattr), requiring `ctx` to hold `WRITE` at `path`.
+    pub async fn removexattr_as(&self, ctx: WriteCtx, path: &str, name: &str) -> Result<bool> {
+        self.fs.removexattr_as(ctx, path, name).await
+    }
+
+    /// Every extended-attribute name on a path, in name order. Unattributed.
     pub async fn listxattr(&self, path: &str) -> Result<Vec<String>> {
-        let ino = self.fs.stat(path).await?.ino;
-        self.fs.vfs_listxattr(ino).await
+        self.fs.listxattr(path).await
+    }
+
+    /// [`listxattr`](Self::listxattr), requiring `ctx` to hold `READ` at `path`
+    /// (inert unless the workspace has `acl_enforce_reads` on).
+    pub async fn listxattr_as(&self, ctx: WriteCtx, path: &str) -> Result<Vec<String>> {
+        self.fs.listxattr_as(ctx, path).await
     }
 
     // --- attribution completeness (issue #128) ------------------------------
@@ -1400,14 +1430,14 @@ impl Workspace {
     /// Seal any buffered writes to durable storage (a no-op unless the content
     /// backend batches, e.g. a packed store). `commit` flushes automatically.
     pub async fn flush(&self) -> Result<()> {
-        self.fs.content.flush().await
+        self.fs.flush_content().await
     }
 
     /// Compact the content store, reclaiming space held by deleted objects;
     /// returns the bytes reclaimed. Meaningful for a packed store; run after
     /// `gc`. A no-op for in-place backends.
     pub async fn repack(&self) -> Result<u64> {
-        self.fs.content.repack().await
+        self.fs.repack_content().await
     }
 
     /// Release this workspace's backend resources and make it unusable
@@ -1436,17 +1466,7 @@ impl Workspace {
     /// Clones share the backend, so this closes it for all of them — as it must,
     /// or a forgotten clone would keep the sockets this exists to release.
     pub async fn close(&self) -> Result<()> {
-        // Flush before either close: sealing a pack needs the content store still
-        // open, and on a packed remote store it needs the metadata store's
-        // sibling index too.
-        let flushed = self.fs.content.flush().await;
-        // Both stores are closed even if the flush failed. A workspace that could
-        // not seal its buffer is in worse shape, not better, for also leaking its
-        // connections — and the flush error is the one returned, since it is the
-        // one that means data did not land.
-        let content = self.fs.content.close().await;
-        let meta = self.fs.meta.close().await;
-        flushed.and(meta).and(content)
+        self.fs.close().await
     }
 
     // --- merge + locks ---------------------------------------------------
@@ -1597,7 +1617,7 @@ impl Workspace {
     /// refuses with a pointer to `pg_dump`/PITR rather than producing something
     /// that only resembles a backup.
     pub async fn backup_metadata(&self, dest: impl AsRef<Path>) -> Result<String> {
-        self.fs.meta.backup_to(dest.as_ref()).await
+        self.fs.backup_metadata_to(dest.as_ref()).await
     }
 
     /// The migration version currently applied to this workspace's metadata DB.
@@ -1605,7 +1625,7 @@ impl Workspace {
     /// [`latest_schema_version`](Self::latest_schema_version); this is here for
     /// operators who want to introspect or gate on it.
     pub async fn schema_version(&self) -> Result<i64> {
-        self.fs.meta.schema_version().await
+        self.fs.schema_version().await
     }
 
     /// The highest schema version this build knows about.
@@ -1618,12 +1638,7 @@ impl Workspace {
     /// so this is mainly for explicitly upgrading a shared DB after deploying a
     /// build with new migrations, or verifying that one is current.
     pub async fn migrate(&self) -> Result<(i64, i64)> {
-        let before = self.fs.meta.schema_version().await?;
-        // `MetadataStore::init` is exactly the (idempotent) migration runner — it
-        // applies unrecorded steps and touches nothing else (no ref/HEAD reset).
-        self.fs.meta.init().await?;
-        let after = self.fs.meta.schema_version().await?;
-        Ok((before, after))
+        self.fs.migrate().await
     }
 
     /// Look up an actor by external identity (`auth_subject`), if registered.

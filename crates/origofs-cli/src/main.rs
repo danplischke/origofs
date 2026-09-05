@@ -9,12 +9,16 @@
 //! origofs --workspace ./ws read /notes/a.txt
 //! ```
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
-use origofs_sdk::{MergeOutcome, SuggestionStatus, Workspace, WriteCtx};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+// `pub(crate)` so the per-subcommand modules under `cmd/` pick these up through
+// their `use super::*`: a glob import only sees items visible at the use site,
+// and a plain `use` is private to the module that writes it.
+pub(crate) use anyhow::{Context, Result};
+pub(crate) use clap::{Parser, Subcommand, ValueEnum};
+pub(crate) use origofs_sdk::{MergeOutcome, SuggestionStatus, Workspace, WriteCtx};
+pub(crate) use std::io::{Read, Write};
+pub(crate) use std::path::{Path, PathBuf};
 
+mod cmd;
 mod config;
 
 #[derive(Parser)]
@@ -1588,132 +1592,13 @@ async fn main() -> Result<()> {
     let ws = cfg.open(&cli.workspace).await?;
 
     match cli.cmd {
-        Cmd::Init => {
-            println!(
-                "initialized origofs workspace at {}",
-                cli.workspace.display()
-            );
-        }
-        Cmd::Mkdir { path, actor } => match resolve_actor(actor)? {
-            Some(actor) => {
-                let ctx = cli_ctx(&ws, actor).await?;
-                ws.mkdir_as(ctx, &path).await?;
-            }
-            None => {
-                ws.ensure_attributed("mkdir").await?;
-                ws.mkdir_p(&path).await?;
-            }
-        },
-        Cmd::Write { path, from, actor } => {
-            // Convenience: ensure the parent directory exists before writing.
-            if let Some(parent) = path
-                .rsplit_once('/')
-                .map(|(p, _)| p)
-                .filter(|p| !p.is_empty())
-            {
-                ws.mkdir_p(parent).await?;
-            }
-            // `write` resolves its actor the same way the other mutating commands
-            // do since #128, so `ORIGOFS_ACTOR` attributes it too.
-            let actor = resolve_actor(actor)?;
-            match (from, actor) {
-                // Unattributed streaming from a file (large files stay off-heap).
-                (Some(p), None) => {
-                    ws.ensure_attributed("write").await?;
-                    let file = std::fs::File::open(p)?;
-                    ws.write_reader(&path, file).await?;
-                }
-                // Attributed write. `--actor` used to force `std::fs::read` of the
-                // whole file — streaming and attribution were mutually exclusive
-                // until `write_reader_as` — so a large file could be written only
-                // by giving up the attribution that is the point of this system.
-                (from, Some(actor)) => {
-                    let session = ws.create_session(actor, Some("cli")).await?;
-                    let ctx = WriteCtx::session(actor, session);
-
-                    // A propose-only actor's edit is queued for review, and a
-                    // suggestion needs the bytes — so that path buffers, whatever
-                    // the source. That is fine by construction: nobody reviews a
-                    // multi-gigabyte diff. Deciding here rather than letting
-                    // `write_reader_as` refuse keeps `origofs policy <actor>
-                    // propose` behaving identically with and without `--from`.
-                    let may_write_directly = ws.ensure_may_write(ctx, "write a file").await.is_ok();
-
-                    match (from, may_write_directly) {
-                        // The good case: stream straight from the file.
-                        (Some(p), true) => {
-                            let file = std::fs::File::open(p)?;
-                            ws.write_reader_as(ctx, &path, file).await?;
-                        }
-                        // Buffered: stdin has no length to stream against here, and
-                        // a propose-only write has to hold the proposed bytes.
-                        (from, _) => {
-                            let data = match from {
-                                Some(p) => std::fs::read(p)?,
-                                None => {
-                                    let mut buf = Vec::new();
-                                    std::io::stdin().read_to_end(&mut buf)?;
-                                    buf
-                                }
-                            };
-                            // `write_or_propose`, not `write_as`: the raw attributed
-                            // write is exempt from the §6 policy by construction, so
-                            // `origofs policy <actor> propose` had no effect on
-                            // `origofs write` — the CLI ignored the gate its own
-                            // subcommand sets.
-                            match ws.write_or_propose(ctx, &path, &data, None, None).await? {
-                                origofs_sdk::WriteOutcome::Wrote => {}
-                                origofs_sdk::WriteOutcome::Proposed(suggestion_id) => {
-                                    println!(
-                                        "actor {actor} is propose-only: queued suggestion #{suggestion_id} for {path} (pending review)"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                (None, None) => {
-                    ws.ensure_attributed("write").await?;
-                    let mut buf = Vec::new();
-                    std::io::stdin().read_to_end(&mut buf)?;
-                    ws.write(&path, &buf).await?;
-                }
-            }
-        }
-        Cmd::Read { path, actor } => {
-            let bytes = match read_ctx(actor)? {
-                Some(ctx) => ws.read_as(ctx, &path).await?,
-                None => ws.read(&path).await?,
-            };
-            std::io::stdout().write_all(&bytes)?;
-        }
-        Cmd::Ls { path, actor } => {
-            let entries = match read_ctx(actor)? {
-                Some(ctx) => ws.ls_as(ctx, &path).await?,
-                None => ws.ls(&path).await?,
-            };
-            for e in entries {
-                println!("{}\t{}", e.kind.as_str(), e.name);
-            }
-        }
-        Cmd::Stat { path, actor } => {
-            let i = match read_ctx(actor)? {
-                Some(ctx) => ws.stat_as(ctx, &path).await?,
-                None => ws.stat(&path).await?,
-            };
-            println!(
-                "ino={} kind={} mode={:o} nlink={} size={}",
-                i.ino,
-                i.kind.as_str(),
-                i.mode,
-                i.nlink,
-                i.size
-            );
-        }
-        Cmd::Info { path, no_probe } => {
-            let info = ws.file_layout(&path, !no_probe).await?;
-            print_info(&path, &info);
-        }
+        Cmd::Init => cmd::files::init(&cli.workspace).await?,
+        Cmd::Mkdir { path, actor } => cmd::files::mkdir(&ws, path, actor).await?,
+        Cmd::Write { path, from, actor } => cmd::files::write(&ws, path, from, actor).await?,
+        Cmd::Read { path, actor } => cmd::files::read(&ws, path, actor).await?,
+        Cmd::Ls { path, actor } => cmd::files::ls(&ws, path, actor).await?,
+        Cmd::Stat { path, actor } => cmd::files::stat(&ws, path, actor).await?,
+        Cmd::Info { path, no_probe } => cmd::files::info(&ws, path, no_probe).await?,
         Cmd::Bench {
             dir,
             files,
@@ -1721,114 +1606,22 @@ async fn main() -> Result<()> {
             seed,
             keep,
             force,
-        } => {
-            let mut opts = origofs_sdk::BenchOpts::new();
-            opts.dir = dir;
-            opts.files = files;
-            opts.file_size = size;
-            opts.seed = seed.unwrap_or(opts.seed);
-            opts.keep = keep;
-            opts.force = force;
-            print_bench(&ws.bench(&opts).await?);
-        }
-        Cmd::Rm { path, actor } => match resolve_actor(actor)? {
-            Some(actor) => {
-                let ctx = cli_ctx(&ws, actor).await?;
-                // `remove_or_propose`, not `remove`: a propose-only actor's delete
-                // is queued for review rather than refused, which is how `write`
-                // already behaves. Refusing would make the two inconsistent in the
-                // opposite direction.
-                match ws.remove_or_propose(ctx, &path, None, None).await? {
-                    origofs_sdk::WriteOutcome::Wrote => {}
-                    origofs_sdk::WriteOutcome::Proposed(id) => {
-                        println!(
-                            "actor {actor} is propose-only: queued suggestion #{id} to delete {path} (pending review)"
-                        );
-                    }
-                }
-            }
-            None => {
-                ws.ensure_attributed("rm").await?;
-                ws.remove(&path).await?;
-            }
-        },
-        Cmd::Mv { from, to, actor } => match resolve_actor(actor)? {
-            Some(actor) => {
-                let ctx = cli_ctx(&ws, actor).await?;
-                ws.rename_as(ctx, &from, &to).await?;
-            }
-            None => {
-                ws.ensure_attributed("mv").await?;
-                ws.rename(&from, &to).await?;
-            }
-        },
+        } => cmd::admin::bench(&ws, dir, files, size, seed, keep, force).await?,
+        Cmd::Rm { path, actor } => cmd::files::rm(&ws, path, actor).await?,
+        Cmd::Mv { from, to, actor } => cmd::files::mv(&ws, from, to, actor).await?,
         Cmd::Commit {
             message,
             author,
             actor,
-        } => {
-            let hash = match resolve_actor(actor)? {
-                Some(actor) => {
-                    let ctx = cli_ctx(&ws, actor).await?;
-                    ws.commit_as(ctx, &author, &message).await?
-                }
-                None => {
-                    ws.ensure_attributed("commit").await?;
-                    ws.commit(&author, &message).await?
-                }
-            };
-            let branch = ws.current_branch().await?.unwrap_or_else(|| "?".into());
-            println!("[{branch} {}] {message}", &hash.to_hex()[..12]);
-        }
-        Cmd::Log => {
-            for ci in ws.log().await? {
-                println!(
-                    "{} {}  {}",
-                    &ci.hash.to_hex()[..12],
-                    ci.commit.author,
-                    ci.commit.message
-                );
-            }
-        }
-        Cmd::Status => {
-            let changes = ws.status().await?;
-            if changes.is_empty() {
-                println!("clean (working tree matches HEAD)");
-            }
-            for d in changes {
-                println!("{} {}", d.status.sigil(), d.path);
-            }
-        }
+        } => cmd::history::commit(&ws, message, author, actor).await?,
+        Cmd::Log => cmd::history::log(&ws).await?,
+        Cmd::Status => cmd::history::status(&ws).await?,
         Cmd::Diff {
             from,
             to,
             path,
             actor,
-        } => match path {
-            Some(p) => {
-                let patch = match read_ctx(actor)? {
-                    Some(ctx) => ws.diff_file_as(ctx, &from, &to, &p).await?,
-                    None => ws.diff_file(&from, &to, &p).await?,
-                };
-                if patch.is_empty() {
-                    println!("{p}: unchanged between {from} and {to}");
-                } else {
-                    print!("{patch}");
-                }
-            }
-            None => {
-                let changes = match read_ctx(actor)? {
-                    Some(ctx) => ws.diff_as(ctx, &from, &to).await?,
-                    None => ws.diff(&from, &to).await?,
-                };
-                if changes.is_empty() {
-                    println!("no differences between {from} and {to}");
-                }
-                for d in changes {
-                    println!("{} {}", d.status.sigil(), d.path);
-                }
-            }
-        },
+        } => cmd::history::diff(&ws, from, to, path, actor).await?,
         Cmd::Suggest {
             path,
             actor,
@@ -1838,837 +1631,107 @@ async fn main() -> Result<()> {
             delete,
             replaces,
         } => {
-            let ctx = match session {
-                Some(s) => WriteCtx::session(actor, s),
-                None => WriteCtx::actor(actor),
-            };
-            let id = if delete {
-                ws.suggest_delete(ctx, &path, summary.as_deref(), replaces)
-                    .await?
-            } else {
-                let data = match from {
-                    Some(p) => std::fs::read(p)?,
-                    None => {
-                        let mut buf = Vec::new();
-                        std::io::stdin().read_to_end(&mut buf)?;
-                        buf
-                    }
-                };
-                ws.suggest(ctx, &path, &data, summary.as_deref(), replaces)
-                    .await?
-            };
-            match replaces {
-                Some(old) => {
-                    println!("suggestion #{id} created (pending review), superseding #{old}")
-                }
-                None => println!("suggestion #{id} created (pending review)"),
-            }
+            cmd::attribution::suggest(
+                &ws,
+                cmd::attribution::SuggestArgs {
+                    path,
+                    actor,
+                    session,
+                    summary,
+                    from,
+                    delete,
+                    replaces,
+                },
+            )
+            .await?
         }
         Cmd::Suggestions {
             status,
             path,
             actor,
-        } => {
-            let st = match status.as_deref() {
-                Some(s) => Some(
-                    SuggestionStatus::parse(s)
-                        .ok_or_else(|| anyhow::anyhow!("unknown status {s:?}"))?,
-                ),
-                None => None,
-            };
-            let list = match read_ctx(actor)? {
-                Some(ctx) => ws.list_suggestions_as(ctx, st, path.as_deref()).await?,
-                None => ws.list_suggestions(st, path.as_deref()).await?,
-            };
-            if list.is_empty() {
-                println!("no suggestions");
-            }
-            for s in list {
-                // The kind matters to a reviewer: a `crdt` proposal merges into a
-                // live document (and is never stale), a `bytes` one replaces the
-                // file and can be superseded when the base moves.
-                println!(
-                    "#{:<4} {:<10} {:<5} actor={} {}{}",
-                    s.id,
-                    s.status.as_str(),
-                    s.kind.as_str(),
-                    s.actor_id,
-                    s.path,
-                    s.summary.map(|m| format!("  — {m}")).unwrap_or_default(),
-                );
-            }
-        }
+        } => cmd::attribution::suggestions(&ws, status, path, actor).await?,
         Cmd::SuggestionDiff { id, actor } => {
-            let patch = match read_ctx(actor)? {
-                Some(ctx) => ws.suggestion_diff_as(ctx, id).await?,
-                None => ws.suggestion_diff(id).await?,
-            };
-            if patch.is_empty() {
-                println!("(no change)");
-            } else {
-                print!("{patch}");
-            }
+            cmd::attribution::suggestion_diff(&ws, id, actor).await?
         }
         Cmd::Accept { id, actor, session } => {
-            let ctx = match session {
-                Some(s) => WriteCtx::session(actor, s),
-                None => WriteCtx::actor(actor),
-            };
-            match ws.accept_suggestion(id, ctx).await? {
-                Some(hash) => println!("accepted suggestion #{id} -> {hash}"),
-                None => println!("accepted suggestion #{id} (file deleted)"),
-            }
+            cmd::attribution::accept(&ws, id, actor, session).await?
         }
         Cmd::Reject { id, actor, session } => {
-            let ctx = match session {
-                Some(s) => WriteCtx::session(actor, s),
-                None => WriteCtx::actor(actor),
-            };
-            ws.reject_suggestion(id, ctx).await?;
-            println!("rejected suggestion #{id}");
+            cmd::attribution::reject(&ws, id, actor, session).await?
         }
         Cmd::Supersede {
             id,
             actor,
             session,
             reason,
-        } => {
-            let ctx = match session {
-                Some(s) => WriteCtx::session(actor, s),
-                None => WriteCtx::actor(actor),
-            };
-            ws.supersede_suggestion(id, ctx, reason.as_deref()).await?;
-            println!("superseded suggestion #{id}");
-        }
-        Cmd::Branch { name } => match name {
-            Some(name) => {
-                ws.create_branch(&name).await?;
-                println!("created branch {name}");
-            }
-            None => {
-                let current = ws.current_branch().await?;
-                for (name, hash) in ws.list_branches().await? {
-                    let marker = if current.as_deref() == Some(&name) {
-                        "* "
-                    } else {
-                        "  "
-                    };
-                    println!("{marker}{name}\t{}", &hash.to_hex()[..12]);
-                }
-            }
-        },
-        Cmd::Checkout { branch } => {
-            ws.checkout(&branch).await?;
-            println!("switched to branch {branch}");
-        }
+        } => cmd::attribution::supersede(&ws, id, actor, session, reason).await?,
+        Cmd::Branch { name } => cmd::history::branch(&ws, name).await?,
+        Cmd::Checkout { branch } => cmd::history::checkout(&ws, branch).await?,
         Cmd::Merge {
             branch,
             author,
             message,
-        } => {
-            let msg = message.unwrap_or_else(|| format!("merge {branch}"));
-            match ws.merge_branch(&branch, &author, &msg).await? {
-                MergeOutcome::AlreadyUpToDate => println!("already up to date"),
-                MergeOutcome::FastForward(h) => {
-                    println!("fast-forward to {}", &h.to_hex()[..12])
-                }
-                MergeOutcome::Merged(h) => println!("merged as {}", &h.to_hex()[..12]),
-                MergeOutcome::Conflicts(cs) => {
-                    println!(
-                        "merge stopped with {} conflict(s); resolve then commit:",
-                        cs.len()
-                    );
-                    for c in cs {
-                        println!("  {} {}", c.kind, c.path);
-                    }
-                }
-            }
-        }
+        } => cmd::history::merge(&ws, branch, author, message).await?,
         Cmd::Resync {
             remote,
             remote_config,
             branch,
             author,
             message,
-        } => {
-            if remote.is_none() && remote_config.is_none() {
-                anyhow::bail!(
-                    "resync needs a remote: pass --remote <DIR> and/or --remote-config <FILE>"
-                );
-            }
-            // `--remote` alone means a plain local SQLite + local-CAS workspace at
-            // that directory; `--remote-config` selects the backends, rooting any
-            // defaulted path at `--remote` (or the config file's own directory).
-            let remote_root = remote.clone().unwrap_or_else(|| {
-                remote_config
-                    .as_ref()
-                    .and_then(|p| p.parent().map(PathBuf::from))
-                    .unwrap_or_else(|| PathBuf::from("."))
-            });
-            let remote_cfg = match &remote_config {
-                Some(path) => config::Config::load(path)?,
-                None => config::Config::default(),
-            };
-            std::fs::create_dir_all(&remote_root)?;
-            let remote_ws = remote_cfg.open(&remote_root).await?;
-
-            let branch = match branch {
-                Some(b) => b,
-                None => ws.current_branch().await?.ok_or_else(|| {
-                    anyhow::anyhow!("HEAD is detached; pass --branch to name the branch to resync")
-                })?,
-            };
-            let msg = message.unwrap_or_else(|| format!("resync {branch}"));
-            let report = ws.resync(&remote_ws, &branch, &author, &msg).await?;
-
-            match &report.outcome {
-                origofs_sdk::ResyncOutcome::UpToDate => {
-                    println!("{}: already up to date", report.branch)
-                }
-                origofs_sdk::ResyncOutcome::Pushed(h) => println!(
-                    "{}: pushed {} to the remote",
-                    report.branch,
-                    &h.to_hex()[..12]
-                ),
-                origofs_sdk::ResyncOutcome::FastForwarded(h) => {
-                    println!("{}: fast-forwarded to {}", report.branch, &h.to_hex()[..12])
-                }
-                origofs_sdk::ResyncOutcome::Merged(h) => println!(
-                    "{}: merged as {} and pushed",
-                    report.branch,
-                    &h.to_hex()[..12]
-                ),
-                origofs_sdk::ResyncOutcome::Conflicted => println!(
-                    "{}: merge stopped with {} conflict(s); the remote was not advanced — \
-                     resolve, commit, then resync again:",
-                    report.branch,
-                    report.conflicts.len()
-                ),
-            }
-            for c in &report.conflicts {
-                println!("  {} {}", c.kind, c.path);
-            }
-            println!(
-                "  fetched {} object(s), {} B ({} already present)",
-                report.fetched.objects, report.fetched.bytes, report.fetched.skipped
-            );
-            println!(
-                "  pushed  {} object(s), {} B ({} already present)",
-                report.pushed.objects, report.pushed.bytes, report.pushed.skipped
-            );
-            println!(
-                "  blame carried: {} in, {} out",
-                report.blame_fetched, report.blame_pushed
-            );
-            if report.cas_retries > 0 {
-                println!(
-                    "  retried {} time(s) after a concurrent remote push",
-                    report.cas_retries
-                );
-            }
-            if report.remote_tree_updated {
-                println!("  the remote working tree was rematerialized at the new head");
-            }
-            for p in &report.stale_live_paths {
-                println!("  warning: {p} has an open live document; its merged bytes may lag it");
-            }
-        }
-        Cmd::Conflicts => {
-            for (path, kind) in ws.conflicts().await? {
-                println!("{kind}\t{path}");
-            }
-        }
-        Cmd::Lock { path, owner } => {
-            if ws.lock(&path, &owner).await? {
-                println!("locked {path}");
-            } else {
-                println!("already locked: {path}");
-            }
-        }
-        Cmd::Unlock { path, owner } => {
-            if ws.unlock(&path, &owner).await? {
-                println!("unlocked {path}");
-            } else {
-                println!("not your lock: {path}");
-            }
-        }
-        Cmd::Locks => {
-            for (path, owner, _at) in ws.locks().await? {
-                println!("{owner}\t{path}");
-            }
-        }
+        } => cmd::history::resync(&ws, remote, remote_config, branch, author, message).await?,
+        Cmd::Conflicts => cmd::history::conflicts(&ws).await?,
+        Cmd::Lock { path, owner } => cmd::history::lock(&ws, path, owner).await?,
+        Cmd::Unlock { path, owner } => cmd::history::unlock(&ws, path, owner).await?,
+        Cmd::Locks => cmd::history::locks(&ws).await?,
         Cmd::Actor {
             name,
             agent,
             model,
             controller,
-        } => {
-            let id = if agent {
-                ws.create_agent(&name, &model, controller).await?
-            } else {
-                ws.create_human(&name, None).await?
-            };
-            println!("{id}");
-        }
+        } => cmd::attribution::actor(&ws, name, agent, model, controller).await?,
         Cmd::WritePolicy { actor, policy } => {
-            let p = origofs_sdk::WritePolicy::parse(&policy).ok_or_else(|| {
-                origofs_sdk::OrigoFSError::InvalidArgument(format!(
-                    "unknown write policy {policy:?} (expected `direct` or `propose`)"
-                ))
-            })?;
-            ws.set_write_policy(actor, p).await?;
-            println!("actor #{actor} write policy set to {}", p.as_str());
+            cmd::attribution::write_policy(&ws, actor, policy).await?
         }
         Cmd::RevertSession {
             actor,
             session,
             by,
             path_prefix,
-        } => {
-            // A revert is performed *on* someone else's work, so the target comes
-            // from `--actor` while `--by` is the reviewer doing it. When `--by` is
-            // given, the reviewer must hold write permission over what it is
-            // reverting — the named subtree, or the whole workspace when no prefix
-            // bounds it — so a propose-only or ACL-restricted actor cannot revert
-            // anyone.
-            let changed = match by {
-                Some(by) => {
-                    let s = ws.create_session(by, Some("cli")).await?;
-                    ws.revert_session_as(
-                        WriteCtx::session(by, s),
-                        actor,
-                        session,
-                        path_prefix.as_deref(),
-                    )
-                    .await?
-                }
-                None => {
-                    ws.revert_session(actor, session, path_prefix.as_deref())
-                        .await?
-                }
-            };
-            println!(
-                "reverted actor {actor} session {session}: {} file(s) changed",
-                changed.len()
-            );
-            for p in &changed {
-                println!("  {p}");
-            }
+        } => cmd::attribution::revert_session(&ws, actor, session, by, path_prefix).await?,
+        Cmd::Dump { out } => cmd::admin::dump(&ws, out).await?,
+        Cmd::Load { input } => cmd::admin::load(&ws, input).await?,
+        Cmd::Du { path, actor } => cmd::files::du(&ws, path, actor).await?,
+        Cmd::Quota { bytes, inodes } => cmd::files::quota(&ws, bytes, inodes).await?,
+        Cmd::Trash { cmd } => cmd::admin::trash(&ws, cmd).await?,
+        Cmd::Acl { cmd } => cmd::attribution::acl(&ws, cmd).await?,
+        Cmd::RequireAttribution { setting } => {
+            cmd::attribution::require_attribution(&ws, setting).await?
         }
-        Cmd::Dump { out } => {
-            let n = if out == "-" {
-                let stdout = std::io::stdout();
-                ws.dump(std::io::BufWriter::new(stdout.lock())).await?
-            } else {
-                let f = std::fs::File::create(&out)?;
-                let n = ws.dump(std::io::BufWriter::new(f)).await?;
-                println!("dumped {n} records to {out}");
-                n
-            };
-            let _ = n;
-        }
-        Cmd::Load { input } => {
-            let report = if input == "-" {
-                let stdin = std::io::stdin();
-                ws.load(std::io::BufReader::new(stdin.lock())).await?
-            } else {
-                let f = std::fs::File::open(&input)?;
-                ws.load(std::io::BufReader::new(f)).await?
-            };
-            println!(
-                "restored {} rows (dump taken at schema v{})",
-                report.total_rows(),
-                report.source_schema_version
-            );
-            for (table, n) in &report.tables {
-                println!("  {table}: {n}");
-            }
-            // The single most likely way to be confused by a successful load: the
-            // names and the blame are all here, and every read fails, because the
-            // bytes were never in the dump. Say so at the moment it matters rather
-            // than letting the user meet `content missing for hash ...` cold.
-            println!(
-                "note: this restored metadata only. File bytes live in the content \
-                 store, which a dump references by hash and does not carry — point \
-                 this workspace at the same content store, or reads will fail."
-            );
-            if !report.skipped_tables.is_empty() {
-                // A dump from a newer build may carry tables this one does not
-                // know. Skipping is deliberate (see `Fs::load`), but silence
-                // would let a partial restore look complete.
-                println!(
-                    "  skipped unknown tables: {}",
-                    report.skipped_tables.join(", ")
-                );
-            }
-        }
-        Cmd::Du { path, actor } => {
-            // Through `stat_as` first, so a subtree the actor may not read is
-            // refused rather than measured — a byte count is a fact about a
-            // subtree, and `du` would otherwise report on one `ls` hides.
-            if let Some(ctx) = read_ctx(actor)? {
-                ws.ensure_may_read_at(ctx, "measure", &path).await?;
-            }
-            let u = if path == "/" {
-                ws.usage().await?
-            } else {
-                ws.du(&path).await?
-            };
-            println!("{}\t{} inodes\t{} bytes", path, u.inodes, u.bytes);
-        }
-        Cmd::Quota { bytes, inodes } => {
-            let current = ws.quota().await?;
-            if bytes.is_none() && inodes.is_none() {
-                let u = ws.usage().await?;
-                println!(
-                    "bytes:  {} / {}",
-                    u.bytes,
-                    current
-                        .bytes
-                        .map(|b| b.to_string())
-                        .unwrap_or_else(|| "unlimited".into())
-                );
-                println!(
-                    "inodes: {} / {}",
-                    u.inodes,
-                    current
-                        .inodes
-                        .map(|i| i.to_string())
-                        .unwrap_or_else(|| "unlimited".into())
-                );
-            } else {
-                let next = origofs_sdk::Quota {
-                    bytes: match bytes.as_deref() {
-                        None => current.bytes,
-                        Some(v) => parse_limit(v)?,
-                    },
-                    inodes: match inodes.as_deref() {
-                        None => current.inodes,
-                        Some(v) => parse_limit(v)?,
-                    },
-                };
-                ws.set_quota(next).await?;
-                println!(
-                    "quota set: bytes={} inodes={}",
-                    next.bytes
-                        .map(|b| b.to_string())
-                        .unwrap_or_else(|| "unlimited".into()),
-                    next.inodes
-                        .map(|i| i.to_string())
-                        .unwrap_or_else(|| "unlimited".into())
-                );
-            }
-        }
-        Cmd::Trash { cmd } => run_trash(&ws, cmd).await?,
-        Cmd::Acl { cmd } => run_acl(&ws, cmd).await?,
-        Cmd::RequireAttribution { setting } => match setting.as_deref() {
-            None => {
-                let on = ws.require_attribution().await?;
-                println!("require-attribution is {}", if on { "on" } else { "off" });
-            }
-            Some(v) => {
-                let on = match v {
-                    "on" | "true" | "1" => true,
-                    "off" | "false" | "0" => false,
-                    other => {
-                        return Err(origofs_sdk::OrigoFSError::InvalidArgument(format!(
-                            "unknown setting {other:?} (expected `on` or `off`)"
-                        ))
-                        .into());
-                    }
-                };
-                ws.set_require_attribution(on).await?;
-                println!(
-                    "require-attribution set to {}",
-                    if on { "on" } else { "off" }
-                );
-            }
-        },
-        Cmd::PosixLocks { setting, path } => {
-            if let Some(path) = path {
-                let held = ws.posix_locks(&path).await?;
-                if held.is_empty() {
-                    // Distinguishes "nothing holds this" from "not collecting",
-                    // the same way `trash list` has to.
-                    let on = ws.posix_locks_enabled().await?;
-                    println!(
-                        "no advisory locks on {path} (locking is {})",
-                        if on { "on" } else { "off" }
-                    );
-                } else {
-                    for l in held {
-                        let end = if l.end == origofs_sdk::posixlock::LOCK_EOF {
-                            "EOF".to_string()
-                        } else {
-                            l.end.to_string()
-                        };
-                        println!(
-                            "{}\t{}-{}\tpid {}\towner {}\tmount {}",
-                            if l.exclusive { "WRITE" } else { "READ " },
-                            l.start,
-                            end,
-                            l.pid,
-                            l.owner,
-                            l.holder
-                        );
-                    }
-                }
-            } else {
-                match setting.as_deref() {
-                    None => {
-                        let on = ws.posix_locks_enabled().await?;
-                        println!("posix-locks is {}", if on { "on" } else { "off" });
-                    }
-                    Some(v) => {
-                        let on = match v {
-                            "on" | "true" | "1" => true,
-                            "off" | "false" | "0" => false,
-                            other => {
-                                return Err(origofs_sdk::OrigoFSError::InvalidArgument(format!(
-                                    "unknown setting {other:?} (expected `on` or `off`)"
-                                ))
-                                .into());
-                            }
-                        };
-                        ws.set_posix_locks_enabled(on).await?;
-                        println!("posix-locks is {}", if on { "on" } else { "off" });
-                    }
-                }
-            }
-        }
-        Cmd::Blame { path, actor } => {
-            let ranges = match read_ctx(actor)? {
-                Some(ctx) => ws.blame_as(ctx, &path).await?,
-                None => ws.blame(&path).await?,
-            };
-            for r in ranges {
-                let who = format!("{}:{}", r.actor.kind.as_str(), r.actor.display_name);
-                if r.line_start == r.line_end {
-                    println!("{:>4}       {who}", r.line_start);
-                } else {
-                    println!("{:>4}-{:<4}  {who}", r.line_start, r.line_end);
-                }
-            }
-        }
+        Cmd::PosixLocks { setting, path } => cmd::admin::posix_locks(&ws, setting, path).await?,
+        Cmd::Blame { path, actor } => cmd::attribution::blame(&ws, path, actor).await?,
         Cmd::Sandbox {
             actor,
             discard,
             isolate,
             cmd,
-        } => {
-            #[cfg(not(unix))]
-            {
-                let _ = (actor, discard, isolate, cmd);
-                return Err(unix_only("sandbox", "an unprivileged overlayfs mount"));
-            }
-            #[cfg(unix)]
-            {
-                if isolate {
-                    // Surface the specific reason (absent / too old / built without
-                    // overlays), not a blanket "needs bwrap on PATH".
-                    if let Some(gap) = origofs_sdk::sandbox::bwrap_gap() {
-                        anyhow::bail!("--isolate is unavailable: {gap}");
-                    }
-                } else if !origofs_sdk::sandbox::overlay_supported() {
-                    anyhow::bail!(
-                        "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
-                    );
-                } else {
-                    // Say it at the moment it matters. Without `--isolate` the child
-                    // runs with the invoker's privileges over a plain copy-on-write
-                    // overlay: the whole host filesystem stays reachable, including
-                    // this workspace's meta.db and cas, with no network namespace and
-                    // no seccomp. That caveat lived only in `--help` and doc comments,
-                    // while strictly less dangerous things (a non-loopback NFS or
-                    // metrics bind) both warned at runtime.
-                    eprintln!(
-                        "warning: running without --isolate: this captures edits but is NOT a \
-                     security boundary. The command runs with your privileges and can read \
-                     and modify anything you can, including this workspace's meta.db and \
-                     cas. Run only code you trust, or pass --isolate for a real filesystem \
-                     boundary (needs a non-setuid bwrap >= 0.11.0, for --overlay support)."
-                    );
-                }
-                let tmp = cli
-                    .workspace
-                    .join(format!("sandbox-{}", std::process::id()));
-                let opts = origofs_sdk::sandbox::RunOpts {
-                    actor,
-                    discard,
-                    work_root: tmp.clone(),
-                    isolate,
-                };
-                let outcome = origofs_sdk::sandbox::run(&ws, opts, &cmd).await?;
-                let _ = std::fs::remove_dir_all(&tmp);
-                if outcome.imported {
-                    println!(
-                        "command exited {}; imported {} change(s)",
-                        outcome.exit_code, outcome.files_changed
-                    );
-                } else {
-                    println!("command exited {}; delta discarded", outcome.exit_code);
-                }
-                std::process::exit(outcome.exit_code);
-            }
-        }
+        } => cmd::surfaces::sandbox(&ws, &cli.workspace, actor, discard, isolate, cmd).await?,
         Cmd::Overlay {
             actor,
             sync_ms,
             isolate,
             cmd,
-        } => {
-            #[cfg(not(unix))]
-            {
-                let _ = (actor, sync_ms, isolate, cmd);
-                return Err(unix_only("overlay", "an unprivileged overlayfs mount"));
-            }
-            #[cfg(unix)]
-            {
-                if isolate {
-                    // Surface the specific reason (absent / too old / built without
-                    // overlays), not a blanket "needs bwrap on PATH".
-                    if let Some(gap) = origofs_sdk::sandbox::bwrap_gap() {
-                        anyhow::bail!("--isolate is unavailable: {gap}");
-                    }
-                } else if !origofs_sdk::sandbox::overlay_supported() {
-                    anyhow::bail!(
-                        "unprivileged overlayfs is unavailable here (needs user-namespace overlay support)"
-                    );
-                } else {
-                    // Say it at the moment it matters. Without `--isolate` the child
-                    // runs with the invoker's privileges over a plain copy-on-write
-                    // overlay: the whole host filesystem stays reachable, including
-                    // this workspace's meta.db and cas, with no network namespace and
-                    // no seccomp. That caveat lived only in `--help` and doc comments,
-                    // while strictly less dangerous things (a non-loopback NFS or
-                    // metrics bind) both warned at runtime.
-                    eprintln!(
-                        "warning: running without --isolate: this captures edits but is NOT a \
-                     security boundary. The command runs with your privileges and can read \
-                     and modify anything you can, including this workspace's meta.db and \
-                     cas. Run only code you trust, or pass --isolate for a real filesystem \
-                     boundary (needs a non-setuid bwrap >= 0.11.0, for --overlay support)."
-                    );
-                }
-                let tmp = cli
-                    .workspace
-                    .join(format!("overlay-{}", std::process::id()));
-                let opts = origofs_sdk::sandbox::LiveOpts {
-                    actor,
-                    work_root: tmp.clone(),
-                    sync_interval: std::time::Duration::from_millis(sync_ms),
-                    isolate,
-                };
-                let outcome = origofs_sdk::sandbox::run_live(&ws, opts, &cmd).await?;
-                let _ = std::fs::remove_dir_all(&tmp);
-                println!(
-                    "agent exited {}; streamed {} change(s) into origofs",
-                    outcome.exit_code, outcome.files_changed
-                );
-                std::process::exit(outcome.exit_code);
-            }
-        }
-        Cmd::Mount { mountpoint, actor } => {
-            #[cfg(not(unix))]
-            {
-                let _ = (mountpoint, actor);
-                return Err(unix_only("mount", "FUSE (`/dev/fuse`)"));
-            }
-            #[cfg(unix)]
-            {
-                if !origofs_sdk::fuse::mountable() {
-                    anyhow::bail!("FUSE mount unavailable here (needs root + /dev/fuse)");
-                }
-                std::fs::create_dir_all(&mountpoint)?;
-                println!(
-                    "mounting origofs at {} (unmount with `umount` to stop)",
-                    mountpoint.display()
-                );
-                // The mount drives its own runtime, so run it off the async main thread.
-                let ctx = read_ctx(actor)?;
-                if ctx.is_none() {
-                    println!(
-                        "  (anonymous mount: path ACLs do not apply — pass --actor to bind one)"
-                    );
-                }
-                let handle =
-                    std::thread::spawn(move || origofs_sdk::fuse::mount_as(ws, &mountpoint, ctx));
-                handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("mount thread panicked"))??;
-            }
-        }
-        Cmd::Mcp { agent_name, model } => {
-            let server = origofs_sdk::mcp::McpServer::create(ws, &agent_name, &model).await?;
-            server.serve_stdio().await?;
-        }
-        Cmd::Git { cmd } => match cmd {
-            GitCmd::Export {
-                dir,
-                branch,
-                format,
-                lfs_threshold,
-            } => {
-                let format = origofs_sdk::git::ObjectFormat::parse(&format)
-                    .ok_or_else(|| anyhow::anyhow!("format must be `sha1` or `sha256`"))?;
-                let opts = origofs_sdk::git::ExportOptions {
-                    format,
-                    branch,
-                    lfs_threshold,
-                };
-                let out = origofs_sdk::git::export_git(&ws, &dir, &opts).await?;
-                println!(
-                    "exported branch {} ({} commit(s), {} lfs object(s)) to {}",
-                    out.branch,
-                    out.commits,
-                    out.lfs_objects,
-                    dir.display()
-                );
-                println!("head {} {}", format.as_str(), out.head);
-            }
-            GitCmd::Import { dir, branch } => {
-                let head = origofs_sdk::git::import_git(&ws, &dir, &branch).await?;
-                println!(
-                    "imported branch {branch} at {} from {}",
-                    &head.to_hex()[..12],
-                    dir.display()
-                );
-            }
-        },
-        Cmd::Gc => {
-            let stats = ws.gc().await?;
-            println!(
-                "gc: kept {} object(s), deleted {} ({} bytes freed)",
-                stats.reachable, stats.deleted, stats.bytes_freed
-            );
-            if stats.skipped_young > 0 {
-                println!(
-                    "  {} unreferenced object(s) left for now: younger than the {}s grace \n  period, which is what keeps a collection safe alongside live writers",
-                    stats.skipped_young,
-                    origofs_sdk::DEFAULT_GC_GRACE_SECS
-                );
-            }
-            if stats.skipped_undated > 0 {
-                println!(
-                    "  warning: {} unreferenced object(s) could not be dated by this content \n  backend, so they were left alone — this store cannot be collected safely",
-                    stats.skipped_undated
-                );
-            }
-        }
-        Cmd::Repack => {
-            let freed = ws.repack().await?;
-            println!("repack: {freed} bytes reclaimed");
-        }
-        Cmd::Flush => {
-            ws.flush().await?;
-            println!("flushed buffered writes to durable storage");
-        }
-        // `Migrate` and `SchemaVersion` are handled before the workspace is
-        // opened — see `run_schema_cmd`. Opening is what migrates, so a report
-        // produced from `ws` could only ever describe the state this process just
-        // created.
+        } => cmd::surfaces::overlay(&ws, &cli.workspace, actor, sync_ms, isolate, cmd).await?,
+        Cmd::Mount { mountpoint, actor } => cmd::surfaces::mount(ws, mountpoint, actor).await?,
+        Cmd::Mcp { agent_name, model } => cmd::surfaces::mcp(ws, agent_name, model).await?,
+        Cmd::Git { cmd } => cmd::history::git(&ws, cmd).await?,
+        Cmd::Gc => cmd::admin::gc(&ws).await?,
+        Cmd::Repack => cmd::admin::repack(&ws).await?,
+        Cmd::Flush => cmd::admin::flush(&ws).await?,
         Cmd::Migrate { .. } | Cmd::SchemaVersion => unreachable!("handled before open"),
-        Cmd::Backup { dest } => {
-            let what = ws.backup_metadata(&dest).await?;
-            println!("{what}");
-            println!(
-                "note: this is the metadata store only — content lives in the content store \n  and is already durable there. Blame, the audit log, actors, and uncommitted \n  edits exist ONLY in this file."
-            );
-        }
-        Cmd::Fsck { rebuild } => {
-            let report = if rebuild {
-                ws.rebuild().await?
-            } else {
-                ws.scan().await?
-            };
-            let corrupt = if report.corrupt > 0 {
-                format!(", {} corrupt", report.corrupt)
-            } else {
-                String::new()
-            };
-            println!(
-                "fsck: scanned {} object(s){corrupt}, found {} commit(s)",
-                report.objects_scanned, report.commits_found
-            );
-            // Only reachable on the dry run: `--rebuild` refuses outright when an
-            // object it can't read would change what gets restored.
-            if report.unsupported > 0 {
-                let kinds = report
-                    .unsupported_kinds
-                    .iter()
-                    .map(|(kind, v)| format!("{kind} v{v}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                println!(
-                    "  WARNING: {} object(s) written by a NEWER origofs ({kinds}) — \
-                     upgrade origofs before rebuilding, or history it can't read will be lost",
-                    report.unsupported
-                );
-            }
-            if report.branches.is_empty() {
-                println!("  no commits to recover (empty or non-versioned workspace)");
-            } else {
-                let src = if report.used_mirror {
-                    "ref mirror"
-                } else {
-                    "inferred heads"
-                };
-                println!("  {} branch(es) via {src}:", report.branches.len());
-                for (name, hex) in &report.branches {
-                    let tip = &hex[..hex.len().min(12)];
-                    let head = if report.checked_out.as_deref() == Some(name) {
-                        "  (HEAD)"
-                    } else {
-                        ""
-                    };
-                    println!("    {name}\t{tip}{head}");
-                }
-            }
-            if rebuild {
-                if let Some(branch) = &report.checked_out {
-                    println!(
-                        "  rebuilt working tree @ {branch}: {} dir(s), {} file(s), {} symlink(s)",
-                        report.dirs, report.files, report.symlinks
-                    );
-                }
-                println!("  note: blame/attribution is not recoverable (DB-only)");
-            } else {
-                println!("  (dry run — pass --rebuild to restore the metadata DB)");
-            }
-        }
-        Cmd::Watch { since, follow } => {
-            let mut cursor = since;
-            loop {
-                for e in ws.watch(cursor).await? {
-                    let who = e
-                        .actor_id
-                        .map(|a| format!("actor:{a}"))
-                        .unwrap_or_else(|| "-".to_string());
-                    let detail = e.detail.map(|d| format!("  ({d})")).unwrap_or_default();
-                    println!("{}\t{}\t{who}\t{}{detail}", e.seq, e.kind, e.path);
-                    cursor = e.seq;
-                }
-                if !follow {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        }
-        Cmd::Presence { window, actor } => {
-            let rows = match read_ctx(actor)? {
-                Some(ctx) => ws.presence_as(ctx, window).await?,
-                None => ws.presence(window).await?,
-            };
-            for p in rows {
-                let path = p.path.unwrap_or_else(|| "-".to_string());
-                println!(
-                    "{}\t{}\t{path}\t(seen {})",
-                    p.kind.as_str(),
-                    p.display_name,
-                    p.last_seen
-                );
-            }
-        }
+        Cmd::Backup { dest } => cmd::admin::backup(&ws, dest).await?,
+        Cmd::Fsck { rebuild } => cmd::admin::fsck(&ws, rebuild).await?,
+        Cmd::Watch { since, follow } => cmd::surfaces::watch(&ws, since, follow).await?,
+        Cmd::Presence { window, actor } => cmd::surfaces::presence(&ws, window, actor).await?,
         Cmd::Serve {
             addr,
             auth_tokens,
@@ -2680,101 +1743,23 @@ async fn main() -> Result<()> {
             max_concurrent_requests,
             metrics,
         } => {
-            // Validated here rather than left to `router_with`, which *panics* on a
-            // malformed root — correct for a library whose caller is code, wrong
-            // for a value a user typed.
-            if let Some(r) = &root {
-                origofs_sdk::Scope::at(r).with_context(|| format!("--root {r:?}"))?;
-            }
-            let auth = build_api_auth(&ws, &addr, &auth_tokens_with_env(auth_tokens)).await?;
-            let defaults = origofs_sdk::api::ApiOptions::default();
-            // `ApiOptions` has a feature-gated field (`checkpoint`, under
-            // `coedit`), so a literal naming every other field is *exhaustive*
-            // under one feature set and not another: `..defaults` is load-bearing
-            // with `coedit` on and `needless_update` with it off. Clippy only ever
-            // sees the set it was compiled with, so one of the two readings is
-            // always wrong — hence the allow rather than a different shape.
-            // Dropping the update would break the `coedit` build; rebuilding this
-            // by field assignment trades it for `field_reassign_with_default`.
-            #[allow(clippy::needless_update)]
-            let options = origofs_sdk::api::ApiOptions {
-                gate_reads,
-                root,
-                cors_origins,
-                max_body_bytes: max_body_bytes.unwrap_or(defaults.max_body_bytes),
-                request_timeout: match request_timeout {
-                    Some(0) => None,
-                    Some(s) => Some(std::time::Duration::from_secs(s)),
-                    None => defaults.request_timeout,
+            cmd::surfaces::serve(
+                ws,
+                cmd::surfaces::ServeArgs {
+                    addr,
+                    auth_tokens,
+                    gate_reads,
+                    root,
+                    cors_origins,
+                    max_body_bytes,
+                    request_timeout,
+                    max_concurrent_requests,
+                    metrics,
                 },
-                max_concurrent_requests: match max_concurrent_requests {
-                    Some(0) => None,
-                    Some(n) => Some(n),
-                    None => defaults.max_concurrent_requests,
-                },
-                ..defaults
-            };
-            // `build_api_auth` refuses to serve unauthenticated *writes* off
-            // loopback. Reads are a separate decision and default to open, so say
-            // so rather than letting a public bind quietly publish every file's
-            // bytes, its blame map, and the change feed.
-            if !gate_reads && !addr.ip().is_loopback() {
-                eprintln!(
-                    "warning: reads are unauthenticated on {addr} (non-loopback bind); anyone who can reach it can read every file, its blame, the audit log and the review queue. Pass --gate-reads, or gate reads at your proxy."
-                );
-            }
-            if metrics || env_flag("ORIGOFS_METRICS") {
-                init_metrics()?;
-                // `/metrics` gets the same auth treatment as `/readyz`: open. Its
-                // labels are closed sets (error code/class, matched route
-                // template), so it exposes no path, actor, or content — but say so
-                // rather than letting a public bind surprise anyone.
-                if !addr.ip().is_loopback() {
-                    eprintln!(
-                        "warning: exposing unauthenticated Prometheus metrics at http://{addr}/metrics (non-loopback bind, same posture as /readyz); restrict it at your proxy if scrapes shouldn't be public"
-                    );
-                }
-                println!("exposing Prometheus metrics at http://{addr}/metrics");
-            }
-            tracing::info!(%addr, "starting origofs HTTP API");
-            println!(
-                "serving origofs at http://{addr} (SIGTERM/Ctrl-C to stop; in-flight requests drain)"
-            );
-            let ws = std::sync::Arc::new(ws);
-            // Housekeeping. `reap_presence` and `supersede_stale_suggestions`
-            // existed with no caller anywhere, so a long-running `origofs serve`
-            // grew its presence table forever and left suggestions pending against
-            // bases that had already moved. A server is exactly the process that
-            // should be running them; nothing else is long-lived enough to.
-            let janitor = tokio::spawn(spawn_janitor(ws.clone()));
-            let result = origofs_sdk::api::serve_with(ws, addr, auth, options).await;
-            janitor.abort();
-            result?;
+            )
+            .await?
         }
-        Cmd::Nfs { addr, actor } => {
-            #[cfg(not(unix))]
-            {
-                let _ = (addr, actor);
-                return Err(unix_only("nfs", "the NFSv3 server surface"));
-            }
-            #[cfg(unix)]
-            {
-                // NFSv3 is unauthenticated; warn loudly if this isn't a loopback bind.
-                if addr
-                    .parse::<std::net::SocketAddr>()
-                    .map(|s| !s.ip().is_loopback())
-                    .unwrap_or(false)
-                {
-                    eprintln!(
-                        "warning: binding NFS to a non-loopback address ({addr}); NFSv3 has no authentication — anyone who can reach it gets full, unattributed access. Prefer a loopback bind reached over a tunnel/VPN."
-                    );
-                }
-                println!(
-                    "serving origofs over NFSv3 at {addr} (SIGTERM/Ctrl-C to stop)\n  mount with: mount -t nfs -o vers=3,tcp,port=<port>,mountport=<port>,nolock <host>:/ /mnt"
-                );
-                origofs_sdk::nfs::serve_as(ws, &addr, read_ctx(actor)?).await?;
-            }
-        }
+        Cmd::Nfs { addr, actor } => cmd::surfaces::nfs(ws, addr, actor).await?,
     }
     Ok(())
 }

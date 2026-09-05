@@ -20,7 +20,7 @@
 
 use origofs_core::migrations::MIGRATIONS;
 use origofs_core::{
-    FileKind, InodeInit, MetadataStore, PostgresMetadataStore, SqliteMetadataStore,
+    FileKind, InodeInit, MetadataStore, PostgresMetadataStore, SqliteMetadataStore, StoreLifecycle,
     latest_schema_version,
 };
 use std::sync::OnceLock;

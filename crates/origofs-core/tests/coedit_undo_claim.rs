@@ -18,7 +18,7 @@
 
 #![cfg(feature = "coedit")]
 
-use origofs_core::{MetadataStore, SqliteMetadataStore};
+use origofs_core::{LockStore, SqliteMetadataStore, StoreLifecycle};
 use std::sync::Arc;
 
 /// Wall-clock stands still in these tests: every time is passed explicitly, so a
