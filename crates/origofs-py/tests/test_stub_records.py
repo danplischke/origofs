@@ -15,6 +15,7 @@ letting coverage quietly lapse.
 """
 import ast
 import asyncio
+import builtins
 import functools
 import os
 import pathlib
@@ -287,3 +288,101 @@ if __name__ == "__main__":
             fn()
             print("ok  ", name)
     print("ALL OK")
+
+
+# --- the stub must type-check as a stub (#163) -------------------------------
+
+
+def _stub_module() -> "ast.Module":
+    return ast.parse(STUB.read_text())
+
+
+def test_every_name_the_stub_annotates_with_is_defined_in_it():
+    """Two undefined names silently degraded `stat_as`/`blame_as` to `Any` (#163).
+
+    `Inode` and `BlameRange` were never declared -- the real records are
+    `StatResult` and `BlameSpan` -- so the *attributed, ACL-checked* variants, the
+    two a multi-tenant host is supposed to prefer, were the two that lost all type
+    information. It fails open twice over: mypy silences errors inside
+    site-packages by default, so a host running plain `mypy` saw no error and no
+    types, and a call site typed `Any` is exactly as quiet.
+
+    A parse-level check rather than a mypy invocation, so it holds regardless of
+    how a given checker is configured or where the package is installed from.
+    """
+    tree = _stub_module()
+
+    defined = {
+        n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                defined.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.Assign):
+            defined.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            defined.add(node.target.id)
+
+    # Builtins, `typing` spellings, and the string contents of forward references
+    # are not the stub's to define.
+    known = defined | set(dir(builtins)) | {
+        "Any", "Awaitable", "Callable", "Dict", "Iterable", "Iterator", "List",
+        "Literal", "Mapping", "NoReturn", "Optional", "Protocol", "Sequence",
+        "Tuple", "TypedDict", "Union", "Self",
+    }
+
+    used: "set[str]" = set()
+
+    def collect(ann):
+        for n in ast.walk(ann):
+            if isinstance(n, ast.Name):
+                used.add(n.id)
+            elif isinstance(n, ast.Attribute):
+                # `sys.platform`, `asyncio.Event` -- the root name is what matters.
+                root = n
+                while isinstance(root, ast.Attribute):
+                    root = root.value
+                if isinstance(root, ast.Name):
+                    used.add(root.id)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.returns is not None:
+                collect(node.returns)
+            for arg in [*node.args.args, *node.args.posonlyargs, *node.args.kwonlyargs]:
+                if arg.annotation is not None:
+                    collect(arg.annotation)
+        elif isinstance(node, ast.AnnAssign) and node.annotation is not None:
+            collect(node.annotation)
+
+    undefined = sorted(used - known)
+    assert not undefined, (
+        f"names used in annotations but never declared in __init__.pyi: "
+        f"{undefined}. A name mypy cannot resolve degrades that signature to "
+        f"`Any` -- and inside site-packages it does so without reporting anything."
+    )
+
+
+def test_the_workspace_protocol_names_only_real_workspace_methods():
+    """`WorkspaceProtocol` is hand-maintained, so it can drift from `Workspace`.
+
+    Drift in this direction is the dangerous one: a method the protocol promises
+    and the real class lacks type-checks at every call site and raises
+    `AttributeError` at runtime -- which is the failure the protocol was added to
+    prevent for *hosts*, reintroduced one level up.
+    """
+    from origofs import Workspace, WorkspaceProtocol
+
+    promised = {
+        n
+        for n in dir(WorkspaceProtocol)
+        if not n.startswith("_") and callable(getattr(WorkspaceProtocol, n, None))
+    }
+    assert promised, "the protocol declared nothing -- did it stop being a Protocol?"
+    missing = sorted(n for n in promised if not hasattr(Workspace, n))
+    assert not missing, (
+        f"WorkspaceProtocol names methods Workspace does not have: {missing}. "
+        f"Either the binding was renamed and protocol.py must follow, or the "
+        f"protocol is promising something that never existed."
+    )

@@ -495,6 +495,15 @@ proxy logs by default. Each connection is bound to a **session**, opened for it
 if the credential didn't name one, so a sitting's live edits can be undone as a
 unit with `revert_session`.
 
+**Frames carry the y-websocket envelope** — an outer message tag (`messageSync`
+= 0) wrapping the y-sync payload — which is what `y-websocket` and `y-protocols`
+emit, so a browser client needs no thought here. It matters if you write a client
+against y-sync *directly*: a bare update frame starts with `messageYjsUpdate` = 2,
+which is `messageAuth` in the envelope, so it decodes cleanly and does nothing.
+The socket then connects, handshakes, reports the right peer count and never
+converges. origofs logs any such frame at `warn` and reports its tag in
+`SyncReply.unhandled`, so the mismatch is diagnosable rather than a mystery.
+
 #### Ctrl+Z — `POST /coedit-undo/{path}`
 
 Undo pops **one actor's own** most recent action, never a collaborator's
@@ -665,13 +674,21 @@ Three consequences worth knowing before you build on it:
   non-overlapping, in range, and on character boundaries, but it cannot check that
   you mapped the right bytes to the right node — it cannot read your serializer.
   That is the price of not owning the schema.
-- **A stale sidecar opens an empty document.** origofs can rebuild a flat document
-  from the file's text and blame; it cannot rebuild a *tree*, because parsing bytes
-  back into nodes needs your schema. Check `resumed()` and seed from `read(path)`
-  when it is false, or a checkpoint writes an empty body over real content.
+- **A stale sidecar opens an empty document — and it will not overwrite one.**
+  origofs can rebuild a flat document from the file's text and blame; it cannot
+  rebuild a *tree*, because parsing bytes back into nodes needs your schema. So
+  check `resumed()`, seed from `read(path)` when it is false, and say so with
+  `seeded_from(body)`. Until you do, a checkpoint over a **non-empty** file is
+  refused (`ForeignWriteError`, `409`) rather than performed. It used to be
+  performed: an empty body landed over real content with nothing failing at any
+  earlier point. Over HTTP the same declaration is `"seeded_from_file": true` in
+  the checkpoint body.
 - **An out-of-band write is refused, not merged.** The flat path folds a foreign
   write in by diffing text into CRDT operations; a tree cannot be reconciled that
-  way, so the checkpoint fails with a conflict. Re-read, reseed, checkpoint again.
+  way, so the checkpoint fails with `ForeignWriteError`. Re-read, reseed,
+  checkpoint again. The comparison is against the *document's* own base, so it
+  holds for a socket-less checkpoint too, and re-opening the room before each
+  checkpoint no longer resets it.
 
 Durability is split to match: the server persists the CRDT sidecar on the same
 sweeper tick as a flat room — so a crash costs no editing history — while the file
@@ -680,7 +697,9 @@ and its blame move only when you checkpoint. From Rust or Python:
 ```python
 doc = await ws.open_coedit_tree(ctx, "/notes.md", "content")
 if not await doc.resumed():
-    ...  # seed the tree from `await ws.read("/notes.md")` — your schema, your parse
+    seed = await ws.read("/notes.md")
+    ...                             # parse it into the tree — your schema, your parse
+    await doc.seeded_from(seed)     # ...and now origofs knows the document covers it
 await ws.checkpoint_coedit_tree(ctx, "/notes.md", doc, body, spans)
 await ws.persist_coedit_tree("/notes.md", doc)   # CRDT only; the file stays put
 ```
@@ -824,7 +843,12 @@ The same [write policy](#propose-and-review-not-just-apply) applies here, becaus
 it lives in the engine: `write_or_propose` on a propose-only actor queues a
 suggestion instead of writing, and returns a `WriteOutcome` telling you which
 happened. Errors map onto Python's own: a missing path raises `FileNotFoundError`,
-a bad argument `ValueError`, a stale suggestion base `origofs.ConflictError`.
+a bad argument `ValueError`, a stale suggestion base `origofs.StaleBaseError` and
+a foreign write around a co-edit document `origofs.ForeignWriteError` — both
+subclasses of `origofs.ConflictError`, so catching that still catches either, and
+the type tells you which recovery to run (re-diff and re-suggest, versus reseed
+the document and checkpoint again). `accept_suggestion` returns the content
+address it landed, so you can confirm what is now at the path without re-reading.
 
 ### FastAPI — bring your own auth
 
@@ -892,6 +916,15 @@ the change feed, presence, actors/sessions, and the
 `/coedit-tree/{path}` with its `/coedit-tree-checkpoint/{path}` (long-lived rooms
 are created once per router, not per request), and per-actor
 [undo/redo](#ctrlz--post-coedit-undopath) at `/coedit-undo/{path}`.
+
+Mount a subset with `include=`/`exclude=`, naming route *groups* rather than
+paths — `files`, `blame`, `history`, `suggestions`, `revert`, `actors`,
+`presence`, `coedit-ws`, `coedit-checkpoint`, `trash`, `health` (plus `coedit`
+for both co-editing groups). `build_coedit_router(ws, authn=...)` is the named
+shortcut for the co-editing surface alone, and
+`build_coedit_router(..., checkpoint_route=False)` gives you the sockets without
+origofs's tree-checkpoint route — for a host that enforces its own authorization
+on body writes and wants exactly one such path, its own.
 
 One workspace can hold many tenants under scoped paths. Pass `root=` — fixed, or
 a dependency resolving it per request — and the router scopes itself:

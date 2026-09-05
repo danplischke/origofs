@@ -118,7 +118,7 @@ async fn accept_refuses_a_stale_base() {
 
     let err = ws.accept_suggestion(id, human_ctx).await.unwrap_err();
     assert!(
-        matches!(err, origofs_sdk::OrigoFSError::Conflict(_)),
+        matches!(err, origofs_sdk::OrigoFSError::StaleBase(_)),
         "got {err:?}"
     );
     // The file keeps the newer content — a stale proposal is never applied.

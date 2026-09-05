@@ -23,6 +23,7 @@ use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use std::sync::Arc;
 use yrs::encoding::read::Cursor;
+use yrs::sync::protocol::MSG_AUTH;
 use yrs::sync::{Message, MessageReader, SyncMessage};
 use yrs::types::Attrs;
 use yrs::types::text::YChange;
@@ -523,6 +524,18 @@ impl CoeditDoc {
     /// authority on authorship. Awareness (cursor presence) is relayed verbatim;
     /// the server keeps no awareness state, so peers gossip presence through the
     /// room's fan-out.
+    ///
+    /// # Framing (#162)
+    ///
+    /// `data` must carry the **y-websocket** envelope: an outer message tag
+    /// (`messageSync` = 0) wrapping the y-sync payload, which is what `y-websocket`,
+    /// `y-protocols` and every browser client built on them emit. A **bare y-sync**
+    /// frame — what you get writing a client against the y-sync protocol directly —
+    /// starts with `messageYjsUpdate` = 2, which is `messageAuth` in the outer
+    /// envelope: it decodes, it is ignored, and the socket then connects, syncs
+    /// nothing and reports nothing. Any such message is counted in
+    /// [`SyncReply::unhandled`] and logged at `warn`; check it if a room is not
+    /// converging.
     pub fn handle_sync(&self, ctx: WriteCtx, data: &[u8]) -> Result<SyncReply> {
         drive_sync(&self.doc, data, |update| self.apply_update_as(ctx, update))
     }
@@ -1212,6 +1225,7 @@ pub(crate) fn drive_sync(
     let mut broadcast = EncoderV1::new();
     let (mut has_reply, mut has_broadcast) = (false, false);
     let mut content_changed = false;
+    let mut unhandled: Vec<u8> = Vec::new();
 
     for msg in reader {
         let msg =
@@ -1253,12 +1267,35 @@ pub(crate) fn drive_sync(
                 has_broadcast = true;
             }
             // Auth is resolved out-of-band (before we ever get here); custom
-            // tags are not part of our protocol. Ignore both.
-            Message::Auth(_) | Message::Custom(_, _) => {}
+            // tags are not part of our protocol. Neither carries content, so
+            // neither has an effect — but *silently* having no effect is what
+            // made a framing mismatch undiagnosable (#162), so both are counted
+            // and reported.
+            Message::Auth(_) => unhandled.push(MSG_AUTH),
+            Message::Custom(tag, _) => unhandled.push(tag),
         }
     }
 
+    if !unhandled.is_empty() {
+        // The overwhelmingly likely cause, and the one worth naming: a client
+        // written against the **y-sync** protocol directly rather than
+        // y-websocket sends a bare `[messageYjsUpdate=2, …]` frame, and 2 is
+        // `messageAuth` in the outer y-websocket envelope this speaks. It decodes
+        // cleanly, carries no content, and used to be dropped without a word — a
+        // socket that connects, handshakes, reports the right peer count, and
+        // never converges, with nothing anywhere to attribute it to.
+        tracing::warn!(
+            tags = ?unhandled,
+            "co-edit: ignored {} y-sync message(s) this server has no handler for. \
+             Frames must carry the y-websocket envelope (outer messageSync=0, then \
+             the y-sync payload); a bare y-sync update arrives as tag 2 (messageAuth) \
+             and syncs nothing",
+            unhandled.len(),
+        );
+    }
+
     Ok(SyncReply {
+        unhandled,
         reply: if has_reply {
             reply.to_vec()
         } else {
@@ -1294,6 +1331,22 @@ pub struct SyncReply {
     /// but idle tab writes an op-log entry and a blame rewrite on every sweeper
     /// tick, forever — churn with nothing to crystallize.
     pub content_changed: bool,
+    /// The outer y-websocket message tags in this payload that carried no effect —
+    /// `messageAuth` (2), which is resolved out-of-band here, and any custom tag.
+    /// Empty for every well-framed payload.
+    ///
+    /// Reported (#162) because the failure it diagnoses is otherwise invisible: a
+    /// client written against the **y-sync** protocol directly, rather than the
+    /// y-websocket envelope this speaks, sends a bare `[messageYjsUpdate=2, …]`
+    /// frame — and 2 is `messageAuth` in the outer envelope. It decodes, it is
+    /// ignored, and the socket then connects, handshakes, reports the right peer
+    /// count and never converges. A caller that can surface this to its client
+    /// should; the server also logs it at `warn`.
+    ///
+    /// Not an error, deliberately: `messageAuth` is a real y-protocol message and
+    /// refusing the whole payload for one would break a conforming client to
+    /// diagnose a non-conforming one.
+    pub unhandled: Vec<u8>,
 }
 
 /// Document-index length of `s`: its UTF-8 **byte** length.
@@ -1684,7 +1737,7 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         // tree shape has always refused here (`refuse_out_of_band`); this is the
         // flat shape holding the same line, reconciling first where it can.
         let refuse = |why: &str| -> Result<()> {
-            Err(OrigoFSError::Conflict(format!(
+            Err(OrigoFSError::ForeignWrite(format!(
                 "{path} was written outside the co-editing session since its last \
                  checkpoint, and the two versions cannot be merged ({why}) — re-open \
                  the document to pick up the current file, then checkpoint again"
