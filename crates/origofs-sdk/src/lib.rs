@@ -1725,10 +1725,11 @@ impl Workspace {
     /// rejecting it (#164).
     ///
     /// The standalone form of `replaces`: use it when a draft is being withdrawn
-    /// with nothing taking its place, or to revise a **CRDT** proposal, whose
-    /// propose calls deliberately carry no `replaces`. The author may always
-    /// retire their own; anyone else needs `WRITE` at the path, exactly as
-    /// rejecting somebody else's proposal does.
+    /// with **nothing taking its place**. Where a replacement is proposed in the
+    /// same breath, prefer `replaces` — every propose call takes it, byte and CRDT
+    /// alike, and then the two cannot come apart. The author may always retire
+    /// their own; anyone else needs `WRITE` at the path, exactly as rejecting
+    /// somebody else's proposal does.
     pub async fn supersede_suggestion(
         &self,
         id: i64,
@@ -2179,8 +2180,11 @@ impl Workspace {
         path: &str,
         doc: &CoeditDoc,
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
-        self.fs.suggest_coedit(ctx, path, doc, summary).await
+        self.fs
+            .suggest_coedit(ctx, path, doc, summary, replaces)
+            .await
     }
 
     /// The primitive behind [`suggest_coedit`](Self::suggest_coedit), for a client
@@ -2194,9 +2198,10 @@ impl Workspace {
         base_sv: &[u8],
         update: &[u8],
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         self.fs
-            .suggest_coedit_update(ctx, path, base_sv, update, summary)
+            .suggest_coedit_update(ctx, path, base_sv, update, summary, replaces)
             .await
     }
 
@@ -2284,8 +2289,11 @@ impl Workspace {
         path: &str,
         doc: &CoeditTreeDoc,
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
-        self.fs.suggest_coedit_tree(ctx, path, doc, summary).await
+        self.fs
+            .suggest_coedit_tree(ctx, path, doc, summary, replaces)
+            .await
     }
 
     /// The primitive behind [`suggest_coedit_tree`](Self::suggest_coedit_tree),
@@ -2299,9 +2307,10 @@ impl Workspace {
         base_sv: &[u8],
         update: &[u8],
         summary: Option<&str>,
+        replaces: Option<i64>,
     ) -> Result<i64> {
         self.fs
-            .suggest_coedit_tree_update(ctx, path, base_sv, update, summary)
+            .suggest_coedit_tree_update(ctx, path, base_sv, update, summary, replaces)
             .await
     }
 

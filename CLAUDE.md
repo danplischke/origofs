@@ -189,10 +189,18 @@ write path enforces this and you must not weaken it:
     first so a refusal cannot retire a draft for nothing.
   - **Disposing of a draft is authorized like rejecting one**: the author may
     always retire their own, anyone else needs `WRITE` at its path — otherwise one
-    propose-only agent clears another's work out of the queue. The **CRDT** propose
-    calls deliberately carry no `replaces`: a CRDT proposal never goes stale and
-    applying an earlier state after a later one merges a subset, so the reject
-    resurrection does not bite there. `supersede_suggestion` covers them.
+    propose-only agent clears another's work out of the queue. **Every** propose
+    call carries `replaces`, the CRDT pair included: stacked CRDT drafts are less
+    dangerous (a CRDT proposal never goes stale, and applying an author's earlier
+    state after their later one merges a subset), but "the proposal I meant is no
+    longer this one" is the same relation on either shape.
+  - **"Already accepted" is a conflict, not a bad request (#164).**
+    `OrigoFSError::AlreadyResolved` (`already_resolved`, `409`,
+    `AlreadyResolvedError` in Python) replaced the `InvalidArgument` every
+    resolve path returned for a settled row — which said the *request* was
+    malformed when it was well-formed and merely out of date. It is the third thing
+    a reviewing caller handles beside `StaleBase` and the raced-CAS `Conflict`, and
+    unlike either it is terminal: read the row's status, there is nothing to retry.
 - **The write policy and the ACLs are enforced in the engine, not per surface.**
   Every *attributed* mutation on `Fs` — `write_or_propose`, `remove_or_propose`,
   `rename_as`, `mkdir_as`, `symlink_as`, `commit_as`, `checkout_as`,

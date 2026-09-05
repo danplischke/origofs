@@ -583,7 +583,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             .await?
             .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
         if s.status != SuggestionStatus::Pending {
-            return Err(OrigoFSError::InvalidArgument(format!(
+            return Err(OrigoFSError::AlreadyResolved(format!(
                 "suggestion #{id} is already {}",
                 s.status.as_str()
             )));
@@ -786,7 +786,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             .await?
             .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
         if s.status != SuggestionStatus::Pending {
-            return Err(OrigoFSError::InvalidArgument(format!(
+            return Err(OrigoFSError::AlreadyResolved(format!(
                 "suggestion #{id} is already {}",
                 s.status.as_str()
             )));
@@ -1025,7 +1025,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             .await?
             .ok_or_else(|| OrigoFSError::NotFound(format!("suggestion #{id}")))?;
         if s.status != SuggestionStatus::Pending {
-            return Err(OrigoFSError::InvalidArgument(format!(
+            return Err(OrigoFSError::AlreadyResolved(format!(
                 "suggestion #{id} is already {}",
                 s.status.as_str()
             )));

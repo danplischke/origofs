@@ -95,7 +95,7 @@ async fn a_propose_only_actor_can_propose_against_a_tree_document() {
     replica.append_text(actx, "p", "and a suggestion\n");
 
     let id =
-        f.ws.suggest_coedit_tree(actx, "/doc.md", &replica, Some("add a line"))
+        f.ws.suggest_coedit_tree(actx, "/doc.md", &replica, Some("add a line"), None)
             .await
             .unwrap();
 
@@ -129,7 +129,7 @@ async fn the_review_diff_shows_the_effect_of_the_merge() {
             .unwrap();
     replica.append_text(actx, "p", "and a suggestion\n");
     let id =
-        f.ws.suggest_coedit_tree(actx, "/doc.md", &replica, None)
+        f.ws.suggest_coedit_tree(actx, "/doc.md", &replica, None, None)
             .await
             .unwrap();
 
@@ -153,7 +153,7 @@ async fn accept_suggestion_refuses_a_tree_proposal_and_says_what_to_call() {
             .unwrap();
     replica.append_text(actx, "p", "proposed\n");
     let id =
-        f.ws.suggest_coedit_tree(actx, "/doc.md", &replica, None)
+        f.ws.suggest_coedit_tree(actx, "/doc.md", &replica, None, None)
             .await
             .unwrap();
 
@@ -188,7 +188,7 @@ async fn accepting_lands_the_host_bytes_attributed_to_the_author() {
             .unwrap();
     replica.append_text(actx, "p", "proposed\n");
     let id =
-        f.ws.suggest_coedit_tree(actx, "/doc.md", &replica, None)
+        f.ws.suggest_coedit_tree(actx, "/doc.md", &replica, None, None)
             .await
             .unwrap();
 
@@ -236,7 +236,7 @@ async fn a_proposal_cannot_be_accepted_by_its_author() {
             .unwrap();
     replica.append_text(octx, "p", "self-approved\n");
     let id =
-        f.ws.suggest_coedit_tree(octx, "/doc.md", &replica, None)
+        f.ws.suggest_coedit_tree(octx, "/doc.md", &replica, None, None)
             .await
             .unwrap();
 
@@ -262,7 +262,7 @@ async fn a_propose_only_reviewer_cannot_accept_either() {
             .unwrap();
     replica.append_text(octx, "p", "proposed\n");
     let id =
-        f.ws.suggest_coedit_tree(octx, "/doc.md", &replica, None)
+        f.ws.suggest_coedit_tree(octx, "/doc.md", &replica, None, None)
             .await
             .unwrap();
 
@@ -291,7 +291,7 @@ async fn an_already_resolved_proposal_is_not_accepted_twice() {
             .unwrap();
     replica.append_text(actx, "p", "proposed\n");
     let id =
-        f.ws.suggest_coedit_tree(actx, "/doc.md", &replica, None)
+        f.ws.suggest_coedit_tree(actx, "/doc.md", &replica, None, None)
             .await
             .unwrap();
 
@@ -347,7 +347,7 @@ async fn an_empty_update_proposes_nothing_and_is_refused() {
     let f = fixture().await;
     let actx = WriteCtx::actor(f.agent);
     let e =
-        f.ws.suggest_coedit_tree_update(actx, "/doc.md", b"", b"", None)
+        f.ws.suggest_coedit_tree_update(actx, "/doc.md", b"", b"", None, None)
             .await
             .unwrap_err();
     assert!(e.to_string().contains("proposes nothing"), "{e}");
@@ -387,7 +387,7 @@ async fn a_propose_only_actors_flat_crdt_proposal_can_actually_be_accepted() {
     let replica = f.ws.load_coedit_as(actx, "/flat.md").await.unwrap();
     replica.insert(actx, replica.text().len() as u32, "proposed\n");
     let id =
-        f.ws.suggest_coedit(actx, "/flat.md", &replica, None)
+        f.ws.suggest_coedit(actx, "/flat.md", &replica, None, None)
             .await
             .unwrap();
 
