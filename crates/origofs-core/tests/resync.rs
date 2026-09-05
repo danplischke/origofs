@@ -175,7 +175,7 @@ async fn divergent_edits_to_the_same_lines_conflict_and_spare_the_remote() {
         vec![("/base.txt".to_string(), "content".to_string())]
     );
     assert_eq!(
-        a.meta.get_ref("MERGE_HEAD").await.unwrap(),
+        a.backends().meta.get_ref("MERGE_HEAD").await.unwrap(),
         Some(remote_head.to_hex())
     );
     let body = text(&a, "/base.txt").await;
@@ -394,7 +394,7 @@ async fn a_concurrent_remote_push_is_retried_not_clobbered() {
     // The commit the "other writer" publishes mid-resync, set before arming.
     let ahead: Arc<std::sync::Mutex<Option<Hash>>> = Arc::new(std::sync::Mutex::new(None));
 
-    let b_meta = b.meta.clone();
+    let b_meta = b.backends().meta.clone();
     let ahead_hook = ahead.clone();
     let race = Arc::new(RaceClock {
         armed: AtomicBool::new(false),

@@ -415,7 +415,12 @@ async fn checkout_rolls_back_and_keeps_the_tree_on_a_missing_object() {
             hash: missing,
         }],
     };
-    let tree_hash = fs.content.put(&tree.encode().unwrap()).await.unwrap();
+    let tree_hash = fs
+        .backends()
+        .content
+        .put(&tree.encode().unwrap())
+        .await
+        .unwrap();
     let commit = Commit {
         tree: tree_hash,
         parents: vec![],
@@ -423,8 +428,14 @@ async fn checkout_rolls_back_and_keeps_the_tree_on_a_missing_object() {
         message: "broken".to_string(),
         timestamp: 0,
     };
-    let commit_hash = fs.content.put(&commit.encode().unwrap()).await.unwrap();
-    fs.meta
+    let commit_hash = fs
+        .backends()
+        .content
+        .put(&commit.encode().unwrap())
+        .await
+        .unwrap();
+    fs.backends()
+        .meta
         .set_ref("broken", &commit_hash.to_hex())
         .await
         .unwrap();

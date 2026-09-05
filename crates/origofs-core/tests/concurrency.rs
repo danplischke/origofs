@@ -536,6 +536,7 @@ async fn rmdir_racing_mkdir_never_orphans_a_dentry() {
         let fs = shared().await;
         fs.mkdir_p("/dir").await.unwrap();
         let dir = fs
+            .backends()
             .meta
             .lookup(1, "dir")
             .await
@@ -550,8 +551,8 @@ async fn rmdir_racing_mkdir_never_orphans_a_dentry() {
 
         // Whatever the interleaving, the two outcomes must agree: a surviving
         // child implies a surviving parent.
-        let children = fs.meta.child_count(dir).await.unwrap();
-        let parent_gone = fs.meta.get_inode(dir).await.unwrap().is_none();
+        let children = fs.backends().meta.child_count(dir).await.unwrap();
+        let parent_gone = fs.backends().meta.get_inode(dir).await.unwrap().is_none();
         assert!(
             !(parent_gone && children > 0),
             "round {round}: /dir deleted with {children} orphaned child dentr(ies) \

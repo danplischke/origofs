@@ -129,13 +129,11 @@ async fn close_seals_content_put_outside_the_engines_write_path() {
     let ws = Workspace::open(sqlite_meta().await, pack.clone())
         .await
         .unwrap();
-    // Straight into the store, so nothing flushes on our behalf.
-    let hash = ws
-        .fs()
-        .content
-        .put(b"staged, never explicitly flushed")
-        .await
-        .unwrap();
+    // Straight into the store, so nothing flushes on our behalf. Written through
+    // the same `pack` handle the workspace was opened on rather than reaching
+    // into `Fs` for it — it is the identical store, and the engine's backends are
+    // private precisely so a caller cannot route around the write path this way.
+    let hash = pack.put(b"staged, never explicitly flushed").await.unwrap();
     assert!(
         data.list().await.unwrap().is_empty(),
         "precondition: the chunk must still be buffered, or this test proves nothing"

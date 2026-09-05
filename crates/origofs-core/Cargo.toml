@@ -123,12 +123,24 @@ object-store = ["dep:object_store"]
 encryption = ["dep:argon2", "dep:chacha20poly1305"]
 
 coedit = ["dep:yrs"]
+# Exposes `Fs::backends()`, the raw metadata/content handles, bypassing every
+# check the engine performs. For this crate's own integration suites, which are
+# separate crates and so cannot see `pub(crate)` — and which legitimately reach
+# around the engine because the engine is what they are testing.
+#
+# Nothing in a dependency graph turns this on for a consumer: it is enabled by
+# the dev-dependency on this same package, below.
+test-support = []
 # Opt-in metrics recording (roadmap M9). Off by default: with the feature off the
 # `record_*` helpers in `metrics.rs` compile to nothing, so call sites stay
 # unconditional and an embedder who wants no metrics pays nothing.
 metrics = ["dep:metrics"]
 
 [dev-dependencies]
+# This crate, depending on itself, purely to turn on `test-support` for the test
+# and bench targets. A dev-dependency's features do not reach a consumer's build,
+# so `Fs::backends()` exists for `tests/` and for nobody else.
+origofs-core = { path = ".", features = ["test-support"] }
 # pack.rs wraps a backend to inject a mid-repack failure, which needs the same
 # `#[async_trait]` the ContentStore trait is declared with.
 async-trait = "0.1.91"

@@ -231,8 +231,13 @@ async fn a_second_workspace_does_not_inherit_the_first_ones_cache() {
         Perms::NONE
     );
 
-    let (id, other_root) = root.meta.create_workspace("other").await.unwrap();
-    let other: TestFs = root.rebind(root.meta.with_workspace(id), other_root);
+    let (id, other_root) = root
+        .backends()
+        .meta
+        .create_workspace("other")
+        .await
+        .unwrap();
+    let other: TestFs = root.rebind(root.backends().meta.with_workspace(id), other_root);
     let perms = other.effective_perms(agent, "/x").await.unwrap();
     assert!(
         perms.contains(Perms::WRITE),

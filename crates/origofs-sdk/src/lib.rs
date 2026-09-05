@@ -639,42 +639,11 @@ impl Workspace {
     /// The metadata connection/pool, content store, and any Postgres push-feed
     /// handle are shared with `self`, so this is cheap.
     pub async fn workspace(&self, name: &str) -> Result<Self> {
-        // Validate the name at the user entry point: it becomes a registry key and
-        // the recovery mirror's tag, and surfaces in listings/URLs. Reject the same
-        // set `validate_component` rejects for path components (empty, `.`/`..`,
-        // path separators, NUL) so a workspace name can't be empty or path-like.
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.contains('/')
-            || name.contains('\0')
-        {
-            return Err(OrigoFSError::InvalidArgument(format!(
-                "invalid workspace name: {name:?}"
-            )));
-        }
-        let (id, root) =
-            match self.fs.meta.lookup_workspace(name).await? {
-                Some(existing) => existing,
-                None => match self.fs.meta.create_workspace(name).await {
-                    Ok(created) => created,
-                    // Lost a concurrent first-time create race: the other caller's row
-                    // is now committed, so adopt it instead of surfacing AlreadyExists
-                    // (matches how `mkdir_p`/`write` adopt the winner). UNIQUE(name)
-                    // guarantees there is exactly one row to find.
-                    Err(OrigoFSError::AlreadyExists(_)) => {
-                        self.fs.meta.lookup_workspace(name).await?.ok_or_else(|| {
-                            OrigoFSError::AlreadyExists(format!("workspace {name}"))
-                        })?
-                    }
-                    Err(e) => return Err(e),
-                },
-            };
-        let scoped = self.fs.meta.with_workspace(id);
-        let fs = self.fs.rebind(scoped, root);
-        // Give a freshly created workspace its versioning refs/config; idempotent
-        // for one that already exists.
-        fs.init().await?;
+        // Name validation, workspace lookup-or-create, the concurrent-create race
+        // and the versioning bootstrap all live in `Fs::open_workspace` — this
+        // used to reach past `Fs` into the metadata store for four of those five
+        // steps and duplicate the name rules for the fifth.
+        let (id, fs) = self.fs.open_workspace(name).await?;
         Ok(Self {
             fs,
             // Re-scope the Postgres push-feed handle to this workspace, so
@@ -687,14 +656,7 @@ impl Workspace {
     /// The names of every workspace in this store — `default` plus any opened via
     /// [`Self::workspace`], oldest first.
     pub async fn workspaces(&self) -> Result<Vec<String>> {
-        Ok(self
-            .fs
-            .meta
-            .list_workspaces()
-            .await?
-            .into_iter()
-            .map(|(_id, name, _root)| name)
-            .collect())
+        self.fs.workspace_names().await
     }
 
     /// Record a collaboration event (best-effort: a feed hiccup never fails the
@@ -1422,14 +1384,14 @@ impl Workspace {
     /// Seal any buffered writes to durable storage (a no-op unless the content
     /// backend batches, e.g. a packed store). `commit` flushes automatically.
     pub async fn flush(&self) -> Result<()> {
-        self.fs.content.flush().await
+        self.fs.flush_content().await
     }
 
     /// Compact the content store, reclaiming space held by deleted objects;
     /// returns the bytes reclaimed. Meaningful for a packed store; run after
     /// `gc`. A no-op for in-place backends.
     pub async fn repack(&self) -> Result<u64> {
-        self.fs.content.repack().await
+        self.fs.repack_content().await
     }
 
     /// Release this workspace's backend resources and make it unusable
@@ -1458,17 +1420,7 @@ impl Workspace {
     /// Clones share the backend, so this closes it for all of them — as it must,
     /// or a forgotten clone would keep the sockets this exists to release.
     pub async fn close(&self) -> Result<()> {
-        // Flush before either close: sealing a pack needs the content store still
-        // open, and on a packed remote store it needs the metadata store's
-        // sibling index too.
-        let flushed = self.fs.content.flush().await;
-        // Both stores are closed even if the flush failed. A workspace that could
-        // not seal its buffer is in worse shape, not better, for also leaking its
-        // connections — and the flush error is the one returned, since it is the
-        // one that means data did not land.
-        let content = self.fs.content.close().await;
-        let meta = self.fs.meta.close().await;
-        flushed.and(meta).and(content)
+        self.fs.close().await
     }
 
     // --- merge + locks ---------------------------------------------------
@@ -1619,7 +1571,7 @@ impl Workspace {
     /// refuses with a pointer to `pg_dump`/PITR rather than producing something
     /// that only resembles a backup.
     pub async fn backup_metadata(&self, dest: impl AsRef<Path>) -> Result<String> {
-        self.fs.meta.backup_to(dest.as_ref()).await
+        self.fs.backup_metadata_to(dest.as_ref()).await
     }
 
     /// The migration version currently applied to this workspace's metadata DB.
@@ -1627,7 +1579,7 @@ impl Workspace {
     /// [`latest_schema_version`](Self::latest_schema_version); this is here for
     /// operators who want to introspect or gate on it.
     pub async fn schema_version(&self) -> Result<i64> {
-        self.fs.meta.schema_version().await
+        self.fs.schema_version().await
     }
 
     /// The highest schema version this build knows about.
@@ -1640,12 +1592,7 @@ impl Workspace {
     /// so this is mainly for explicitly upgrading a shared DB after deploying a
     /// build with new migrations, or verifying that one is current.
     pub async fn migrate(&self) -> Result<(i64, i64)> {
-        let before = self.fs.meta.schema_version().await?;
-        // `MetadataStore::init` is exactly the (idempotent) migration runner — it
-        // applies unrecorded steps and touches nothing else (no ref/HEAD reset).
-        self.fs.meta.init().await?;
-        let after = self.fs.meta.schema_version().await?;
-        Ok((before, after))
+        self.fs.migrate().await
     }
 
     /// Look up an actor by external identity (`auth_subject`), if registered.

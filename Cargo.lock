@@ -1943,6 +1943,7 @@ dependencies = [
  "libc",
  "metrics",
  "object_store",
+ "origofs-core",
  "parking_lot",
  "proptest",
  "rusqlite",
