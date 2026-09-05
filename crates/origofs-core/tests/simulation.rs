@@ -45,7 +45,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use origofs_core::{
     Clock, ContentStore, Fs, Hash, MetadataStore, OrigoFSError, Result, SqliteMetadataStore,
-    WriteCtx,
+    WorkspaceRegistry, WriteCtx,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};

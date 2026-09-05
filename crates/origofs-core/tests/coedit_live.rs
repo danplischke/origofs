@@ -19,7 +19,8 @@
 #![cfg(feature = "coedit")]
 
 use origofs_core::{
-    CoeditDoc, Fs, MemStore, MetadataStore, PostgresMetadataStore, SqliteMetadataStore, WriteCtx,
+    CoeditDoc, Fs, MemStore, MetadataStore, PostgresMetadataStore, SqliteMetadataStore,
+    WorkspaceRegistry, WriteCtx,
 };
 use std::sync::Arc;
 use std::sync::OnceLock;

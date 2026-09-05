@@ -11,7 +11,8 @@
 //! and Postgres (column collation) legitimately differ on non-ASCII names.
 
 use origofs_core::{
-    FileKind, Fs, INO_ROOT, Ino, InodeInit, MemStore, MetadataStore, SqliteMetadataStore,
+    FileKind, Fs, INO_ROOT, Ino, InodeInit, MemStore, MetadataStore, NamespaceStore,
+    SqliteMetadataStore,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

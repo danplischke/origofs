@@ -5,8 +5,8 @@
 //!   ORIGOFS_PG_TEST_URL="host=/tmp/origofs-pg/sock port=5433 user=postgres dbname=origofs"
 
 use origofs_core::{
-    EventInit, FileKind, Fs, InodeInit, MemStore, MetadataStore, PostgresMetadataStore,
-    SuggestionStatus, WriteCtx,
+    CollabStore, EventInit, FileKind, Fs, InodeInit, LockStore, MemStore, NamespaceStore,
+    PostgresMetadataStore, StoreLifecycle, SuggestionStatus, WorkspaceRegistry, WriteCtx,
 };
 use std::sync::Arc;
 use std::sync::OnceLock;

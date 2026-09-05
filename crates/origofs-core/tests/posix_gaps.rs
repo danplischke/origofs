@@ -11,7 +11,8 @@
 //! something to report, which is why the two landed together.
 
 use origofs_core::{
-    Fs, INO_ROOT, MAX_XATTR_LEN, MemStore, MetadataStore, OrigoFSError, Quota, SqliteMetadataStore,
+    Fs, INO_ROOT, MAX_XATTR_LEN, MemStore, MetadataStore, NamespaceStore, OrigoFSError, Quota,
+    SqliteMetadataStore,
 };
 use std::sync::Arc;
 

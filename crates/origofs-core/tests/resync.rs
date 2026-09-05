@@ -9,8 +9,8 @@
 
 use origofs_core::{
     ActorInit, ActorKind, Clock, ContentStore, Fs, Hash, MemStore, MergeOutcome, MetadataStore,
-    PostgresMetadataStore, ResyncOutcome, SqliteMetadataStore, SystemClock, WriteCtx, resync,
-    transfer,
+    PostgresMetadataStore, RefStore, ResyncOutcome, SqliteMetadataStore, SystemClock, WriteCtx,
+    resync, transfer,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

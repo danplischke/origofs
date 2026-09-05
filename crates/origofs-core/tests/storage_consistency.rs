@@ -7,8 +7,9 @@
 //! bugs live in the seam between two modules.
 
 use origofs_core::{
-    Commit, ContentStore, Fs, Hash, MemStore, MergeOutcome, MetadataStore, OrigoFSError,
-    SqliteMetadataStore, Tree, TreeEntry, TreeKind, WriteCtx,
+    AttributionStore, CollabStore, Commit, ConfigStore, ContentStore, Fs, Hash, MemStore,
+    MergeOutcome, NamespaceStore, OrigoFSError, RefStore, SqliteMetadataStore, StoreLifecycle,
+    Tree, TreeEntry, TreeKind, WriteCtx,
 };
 use std::sync::Arc;
 

@@ -14,7 +14,9 @@
 //! bumped by every change that can alter an answer. These tests are mostly about
 //! that: a cache that is fast and wrong is worse than the slow version.
 
-use origofs_core::{Fs, MemStore, MetadataStore, Perms, SqliteMetadataStore, WritePolicy};
+use origofs_core::{
+    Fs, MemStore, MetadataStore, Perms, SqliteMetadataStore, WorkspaceRegistry, WritePolicy,
+};
 use std::sync::Arc;
 use std::time::Instant;
 

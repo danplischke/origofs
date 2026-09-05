@@ -8,7 +8,9 @@
 //! (the engine's write paths, which now route through it, are covered by the
 //! roundtrip/attribution/nfs suites).
 
-use origofs_core::{FileKind, InodeInit, MetadataStore, OrigoFSError, SqliteMetadataStore};
+use origofs_core::{
+    FileKind, InodeInit, NamespaceStore, OrigoFSError, SqliteMetadataStore, StoreLifecycle,
+};
 
 fn file() -> InodeInit {
     InodeInit::new(FileKind::File, 0o100644)

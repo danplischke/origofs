@@ -19,7 +19,11 @@ use crate::attribution::{
 };
 use crate::collab::{Event, EventInit, LiveDoc, Presence};
 use crate::error::{OrigoFSError, Result};
-use crate::metadata::{MetaTxn, MetadataStore};
+use crate::metadata::{
+    AclStore, AttributionStore, CollabStore, ConfigStore, LockStore, MetaTxn, MetadataStore,
+    NamespaceStore, PortableStore, RefStore, StoreLifecycle, SuggestionStore, TrashStore,
+    WorkspaceRegistry,
+};
 use crate::migrations::MIGRATIONS;
 use crate::posixlock::{LockRequest, PosixLock};
 use crate::suggest::{Suggestion, SuggestionInit, SuggestionKind, SuggestionStatus};
@@ -431,7 +435,7 @@ fn row_to_lock(r: &rusqlite::Row<'_>) -> rusqlite::Result<PosixLock> {
 }
 
 #[async_trait]
-impl MetadataStore for SqliteMetadataStore {
+impl StoreLifecycle for SqliteMetadataStore {
     async fn init(&self) -> Result<()> {
         blocking_section(move || {
             let mut conn = self.lock();
@@ -570,7 +574,10 @@ impl MetadataStore for SqliteMetadataStore {
             }) as Box<dyn MetaTxn>)
         })
     }
+}
 
+#[async_trait]
+impl NamespaceStore for SqliteMetadataStore {
     async fn get_inode(&self, ino: Ino) -> Result<Option<Inode>> {
         blocking_section(move || {
             let conn = self.read();
@@ -932,69 +939,301 @@ impl MetadataStore for SqliteMetadataStore {
         })
     }
 
-    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
-        let table = validated_dump_table(table)?;
+    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
         blocking_section(move || {
             let conn = self.read();
-            // Quoted: `ref` is a reserved word in both dialects, and the allowlist
-            // above is what makes interpolating the name here safe at all.
-            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\""))?;
-            let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
-            let mut rows = stmt.query([])?;
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM xattr WHERE ino = ?1 AND name = ?2",
+                    params![ino, name],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?)
+        })
+    }
+
+    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO xattr(ino, name, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(ino, name) DO UPDATE SET value = excluded.value",
+                params![ino, name, value],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let n = conn.execute(
+                "DELETE FROM xattr WHERE ino = ?1 AND name = ?2",
+                params![ino, name],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
+        blocking_section(move || {
+            let conn = self.read();
+            let mut stmt = conn.prepare("SELECT name FROM xattr WHERE ino = ?1 ORDER BY name")?;
+            let rows = stmt.query_map(params![ino], |r| r.get::<_, String>(0))?;
             let mut out = Vec::new();
-            while let Some(r) = rows.next()? {
-                let mut cells = Vec::with_capacity(cols.len());
-                for (i, name) in cols.iter().enumerate() {
-                    cells.push((name.clone(), sqlite_cell(r, i)?));
-                }
-                out.push(crate::portable::Row(cells));
+            for r in rows {
+                out.push(r?);
             }
             Ok(out)
         })
     }
 
-    async fn reset_for_load(&self) -> Result<()> {
+    async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()> {
         blocking_section(move || {
-            let mut conn = self.lock();
-            let tx = conn.transaction()?;
-            // Reverse dependency order, so nothing is orphaned mid-way even though
-            // the schema declares no foreign keys to enforce it.
-            for table in crate::portable::DUMP_TABLES.iter().rev() {
-                tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
-            }
-            tx.commit()?;
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO symlink(ino, target) VALUES (?1, ?2)
+                 ON CONFLICT(ino) DO UPDATE SET target = excluded.target",
+                params![ino, target],
+            )?;
             Ok(())
         })
     }
 
-    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
-        let table = validated_dump_table(table)?;
-        if rows.is_empty() {
-            return Ok(());
-        }
+    async fn get_symlink(&self, ino: Ino) -> Result<Option<String>> {
         blocking_section(move || {
-            let mut conn = self.lock();
-            let tx = conn.transaction()?;
+            let conn = self.read();
+            conn.query_row(
+                "SELECT target FROM symlink WHERE ino = ?1",
+                params![ino],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    async fn truncate_tree(&self) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            truncate_workspace_tree(&conn, self.workspace_id)?;
+            Ok(())
+        })
+    }
+}
+
+#[async_trait]
+impl RefStore for SqliteMetadataStore {
+    async fn get_ref(&self, name: &str) -> Result<Option<String>> {
+        blocking_section(move || {
+            let conn = self.read();
+            conn.query_row(
+                "SELECT value FROM ref WHERE workspace_id = ?1 AND name = ?2",
+                params![self.workspace_id, name],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    async fn set_ref(&self, name: &str, value: &str) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO ref(workspace_id, name, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(workspace_id, name) DO UPDATE SET value = excluded.value",
+                params![self.workspace_id, name, value],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn cas_ref(&self, name: &str, expect: Option<&str>, new: &str) -> Result<bool> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let changed = match expect {
+                None => conn.execute(
+                    "INSERT INTO ref(workspace_id, name, value) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(workspace_id, name) DO NOTHING",
+                    params![self.workspace_id, name, new],
+                )?,
+                Some(v) => conn.execute(
+                    "UPDATE ref SET value = ?1 WHERE workspace_id = ?2 AND name = ?3 AND value = ?4",
+                    params![new, self.workspace_id, name, v],
+                )?,
+            };
+            Ok(changed == 1)
+        })
+    }
+
+    async fn delete_ref(&self, name: &str) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            conn.execute(
+                "DELETE FROM ref WHERE workspace_id = ?1 AND name = ?2",
+                params![self.workspace_id, name],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn list_refs(&self) -> Result<Vec<(String, String)>> {
+        blocking_section(move || {
+            let conn = self.read();
+            let mut stmt =
+                conn.prepare("SELECT name, value FROM ref WHERE workspace_id = ?1 ORDER BY name")?;
+            let rows = stmt.query_map(params![self.workspace_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
             for row in rows {
-                let cols: Vec<&str> = row.0.iter().map(|(c, _)| c.as_str()).collect();
-                let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
-                let quoted: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
-                let sql = format!(
-                    "INSERT INTO \"{table}\"({}) VALUES ({})",
-                    quoted.join(", "),
-                    placeholders.join(", ")
-                );
-                let vals: Vec<rusqlite::types::Value> =
-                    row.0.iter().map(|(_, v)| cell_to_sqlite(v)).collect();
-                let refs: Vec<&dyn rusqlite::ToSql> =
-                    vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-                tx.execute(&sql, refs.as_slice())?;
+                out.push(row?);
             }
-            tx.commit()?;
+            Ok(out)
+        })
+    }
+}
+
+#[async_trait]
+impl ConfigStore for SqliteMetadataStore {
+    async fn get_config(&self, key: &str) -> Result<Option<String>> {
+        blocking_section(move || {
+            let conn = self.read();
+            conn.query_row(
+                "SELECT value FROM config WHERE workspace_id = ?1 AND key = ?2",
+                params![self.workspace_id, key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    async fn set_config(&self, key: &str, value: &str) -> Result<()> {
+        blocking_section(move || {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO config(workspace_id, key, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(workspace_id, key) DO UPDATE SET value = excluded.value",
+                params![self.workspace_id, key, value],
+            )?;
             Ok(())
         })
     }
 
+    async fn bump_counter(&self, key: &str) -> Result<i64> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // One atomic upsert: create at 1, else increment the stored integer.
+            //
+            // The `WHERE` is what keeps this honest on a non-integer value.
+            // SQLite's `CAST` never fails — it takes the numeric prefix and yields
+            // 0 for text — so a key holding `"abc"` silently reset the counter to 1
+            // and `"3.7"` became 4, while Postgres's `value::bigint` raised. The
+            // round-trip comparison admits exactly the values this method itself
+            // writes (a plain decimal integer) and rejects the rest, leaving the
+            // row untouched and returning no row.
+            let v: Option<i64> = conn
+                .query_row(
+                    "INSERT INTO config(workspace_id, key, value) VALUES (?1, ?2, '1')
+                     ON CONFLICT(workspace_id, key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+                       WHERE CAST(CAST(value AS INTEGER) AS TEXT) = value
+                     RETURNING CAST(value AS INTEGER)",
+                    params![self.workspace_id, key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            v.ok_or_else(|| {
+                OrigoFSError::InvalidArgument(format!(
+                    "config key {key:?} does not hold an integer, so it cannot be used as a counter"
+                ))
+            })
+        })
+    }
+}
+
+#[async_trait]
+impl WorkspaceRegistry for SqliteMetadataStore {
+    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore> {
+        Arc::new(SqliteMetadataStore {
+            conn: self.conn.clone(),
+            readers: self.readers.clone(),
+            next_reader: self.next_reader.clone(),
+            workspace_id,
+        })
+    }
+
+    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)> {
+        blocking_section(move || {
+            let mut conn = self.lock();
+            let now = now_secs();
+            let tx = conn.transaction()?;
+            // Reserve the row (fails on a duplicate name), give it its own root
+            // directory inode, then point the row at that inode — all atomic.
+            match tx.execute(
+                "INSERT INTO workspace(name, root_ino, created_at) VALUES (?1, 0, ?2)",
+                params![name, now],
+            ) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    return Err(OrigoFSError::AlreadyExists(format!("workspace {name}")));
+                }
+                Err(e) => return Err(e.into()),
+            }
+            let id = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
+                 VALUES (?1, 'dir', ?2, 1, 0, NULL, ?3, ?3)",
+                params![id, DIR_MODE, now],
+            )?;
+            let root_ino = tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE workspace SET root_ino = ?1 WHERE id = ?2",
+                params![root_ino, id],
+            )?;
+            tx.commit()?;
+            Ok((id, root_ino))
+        })
+    }
+
+    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>> {
+        blocking_section(move || {
+            let conn = self.read();
+            conn.query_row(
+                "SELECT id, root_ino FROM workspace WHERE name = ?1",
+                params![name],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>> {
+        blocking_section(move || {
+            let conn = self.read();
+            let mut stmt = conn.prepare("SELECT id, name, root_ino FROM workspace ORDER BY id")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+}
+
+#[async_trait]
+impl AclStore for SqliteMetadataStore {
     async fn set_acl(
         &self,
         actor_id: i64,
@@ -1060,7 +1299,10 @@ impl MetadataStore for SqliteMetadataStore {
             Ok(out)
         })
     }
+}
 
+#[async_trait]
+impl TrashStore for SqliteMetadataStore {
     async fn push_trash(&self, init: crate::trash::TrashInit) -> Result<i64> {
         blocking_section(move || {
             let conn = self.lock();
@@ -1157,290 +1399,10 @@ impl MetadataStore for SqliteMetadataStore {
             Ok(out)
         })
     }
+}
 
-    async fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>> {
-        blocking_section(move || {
-            let conn = self.read();
-            Ok(conn
-                .query_row(
-                    "SELECT value FROM xattr WHERE ino = ?1 AND name = ?2",
-                    params![ino, name],
-                    |r| r.get::<_, Vec<u8>>(0),
-                )
-                .optional()?)
-        })
-    }
-
-    async fn set_xattr(&self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
-        blocking_section(move || {
-            let conn = self.lock();
-            conn.execute(
-                "INSERT INTO xattr(ino, name, value) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(ino, name) DO UPDATE SET value = excluded.value",
-                params![ino, name, value],
-            )?;
-            Ok(())
-        })
-    }
-
-    async fn remove_xattr(&self, ino: Ino, name: &str) -> Result<bool> {
-        blocking_section(move || {
-            let conn = self.lock();
-            let n = conn.execute(
-                "DELETE FROM xattr WHERE ino = ?1 AND name = ?2",
-                params![ino, name],
-            )?;
-            Ok(n > 0)
-        })
-    }
-
-    async fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>> {
-        blocking_section(move || {
-            let conn = self.read();
-            let mut stmt = conn.prepare("SELECT name FROM xattr WHERE ino = ?1 ORDER BY name")?;
-            let rows = stmt.query_map(params![ino], |r| r.get::<_, String>(0))?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r?);
-            }
-            Ok(out)
-        })
-    }
-
-    async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()> {
-        blocking_section(move || {
-            let conn = self.lock();
-            conn.execute(
-                "INSERT INTO symlink(ino, target) VALUES (?1, ?2)
-                 ON CONFLICT(ino) DO UPDATE SET target = excluded.target",
-                params![ino, target],
-            )?;
-            Ok(())
-        })
-    }
-
-    async fn get_symlink(&self, ino: Ino) -> Result<Option<String>> {
-        blocking_section(move || {
-            let conn = self.read();
-            conn.query_row(
-                "SELECT target FROM symlink WHERE ino = ?1",
-                params![ino],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(Into::into)
-        })
-    }
-
-    async fn get_ref(&self, name: &str) -> Result<Option<String>> {
-        blocking_section(move || {
-            let conn = self.read();
-            conn.query_row(
-                "SELECT value FROM ref WHERE workspace_id = ?1 AND name = ?2",
-                params![self.workspace_id, name],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(Into::into)
-        })
-    }
-
-    async fn set_ref(&self, name: &str, value: &str) -> Result<()> {
-        blocking_section(move || {
-            let conn = self.lock();
-            conn.execute(
-                "INSERT INTO ref(workspace_id, name, value) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(workspace_id, name) DO UPDATE SET value = excluded.value",
-                params![self.workspace_id, name, value],
-            )?;
-            Ok(())
-        })
-    }
-
-    async fn cas_ref(&self, name: &str, expect: Option<&str>, new: &str) -> Result<bool> {
-        blocking_section(move || {
-            let conn = self.lock();
-            let changed = match expect {
-                None => conn.execute(
-                    "INSERT INTO ref(workspace_id, name, value) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(workspace_id, name) DO NOTHING",
-                    params![self.workspace_id, name, new],
-                )?,
-                Some(v) => conn.execute(
-                    "UPDATE ref SET value = ?1 WHERE workspace_id = ?2 AND name = ?3 AND value = ?4",
-                    params![new, self.workspace_id, name, v],
-                )?,
-            };
-            Ok(changed == 1)
-        })
-    }
-
-    async fn delete_ref(&self, name: &str) -> Result<()> {
-        blocking_section(move || {
-            let conn = self.lock();
-            conn.execute(
-                "DELETE FROM ref WHERE workspace_id = ?1 AND name = ?2",
-                params![self.workspace_id, name],
-            )?;
-            Ok(())
-        })
-    }
-
-    async fn list_refs(&self) -> Result<Vec<(String, String)>> {
-        blocking_section(move || {
-            let conn = self.read();
-            let mut stmt =
-                conn.prepare("SELECT name, value FROM ref WHERE workspace_id = ?1 ORDER BY name")?;
-            let rows = stmt.query_map(params![self.workspace_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
-        })
-    }
-
-    async fn get_config(&self, key: &str) -> Result<Option<String>> {
-        blocking_section(move || {
-            let conn = self.read();
-            conn.query_row(
-                "SELECT value FROM config WHERE workspace_id = ?1 AND key = ?2",
-                params![self.workspace_id, key],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(Into::into)
-        })
-    }
-
-    async fn set_config(&self, key: &str, value: &str) -> Result<()> {
-        blocking_section(move || {
-            let conn = self.lock();
-            conn.execute(
-                "INSERT INTO config(workspace_id, key, value) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(workspace_id, key) DO UPDATE SET value = excluded.value",
-                params![self.workspace_id, key, value],
-            )?;
-            Ok(())
-        })
-    }
-
-    async fn bump_counter(&self, key: &str) -> Result<i64> {
-        blocking_section(move || {
-            let conn = self.lock();
-            // One atomic upsert: create at 1, else increment the stored integer.
-            //
-            // The `WHERE` is what keeps this honest on a non-integer value.
-            // SQLite's `CAST` never fails — it takes the numeric prefix and yields
-            // 0 for text — so a key holding `"abc"` silently reset the counter to 1
-            // and `"3.7"` became 4, while Postgres's `value::bigint` raised. The
-            // round-trip comparison admits exactly the values this method itself
-            // writes (a plain decimal integer) and rejects the rest, leaving the
-            // row untouched and returning no row.
-            let v: Option<i64> = conn
-                .query_row(
-                    "INSERT INTO config(workspace_id, key, value) VALUES (?1, ?2, '1')
-                     ON CONFLICT(workspace_id, key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
-                       WHERE CAST(CAST(value AS INTEGER) AS TEXT) = value
-                     RETURNING CAST(value AS INTEGER)",
-                    params![self.workspace_id, key],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            v.ok_or_else(|| {
-                OrigoFSError::InvalidArgument(format!(
-                    "config key {key:?} does not hold an integer, so it cannot be used as a counter"
-                ))
-            })
-        })
-    }
-
-    fn with_workspace(&self, workspace_id: i64) -> Arc<dyn MetadataStore> {
-        Arc::new(SqliteMetadataStore {
-            conn: self.conn.clone(),
-            readers: self.readers.clone(),
-            next_reader: self.next_reader.clone(),
-            workspace_id,
-        })
-    }
-
-    async fn create_workspace(&self, name: &str) -> Result<(i64, Ino)> {
-        blocking_section(move || {
-            let mut conn = self.lock();
-            let now = now_secs();
-            let tx = conn.transaction()?;
-            // Reserve the row (fails on a duplicate name), give it its own root
-            // directory inode, then point the row at that inode — all atomic.
-            match tx.execute(
-                "INSERT INTO workspace(name, root_ino, created_at) VALUES (?1, 0, ?2)",
-                params![name, now],
-            ) {
-                Ok(_) => {}
-                Err(rusqlite::Error::SqliteFailure(e, _))
-                    if e.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
-                    return Err(OrigoFSError::AlreadyExists(format!("workspace {name}")));
-                }
-                Err(e) => return Err(e.into()),
-            }
-            let id = tx.last_insert_rowid();
-            tx.execute(
-                "INSERT INTO inode(workspace_id, kind, mode, nlink, size, content_hash, mtime, ctime)
-                 VALUES (?1, 'dir', ?2, 1, 0, NULL, ?3, ?3)",
-                params![id, DIR_MODE, now],
-            )?;
-            let root_ino = tx.last_insert_rowid();
-            tx.execute(
-                "UPDATE workspace SET root_ino = ?1 WHERE id = ?2",
-                params![root_ino, id],
-            )?;
-            tx.commit()?;
-            Ok((id, root_ino))
-        })
-    }
-
-    async fn lookup_workspace(&self, name: &str) -> Result<Option<(i64, Ino)>> {
-        blocking_section(move || {
-            let conn = self.read();
-            conn.query_row(
-                "SELECT id, root_ino FROM workspace WHERE name = ?1",
-                params![name],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            )
-            .optional()
-            .map_err(Into::into)
-        })
-    }
-
-    async fn list_workspaces(&self) -> Result<Vec<(i64, String, Ino)>> {
-        blocking_section(move || {
-            let conn = self.read();
-            let mut stmt = conn.prepare("SELECT id, name, root_ino FROM workspace ORDER BY id")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
-        })
-    }
-
-    async fn truncate_tree(&self) -> Result<()> {
-        blocking_section(move || {
-            let conn = self.lock();
-            truncate_workspace_tree(&conn, self.workspace_id)?;
-            Ok(())
-        })
-    }
-
+#[async_trait]
+impl LockStore for SqliteMetadataStore {
     async fn set_conflict(&self, path: &str, kind: &str) -> Result<()> {
         blocking_section(move || {
             let conn = self.lock();
@@ -1715,7 +1677,10 @@ impl MetadataStore for SqliteMetadataStore {
             Ok(n as u64)
         })
     }
+}
 
+#[async_trait]
+impl AttributionStore for SqliteMetadataStore {
     async fn create_actor(&self, init: ActorInit) -> Result<i64> {
         blocking_section(move || {
             let conn = self.lock();
@@ -1975,7 +1940,10 @@ impl MetadataStore for SqliteMetadataStore {
             .map_err(Into::into)
         })
     }
+}
 
+#[async_trait]
+impl CollabStore for SqliteMetadataStore {
     async fn append_event(&self, ev: EventInit, ts: i64) -> Result<i64> {
         blocking_section(move || {
             let conn = self.lock();
@@ -2169,7 +2137,10 @@ impl MetadataStore for SqliteMetadataStore {
             Ok(())
         })
     }
+}
 
+#[async_trait]
+impl SuggestionStore for SqliteMetadataStore {
     async fn create_suggestion(&self, init: SuggestionInit, ts: i64) -> Result<i64> {
         blocking_section(move || {
             let conn = self.lock();
@@ -2251,6 +2222,72 @@ impl MetadataStore for SqliteMetadataStore {
                 params![status.as_str(), resolved_by, ts, id, self.workspace_id],
             )?;
             Ok(n == 1)
+        })
+    }
+}
+
+#[async_trait]
+impl PortableStore for SqliteMetadataStore {
+    async fn export_table(&self, table: &str) -> Result<Vec<crate::portable::Row>> {
+        let table = validated_dump_table(table)?;
+        blocking_section(move || {
+            let conn = self.read();
+            // Quoted: `ref` is a reserved word in both dialects, and the allowlist
+            // above is what makes interpolating the name here safe at all.
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\""))?;
+            let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(r) = rows.next()? {
+                let mut cells = Vec::with_capacity(cols.len());
+                for (i, name) in cols.iter().enumerate() {
+                    cells.push((name.clone(), sqlite_cell(r, i)?));
+                }
+                out.push(crate::portable::Row(cells));
+            }
+            Ok(out)
+        })
+    }
+
+    async fn import_table(&self, table: &str, rows: &[crate::portable::Row]) -> Result<()> {
+        let table = validated_dump_table(table)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        blocking_section(move || {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            for row in rows {
+                let cols: Vec<&str> = row.0.iter().map(|(c, _)| c.as_str()).collect();
+                let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+                let quoted: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
+                let sql = format!(
+                    "INSERT INTO \"{table}\"({}) VALUES ({})",
+                    quoted.join(", "),
+                    placeholders.join(", ")
+                );
+                let vals: Vec<rusqlite::types::Value> =
+                    row.0.iter().map(|(_, v)| cell_to_sqlite(v)).collect();
+                let refs: Vec<&dyn rusqlite::ToSql> =
+                    vals.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+                tx.execute(&sql, refs.as_slice())?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    async fn reset_for_load(&self) -> Result<()> {
+        blocking_section(move || {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            // Reverse dependency order, so nothing is orphaned mid-way even though
+            // the schema declares no foreign keys to enforce it.
+            for table in crate::portable::DUMP_TABLES.iter().rev() {
+                tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
+            }
+            tx.commit()?;
+            Ok(())
         })
     }
 }

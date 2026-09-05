@@ -17,7 +17,10 @@
 //! would have no coverage at all, which is exactly the way to ship a `set_ref`
 //! that quietly stopped working under a pool.
 
-use origofs_core::{ActorInit, Fs, LocalCasStore, MetadataStore, SqliteMetadataStore, WritePolicy};
+use origofs_core::{
+    ActorInit, AttributionStore, ConfigStore, Fs, LocalCasStore, LockStore, MetadataStore,
+    RefStore, SqliteMetadataStore, StoreLifecycle, WorkspaceRegistry, WritePolicy,
+};
 use std::sync::Arc;
 
 async fn on_disk() -> (tempfile::TempDir, Arc<dyn MetadataStore>) {

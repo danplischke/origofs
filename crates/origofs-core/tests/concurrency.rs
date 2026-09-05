@@ -13,7 +13,7 @@
 
 use origofs_core::posixlock::{self, LockAnswer, LockKind, LockRequest};
 use origofs_core::{
-    EventInit, FileKind, Fs, MemStore, MetadataStore, OrigoFSError, SqliteMetadataStore, WriteCtx,
+    EventInit, FileKind, Fs, MemStore, NamespaceStore, OrigoFSError, SqliteMetadataStore, WriteCtx,
 };
 use std::collections::HashSet;
 use std::sync::Arc;

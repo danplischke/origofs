@@ -2,8 +2,8 @@
 //! Each test pins a specific fix so the failure mode can't silently return.
 
 use origofs_core::{
-    ActorInit, ChunkRef, Fs, Hash, INO_ROOT, Manifest, MemStore, MetadataStore, OrigoFSError,
-    Owner, SqliteMetadataStore, WriteCtx,
+    ActorInit, AttributionStore, ChunkRef, CollabStore, ConfigStore, Fs, Hash, INO_ROOT, Manifest,
+    MemStore, OrigoFSError, Owner, RefStore, SqliteMetadataStore, StoreLifecycle, WriteCtx,
 };
 use std::sync::Arc;
 

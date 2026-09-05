@@ -21,7 +21,7 @@
 //! matching `tests/postgres.rs`.
 
 use origofs_core::{
-    Commit, ContentStore, Fs, Hash, MemStore, MetadataStore, PostgresMetadataStore,
+    Commit, ContentStore, Fs, Hash, MemStore, MetadataStore, PostgresMetadataStore, RefStore,
     SqliteMetadataStore, SuggestionStatus, Tree, TreeEntry, TreeKind, WriteCtx,
 };
 use std::sync::Arc;

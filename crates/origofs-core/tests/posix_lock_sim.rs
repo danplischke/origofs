@@ -18,7 +18,7 @@
 //! exercised where `ORIGOFS_PG_TEST_URL` is set.
 
 use origofs_core::posixlock::{self, LOCK_EOF, LockKind, LockRequest, PosixLock};
-use origofs_core::{Fs, MemStore, MetadataStore, SqliteMetadataStore};
+use origofs_core::{Fs, LockStore, MemStore, MetadataStore, SqliteMetadataStore};
 use std::sync::Arc;
 
 /// Seeded xorshift: every input to a run is derived from one `u64`.

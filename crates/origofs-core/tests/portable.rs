@@ -11,7 +11,8 @@
 //! edits do not travel with content.
 
 use origofs_core::{
-    Fs, MemStore, MetadataStore, OrigoFSError, Perms, SqliteMetadataStore, VersioningMode, WriteCtx,
+    Fs, MemStore, MetadataStore, OrigoFSError, Perms, PortableStore, SqliteMetadataStore,
+    VersioningMode, WriteCtx,
 };
 use std::sync::Arc;
 

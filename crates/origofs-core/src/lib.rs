@@ -147,7 +147,14 @@ pub use trash::{DEFAULT_TRASH_RETENTION_SECS, TrashEntry, TrashInit};
 pub const MAX_XATTR_LEN: usize = 64 * 1024;
 pub use gc::{DEFAULT_GC_GRACE_SECS, GcStats};
 pub use merge::{Conflict, MergeOutcome};
-pub use metadata::{MetaTxn, MetadataStore};
+// The metadata backend, as its twelve concern-scoped parts plus the sum of them.
+// Depend on `MetadataStore` where you need the whole store; name a part where you
+// do not, which is most places.
+pub use metadata::{
+    AclStore, AttributionStore, CollabStore, ConfigStore, LockStore, MetaTxn, MetadataStore,
+    NamespaceStore, PortableStore, RefStore, StoreLifecycle, SuggestionStore, TrashStore,
+    WorkspaceRegistry,
+};
 pub use metrics::OpTimer;
 pub use migrations::latest_schema_version;
 pub use objectgraph::{
