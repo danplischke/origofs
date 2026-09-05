@@ -96,6 +96,33 @@ enum Cmd {
         #[arg(long)]
         actor: Option<i64>,
     },
+    /// Search file contents for every term in the query.
+    ///
+    /// Whole-word terms, ANDed, over the **working tree**. Results come from the
+    /// index, so run `origofs reindex` first — an unbuilt index reports no
+    /// matches, which is not the same claim as "nothing matches", and the
+    /// footer says which one you got.
+    Search {
+        /// Terms to match. All of them must be present in a file.
+        query: Vec<String>,
+        /// Maximum hits to print.
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the search is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
+    /// Build (or top up) the content search index.
+    ///
+    /// Indexes every file in the working tree that has not been indexed yet.
+    /// Idempotent and resumable — the queue is "content this index has not
+    /// seen", so re-running costs nothing and an interrupted run keeps what it
+    /// finished. Content is addressed by hash, so a rename, a delete or a branch
+    /// checkout needs no reindexing at all.
+    Reindex,
     /// Show inode metadata for a path.
     Stat {
         path: String,
@@ -1677,6 +1704,38 @@ async fn main() -> Result<()> {
             for e in entries {
                 println!("{}\t{}", e.kind.as_str(), e.name);
             }
+        }
+        Cmd::Search {
+            query,
+            limit,
+            actor,
+        } => {
+            let q = query.join(" ");
+            let hits = match read_ctx(actor)? {
+                Some(ctx) => ws.search_as(ctx, &q, limit).await?,
+                None => ws.search(&q, limit).await?,
+            };
+            for h in &hits {
+                println!("{}", h.path);
+            }
+            // An empty result from an unbuilt index is not an answer about the
+            // workspace's contents, so the two are never printed the same way.
+            let st = ws.search_status().await?;
+            if !st.complete() {
+                eprintln!(
+                    "note: {} blob(s) not indexed yet — these results are partial. Run `origofs reindex`.",
+                    st.pending
+                );
+            } else if hits.is_empty() && st.indexed == 0 {
+                eprintln!("note: nothing is indexed. Run `origofs reindex`.");
+            }
+        }
+        Cmd::Reindex => {
+            let r = ws.reindex().await?;
+            println!(
+                "indexed {} blob(s), {} with no searchable text, {} term(s)",
+                r.indexed, r.skipped_binary, r.terms
+            );
         }
         Cmd::Stat { path, actor } => {
             let i = match read_ctx(actor)? {

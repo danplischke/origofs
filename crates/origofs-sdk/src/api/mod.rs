@@ -333,6 +333,18 @@ impl ReadAuth {
         })
     }
 
+    async fn search(
+        &self,
+        ws: &Workspace,
+        query: &str,
+        limit: i64,
+    ) -> ApiResult<Vec<crate::SearchHit>> {
+        Ok(match self.0 {
+            Some(p) => ws.search_as(p.write_ctx(), query, limit).await?,
+            None => ws.search(query, limit).await?,
+        })
+    }
+
     /// Whether this reader may read `path` — the filter form of
     /// [`ensure_may_read`](Self::ensure_may_read), for a listing that drops an
     /// entry rather than refusing the request.
@@ -521,6 +533,7 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
         .route("/dirs", get(list_root).post(make_root))
         .route("/dirs/{*path}", get(list_dir).post(make_dir))
         .route("/stat/{*path}", get(stat))
+        .route("/search", get(search))
         .route("/blame/{*path}", get(blame))
         .route("/rename", post(rename))
         .route("/commit", post(commit))
@@ -1350,6 +1363,71 @@ async fn stat(
         size: i.size,
         mtime: i.mtime,
         ctime: i.ctime,
+    }))
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+    #[serde(default = "default_search_limit")]
+    limit: i64,
+}
+
+fn default_search_limit() -> i64 {
+    50
+}
+
+#[derive(Serialize)]
+struct SearchHitDto {
+    path: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct SearchResponseDto {
+    hits: Vec<SearchHitDto>,
+    /// Blobs indexed for this workspace.
+    indexed: i64,
+    /// Blobs in the working tree still waiting to be indexed.
+    pending: i64,
+    /// Whether `hits` is the whole answer. `false` means the index is still
+    /// filling, so an empty `hits` says nothing about the workspace's contents.
+    complete: bool,
+}
+
+/// `GET /v1/search?q=…&limit=…` — paths whose content matches every term.
+///
+/// Bound to `ReadAuth` like every other read that names a path, and for a
+/// sharper reason than most: a search result *is* a path plus the fact that some
+/// content sits at it, so an unchecked one is an existence oracle over the whole
+/// workspace. With enforcement on, each hit is checked at its own path exactly
+/// as `stat` would be, and `limit` bounds the **visible** hits so a run of
+/// unreadable ones cannot truncate the page.
+///
+/// The index counters are part of the response rather than a separate endpoint
+/// because they change what an empty `hits` means: from an index that is still
+/// filling, it is not an answer about the workspace at all. A client that
+/// renders "no results" without reading `complete` is showing its user
+/// something false.
+async fn search(
+    State(ws): State<Shared>,
+    who: ReadAuth,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Json<SearchResponseDto>> {
+    let limit = q.limit.clamp(1, 500);
+    let hits = who.search(&ws, &q.q, limit).await?;
+    let status = ws.search_status().await?;
+    Ok(Json(SearchResponseDto {
+        hits: hits
+            .into_iter()
+            .map(|h| SearchHitDto {
+                path: h.path,
+                content: h.content.to_hex(),
+            })
+            .collect(),
+        indexed: status.indexed,
+        pending: status.pending,
+        complete: status.complete(),
     }))
 }
 

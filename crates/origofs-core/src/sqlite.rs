@@ -22,6 +22,7 @@ use crate::error::{OrigoFSError, Result};
 use crate::metadata::{MetaTxn, MetadataStore};
 use crate::migrations::MIGRATIONS;
 use crate::posixlock::{LockRequest, PosixLock};
+use crate::search::MAX_INDEXED_BYTES;
 use crate::suggest::{Suggestion, SuggestionInit, SuggestionKind, SuggestionStatus};
 use crate::types::{DirEntry, FileKind, Hash, INO_ROOT, Ino, Inode, InodeInit};
 use crate::util::{blocking_section, now_secs};
@@ -37,6 +38,50 @@ const DIR_MODE: i64 = 0o040755;
 /// `SQLITE_MAX_VARIABLE_NUMBER` is 999 on builds before 3.32, so the IN-list is
 /// chunked well under it rather than trusting the caller's slice length.
 const INODE_BATCH: usize = 500;
+
+/// The working tree's not-yet-indexed content addresses, as a recursive walk
+/// down `dentry` from a workspace root (V22).
+///
+/// This is the indexer's queue, and it is a **set difference rather than a log**:
+/// there is no event to miss and nothing to replay, so a blob that was skipped
+/// for any reason simply appears again on the next sweep. Distinct on
+/// `content_hash`, because the unit of work is a blob and not a path — one file
+/// linked at four paths, or the same content on four branches, is indexed once.
+///
+/// `?1` root ino, `?2` workspace id, `?3` size cap.
+const PENDING_SQL: &str = "
+WITH RECURSIVE sub(ino) AS (
+    SELECT ?1
+    UNION
+    SELECT d.ino FROM dentry d JOIN sub ON d.parent_ino = sub.ino
+)
+SELECT DISTINCT i.content_hash, i.size
+  FROM inode i JOIN sub ON i.ino = sub.ino
+ WHERE i.kind = 'file'
+   AND i.content_hash IS NOT NULL
+   AND i.size <= ?3
+   AND NOT EXISTS (
+        SELECT 1 FROM blob_index b
+         WHERE b.workspace_id = ?2 AND b.content_hash = i.content_hash)
+";
+
+/// [`PENDING_SQL`] with a bound, for one sweep batch. `?4` limit.
+const UNINDEXED_SQL: &str = "
+WITH RECURSIVE sub(ino) AS (
+    SELECT ?1
+    UNION
+    SELECT d.ino FROM dentry d JOIN sub ON d.parent_ino = sub.ino
+)
+SELECT DISTINCT i.content_hash, i.size
+  FROM inode i JOIN sub ON i.ino = sub.ino
+ WHERE i.kind = 'file'
+   AND i.content_hash IS NOT NULL
+   AND i.size <= ?3
+   AND NOT EXISTS (
+        SELECT 1 FROM blob_index b
+         WHERE b.workspace_id = ?2 AND b.content_hash = i.content_hash)
+ LIMIT ?4
+";
 
 /// The workspace every store is bound to until re-scoped with `with_workspace`;
 /// its root is [`INO_ROOT`]. Backfilled by migration V11 (`docs/MULTI_TENANCY.md`).
@@ -799,6 +844,156 @@ impl MetadataStore for SqliteMetadataStore {
                 |r| r.get(0),
             )?;
             Ok(n as usize)
+        })
+    }
+
+    // --- content search index (V22) -------------------------------------
+
+    async fn index_blob(&self, hash: &Hash, bytes: u64, terms: &[String], now: i64) -> Result<()> {
+        let hex = hash.to_hex();
+        let terms = terms.to_vec();
+        blocking_section(move || {
+            let mut conn = self.lock();
+            // One transaction: a half-written term set under an `indexed` marker
+            // is invisible to the sweep forever, because the sweep's queue is
+            // "blobs with no `blob_index` row".
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM blob_term WHERE workspace_id = ?1 AND content_hash = ?2",
+                params![self.workspace_id, hex],
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT OR IGNORE INTO blob_term(workspace_id, term, content_hash)
+                     VALUES (?1, ?2, ?3)",
+                )?;
+                for term in &terms {
+                    stmt.execute(params![self.workspace_id, term, hex])?;
+                }
+            }
+            tx.execute(
+                "INSERT INTO blob_index(workspace_id, content_hash, indexed_at, bytes, terms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(workspace_id, content_hash) DO UPDATE SET
+                   indexed_at = excluded.indexed_at,
+                   bytes      = excluded.bytes,
+                   terms      = excluded.terms",
+                params![
+                    self.workspace_id,
+                    hex,
+                    now,
+                    bytes as i64,
+                    terms.len() as i64
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    async fn unindexed_blobs(&self, root: Ino, limit: i64) -> Result<Vec<(Hash, u64)>> {
+        crate::metadata::reject_negative_limit(limit)?;
+        blocking_section(move || {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(UNINDEXED_SQL)?;
+            let rows = stmt.query_map(
+                params![root, self.workspace_id, MAX_INDEXED_BYTES as i64, limit],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (hex, size) = row?;
+                if let Some(h) = Hash::from_hex(&hex) {
+                    out.push((h, size as u64));
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    async fn index_status(&self, root: Ino) -> Result<(i64, i64)> {
+        blocking_section(move || {
+            let conn = self.lock();
+            let indexed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM blob_index WHERE workspace_id = ?1",
+                params![self.workspace_id],
+                |r| r.get(0),
+            )?;
+            let pending: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM ({PENDING_SQL})"),
+                params![root, self.workspace_id, MAX_INDEXED_BYTES as i64],
+                |r| r.get(0),
+            )?;
+            Ok((indexed, pending))
+        })
+    }
+
+    async fn search_blobs(&self, terms: &[String], limit: i64) -> Result<Vec<(Ino, Hash)>> {
+        crate::metadata::reject_negative_limit(limit)?;
+        if terms.is_empty() {
+            // An empty term set is "nothing searchable was asked for", never
+            // "everything". Returning early also keeps the SQL below from
+            // degenerating into an unfiltered scan.
+            return Ok(Vec::new());
+        }
+        let terms = terms.to_vec();
+        blocking_section(move || {
+            let conn = self.lock();
+            let placeholders = (0..terms.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let n = terms.len();
+            let sql = format!(
+                "SELECT i.ino, bt.content_hash
+                   FROM blob_term bt
+                   JOIN inode i ON i.content_hash = bt.content_hash
+                  WHERE bt.workspace_id = ?1 AND bt.term IN ({placeholders})
+                  GROUP BY i.ino, bt.content_hash
+                 HAVING COUNT(DISTINCT bt.term) = ?{}
+                  ORDER BY i.ino
+                  LIMIT ?{}",
+                n + 2,
+                n + 3
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(terms.len() + 3);
+            binds.push(&self.workspace_id);
+            for t in &terms {
+                binds.push(t as &dyn rusqlite::ToSql);
+            }
+            let want = n as i64;
+            binds.push(&want);
+            binds.push(&limit);
+            let rows = stmt.query_map(binds.as_slice(), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (ino, hex) = row?;
+                if let Some(h) = Hash::from_hex(&hex) {
+                    out.push((ino, h));
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    async fn forget_blob_index(&self, hash: &Hash) -> Result<bool> {
+        let hex = hash.to_hex();
+        blocking_section(move || {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM blob_term WHERE workspace_id = ?1 AND content_hash = ?2",
+                params![self.workspace_id, hex],
+            )?;
+            let n = tx.execute(
+                "DELETE FROM blob_index WHERE workspace_id = ?1 AND content_hash = ?2",
+                params![self.workspace_id, hex],
+            )?;
+            tx.commit()?;
+            Ok(n > 0)
         })
     }
 

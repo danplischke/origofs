@@ -315,6 +315,20 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
                         Some(freed) => {
                             stats.bytes_freed += freed;
                             stats.deleted += 1;
+                            // The search index is derived from content, so it goes
+                            // when the content does. Left behind, its rows would
+                            // match a query and then resolve to nothing — and,
+                            // worse, keep the blob marked "already indexed" so a
+                            // later write of the same bytes would never re-index
+                            // it. Best-effort: the object is already gone, and
+                            // failing the sweep here would strand the rest of it.
+                            if let Err(e) = self.meta.forget_blob_index(&hash).await {
+                                tracing::warn!(
+                                    hash = %hash.to_hex(),
+                                    error = %e,
+                                    "gc: could not drop the search index rows for a swept blob"
+                                );
+                            }
                         }
                         // Refreshed under us — a live write, not garbage. The next
                         // pass takes it if it really is garbage.

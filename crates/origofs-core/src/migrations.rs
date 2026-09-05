@@ -281,6 +281,37 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V21,
         postgres: V21,
     },
+    // V22 — the content search index.
+    //
+    // Two tables, and the split is the whole design. `blob_index` records that a
+    // *content address* has been indexed; `blob_term` is the inverted index from
+    // term to content address. **Neither stores a path.** A search resolves hits
+    // to paths by joining against the live working tree at query time, which is
+    // what makes deletes, renames and branch checkouts correct for free: the row
+    // that disappears is a `dentry`, and a hit that no longer resolves is simply
+    // not returned. Nothing here ever needs invalidating, because content is
+    // immutable — the same reason `blob_blame` is keyed this way.
+    //
+    // That is also the performance argument. Extraction and tokenization happen
+    // once per unique blob, ever: a branch switch re-materializes paths whose
+    // content addresses the index already holds, so it costs nothing, and a
+    // rename costs nothing because no indexed row mentions the name.
+    //
+    // Scoped per workspace like `blob_blame` (V13), and for its reason rather
+    // than out of symmetry: the path join already confines a hit to the
+    // workspace's own subtree, but a shared row would make one tenant's
+    // *indexing work* observable to another through timing, and the duplication
+    // is bounded by content that is genuinely shared.
+    //
+    // `terms` on `blob_index` is a count, not a list — the list is `blob_term`.
+    // Zero is a real, recorded outcome ("indexed; holds no searchable text"),
+    // which is what stops a binary or an empty file being re-read on every
+    // sweep forever.
+    Migration {
+        version: 22,
+        sqlite: V22_SQLITE,
+        postgres: V22_POSTGRES,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -520,6 +551,46 @@ CREATE INDEX IF NOT EXISTS idx_acl_actor ON acl(workspace_id, actor_id);
 // V21 — POSIX advisory locks (see the migration entry above). `start_off`/`end_off`
 // rather than `start`/`end` because `end` is reserved in SQL; the range is inclusive
 // and `i64::MAX` means end-of-file. One statement set serves both engines.
+// V22 — content search index (see the migration entry above). The primary key on
+// `blob_term` is `(workspace_id, term, content_hash)` so a term lookup is a range
+// scan on the PK itself rather than an index hop; `idx_blob_term_hash` is the
+// reverse direction, for dropping a blob's terms when GC reclaims it.
+const V22_SQLITE: &str = "
+CREATE TABLE IF NOT EXISTS blob_index(
+    workspace_id INTEGER NOT NULL,
+    content_hash TEXT    NOT NULL,
+    indexed_at   INTEGER NOT NULL,
+    bytes        INTEGER NOT NULL,
+    terms        INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, content_hash)
+);
+CREATE TABLE IF NOT EXISTS blob_term(
+    workspace_id INTEGER NOT NULL,
+    term         TEXT    NOT NULL,
+    content_hash TEXT    NOT NULL,
+    PRIMARY KEY (workspace_id, term, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_blob_term_hash ON blob_term(workspace_id, content_hash);
+";
+
+const V22_POSTGRES: &str = "
+CREATE TABLE IF NOT EXISTS blob_index(
+    workspace_id BIGINT NOT NULL,
+    content_hash TEXT   NOT NULL,
+    indexed_at   BIGINT NOT NULL,
+    bytes        BIGINT NOT NULL,
+    terms        BIGINT NOT NULL,
+    PRIMARY KEY (workspace_id, content_hash)
+);
+CREATE TABLE IF NOT EXISTS blob_term(
+    workspace_id BIGINT NOT NULL,
+    term         TEXT   NOT NULL,
+    content_hash TEXT   NOT NULL,
+    PRIMARY KEY (workspace_id, term, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_blob_term_hash ON blob_term(workspace_id, content_hash);
+";
+
 const V21: &str = "
 CREATE TABLE IF NOT EXISTS posix_lock(
     workspace_id BIGINT NOT NULL,

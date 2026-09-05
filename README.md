@@ -1021,6 +1021,45 @@ Both count an inode with several names once, and sum **logical** size — never
 deduplicated bytes. A quota measured in physical bytes would move under a user
 who changed nothing, because someone else's write can dedup against theirs.
 
+### Search file contents — `origofs search`
+
+```bash
+origofs reindex                  # indexed 128 blob(s), 9 with no searchable text, 40213 term(s)
+origofs search quick brown       # /notes.md
+origofs search --actor 7 needle  # …as actor 7 would be served
+```
+
+Whole-word terms, ANDed, over the working tree. Also `GET /v1/search?q=…`, the
+`origofs_search` MCP tool, and `ws.search()` / `ws.search_as()` from Python.
+
+**The index is keyed by content hash, not by path**, which is the whole design.
+Content in origofs is immutable and deduplicated, so an indexed blob stays
+correctly indexed forever and the expensive half — reading a body back through
+its chunks and tokenizing it — happens once per unique blob rather than once per
+path per change. What that buys is the absence of an invalidation protocol:
+
+| Operation | Reindexing needed |
+|---|---|
+| rename | none — no indexed row holds a name |
+| delete | none — hits resolve against the live tree, so it stops resolving |
+| branch checkout | none — the content addresses are already indexed |
+| same file at *n* paths | indexed once, found at all *n* |
+
+Indexing is explicit. `origofs reindex` is idempotent and resumable — its queue
+is "content in the tree this index has not seen", so re-running costs nothing and
+an interrupted run keeps what it finished. Run it from cron, or call
+`index_pending()` from a periodic task.
+
+**An empty result is never silently a stale index.** Every surface reports
+`indexed`/`pending` beside the hits, and the CLI says so on stderr: "nothing
+matched" and "nothing is indexed" are different claims, and only one of them is
+about your files.
+
+Searching is a read, so `search_as` applies `Perms.READ` **per hit**, at each
+hit's own path, exactly as `stat_as` would — a result that named a file a `stat`
+would refuse is the existence oracle the refusal exists to prevent. `limit`
+bounds the *visible* hits, so a run of unreadable ones cannot truncate the page.
+
 ### Share file locks between mounts — `origofs posix-locks`
 
 ```bash

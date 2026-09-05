@@ -411,6 +411,7 @@ async fn every_mutating_mcp_tool_is_policy_classified() {
         "origofs_trash",
         "origofs_read",
         "origofs_ls",
+        "origofs_search",
         "origofs_blame",
         "origofs_log",
         "origofs_live",

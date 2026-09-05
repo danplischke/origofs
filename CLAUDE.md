@@ -287,6 +287,55 @@ write path enforces this and you must not weaken it:
   then refused at acceptance with a `Denied` naming the author — the review queue
   was unusable for exactly the population it exists for. The approver's right is
   established before that point; re-checking as the author asks the wrong actor.
+- **Content search is indexed by content hash, never by path, and that is the
+  whole design.** The engine had no search at all: no grep, no index, no query
+  API on any surface, because the metadata/content split makes a scan expensive
+  (every body is chunks behind a possibly packed, encrypted, remote store).
+  `blob_index` + `blob_term` (V22) are keyed on `(workspace_id, content_hash)`,
+  like `blob_blame` and for the same reason — **content is immutable, so an
+  indexed row never needs invalidating**. Extraction happens once per unique
+  blob, ever.
+  - **The consequences are what justify it.** A rename costs nothing (no indexed
+    row holds a name); a delete costs nothing and needs no tombstone (`search`
+    resolves hits against the live tree, so an unlinked file stops resolving); a
+    **branch checkout costs nothing**, which is the case that rules out the
+    alternatives — a path-keyed index or a per-inode version column both have to
+    walk every file, and a change-feed row per path turns one checkout into
+    thousands of log rows.
+  - **It deliberately does not consume the change feed.** The feed is emitted at
+    the `Workspace` API boundary and carries user *intent*, not every state
+    mutation — a write through a mount produces no event at all (`fuse.rs`
+    documents this), and the emit is best-effort and non-transactional. An
+    indexer built on it would drift silently. The queue is instead a **set
+    difference** (`unindexed_blobs`: content in the tree with no index row),
+    which is self-healing and cannot drift. A missed signal can only delay a
+    hit, never serve a stale one.
+  - **A stale index must never read as an empty workspace.** Every surface
+    returns the `(indexed, pending)` counters beside the hits, because "nothing
+    matched" and "nothing is indexed" are different claims — the same rule the
+    trash listing follows for "nothing deleted" vs "not collecting". Indexing is
+    explicit (`origofs reindex` / `index_pending`), not automatic.
+  - **The inverted index is a plain table, not FTS5 or `tsvector`.** So both
+    backends answer identically — the same reasoning as the POSIX-lock resolver
+    living in one place. A backend-native index would rank differently on SQLite
+    and Postgres, and a dev box disagreeing with production about which files
+    match is worse than having no ranking. The tokenizer lives in `search.rs`
+    and is unit-tested directly.
+  - **`search_as` filters per hit, like `ls_as` — and it had to.** A search
+    result is a path plus the fact that content sits at it, so unfiltered it is
+    an existence oracle over the whole workspace. Each hit is checked at its own
+    full path exactly as `stat_as` would, and `limit` bounds the **visible**
+    hits: the engine over-fetches and widens, because paging before filtering
+    lets a run of unreadable hits filter to empty and read as end-of-results.
+    Skips `/.origofs` via `is_internal_path`, or the co-edit sidecars' actor and
+    session stamps become searchable (#143's class of leak).
+  - **GC drops the index rows with the content.** Left behind they would match a
+    query and resolve to nothing — and, worse, keep the blob marked "already
+    indexed" so re-writing the same bytes would never re-index it.
+  - **A one-byte edit re-extracts the whole file.** Chunk-level incrementality is
+    not available: FastCDC boundaries fall mid-token, so per-chunk indexing would
+    split terms across chunk edges and lose them. That is the accepted trade.
+
 - **Usage accounting reaches the CLI too.** `#116` built recursive usage,
   `statfs` and quotas, and the mounts answer `df` from them — but nothing on the
   CLI did, so a workspace could not be measured or capped without writing code.

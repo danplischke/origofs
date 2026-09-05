@@ -43,6 +43,7 @@ pub mod recover;
 pub mod resync;
 mod retry;
 pub mod scope;
+pub mod search;
 pub mod sqlite;
 pub mod stats;
 pub mod suggest;
@@ -108,6 +109,7 @@ pub use engine::{Fs, INTERNAL_DIR, is_internal_path, validate_ref_name};
 pub use error::{BackendOrigin, ErrorClass, OrigoFSError, Result};
 pub use portable::{Cell, DUMP_FORMAT, DUMP_TABLES, LoadReport, Row};
 pub use scope::{Scope, ScopeError};
+pub use search::{IndexReport, MAX_INDEXED_BYTES, SearchHit, SearchStatus};
 pub use stats::{FsStat, Quota, STATFS_BLOCK_SIZE, Usage};
 pub use trash::{DEFAULT_TRASH_RETENTION_SECS, TrashEntry, TrashInit};
 

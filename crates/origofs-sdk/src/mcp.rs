@@ -479,6 +479,47 @@ impl McpServer {
                 let path = self.ws.restore_trash(id, self.ctx()).await?;
                 Ok(format!("restored {path}"))
             }
+            "origofs_search" => {
+                // Attributed, like every other read here: an agent always has an
+                // identity, and a search result is a path plus the fact that some
+                // content sits at it — unfiltered, that is an existence oracle
+                // over the whole workspace.
+                let query = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(50)
+                    .clamp(1, 500);
+                let hits = self.ws.search_as(self.ctx(), query, limit).await?;
+                let status = self.ws.search_status().await?;
+                let mut out = hits
+                    .iter()
+                    .map(|h| h.path.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // The agent has to be able to tell "nothing matches" from
+                // "nothing is indexed", or it will confidently report the first
+                // when the truth is the second.
+                if !status.complete() {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&format!(
+                        "(partial: {} blob(s) not indexed yet)",
+                        status.pending
+                    ));
+                } else if hits.is_empty() {
+                    out = if status.indexed == 0 {
+                        "(no results: the search index is empty — nothing has been indexed)".into()
+                    } else {
+                        "(no results)".into()
+                    };
+                }
+                Ok(out)
+            }
             "origofs_ls" => {
                 let entries = self.ws.ls_as(self.ctx(), &path()?).await?;
                 Ok(entries
@@ -692,6 +733,18 @@ fn tool_defs() -> Vec<Value> {
             "List a directory.",
             path_prop.clone(),
             &["path"],
+        ),
+        tool(
+            "origofs_search",
+            "Search file contents. Whole-word terms, all of which must appear in a file; \
+             returns matching paths in the current working tree. Says so explicitly when \
+             the index is incomplete, so an empty result is never mistaken for \
+             \"nothing matches\".",
+            json!({
+                "query": { "type": "string" },
+                "limit": { "type": "integer" }
+            }),
+            &["query"],
         ),
         tool(
             "origofs_mkdir",

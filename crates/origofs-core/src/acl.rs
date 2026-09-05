@@ -994,6 +994,77 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     }
 }
 
+impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
+    /// [`search`](Fs::search), filtered to the paths `ctx` may actually read.
+    ///
+    /// # Search is an existence oracle unless every hit is checked
+    ///
+    /// A search result is a path, so an unfiltered one tells a caller that a
+    /// file exists, where it is, and roughly what is in it — for every path in
+    /// the workspace, including the ones a `stat` would refuse. That makes this
+    /// the same problem [`ls_as`](Fs::ls_as) solves, and it gets the same
+    /// answer: ask the resolver whether the actor holds [`Perms::READ`] at the
+    /// hit's own full path, exactly as `stat_as` would. The two have to agree,
+    /// or the pair is the oracle whichever way they differ.
+    ///
+    /// Unlike `ls_as` there is **no container to check first**. A directory
+    /// listing has a directory whose own readability is a separate question; a
+    /// search has only its hits, so a refusal has nothing to attach to and every
+    /// drop is an absence. That is the right shape here: a query matching only
+    /// unreadable paths is indistinguishable from a query matching nothing,
+    /// which is the property the filter exists to provide.
+    ///
+    /// # It filters before it pages, and that is not an optimization
+    ///
+    /// `limit` bounds the **visible** hits, so the engine over-fetches and
+    /// filters down. Paging first and filtering after would let a page of
+    /// entirely-unreadable hits filter to empty and read as "no more results",
+    /// truncating the answer at the first page an actor happens not to be able
+    /// to see — the same bug the paged `readdir` filter documents.
+    pub async fn search_as(
+        &self,
+        ctx: crate::WriteCtx,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::search::SearchHit>> {
+        // Enforcement off is the default, and then this is `search` — no
+        // per-hit resolver calls at all, rather than a resolver that always
+        // says yes.
+        if !self.acl_enforce_reads().await? {
+            return self.search(query, limit).await;
+        }
+        let mut visible = Vec::new();
+        let mut fetch = limit;
+        let mut scanned = 0usize;
+        // Widen until the page is full or the index has no more to offer. The
+        // loop is what makes "filter, then page" true: one over-fetch by a fixed
+        // factor still truncates when a run of hits happens to be unreadable.
+        loop {
+            let hits = self.search(query, fetch).await?;
+            let exhausted = (hits.len() as i64) < fetch;
+            for hit in hits.into_iter().skip(scanned) {
+                scanned += 1;
+                if self
+                    .effective_perms(ctx.actor, &hit.path)
+                    .await?
+                    .contains(Perms::READ)
+                {
+                    visible.push(hit);
+                    if visible.len() as i64 >= limit {
+                        return Ok(visible);
+                    }
+                }
+            }
+            if exhausted {
+                return Ok(visible);
+            }
+            // Bounded growth: doubling terminates on the `exhausted` check above
+            // rather than running forever on a workspace where nothing matches.
+            fetch = fetch.saturating_mul(2);
+        }
+    }
+}
+
 /// Join a directory path and an entry name into the child's absolute path.
 ///
 /// The entry name comes from a dentry row, and `validate_component` refused a

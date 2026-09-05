@@ -1694,3 +1694,62 @@ async def test_a_workspace_is_an_async_context_manager():
     with pytest.raises(ValueError):
         async with ws2:
             raise ValueError("boom")
+
+
+# --- content search --------------------------------------------------------
+
+
+@asyncio_test
+async def test_search_finds_content_and_survives_a_rename_without_reindexing():
+    """The property the whole design rests on: the index holds no path.
+
+    Content is addressed by hash, so a rename has nothing to update — the hit is
+    resolved against the live tree at query time and simply comes back under the
+    new name. A path-keyed index would need an invalidation event here, and
+    missing it would serve a stale path forever.
+    """
+    ws = await workspace()
+    await ws.write("/notes.md", b"the quick brown fox")
+
+    # Nothing is searchable until it is indexed, and the status says so rather
+    # than letting an empty result read as "nothing matches".
+    assert await ws.search("quick") == []
+    assert (await ws.search_status())["complete"] is False
+
+    report = await ws.reindex()
+    assert report["indexed"] == 1
+    st = await ws.search_status()
+    assert st["complete"] is True and st["pending"] == 0
+
+    hits = await ws.search("quick brown")
+    assert [h["path"] for h in hits] == ["/notes.md"]
+    assert len(hits[0]["content"]) == 64  # the content address that matched
+
+    # No reindex in between.
+    await ws.rename("/notes.md", "/renamed.md")
+    assert [h["path"] for h in await ws.search("quick")] == ["/renamed.md"]
+
+    # And a delete needs no tombstone: the hit stops resolving.
+    await ws.remove("/renamed.md")
+    assert await ws.search("quick") == []
+
+
+@asyncio_test
+async def test_search_as_filters_hits_the_actor_cannot_read():
+    """A search result is an existence oracle unless every hit is checked."""
+    ws = await workspace()
+    actor = await ws.create_agent("agent", "opus", None)
+    await ws.mkdir_p("/open")
+    await ws.mkdir_p("/secret")
+    await ws.write("/open/a.md", b"shared needle")
+    await ws.write("/secret/b.md", b"secret needle")
+    await ws.reindex()
+
+    await ws.set_acl_default_deny(True)
+    await ws.set_acl_enforce_reads(True)
+    await ws.grant(actor, "/open", "read", None)
+
+    ctx = origofs.WriteCtx.actor(actor)
+    assert [h["path"] for h in await ws.search_as(ctx, "needle")] == ["/open/a.md"]
+    # The unattributed call still sees both, so the filter is doing the work.
+    assert len(await ws.search("needle")) == 2

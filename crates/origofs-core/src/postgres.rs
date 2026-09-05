@@ -33,6 +33,45 @@ const DIR_MODE: i64 = 0o040755;
 /// its root is inode 1. Backfilled by migration V11 (`docs/MULTI_TENANCY.md`).
 const DEFAULT_WORKSPACE: i64 = 1;
 
+/// The working tree's not-yet-indexed content addresses (V22) — the indexer's
+/// queue as a **set difference rather than a log**, so there is no event to miss
+/// and a skipped blob reappears on the next sweep. Distinct on `content_hash`:
+/// the unit of work is a blob, so one file at four paths, or the same content on
+/// four branches, is indexed once. `$1` root ino, `$2` workspace, `$3` size cap.
+const PENDING_SQL: &str = "
+WITH RECURSIVE sub(ino) AS (
+    SELECT $1::bigint
+    UNION
+    SELECT d.ino FROM dentry d JOIN sub ON d.parent_ino = sub.ino
+)
+SELECT DISTINCT i.content_hash, i.size
+  FROM inode i JOIN sub ON i.ino = sub.ino
+ WHERE i.kind = 'file'
+   AND i.content_hash IS NOT NULL
+   AND i.size <= $3
+   AND NOT EXISTS (
+        SELECT 1 FROM blob_index b
+         WHERE b.workspace_id = $2 AND b.content_hash = i.content_hash)
+";
+
+/// [`PENDING_SQL`] with a bound, for one sweep batch. `$4` limit.
+const UNINDEXED_SQL: &str = "
+WITH RECURSIVE sub(ino) AS (
+    SELECT $1::bigint
+    UNION
+    SELECT d.ino FROM dentry d JOIN sub ON d.parent_ino = sub.ino
+)
+SELECT DISTINCT i.content_hash, i.size
+  FROM inode i JOIN sub ON i.ino = sub.ino
+ WHERE i.kind = 'file'
+   AND i.content_hash IS NOT NULL
+   AND i.size <= $3
+   AND NOT EXISTS (
+        SELECT 1 FROM blob_index b
+         WHERE b.workspace_id = $2 AND b.content_hash = i.content_hash)
+ LIMIT $4
+";
+
 /// Advisory-lock key that serializes concurrent schema bootstraps (`init`).
 const MIGRATION_LOCK_KEY: i64 = 0x0af5_0000_dbdb;
 
@@ -1235,6 +1274,140 @@ impl MetadataStore for PostgresMetadataStore {
             )
             .await?;
         Ok(row.get::<_, i64>(0) as usize)
+    }
+
+    // --- content search index (V22) -------------------------------------
+
+    async fn index_blob(&self, hash: &Hash, bytes: u64, terms: &[String], now: i64) -> Result<()> {
+        let hex = hash.to_hex();
+        let mut c = self.client().await?;
+        // One transaction, for the reason on the trait: a term set half-written
+        // under an `indexed` marker is invisible to the sweep forever.
+        let tx = c.transaction().await?;
+        tx.execute(
+            "DELETE FROM blob_term WHERE workspace_id = $1 AND content_hash = $2",
+            &[&self.workspace_id, &hex],
+        )
+        .await?;
+        if !terms.is_empty() {
+            // One statement with an array parameter rather than a row per term:
+            // a 20k-term blob is one round trip, not twenty thousand.
+            tx.execute(
+                "INSERT INTO blob_term(workspace_id, term, content_hash)
+                 SELECT $1, t, $3 FROM UNNEST($2::text[]) AS t
+                 ON CONFLICT DO NOTHING",
+                &[&self.workspace_id, &terms, &hex],
+            )
+            .await?;
+        }
+        tx.execute(
+            "INSERT INTO blob_index(workspace_id, content_hash, indexed_at, bytes, terms)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (workspace_id, content_hash) DO UPDATE SET
+               indexed_at = EXCLUDED.indexed_at,
+               bytes      = EXCLUDED.bytes,
+               terms      = EXCLUDED.terms",
+            &[
+                &self.workspace_id,
+                &hex,
+                &now,
+                &(bytes as i64),
+                &(terms.len() as i64),
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn unindexed_blobs(&self, root: Ino, limit: i64) -> Result<Vec<(Hash, u64)>> {
+        crate::metadata::reject_negative_limit(limit)?;
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                UNINDEXED_SQL,
+                &[
+                    &root,
+                    &self.workspace_id,
+                    &(crate::search::MAX_INDEXED_BYTES as i64),
+                    &limit,
+                ],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Hash::from_hex(r.get::<_, &str>(0)).map(|h| (h, r.get::<_, i64>(1) as u64))
+            })
+            .collect())
+    }
+
+    async fn index_status(&self, root: Ino) -> Result<(i64, i64)> {
+        let c = self.client().await?;
+        let indexed = c
+            .query_one(
+                "SELECT COUNT(*) FROM blob_index WHERE workspace_id = $1",
+                &[&self.workspace_id],
+            )
+            .await?
+            .get::<_, i64>(0);
+        let pending = c
+            .query_one(
+                &format!("SELECT COUNT(*) FROM ({PENDING_SQL}) q"),
+                &[
+                    &root,
+                    &self.workspace_id,
+                    &(crate::search::MAX_INDEXED_BYTES as i64),
+                ],
+            )
+            .await?
+            .get::<_, i64>(0);
+        Ok((indexed, pending))
+    }
+
+    async fn search_blobs(&self, terms: &[String], limit: i64) -> Result<Vec<(Ino, Hash)>> {
+        crate::metadata::reject_negative_limit(limit)?;
+        if terms.is_empty() {
+            // "Nothing searchable was asked for", never "everything".
+            return Ok(Vec::new());
+        }
+        let c = self.client().await?;
+        let rows = c
+            .query(
+                "SELECT i.ino, bt.content_hash
+                   FROM blob_term bt
+                   JOIN inode i ON i.content_hash = bt.content_hash
+                  WHERE bt.workspace_id = $1 AND bt.term = ANY($2::text[])
+                  GROUP BY i.ino, bt.content_hash
+                 HAVING COUNT(DISTINCT bt.term) = $3
+                  ORDER BY i.ino
+                  LIMIT $4",
+                &[&self.workspace_id, &terms, &(terms.len() as i64), &limit],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| Hash::from_hex(r.get::<_, &str>(1)).map(|h| (r.get::<_, i64>(0), h)))
+            .collect())
+    }
+
+    async fn forget_blob_index(&self, hash: &Hash) -> Result<bool> {
+        let hex = hash.to_hex();
+        let mut c = self.client().await?;
+        let tx = c.transaction().await?;
+        tx.execute(
+            "DELETE FROM blob_term WHERE workspace_id = $1 AND content_hash = $2",
+            &[&self.workspace_id, &hex],
+        )
+        .await?;
+        let n = tx
+            .execute(
+                "DELETE FROM blob_index WHERE workspace_id = $1 AND content_hash = $2",
+                &[&self.workspace_id, &hex],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(n > 0)
     }
 
     async fn workspace_usage(&self) -> Result<(u64, u64)> {

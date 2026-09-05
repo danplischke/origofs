@@ -35,7 +35,7 @@ use pyo3::exceptions::{
     PyPermissionError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
 #[cfg(target_os = "linux")]
 use std::path::Path;
@@ -434,6 +434,27 @@ fn actor_dict(py: Python<'_>, a: &Actor) -> PyResult<Py<PyAny>> {
     d.set_item("controller_actor_id", a.controller_actor_id)?;
     d.set_item("created_at", a.created_at)?;
     Ok(d.into_any().unbind())
+}
+
+/// `[{path, content}]` for a list of search hits.
+fn search_hits(py: Python<'_>, hits: &[origofs_sdk::SearchHit]) -> PyResult<Py<PyAny>> {
+    let out = PyList::empty(py);
+    for h in hits {
+        let d = PyDict::new(py);
+        d.set_item("path", &h.path)?;
+        d.set_item("content", h.content.to_hex())?;
+        out.append(d)?;
+    }
+    Ok(out.unbind().into())
+}
+
+/// `{indexed, skipped_binary, terms}` for one indexing pass.
+fn index_report(py: Python<'_>, r: origofs_sdk::IndexReport) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("indexed", r.indexed)?;
+    d.set_item("skipped_binary", r.skipped_binary)?;
+    d.set_item("terms", r.terms)?;
+    Ok(d.unbind().into())
 }
 
 fn blame_dict(py: Python<'_>, b: &BlameRange) -> PyResult<Py<PyAny>> {
@@ -2556,6 +2577,100 @@ impl Workspace {
                     .map(|b| blame_dict(py, b))
                     .collect::<PyResult<Vec<_>>>()
             })
+        })
+    }
+
+    /// Search file contents for every term in `query`, **unfiltered**.
+    ///
+    /// Returns `[{path, content}]` — the path each hit is at now, and the content
+    /// address that matched. Whole-word terms, ANDed, over the working tree.
+    ///
+    /// Unattributed, like `read`/`ls`: no permission check. A service must call
+    /// ``search_as`` — a search result names a path and says roughly what is in
+    /// it, so an unchecked one is an existence oracle over the whole workspace.
+    ///
+    /// Results are only as complete as the index. Call ``search_status()``
+    /// before showing "no matches": from an unbuilt index that is not an answer
+    /// about the workspace at all.
+    #[pyo3(signature = (query, limit = 50))]
+    fn search<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        limit: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let hits = ws.search(&query, limit).await.map_err(to_pyerr)?;
+            Python::attach(|py| search_hits(py, &hits))
+        })
+    }
+
+    /// ``search`` filtered to what `ctx` may read.
+    ///
+    /// Each hit is checked at its own path exactly as ``stat_as`` would be, and
+    /// `limit` bounds the **visible** hits — the engine over-fetches so a run of
+    /// unreadable ones cannot truncate the page. Inert unless the workspace has
+    /// ``acl_enforce_reads`` on.
+    #[pyo3(signature = (ctx, query, limit = 50))]
+    fn search_as<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: WriteCtx,
+        query: String,
+        limit: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let hits = ws
+                .search_as(ctx.inner, &query, limit)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| search_hits(py, &hits))
+        })
+    }
+
+    /// How complete the search index is: ``{indexed, pending, complete}``.
+    ///
+    /// Exists so a caller can tell "nothing matched" from "nothing is indexed
+    /// yet" — only one of those is an answer about the workspace's contents.
+    fn search_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let st = ws.search_status().await.map_err(to_pyerr)?;
+            Python::attach(|py| {
+                let d = PyDict::new(py);
+                d.set_item("indexed", st.indexed)?;
+                d.set_item("pending", st.pending)?;
+                d.set_item("complete", st.complete())?;
+                Ok(d.unbind())
+            })
+        })
+    }
+
+    /// Index up to `limit` outstanding blobs; returns
+    /// ``{indexed, skipped_binary, terms}``.
+    ///
+    /// Idempotent and resumable — the queue is "content in the tree this index
+    /// has not seen" — so this is what a periodic task calls.
+    #[pyo3(signature = (limit = 256))]
+    fn index_pending<'py>(&self, py: Python<'py>, limit: i64) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let r = ws.index_pending(limit).await.map_err(to_pyerr)?;
+            Python::attach(|py| index_report(py, r))
+        })
+    }
+
+    /// Index everything outstanding, in batches, until nothing is left.
+    ///
+    /// Content is addressed by hash, so a rename, a delete or a branch checkout
+    /// needs no reindexing — this only ever reads content the index has not seen.
+    fn reindex<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ws = self.inner.clone();
+        future_into_py(py, async move {
+            let r = ws.reindex().await.map_err(to_pyerr)?;
+            Python::attach(|py| index_report(py, r))
         })
     }
 

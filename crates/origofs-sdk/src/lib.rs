@@ -24,12 +24,12 @@ pub use origofs_core::posixlock;
 pub use origofs_core::{
     AclGrant, Actor, ActorInit, ActorKind, BlameRange, CacheLimits, CommitInfo, Conflict,
     DEFAULT_GC_GRACE_SECS, DiffEntry, DiffStatus, DirEntry, DirEntryAttr, DirPage, EditOp, Event,
-    EventInit, FileKind, FsStat, GcStats, Hash, Inode, LiveDoc, LoadReport, MemStore, MergeOutcome,
-    OrigoFSError, Owner, PackStore, Passage, PassageOptions, Perms, Presence, Quota, RebuildReport,
-    ResyncOutcome, ResyncReport, Scope, ScopeError, Segmentation, Suggestion, SuggestionContent,
-    SuggestionInit, SuggestionKind, SuggestionStatus, TieredStore, ToolCallInit, TransferStats,
-    TrashEntry, Usage, VerifyingStore, VersioningMode, WriteCtx, WriteOutcome, WritePolicy,
-    latest_schema_version,
+    EventInit, FileKind, FsStat, GcStats, Hash, IndexReport, Inode, LiveDoc, LoadReport, MemStore,
+    MergeOutcome, OrigoFSError, Owner, PackStore, Passage, PassageOptions, Perms, Presence, Quota,
+    RebuildReport, ResyncOutcome, ResyncReport, Scope, ScopeError, SearchHit, SearchStatus,
+    Segmentation, Suggestion, SuggestionContent, SuggestionInit, SuggestionKind, SuggestionStatus,
+    TieredStore, ToolCallInit, TransferStats, TrashEntry, Usage, VerifyingStore, VersioningMode,
+    WriteCtx, WriteOutcome, WritePolicy, latest_schema_version,
 };
 // Backend-specific re-exports, gated to match `origofs-core`'s own features.
 #[cfg(feature = "coedit")]
@@ -1408,6 +1408,60 @@ impl Workspace {
     /// `gc`. A no-op for in-place backends.
     pub async fn repack(&self) -> Result<u64> {
         self.fs.content.repack().await
+    }
+
+    // --- content search ---------------------------------------------------
+
+    /// Paths whose content matches every term in `query`, **unfiltered**.
+    ///
+    /// Unattributed, like `read`/`ls`: it performs no permission check. A
+    /// network surface must call [`search_as`](Self::search_as) instead — a
+    /// search result names a path and roughly describes its contents, so an
+    /// unchecked one is an existence oracle over the whole workspace.
+    ///
+    /// Results come from the index, so they are only as complete as it is. Ask
+    /// [`search_status`](Self::search_status) before presenting "no matches" as
+    /// an answer: an empty result from an unbuilt index is not the same claim.
+    pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>> {
+        self.fs.search(query, limit).await
+    }
+
+    /// [`search`](Self::search) filtered to what `ctx` may read.
+    ///
+    /// Every hit is checked at its own path, exactly as `stat_as` would, and
+    /// `limit` bounds the **visible** results — the engine over-fetches so a run
+    /// of unreadable hits cannot truncate the answer. Inert unless the workspace
+    /// has `acl_enforce_reads` on, like every other attributed read.
+    pub async fn search_as(
+        &self,
+        ctx: WriteCtx,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<SearchHit>> {
+        self.fs.search_as(ctx, query, limit).await
+    }
+
+    /// How complete the search index is: blobs indexed, and blobs still pending.
+    ///
+    /// Exists so a caller can tell "nothing matched" from "nothing is indexed
+    /// yet" — only one of those is an answer about the workspace's contents.
+    pub async fn search_status(&self) -> Result<SearchStatus> {
+        self.fs.search_status().await
+    }
+
+    /// Index up to `limit` outstanding blobs, returning what it did.
+    ///
+    /// Idempotent and resumable: the queue is the set of content addresses in
+    /// the working tree with no index row, so calling this repeatedly converges
+    /// and an interrupted run loses only the batch in flight. Suitable for a
+    /// periodic task.
+    pub async fn index_pending(&self, limit: i64) -> Result<IndexReport> {
+        self.fs.index_pending(limit).await
+    }
+
+    /// Index everything outstanding, in batches, until nothing is left.
+    pub async fn reindex(&self) -> Result<IndexReport> {
+        self.fs.reindex().await
     }
 
     /// Release this workspace's backend resources and make it unusable

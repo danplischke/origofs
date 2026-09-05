@@ -120,6 +120,63 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ### Added
 
+- **Content search, indexed by content hash rather than by path.** origofs had no
+  search at all — no grep, no index, no query API on any surface — because the
+  metadata/content split makes a scan expensive: every body is chunks behind a
+  possibly packed, encrypted, remote store.
+
+  `origofs search` / `origofs reindex`, `GET /v1/search`, the `origofs_search`
+  MCP tool, and `search`/`search_as`/`search_status`/`index_pending`/`reindex`
+  on the SDK and the Python bindings. Whole-word terms, ANDed, over the working
+  tree.
+
+  **The index is keyed on `(workspace_id, content_hash)`** — like `blob_blame`,
+  and for its reason: content is immutable, so an indexed row never needs
+  invalidating and extraction happens once per unique blob, ever. The
+  consequences are the justification. A rename costs nothing, because no indexed
+  row holds a name. A delete costs nothing and needs no tombstone, because hits
+  are resolved against the live tree and an unlinked file stops resolving. A
+  **branch checkout costs nothing**, which is the case that rules out the
+  alternatives: a path-keyed index or a per-inode version column both have to
+  walk every file, and a change-feed row per path turns one checkout into
+  thousands of log rows.
+
+  **It deliberately does not consume the change feed.** That feed is emitted at
+  the `Workspace` API boundary and carries user *intent* rather than every state
+  mutation — a write through a mount produces no event at all, and the emit is
+  best-effort and non-transactional — so an indexer built on it would drift
+  silently. The queue is a **set difference** instead (content in the tree with
+  no index row), which is self-healing and cannot drift: a missed signal can
+  delay a hit, never serve a stale one. That is also why indexing needs no new
+  write-path cost — no column, no counter, no extra row.
+
+  **A stale index never reads as an empty workspace.** Every surface returns the
+  `indexed`/`pending` counters beside the hits, because "nothing matched" and
+  "nothing is indexed" are different claims — the same distinction the trash
+  listing draws between "nothing deleted" and "not collecting".
+
+  The inverted index is a plain table rather than FTS5 or `tsvector`, **so both
+  backends answer identically** — the reasoning the POSIX-lock resolver already
+  follows. A backend-native index would rank differently on SQLite and Postgres,
+  and a dev box disagreeing with production about which files match is a worse
+  deal than no ranking.
+
+  `search_as` filters **per hit**, at each hit's own path, exactly as `stat_as`
+  would: a search result is a path plus the fact that content sits at it, so
+  unfiltered it is an existence oracle over the whole workspace. `limit` bounds
+  the *visible* hits and the engine over-fetches, because paging before
+  filtering lets a run of unreadable hits filter to empty and read as
+  end-of-results. `/.origofs` is skipped via `is_internal_path`, or the co-edit
+  sidecars' `(actor, session)` stamps become searchable — #143's class of leak.
+  GC drops a blob's index rows with its content, since a row left behind would
+  match and resolve to nothing, and would keep the blob marked "already indexed"
+  so the same bytes written later would never be re-indexed.
+
+  Known limit, stated rather than discovered: a one-byte edit to a large file
+  re-extracts the whole file. Chunk-level incrementality is not available —
+  FastCDC boundaries fall mid-token, so per-chunk indexing would split terms
+  across chunk edges and lose them.
+
 - **`Workspace.aclose()` and `async with`, so a long-lived host can release the
   backends on purpose** (#154). A server opens a workspace in its startup hook and
   had nothing to await at shutdown: the Postgres pool is reclaimed when the last

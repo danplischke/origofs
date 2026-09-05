@@ -208,6 +208,58 @@ pub trait MetadataStore: Send + Sync {
     /// Number of entries directly under `parent`.
     async fn child_count(&self, parent: Ino) -> Result<usize>;
 
+    // --- content search index (V22) -------------------------------------
+    //
+    // Addressed by content hash throughout: no method here takes or returns a
+    // path. See `crate::search` for why that is the whole design rather than a
+    // detail — a path-keyed index would need invalidating on every rename,
+    // delete and checkout, and this one never needs invalidating at all.
+
+    /// Record `hash` as indexed, replacing whatever terms it had.
+    ///
+    /// One transaction: the `blob_index` row and the `blob_term` rows land
+    /// together or not at all, so a crash mid-write cannot leave a blob marked
+    /// indexed with half its terms — which would be a permanently short answer
+    /// that no later sweep would ever notice, because the sweep's queue is
+    /// "blobs with no `blob_index` row".
+    ///
+    /// `terms` may be empty. That is a real outcome, not a no-op: it records
+    /// "indexed, holds nothing searchable" for a binary or an empty file, and is
+    /// what stops the sweep re-reading it forever.
+    async fn index_blob(&self, hash: &Hash, bytes: u64, terms: &[String], now: i64) -> Result<()>;
+
+    /// Content addresses in the working tree under `root` that have no
+    /// `blob_index` row yet, up to `limit`.
+    ///
+    /// The indexer's whole work queue, expressed as a set difference rather than
+    /// as a log to tail. That is what makes it self-healing: there is no event
+    /// to miss, and a blob that was somehow skipped simply appears here again on
+    /// the next sweep.
+    async fn unindexed_blobs(&self, root: Ino, limit: i64) -> Result<Vec<(Hash, u64)>>;
+
+    /// `(indexed, pending)` counts of distinct content addresses for this
+    /// workspace — what [`crate::SearchStatus`] reports.
+    async fn index_status(&self, root: Ino) -> Result<(i64, i64)>;
+
+    /// Inodes under this workspace whose content matches **every** term.
+    ///
+    /// Returns `(ino, content_hash)` pairs, not paths: resolving an inode to its
+    /// current path is the caller's job (`Fs::search`), and doing it there is
+    /// what confines a hit to the workspace's own subtree — a walk that does not
+    /// reach `root` is dropped. `limit` bounds the rows this returns, before the
+    /// caller's own ACL filtering, so a caller that needs `n` visible hits must
+    /// be prepared to ask for more.
+    ///
+    /// An empty `terms` matches nothing. A query with no searchable terms is not
+    /// a request for the whole workspace.
+    async fn search_blobs(&self, terms: &[String], limit: i64) -> Result<Vec<(Ino, Hash)>>;
+
+    /// Drop every index row for `hash`, returning whether one existed.
+    ///
+    /// For GC: the index is derived from content, so when content goes the index
+    /// row must go with it or the sweep leaves rows nothing can resolve.
+    async fn forget_blob_index(&self, hash: &Hash) -> Result<bool>;
+
     /// `(inodes, bytes)` for the whole current workspace (issue #116).
     ///
     /// One aggregate over the workspace's inode rows — not a tree walk — so it is
@@ -832,6 +884,21 @@ impl<T: MetadataStore + ?Sized> MetadataStore for Arc<T> {
     }
     async fn child_count(&self, parent: Ino) -> Result<usize> {
         (**self).child_count(parent).await
+    }
+    async fn index_blob(&self, hash: &Hash, bytes: u64, terms: &[String], now: i64) -> Result<()> {
+        (**self).index_blob(hash, bytes, terms, now).await
+    }
+    async fn unindexed_blobs(&self, root: Ino, limit: i64) -> Result<Vec<(Hash, u64)>> {
+        (**self).unindexed_blobs(root, limit).await
+    }
+    async fn index_status(&self, root: Ino) -> Result<(i64, i64)> {
+        (**self).index_status(root).await
+    }
+    async fn search_blobs(&self, terms: &[String], limit: i64) -> Result<Vec<(Ino, Hash)>> {
+        (**self).search_blobs(terms, limit).await
+    }
+    async fn forget_blob_index(&self, hash: &Hash) -> Result<bool> {
+        (**self).forget_blob_index(hash).await
     }
     async fn set_symlink(&self, ino: Ino, target: &str) -> Result<()> {
         (**self).set_symlink(ino, target).await

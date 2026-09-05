@@ -2278,6 +2278,14 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
             Exempt("reclaims unreferenced content; touches no names"),
         ),
         (
+            "reindex",
+            Exempt(
+                "writes only the derived search index, which is addressed by content hash \
+                 and holds no path, so there is nothing an actor could be said to have \
+                 authored; it reads content that is already in the tree and adds no name",
+            ),
+        ),
+        (
             "repack",
             Exempt("re-encodes stored objects; content-addressed, so a no-op semantically"),
         ),
@@ -2322,6 +2330,7 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         ("locks", ReadOnly),
         ("blame", ReadOnly),
         ("du", ReadOnly),
+        ("search", ReadOnly),
         ("schema-version", ReadOnly),
         ("watch", ReadOnly),
         ("presence", ReadOnly),
@@ -2499,6 +2508,10 @@ fn every_mutating_subcommand_is_classified_and_attributable() {
         "read",
         "ls",
         "stat",
+        // A search result *is* a path, plus the fact that some content is in
+        // it -- an unattributed one is an existence oracle over the whole
+        // workspace, which is exactly what the read gate exists to stop.
+        "search",
         "blame",
         "diff",
         "suggestions",

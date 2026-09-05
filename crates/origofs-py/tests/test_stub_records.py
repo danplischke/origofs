@@ -149,6 +149,12 @@ async def _collect() -> dict:
     await ws.dump_as(ctx, dump)
     loaded = await (await _workspace()).load(dump)
 
+    # The search index has to be built before it can be searched -- an unindexed
+    # workspace returns no hits at all, which would make the hit record
+    # unbuildable here rather than merely empty.
+    index_report = await ws.reindex()
+    search_hits = await ws.search("one two")
+
     records = {
         "ActorRecord": await ws.actor(human),
         "BlameSpan": (await ws.blame("/docs/notes.txt"))[0],
@@ -186,6 +192,9 @@ async def _collect() -> dict:
         "TransferStats": pushed,
         "ResyncReport": resynced,
         "LoadReport": loaded,
+        "IndexReportRecord": index_report,
+        "SearchStatusRecord": await ws.search_status(),
+        "SearchHitRecord": search_hits[0],
     }
     assert commit  # the commit above is what `log`/`branches` report on
     return records

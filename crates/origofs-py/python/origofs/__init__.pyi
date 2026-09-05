@@ -280,6 +280,44 @@ class MergeResult(TypedDict):
     conflicts: list[ConflictRecord]
 
 
+class SearchHitRecord(TypedDict):
+    """One content-search hit (``search``/``search_as``).
+
+    ``path`` is where the matching content is **now** — resolved against the
+    live working tree, which is why a rename needs no reindexing. ``content`` is
+    the content address that matched, and is the index's actual key.
+    """
+
+    path: str
+    content: str
+
+
+class SearchStatusRecord(TypedDict):
+    """How complete the search index is (``search_status``).
+
+    ``pending`` is what makes an empty result readable: while it is non-zero the
+    results are a subset, so "no matches" is not yet a claim about the
+    workspace's contents.
+    """
+
+    indexed: int
+    pending: int
+    complete: bool
+
+
+class IndexReportRecord(TypedDict):
+    """What one indexing pass did (``index_pending``/``reindex``).
+
+    ``skipped_binary`` counts blobs that were read and found to hold no
+    searchable text. They are *recorded* as indexed rather than skipped, so they
+    are not re-read on every future pass.
+    """
+
+    indexed: int
+    skipped_binary: int
+    terms: int
+
+
 class GcReport(TypedDict):
     """What a mark-and-sweep collection did (``gc``/``gc_with_grace``)."""
 
@@ -1178,6 +1216,21 @@ class Workspace:
     # afterwards for the space to actually come back.
     async def gc(self) -> GcReport: ...
     async def gc_with_grace(self, grace_secs: int) -> GcReport: ...
+    # --- content search --------------------------------------------------
+    # The index is keyed by **content hash**, never by path, so a rename, a
+    # delete and a branch checkout need no reindexing at all: hits are resolved
+    # against the live tree at query time. `search` is unattributed and open --
+    # a service must use `search_as`, because a search result is a path plus the
+    # fact that content sits at it, which unchecked is an existence oracle.
+    # Always read `search_status()`: an empty result from an unbuilt index is
+    # not an answer about the workspace.
+    async def search(self, query: str, limit: int = 50) -> list[SearchHitRecord]: ...
+    async def search_as(
+        self, ctx: WriteCtx, query: str, limit: int = 50
+    ) -> list[SearchHitRecord]: ...
+    async def search_status(self) -> SearchStatusRecord: ...
+    async def index_pending(self, limit: int = 256) -> IndexReportRecord: ...
+    async def reindex(self) -> IndexReportRecord: ...
     async def flush(self) -> None: ...
     async def repack(self) -> int: ...
     # Deterministic shutdown (#154): release the Postgres pool and any backend
