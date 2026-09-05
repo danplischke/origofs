@@ -1888,8 +1888,10 @@ async fn main() -> Result<()> {
                 Some(s) => WriteCtx::session(actor, s),
                 None => WriteCtx::actor(actor),
             };
-            ws.accept_suggestion(id, ctx).await?;
-            println!("accepted suggestion #{id}");
+            match ws.accept_suggestion(id, ctx).await? {
+                Some(hash) => println!("accepted suggestion #{id} -> {hash}"),
+                None => println!("accepted suggestion #{id} (file deleted)"),
+            }
         }
         Cmd::Reject { id, actor, session } => {
             let ctx = match session {

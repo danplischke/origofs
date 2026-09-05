@@ -839,7 +839,11 @@ impl IntoResponse for ApiError {
                 origofs_core::metrics::record_error(&e);
                 let status = match &e {
                     NotFound(_) | ContentMissing(_) => StatusCode::NOT_FOUND,
-                    AlreadyExists(_) | Conflict(_) => StatusCode::CONFLICT,
+                    AlreadyExists(_) => StatusCode::CONFLICT,
+                    // Every conflict shape, not a `Conflict(_)` pattern: #159 split
+                    // `stale_base` and `foreign_write` out, and all three are 409.
+                    // The `code` in the envelope below is what tells them apart.
+                    e if e.is_conflict() => StatusCode::CONFLICT,
                     // Well-formed, but this actor may not do it (§6 write policy).
                     Denied(_) => StatusCode::FORBIDDEN,
                     IsADirectory(_) | NotADirectory(_) | DirectoryNotEmpty(_) | InvalidPath(_)
@@ -1680,8 +1684,10 @@ async fn accept_suggestion(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     suggestion_in_scope(&ws, &scope, id).await?;
-    ws.accept_suggestion(id, principal.write_ctx()).await?;
-    Ok(Json(json!({ "accepted": id })))
+    // `content` is the address now at the path (`null` for an accepted deletion),
+    // so a client can reconcile without a follow-up GET (#163).
+    let content = ws.accept_suggestion(id, principal.write_ctx()).await?;
+    Ok(Json(json!({ "accepted": id, "content": content })))
 }
 
 async fn reject_suggestion(

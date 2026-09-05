@@ -565,6 +565,11 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     /// while `approver` is recorded as who accepted it — and must be a different
     /// actor.
     ///
+    /// Returns the **content address now at the path**, so a caller can confirm
+    /// what landed without a second read — `None` for an accepted deletion, where
+    /// there is no longer a file to address. It returned `()` until #163, which
+    /// left "what did that actually do?" answerable only by re-reading.
+    ///
     /// **Staleness depends on the kind** ([`SuggestionKind`]).
     ///
     /// * A [`Bytes`](SuggestionKind::Bytes) suggestion replaces the whole file, so
@@ -578,7 +583,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
     ///   conflict. Applying it can therefore never discard anything, so it is
     ///   **not** subject to the staleness guard — that guard false-rejected every
     ///   concurrent edit over an always-mergeable document.
-    pub async fn accept_suggestion(&self, id: i64, approver: WriteCtx) -> Result<()> {
+    pub async fn accept_suggestion(&self, id: i64, approver: WriteCtx) -> Result<Option<String>> {
         let s = self
             .meta
             .get_suggestion(id)
@@ -680,7 +685,12 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
         // discover one failed accept at a time.
         self.supersede_stale_byte_suggestions(&s.path, Some(id))
             .await?;
-        Ok(())
+        // The address the acceptance landed, so a caller can confirm what is now at
+        // the path without a second round trip -- and reconcile after a conflict
+        // without re-reading (#163). `None` for an accepted *deletion*: there is no
+        // longer a file to address, which is the honest answer rather than an empty
+        // hash.
+        self.current_content_hex(&s.path).await
     }
 
     /// Apply a whole-file byte suggestion, guarding the base it was proposed
@@ -713,8 +723,11 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 {
                     Ok(()) => Ok(()),
                     // Lost the race in the window between the check and the write:
-                    // same situation, same terminal state.
-                    Err(OrigoFSError::Conflict(_)) => Err(self.mark_superseded(s).await),
+                    // same situation, same terminal state. `is_conflict`, not a
+                    // `Conflict(_)` pattern — the family grew in #159 and a
+                    // narrowed match here would let a lost CAS escape as itself
+                    // instead of superseding the row.
+                    Err(e) if e.is_conflict() => Err(self.mark_superseded(s).await),
                     Err(e) => Err(e),
                 }
             }
@@ -753,7 +766,7 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 branch: self.current_branch().await.ok().flatten(),
             })
             .await;
-        OrigoFSError::Conflict(format!(
+        OrigoFSError::StaleBase(format!(
             "suggestion #{}: {} changed since it was proposed; marked superseded — re-diff and re-suggest",
             s.id, s.path
         ))

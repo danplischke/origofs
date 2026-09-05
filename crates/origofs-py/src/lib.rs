@@ -43,6 +43,13 @@ use std::sync::Arc;
 
 create_exception!(origofs, OrigoFSError, pyo3::exceptions::PyException);
 create_exception!(origofs, ConflictError, OrigoFSError);
+// #159: `ConflictError` covered at least two conditions that demand *opposite*
+// recoveries — re-diff-and-re-suggest vs. reseed-and-checkpoint — and the only way
+// to tell them apart was a substring match on the message, which then breaks on
+// any rewording. Both subclass `ConflictError`, so `except ConflictError` and the
+// FastAPI 409 mapping keep working unchanged.
+create_exception!(origofs, StaleBaseError, ConflictError);
+create_exception!(origofs, ForeignWriteError, ConflictError);
 
 /// Map an origofs error onto the closest Python exception.
 fn to_pyerr(e: origofs_sdk::OrigoFSError) -> PyErr {
@@ -56,6 +63,8 @@ fn to_pyerr(e: origofs_sdk::OrigoFSError) -> PyErr {
         DirectoryNotEmpty(_) => PyOSError::new_err(msg),
         InvalidArgument(_) | InvalidPath(_) => PyValueError::new_err(msg),
         Conflict(_) => ConflictError::new_err(msg),
+        StaleBase(_) => StaleBaseError::new_err(msg),
+        ForeignWrite(_) => ForeignWriteError::new_err(msg),
         // The actor's write policy forbids it — the closest built-in is
         // `PermissionError`, which is what a caller would `except` on.
         Denied(_) => PyPermissionError::new_err(msg),
@@ -1126,6 +1135,7 @@ struct CoeditSyncReply {
     reply: Vec<u8>,
     broadcast: Vec<u8>,
     content_changed: bool,
+    unhandled: Vec<u8>,
 }
 
 #[pymethods]
@@ -1151,12 +1161,27 @@ impl CoeditSyncReply {
         self.content_changed
     }
 
+    /// Outer y-websocket message tags in this payload that carried no effect —
+    /// empty for every well-framed payload (#162).
+    ///
+    /// A non-empty value almost always means the client is sending **bare y-sync**
+    /// frames instead of the y-websocket envelope this server speaks: a bare
+    /// ``messageYjsUpdate`` is tag 2, which is ``messageAuth`` in the envelope, so
+    /// it decodes cleanly and is dropped. The socket then connects, handshakes,
+    /// reports the right peer count -- and never converges. Surface this to the
+    /// client or log it; the server also logs it at ``warn``.
+    #[getter]
+    fn unhandled<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.unhandled)
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "CoeditSyncReply(reply={} bytes, broadcast={} bytes, content_changed={})",
+            "CoeditSyncReply(reply={} bytes, broadcast={} bytes, content_changed={}, unhandled={:?})",
             self.reply.len(),
             self.broadcast.len(),
-            self.content_changed
+            self.content_changed,
+            self.unhandled
         )
     }
 }
@@ -1309,6 +1334,7 @@ impl CoeditDoc {
                         reply: out.reply,
                         broadcast: out.broadcast,
                         content_changed: out.content_changed,
+                        unhandled: out.unhandled,
                     },
                 )
             })
@@ -1473,6 +1499,7 @@ impl CoeditTreeDoc {
                         reply: out.reply,
                         broadcast: out.broadcast,
                         content_changed: out.content_changed,
+                        unhandled: out.unhandled,
                     },
                 )
             })
@@ -1515,10 +1542,56 @@ impl CoeditTreeDoc {
     /// **Check this before binding an editor.** origofs cannot rebuild a *tree*
     /// from a flat file — that needs your schema — so a document whose sidecar is
     /// missing or stale opens empty, and checkpointing it would write an empty body
-    /// over a file with content. Seed it from ``await ws.read(path)`` first.
+    /// over a file with content. Seed it from ``await ws.read(path)`` first, then
+    /// declare that with ``seeded_from``.
+    ///
+    /// Since #158 forgetting to is an error rather than data loss: a checkpoint from
+    /// an unseeded document over a non-empty file raises ``ForeignWriteError``.
     fn resumed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move { Ok(inner.lock().await.resumed()) })
+    }
+
+    /// Declare that this document now represents ``body`` — the seeding handshake
+    /// (#158).
+    ///
+    /// origofs cannot parse bytes back into tree nodes (that needs your schema), so
+    /// a document that could not resume opens **empty** and checkpointing it would
+    /// replace the file's content with nothing. That is refused until you say the
+    /// document accounts for those bytes: when ``resumed()`` is false, read the
+    /// file, parse it into the tree with your own parser, and pass the same bytes
+    /// here.
+    ///
+    /// Seeding from the file's current bytes *without* parsing them is the
+    /// deliberate-overwrite escape hatch: it says "I have looked at what is there
+    /// and I am replacing it", which is a thing a host may legitimately mean — and
+    /// which now has to be written down rather than being the default.
+    fn seeded_from<'py>(&self, py: Python<'py>, body: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.lock().await.seeded_from(&body);
+            Ok(())
+        })
+    }
+
+    /// Hex BLAKE3 of the body this document is **coherent with** — what it resumed
+    /// from, was seeded from, or last crystallized — or ``None`` when it has no
+    /// established relationship to any file.
+    ///
+    /// This is what ``checkpoint_coedit_tree`` compares the file against. Note it
+    /// is a BLAKE3 of the bytes, *not* the chunk-manifest address ``stat()`` returns
+    /// — the two are different hashes of the same content and never compare equal.
+    fn base_hash<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            Ok(inner.lock().await.base_hash().map(|h| {
+                h.iter().fold(String::with_capacity(64), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                })
+            }))
+        })
     }
 
     /// Whether the tree has no nodes at all.
@@ -3639,8 +3712,9 @@ impl Workspace {
         let ws = self.inner.clone();
         let c = approver.inner;
         future_into_py(py, async move {
-            ws.accept_suggestion(id, c).await.map_err(to_pyerr)?;
-            Ok(())
+            // The address now at the path (`None` for an accepted deletion), so a
+            // caller can confirm what landed without re-reading (#163).
+            ws.accept_suggestion(id, c).await.map_err(to_pyerr)
         })
     }
 
@@ -5848,6 +5922,8 @@ fn _origofs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(content_hash, m)?)?;
     m.add("OrigoFSError", m.py().get_type::<OrigoFSError>())?;
     m.add("ConflictError", m.py().get_type::<ConflictError>())?;
+    m.add("StaleBaseError", m.py().get_type::<StaleBaseError>())?;
+    m.add("ForeignWriteError", m.py().get_type::<ForeignWriteError>())?;
     // `origofs.__version__`, single-sourced from `[workspace.package].version`:
     // `CARGO_PKG_VERSION` is the same value maturin stamps the wheel with, so the
     // string a caller reads and the version `pip` resolved cannot disagree.

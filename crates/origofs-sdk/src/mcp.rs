@@ -422,8 +422,10 @@ impl McpServer {
             }
             "origofs_accept" => {
                 let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
-                self.ws.accept_suggestion(id, self.ctx()).await?;
-                Ok(format!("accepted suggestion #{id}"))
+                match self.ws.accept_suggestion(id, self.ctx()).await? {
+                    Some(hash) => Ok(format!("accepted suggestion #{id}; now at {hash}")),
+                    None => Ok(format!("accepted suggestion #{id}; the file is deleted")),
+                }
             }
             "origofs_reject" => {
                 let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);

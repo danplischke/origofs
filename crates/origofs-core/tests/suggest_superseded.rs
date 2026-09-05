@@ -76,10 +76,14 @@ async fn stale_accept_supersedes<M: MetadataStore>(fs: Fs<M, Arc<MemStore>>) {
 
     // Accepting is refused...
     let err = fs.accept_suggestion(id, r).await.unwrap_err();
+    // `StaleBase`, not a bare `Conflict` (#159): the caller has to be able to tell
+    // "re-diff and re-suggest" from "reseed your co-edit document" without reading
+    // the message, and both used to arrive as the same class.
     assert!(
-        matches!(err, OrigoFSError::Conflict(_)),
+        matches!(err, OrigoFSError::StaleBase(_)),
         "a stale byte suggestion must not be applied: {err:?}"
     );
+    assert_eq!(err.code(), "stale_base");
     // ...the file is untouched (no silent clobber)...
     assert_eq!(
         &fs.read("/notes.md").await.unwrap()[..],

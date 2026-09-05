@@ -87,7 +87,13 @@ if TYPE_CHECKING:  # import only for type checkers; the module loads without the
 # It may be sync or async and may declare its own FastAPI dependencies/params.
 AuthnDep = Callable[..., Union["Any", Awaitable["Any"]]]
 
-__all__ = ["build_router", "build_coedit_router", "CheckpointPolicy", "ROUTE_GROUPS"]
+__all__ = [
+    "build_router",
+    "build_coedit_router",
+    "CheckpointPolicy",
+    "ROUTE_GROUPS",
+    "ROUTE_GROUP_ALIASES",
+]
 
 
 # --- route groups (issue #153) ----------------------------------------------
@@ -158,21 +164,31 @@ _ROUTE_GROUPS: "dict[str, tuple[tuple[Optional[str], str], ...]]" = {
         ("POST", "/presence"),
         ("POST", "/presence/touch"),
     ),
-    # Live co-editing: both sockets, plus the checkpoint route the tree socket
-    # cannot work without -- origofs cannot serialize a tree, so the host lands
-    # the bytes. Mounting the socket without it would give a room nobody can save.
+    # Live co-editing: both y-sync sockets, plus undo.
     #
-    # Undo belongs here for the same reason (#146): it acts only on a live room,
-    # so it is meaningless without the sockets and useless to mount separately.
-    # It is a request beside the socket rather than a message on it because the
-    # result travels the room's own y-sync fan-out -- only the request needed a
-    # channel -- so it is one of this group's routes despite being plain REST.
-    "coedit": (
+    # Undo belongs here (#146): it acts only on a live room, so it is meaningless
+    # without the sockets and useless to mount separately. It is a request beside
+    # the socket rather than a message on it because the result travels the room's
+    # own y-sync fan-out -- only the request needed a channel -- so it is one of
+    # this group's routes despite being plain REST. It changes the live document,
+    # not the durable bytes, which is why it is not in `coedit-checkpoint`.
+    "coedit-ws": (
         (None, "/coedit/{path:path}"),
         (None, "/coedit-tree/{path:path}"),
-        ("POST", "/coedit-tree-checkpoint/{path:path}"),
         ("POST", "/coedit-undo/{path:path}"),
     ),
+    # The tree checkpoint: origofs cannot serialize a tree, so the host hands it
+    # the bytes through this route.
+    #
+    # Its own group since #160. It was bundled with the sockets on the rationale
+    # that a tree room cannot be saved without it -- true of the *capability*, but
+    # not of *this route*. It is a mutating body write, and a host that enforces
+    # its own authorization on body writes needs exactly one such path, its own;
+    # mounting origofs's alongside adds a second write path to the same bytes,
+    # gated differently, which is the class of bypass `include`/`exclude` exists to
+    # close. Per #158 every tree-room host owns a checkpoint anyway, so "some
+    # checkpoint must exist" is satisfied without this one.
+    "coedit-checkpoint": (("POST", "/coedit-tree-checkpoint/{path:path}"),),
     # Recovering uncommitted deletions.
     "trash": (
         ("GET", "/trash"),
@@ -184,13 +200,35 @@ _ROUTE_GROUPS: "dict[str, tuple[tuple[Optional[str], str], ...]]" = {
     "health": (("GET", "/health"), ("GET", "/readyz")),
 }
 
+# Names that stand for several groups at once. `coedit` was one group until #160
+# split it; keeping it as an alias means every existing `include=["coedit"]` and
+# `exclude=["coedit"]` keeps meaning exactly what it did.
+_GROUP_ALIASES: "dict[str, tuple[str, ...]]" = {
+    "coedit": ("coedit-ws", "coedit-checkpoint"),
+}
+
 #: The route groups :func:`build_router` understands, for ``include``/``exclude``.
 #: Read it rather than hard-coding names -- it is the list the validation checks
-#: against, so a name from here is a name that works.
-ROUTE_GROUPS = frozenset(_ROUTE_GROUPS)
+#: against, so a name from here is a name that works. It includes the aliases in
+#: :data:`ROUTE_GROUP_ALIASES`, each of which stands for several groups.
+ROUTE_GROUPS = frozenset(_ROUTE_GROUPS) | frozenset(_GROUP_ALIASES)
+
+#: Group names that expand to several others, as ``{alias: (group, ...)}``.
+ROUTE_GROUP_ALIASES = {k: frozenset(v) for k, v in _GROUP_ALIASES.items()}
+
+# The groups a route can actually belong to -- `ROUTE_GROUPS` minus the aliases.
+_CONCRETE_GROUPS = frozenset(_ROUTE_GROUPS)
 
 # (method, path) -> group. Built once; the reverse of the table above.
 _GROUP_OF = {key: group for group, keys in _ROUTE_GROUPS.items() for key in keys}
+
+
+def _expand(names: "frozenset[str]") -> "frozenset[str]":
+    """Replace every alias in ``names`` with the groups it stands for."""
+    out: "set[str]" = set()
+    for n in names:
+        out.update(_GROUP_ALIASES.get(n, (n,)))
+    return frozenset(out)
 
 
 def _route_keys(route: Any) -> "list[tuple[Optional[str], str]]":
@@ -231,7 +269,10 @@ def _resolve_groups(
             f"unknown route group(s): {unknown}. Known groups: "
             f"{sorted(ROUTE_GROUPS)} (see `origofs.fastapi.ROUTE_GROUPS`)"
         )
-    return names if include is not None else ROUTE_GROUPS - names
+    # Aliases are expanded *before* the set arithmetic, so `exclude=["coedit"]`
+    # drops both halves rather than only the group that still bears that name.
+    names = _expand(names)
+    return names if include is not None else _CONCRETE_GROUPS - names
 
 
 def _filter_routes(router: "APIRouter", keep: "frozenset[str]") -> None:
@@ -1035,7 +1076,12 @@ class _Rooms:
                 del self._rooms[key]
 
     async def checkpoint_tree(
-        self, key: tuple, ctx: Any, body: bytes, spans: list
+        self,
+        key: tuple,
+        ctx: Any,
+        body: bytes,
+        spans: list,
+        seed_from_file: bool = False,
     ) -> None:
         """Land a tree room's bytes: the host's serialized `body` plus the span map
         saying which byte ranges came from which co-edit node (#92).
@@ -1043,18 +1089,33 @@ class _Rooms:
         Runs against the **live** room when one exists, so the node ids the host
         cites resolve against the same stamps its socket is seeing; falls back to
         the document on disk when the host checkpoints with no socket attached.
+
+        `seed_from_file` declares that the caller has accounted for whatever the
+        file currently holds -- it seeded the room from it, or it means to replace
+        it. Without that declaration a room that could not resume refuses to
+        checkpoint over a non-empty file (#158), because origofs cannot tell an
+        editor seeded from the file apart from an empty one about to blank it.
         """
         room = self._rooms.get(key)
         path, xml_root = key[2], key[1]
+        # `load_`, not `open_`: a socket-less checkpoint never reaches `leave()`,
+        # which is what clears the live marker, so opening here marked the path
+        # live for good -- every "Save" with no editor attached leaked one. Same
+        # write check, no claim.
+        doc = (
+            room.doc
+            if room is not None
+            else await self._ws.load_coedit_tree_as(ctx, path, xml_root)
+        )
+        if seed_from_file:
+            try:
+                current = await self._ws.read(path)
+            except FileNotFoundError:
+                current = b""
+            await doc.seeded_from(current)
+        await self._ws.checkpoint_coedit_tree(ctx, path, doc, body, spans)
         if room is None:
-            # `load_`, not `open_`: a socket-less checkpoint never reaches `leave()`,
-            # which is what clears the live marker, so opening here marked the path
-            # live for good -- every "Save" with no editor attached leaked one. Same
-            # write check, no claim.
-            doc = await self._ws.load_coedit_tree_as(ctx, path, xml_root)
-            await self._ws.checkpoint_coedit_tree(ctx, path, doc, body, spans)
             return
-        await self._ws.checkpoint_coedit_tree(ctx, path, room.doc, body, spans)
         # The host has crystallized these bytes, so the room is no longer behind.
         room.dirty = False
         room.last_checkpoint = time.monotonic()
@@ -1207,8 +1268,22 @@ def build_router(
     include:
         Mount only these route groups (issue #153). Names come from
         :data:`ROUTE_GROUPS`: ``files``, ``blame``, ``history``, ``suggestions``,
-        ``revert``, ``actors``, ``presence``, ``coedit``, ``trash``, ``health``.
-        Omit for the whole surface, which is what every existing caller gets.
+        ``revert``, ``actors``, ``presence``, ``coedit-ws``, ``coedit-checkpoint``,
+        ``trash``, ``health`` — plus ``coedit``, which stands for both co-editing
+        groups. Omit for the whole surface, which is what every existing caller
+        gets.
+
+        ``coedit-ws`` is the two y-sync sockets and undo; ``coedit-checkpoint`` is
+        the single ``POST /coedit-tree-checkpoint/{path}``, split out in #160
+        because it is a **mutating body write**. A host that enforces its own
+        authorization on body writes wants exactly one such path, its own, and
+        mounting origofs's alongside adds a second one gated differently::
+
+            build_router(ws, authn=authn, include=["coedit-ws"])
+
+        Note this is a case ``authn`` cannot express: the sockets *and* the
+        checkpoint are all mutating, so they all sit behind ``authn`` and no
+        strictness ordering separates them. Route selection is the only lever.
 
         This is for the host that stores bodies in origofs but owns the access
         model: it wants the co-editing socket and routes every mutation through
@@ -1967,10 +2042,21 @@ def build_router(
         serializer has run, so you are the only party that can supply them — along
         with the span map saying which bytes came from which co-edit node.
 
-        Body: ``{"body": "...", "spans": [[start, end, node], ...], "root": "..."}``.
+        Body: ``{"body": "...", "spans": [[start, end, node], ...], "root": "...",
+        "seeded_from_file": false}``.
         Authorship is still resolved server-side from origofs's own stamps — the
         request names byte ranges and node ids, never an actor. Bytes no span covers
         (your serializer's own punctuation) are attributed to the caller.
+
+        ``seeded_from_file`` (#158) declares that you have accounted for whatever
+        the file currently holds. A tree room opened over a file origofs cannot
+        resume from starts **empty** — it cannot parse bytes back into nodes, that
+        needs your schema — and checkpointing it would replace the file's content
+        with nothing. So without this flag such a checkpoint is refused with
+        ``409``. Send it ``true`` on the first checkpoint after your client seeded
+        the editor from ``GET /files/{path}``, or when you genuinely mean to
+        replace what is there. The ``409`` names ``seeded_from`` — the SDK call
+        this flag makes on your behalf.
         """
         p = _scoped(root, path)
         body = payload.get("body", "")
@@ -1981,7 +2067,15 @@ def build_router(
         # Through the shared mapper, so a malformed span map is a 400 and a write
         # that landed outside the session is a 409 -- the same translation every
         # other route gets, rather than a second one that could drift from it.
-        await _run(rooms.checkpoint_tree(_tree_key(p, xml_root), ctx, body, spans))
+        await _run(
+            rooms.checkpoint_tree(
+                _tree_key(p, xml_root),
+                ctx,
+                body,
+                spans,
+                seed_from_file=bool(payload.get("seeded_from_file")),
+            )
+        )
         return {"path": p, "bytes": len(body), "spans": len(spans)}
 
     @router.post("/coedit-undo/{path:path}")
@@ -2232,14 +2326,15 @@ def build_coedit_router(
     authn: AuthnDep,
     root: Optional[Union[str, AuthnDep]] = None,
     checkpoint: Optional["CheckpointPolicy"] = None,
+    checkpoint_route: bool = True,
     **router_kwargs: Any,
 ) -> "APIRouter":
     """A router carrying **only** live co-editing (issue #153).
 
-    The two y-sync WebSockets plus the tree checkpoint route they cannot work
-    without — and nothing else: no ``PUT``, no ``DELETE``, no commit, no
-    ``revert-session``. For an app that keeps its bodies in origofs but owns its
-    own access model, this is the whole integration::
+    The two y-sync WebSockets, undo, and the tree checkpoint route — and nothing
+    else: no ``PUT``, no ``DELETE``, no commit, no ``revert-session``. For an app
+    that keeps its bodies in origofs but owns its own access model, this is the
+    whole integration::
 
         app.include_router(
             build_coedit_router(ws, authn=my_authn, root=project_root),
@@ -2250,13 +2345,27 @@ def build_coedit_router(
     shape people actually asked for and a named function is a stabler thing to
     depend on than a magic string. There is no ``reader``: nothing here is a read
     route.
+
+    Parameters
+    ----------
+    checkpoint_route:
+        Mount ``POST /coedit-tree-checkpoint/{path}`` (default ``True``). Pass
+        ``False`` for the sockets alone — issue #160: that route is a mutating
+        body write, and a host that enforces its own authorization on body writes
+        wants exactly one such path, its own. Mounting origofs's alongside adds a
+        second write path to the same bytes, gated differently.
+
+        Only the *route* goes; a tree room still cannot be saved without a
+        checkpoint, so the host must land the bytes itself through
+        ``load_coedit_tree_as`` + ``checkpoint_coedit_tree`` — which, per #158, a
+        tree-room host owns anyway.
     """
     return build_router(
         ws,
         authn=authn,
         root=root,
         checkpoint=checkpoint,
-        include=["coedit"],
+        include=["coedit"] if checkpoint_route else ["coedit-ws"],
         **router_kwargs,
     )
 

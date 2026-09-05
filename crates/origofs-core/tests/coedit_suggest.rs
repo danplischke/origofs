@@ -184,7 +184,7 @@ async fn a_byte_suggestion_over_the_same_edit_is_still_refused() {
     fs.checkpoint_coedit(h, "/notes.md", &doc).await.unwrap();
 
     let err = fs.accept_suggestion(id, h).await.unwrap_err();
-    assert!(matches!(err, OrigoFSError::Conflict(_)), "{err:?}");
+    assert!(matches!(err, OrigoFSError::StaleBase(_)), "{err:?}");
     assert_eq!(
         fs.get_suggestion(id).await.unwrap().unwrap().status,
         SuggestionStatus::Superseded

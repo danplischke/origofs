@@ -317,7 +317,7 @@ async fn an_out_of_band_write_is_refused_instead_of_silently_clobbered() {
         .checkpoint_coedit_tree(ctx_a, "/n.md", &doc, b"edited\n", &[])
         .await
         .unwrap_err();
-    assert!(matches!(err, OrigoFSError::Conflict(_)), "got {err:?}");
+    assert!(matches!(err, OrigoFSError::ForeignWrite(_)), "got {err:?}");
     assert_eq!(
         &fs.read("/n.md").await.unwrap()[..],
         b"bob was here\n",

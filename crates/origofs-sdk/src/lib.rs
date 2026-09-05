@@ -1872,8 +1872,13 @@ impl Workspace {
     }
 
     /// Accept a pending suggestion: apply it (attributed to the original author)
-    /// and mark it accepted. Errors if the file changed since it was proposed.
-    pub async fn accept_suggestion(&self, id: i64, approver: WriteCtx) -> Result<()> {
+    /// and mark it accepted. Errors with
+    /// [`StaleBase`](OrigoFSError::StaleBase) if the file changed since it was
+    /// proposed.
+    ///
+    /// Returns the content address now at the path — `None` for an accepted
+    /// deletion — so a caller can confirm what landed without re-reading (#163).
+    pub async fn accept_suggestion(&self, id: i64, approver: WriteCtx) -> Result<Option<String>> {
         self.fs.accept_suggestion(id, approver).await
     }
 

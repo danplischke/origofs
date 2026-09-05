@@ -19,6 +19,8 @@ import sys
 from ._origofs import (
     OrigoFSError,
     ConflictError,
+    StaleBaseError,
+    ForeignWriteError,
     CoeditDoc,
     CoeditRelayNote,
     CoeditRelaySub,
@@ -45,9 +47,16 @@ from ._origofs import (
 # overwrite their own module's `__version__`.
 from ._origofs import __version__ as __version__
 
+# A structural type for the subset of `Workspace` a host builds on (#163). Pure
+# Python and import-cheap (its record types are `TYPE_CHECKING`-only), so it can
+# live here rather than behind an extra import.
+from .protocol import WorkspaceProtocol as WorkspaceProtocol
+
 __all__ = [
     "OrigoFSError",
     "ConflictError",
+    "StaleBaseError",
+    "ForeignWriteError",
     "CoeditDoc",
     "CoeditRelayNote",
     "CoeditRelaySub",
@@ -63,6 +72,7 @@ __all__ = [
     "WriteOutcome",
     "content_hash",
     "fuse_mountable",
+    "WorkspaceProtocol",
 ]
 
 # `Mount` is registered by the extension only on Linux (`#[cfg(target_os =
