@@ -32,6 +32,11 @@ async def _fixture():
     ws = await origofs.Workspace.open_local(
         os.path.join(d, "meta.db"), os.path.join(d, "cas")
     )
+    # This file is about the routes, and reads through them anonymously. A
+    # workspace created now enforces reads (`origofs_core::defaults`), which
+    # would refuse those for an unrelated reason — the creation default has
+    # its own coverage in test_acl_reads.py.
+    await ws.set_acl_enforce_reads(False)
     human = await ws.create_human("h", None)
     agent = await ws.create_agent("a", "opus", human)
     await ws.set_write_policy(agent, "propose")
@@ -119,6 +124,10 @@ def _app():
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
     )
+    # The routes are what this pins, and it reads through them anonymously in
+    # places. A workspace created now enforces reads (`origofs_core::defaults`),
+    # which would refuse those for an unrelated reason.
+    _run(lambda: ws.set_acl_enforce_reads(False))
     human = _run(lambda: ws.create_human("h", None))
     agent = _run(lambda: ws.create_agent("a", "opus", human))
     _run(lambda: ws.set_write_policy(agent, "propose"))

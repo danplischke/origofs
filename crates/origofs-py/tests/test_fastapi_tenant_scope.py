@@ -40,6 +40,11 @@ def _setup():
         ws = await origofs.Workspace.open_local(
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
+        # This file is about the routes, and reads through them anonymously. A
+        # workspace created now enforces reads (`origofs_core::defaults`), which
+        # would refuse those for an unrelated reason — the creation default has
+        # its own coverage in test_acl_reads.py.
+        await ws.set_acl_enforce_reads(False)
         dan = await ws.create_human("dan", None)
         sess = await ws.create_session(dan, "web")
         ctx = origofs.WriteCtx.session(dan, sess)

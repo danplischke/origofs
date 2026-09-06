@@ -7,7 +7,7 @@
 
 use futures::{SinkExt, StreamExt};
 use origofs_sdk::Workspace;
-use origofs_sdk::api::{BearerAuth, router};
+use origofs_sdk::api::{ApiOptions, BearerAuth, router_with};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -79,7 +79,17 @@ async fn vanilla_yjs_clients_collaborate_over_websocket() {
     let ws = Arc::new(ws);
 
     // Bring up a real server on an ephemeral port.
-    let app = router(ws.clone(), Arc::new(auth));
+    // The co-editing routes are mounted only when asked for — building with
+    // `coedit` is not by itself consent to expose a y-sync socket. See
+    // `ApiOptions::coedit_routes`.
+    let app = router_with(
+        ws.clone(),
+        Arc::new(auth),
+        ApiOptions {
+            coedit_routes: true,
+            ..Default::default()
+        },
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -161,7 +171,17 @@ async fn a_credential_can_ride_the_websocket_subprotocol() {
     let auth = BearerAuth::new().with_token("tok-alice", alice, Some(alice_s));
     let ws = Arc::new(ws);
 
-    let app = router(ws.clone(), Arc::new(auth));
+    // The co-editing routes are mounted only when asked for — building with
+    // `coedit` is not by itself consent to expose a y-sync socket. See
+    // `ApiOptions::coedit_routes`.
+    let app = router_with(
+        ws.clone(),
+        Arc::new(auth),
+        ApiOptions {
+            coedit_routes: true,
+            ..Default::default()
+        },
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -215,7 +235,17 @@ async fn a_bogus_subprotocol_credential_is_still_rejected() {
     let alice = ws.create_human("alice", None).await.unwrap();
     let auth = BearerAuth::new().with_token("tok-alice", alice, None);
 
-    let app = router(Arc::new(ws), Arc::new(auth));
+    // The co-editing routes are mounted only when asked for — building with
+    // `coedit` is not by itself consent to expose a y-sync socket. See
+    // `ApiOptions::coedit_routes`.
+    let app = router_with(
+        Arc::new(ws),
+        Arc::new(auth),
+        ApiOptions {
+            coedit_routes: true,
+            ..Default::default()
+        },
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -251,7 +281,17 @@ async fn a_session_less_credential_gets_a_session_for_the_connection() {
     let auth = BearerAuth::new().with_token("tok-alice", alice, None);
     let ws = Arc::new(ws);
 
-    let app = router(ws.clone(), Arc::new(auth));
+    // The co-editing routes are mounted only when asked for — building with
+    // `coedit` is not by itself consent to expose a y-sync socket. See
+    // `ApiOptions::coedit_routes`.
+    let app = router_with(
+        ws.clone(),
+        Arc::new(auth),
+        ApiOptions {
+            coedit_routes: true,
+            ..Default::default()
+        },
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -312,6 +352,7 @@ async fn an_idle_room_is_checkpointed_without_anyone_disconnecting() {
             max_interval: None,
             tick: Duration::from_millis(20),
         },
+        coedit_routes: true,
         ..Default::default()
     };
     let app = router_with(ws.clone(), Arc::new(auth), options);
@@ -401,6 +442,7 @@ async fn continuous_editing_is_checkpointed_on_the_interval() {
             max_interval: Some(Duration::from_millis(100)),
             tick: Duration::from_millis(20),
         },
+        coedit_routes: true,
         ..Default::default()
     };
     let app = router_with(ws.clone(), Arc::new(auth), options);
@@ -466,6 +508,7 @@ async fn a_room_with_no_edits_is_not_rewritten() {
             max_interval: Some(Duration::from_millis(10)),
             tick: Duration::from_millis(10),
         },
+        coedit_routes: true,
         ..Default::default()
     };
     let app = router_with(ws.clone(), Arc::new(auth), options);
@@ -523,6 +566,7 @@ async fn awareness_alone_does_not_make_a_room_due_for_checkpointing() {
             max_interval: Some(Duration::from_millis(10)),
             tick: Duration::from_millis(10),
         },
+        coedit_routes: true,
         ..Default::default()
     };
     let app = router_with(ws.clone(), Arc::new(auth), options);

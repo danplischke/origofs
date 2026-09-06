@@ -735,6 +735,25 @@ enum Cmd {
         /// endpoint is unauthenticated.
         #[arg(long)]
         metrics: bool,
+        /// Serve a non-loopback address even though this workspace does not
+        /// require attribution, so an API write can land with no author.
+        ///
+        /// The refusal exists because a shared write surface is where "who wrote
+        /// this" stops being answerable, and attribution is the point of the
+        /// system. Prefer `origofs require-attribution on`; this is for a
+        /// deployment that has decided otherwise. A loopback bind never needs it.
+        #[arg(long)]
+        allow_unattributed: bool,
+        /// Mount the co-editing routes: the two y-sync WebSockets, the tree
+        /// checkpoint, and undo/redo. Off by default even in a `coedit` build.
+        ///
+        /// The sockets hand client bytes to `yrs`, which is pinned at 0.23.5
+        /// because every version through 0.27.4 reaches `from_utf8_unchecked` on a
+        /// malformed update — undefined behaviour, silent in release, from 51
+        /// bytes (#144, see SECURITY.md). Building with co-editing and exposing it
+        /// to the network are separate decisions; this is the second one.
+        #[arg(long)]
+        coedit: bool,
     },
     /// Serve the workspace over NFSv3 (blocks; mount with `-o vers=3,tcp,port=…`).
     Nfs {
@@ -1780,6 +1799,8 @@ async fn main() -> Result<()> {
             request_timeout,
             max_concurrent_requests,
             metrics,
+            allow_unattributed,
+            coedit,
         } => {
             cmd::surfaces::serve(
                 ws,
@@ -1793,6 +1814,8 @@ async fn main() -> Result<()> {
                     request_timeout,
                     max_concurrent_requests,
                     metrics,
+                    allow_unattributed,
+                    coedit,
                 },
             )
             .await?

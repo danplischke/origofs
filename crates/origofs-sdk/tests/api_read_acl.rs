@@ -40,6 +40,11 @@ async fn fixture() -> Fixture {
     let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
         .await
         .unwrap();
+    // This file is about what the switch does, so it starts from the switch off —
+    // the posture of a workspace that already existed. A workspace created by this
+    // build starts with it on (`origofs_core::defaults`), which is asserted in
+    // `an_anonymous_read_is_refused_on_a_new_workspace` below rather than here.
+    ws.set_acl_enforce_reads(false).await.unwrap();
 
     let owner = ws.create_human("owner", None).await.unwrap();
     let octx = WriteCtx::actor(owner);
@@ -110,6 +115,52 @@ async fn reads_stay_open_and_anonymous_while_the_switch_is_off() {
         assert_eq!(anon, StatusCode::OK, "anonymous {uri}");
         assert_eq!(named, StatusCode::OK, "bob {uri}");
     }
+}
+
+#[tokio::test]
+async fn an_anonymous_read_is_refused_on_a_new_workspace() {
+    // The other side of that invariant, and the reason the fixture above has to
+    // turn the switch off explicitly: a workspace *created* by this build starts
+    // with `acl.enforce_reads` on (`origofs_core::defaults`), and on this surface
+    // that closes the anonymous door by itself.
+    //
+    // It is the change's real blast radius, so it is pinned here rather than left
+    // implied: an HTTP consumer that reads without a credential works against an
+    // existing workspace and gets 401 against a new one. That is the intended
+    // behaviour — the alternative is a new deployment publishing every file's
+    // bytes, its blame and its audit log to anyone who can reach the port — but it
+    // is a behaviour change and it should fail loudly here if it is ever reverted
+    // by accident.
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    assert!(
+        ws.acl_enforce_reads().await.unwrap(),
+        "a workspace created now should enforce reads"
+    );
+
+    let owner = ws.create_human("owner", None).await.unwrap();
+    let octx = WriteCtx::actor(owner);
+    ws.grant(owner, "/", Perms::READ | Perms::WRITE, None)
+        .await
+        .unwrap();
+    ws.write_as(octx, "/doc.md", b"secret\n").await.unwrap();
+
+    let auth = BearerAuth::new().with_token(T_OWNER, owner, None);
+    let app = router(Arc::new(ws), Arc::new(auth));
+
+    let (anon, _) = send(&app, get("/v1/files/doc.md", None)).await;
+    assert_eq!(
+        anon,
+        StatusCode::UNAUTHORIZED,
+        "an anonymous read of a new workspace should be refused"
+    );
+
+    // ...and a credentialed read still works, so this is the anonymous door
+    // closing rather than the route breaking.
+    let (named, _) = send(&app, get("/v1/files/doc.md", Some(T_OWNER))).await;
+    assert_eq!(named, StatusCode::OK);
 }
 
 // --- with the switch on ------------------------------------------------------

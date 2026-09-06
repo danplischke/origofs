@@ -40,6 +40,7 @@ pub mod coedit_tree;
 pub mod collab;
 pub mod content;
 pub mod corpus;
+pub mod defaults;
 #[cfg(feature = "encryption")]
 pub mod encrypt;
 pub mod engine;

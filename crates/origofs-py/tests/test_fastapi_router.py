@@ -223,6 +223,11 @@ def _real_client_with_actor(**router_kw):
         ws = await origofs.Workspace.open_local(
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
+        # This file is about the routes, and reads through them anonymously. A
+        # workspace created now enforces reads (`origofs_core::defaults`), which
+        # would refuse those for an unrelated reason — the creation default has
+        # its own coverage in test_acl_reads.py.
+        await ws.set_acl_enforce_reads(False)
         dan = await ws.create_human("dan", None)
         sess = await ws.create_session(dan, "test")
         return ws, dan, sess
@@ -539,6 +544,11 @@ def test_integration_attribution_end_to_end():
         ws = await origofs.Workspace.open_local(
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
+        # This file is about the routes, and reads through them anonymously. A
+        # workspace created now enforces reads (`origofs_core::defaults`), which
+        # would refuse those for an unrelated reason — the creation default has
+        # its own coverage in test_acl_reads.py.
+        await ws.set_acl_enforce_reads(False)
         dan = await ws.create_human("dan", "dan@example.com")
         sess = await ws.create_session(dan, "fastapi")
         return ws, dan, sess
@@ -570,6 +580,11 @@ def test_propose_only_actor_write_is_queued_via_router():
         ws = await origofs.Workspace.open_local(
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
+        # This file is about the routes, and reads through them anonymously. A
+        # workspace created now enforces reads (`origofs_core::defaults`), which
+        # would refuse those for an unrelated reason — the creation default has
+        # its own coverage in test_acl_reads.py.
+        await ws.set_acl_enforce_reads(False)
         author = await ws.create_human("ext", None)  # an untrusted contributor
         author_s = await ws.create_session(author, "web")
         reviewer = await ws.create_human("dan", None)
@@ -786,6 +801,11 @@ def test_propose_only_actor_is_refused_every_direct_mutation_via_router():
         ws = await origofs.Workspace.open_local(
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
+        # This file is about the routes, and reads through them anonymously. A
+        # workspace created now enforces reads (`origofs_core::defaults`), which
+        # would refuse those for an unrelated reason — the creation default has
+        # its own coverage in test_acl_reads.py.
+        await ws.set_acl_enforce_reads(False)
         reviewer = await ws.create_human("dan", None)
         reviewer_s = await ws.create_session(reviewer, "web")
         agent = await ws.create_agent("restricted", "opus", reviewer)
@@ -1051,6 +1071,11 @@ def _grant_scoped_proposer():
         ws = await origofs.Workspace.open_local(
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
+        # This file is about the routes, and reads through them anonymously. A
+        # workspace created now enforces reads (`origofs_core::defaults`), which
+        # would refuse those for an unrelated reason — the creation default has
+        # its own coverage in test_acl_reads.py.
+        await ws.set_acl_enforce_reads(False)
         owner = await ws.create_human("owner", None)
         await ws.grant(owner, "/", "read+write", None)
         await ws.mkdir_as(origofs.WriteCtx.actor(owner), "/x")
@@ -1109,6 +1134,11 @@ def test_a_write_granted_actor_still_writes_directly():
         ws = await origofs.Workspace.open_local(
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
+        # This file is about the routes, and reads through them anonymously. A
+        # workspace created now enforces reads (`origofs_core::defaults`), which
+        # would refuse those for an unrelated reason — the creation default has
+        # its own coverage in test_acl_reads.py.
+        await ws.set_acl_enforce_reads(False)
         owner = await ws.create_human("owner", None)
         await ws.grant(owner, "/", "read+write", None)
         return ws, owner
@@ -1350,6 +1380,11 @@ def test_log_path_returns_only_the_commits_that_touched_the_path():
         ws = await origofs.Workspace.open_local(
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
+        # This file is about the routes, and reads through them anonymously. A
+        # workspace created now enforces reads (`origofs_core::defaults`), which
+        # would refuse those for an unrelated reason — the creation default has
+        # its own coverage in test_acl_reads.py.
+        await ws.set_acl_enforce_reads(False)
         dan = await ws.create_human("dan", None)
         sess = await ws.create_session(dan, "fastapi")
         return ws, dan, sess
@@ -1392,6 +1427,11 @@ def test_log_path_is_scoped_to_the_router_root():
         ws = await origofs.Workspace.open_local(
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
+        # This file is about the routes, and reads through them anonymously. A
+        # workspace created now enforces reads (`origofs_core::defaults`), which
+        # would refuse those for an unrelated reason — the creation default has
+        # its own coverage in test_acl_reads.py.
+        await ws.set_acl_enforce_reads(False)
         dan = await ws.create_human("dan", None)
         sess = await ws.create_session(dan, "fastapi")
         ctx = origofs.WriteCtx.session(dan, sess)
@@ -1423,6 +1463,11 @@ def test_edits_follows_the_file_and_is_grouped_with_blame():
         ws = await origofs.Workspace.open_local(
             os.path.join(d, "meta.db"), os.path.join(d, "cas")
         )
+        # This file is about the routes, and reads through them anonymously. A
+        # workspace created now enforces reads (`origofs_core::defaults`), which
+        # would refuse those for an unrelated reason — the creation default has
+        # its own coverage in test_acl_reads.py.
+        await ws.set_acl_enforce_reads(False)
         dan = await ws.create_human("dan", None)
         sess = await ws.create_session(dan, "fastapi")
         return ws, dan, sess

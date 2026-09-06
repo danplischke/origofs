@@ -18,7 +18,7 @@ use axum::http::{Request, StatusCode};
 use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use origofs_sdk::Workspace;
-use origofs_sdk::api::{BearerAuth, router};
+use origofs_sdk::api::{ApiOptions, BearerAuth, router_with};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -149,7 +149,17 @@ async fn fixture() -> Fixture {
         .with_token("tok-alice", alice, Some(alice_s))
         .with_token("tok-bob", bob, Some(bob_s));
     let ws = Arc::new(ws);
-    let app = router(ws.clone(), Arc::new(auth));
+    // The co-editing routes are mounted only when asked for — building with
+    // `coedit` is not by itself consent to expose a y-sync socket. See
+    // `ApiOptions::coedit_routes`.
+    let app = router_with(
+        ws.clone(),
+        Arc::new(auth),
+        ApiOptions {
+            coedit_routes: true,
+            ..Default::default()
+        },
+    );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -273,6 +283,7 @@ async fn the_sweeper_persists_a_tree_room_without_inventing_a_body() {
             max_interval: None,
             tick: Duration::from_millis(20),
         },
+        coedit_routes: true,
         ..Default::default()
     };
     let app = router_with(ws.clone(), Arc::new(auth), options);

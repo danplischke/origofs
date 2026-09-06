@@ -7,9 +7,13 @@
 //!
 //! These pin the check itself. Two properties matter more than "a denial denies":
 //!
-//! * **It is off by default.** Reads have never been checked, so an existing
-//!   workspace has no read grants; enforcing on upgrade would stop every actor at
-//!   once. Every test here that expects a refusal turns it on explicitly.
+//! * **It is off for a workspace that already existed.** Reads have never been
+//!   checked, so such a workspace has no read grants; enforcing on upgrade would
+//!   stop every actor at once. Every test here that expects a refusal turns it on
+//!   explicitly, and the fixtures start from the pre-epoch posture (see
+//!   `as_legacy_workspace`) because that is the population these tests are about.
+//!   A workspace *created* by this build starts with it on instead —
+//!   `origofs_core::defaults`, tested in `creation_defaults.rs`.
 //! * **A denial says nothing about existence.** Probing for existence is the whole
 //!   point of an unauthorized read, so a check that ran after the lookup would
 //!   answer the question it exists to refuse.
@@ -21,11 +25,26 @@ use std::sync::Arc;
 
 type TestFs = Fs<Arc<dyn MetadataStore>, Arc<MemStore>>;
 
+/// Return a just-created workspace to the posture of one created before
+/// `defaults.epoch` existed.
+///
+/// These tests are about the switch's *mechanics* and about the migration
+/// invariant — that adding the check changed nothing for a workspace that already
+/// existed — so their subject is a pre-epoch workspace. A workspace created by
+/// this build is stamped epoch 1 and starts with enforcement on
+/// (`origofs_core::defaults`), which is a different subject with its own tests in
+/// `creation_defaults.rs`. Asserting the old default on a new workspace would be
+/// asserting the wrong thing.
+async fn as_legacy_workspace(fs: &TestFs) {
+    fs.set_acl_enforce_reads(false).await.unwrap();
+}
+
 /// An owner who may write, and `bob`, whose rights each test sets.
 async fn fixture() -> (TestFs, WriteCtx, i64) {
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
     let fs = Fs::new(meta, Arc::new(MemStore::new()));
     fs.init().await.unwrap();
+    as_legacy_workspace(&fs).await;
     let owner = fs.create_agent("owner", "opus", None).await.unwrap();
     let octx = WriteCtx::actor(owner);
     fs.grant(owner, "/", Perms::READ | Perms::WRITE, None)
@@ -333,6 +352,7 @@ async fn the_enforcement_switch_is_seen_across_handles() {
     let content = Arc::new(MemStore::new());
     let a: TestFs = Fs::new(meta.clone(), content.clone());
     a.init().await.unwrap();
+    as_legacy_workspace(&a).await;
     let owner = a.create_agent("owner", "opus", None).await.unwrap();
     a.grant(owner, "/", Perms::READ | Perms::WRITE, None)
         .await

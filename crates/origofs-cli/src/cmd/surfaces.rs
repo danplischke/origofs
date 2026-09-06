@@ -214,6 +214,8 @@ pub struct ServeArgs {
     pub request_timeout: Option<u64>,
     pub max_concurrent_requests: Option<usize>,
     pub metrics: bool,
+    pub allow_unattributed: bool,
+    pub coedit: bool,
 }
 
 pub async fn serve(ws: Workspace, args: ServeArgs) -> Result<()> {
@@ -227,7 +229,31 @@ pub async fn serve(ws: Workspace, args: ServeArgs) -> Result<()> {
         request_timeout,
         max_concurrent_requests,
         metrics,
+        allow_unattributed,
+        coedit,
     } = args;
+    // A multi-actor write surface with attribution optional is the one deployment
+    // where "who wrote this" stops being answerable — and attribution is what this
+    // system is *for*. `write.require_attribution` is off by default and stays
+    // off, because turning it on would break the single-user local flow that the
+    // README opens with; this refuses the case where that reasoning does not
+    // apply.
+    //
+    // Scoped to a non-loopback bind, and worded, exactly like `build_api_auth`'s
+    // refusal to expose an unauthenticated API: local dev is untouched, and a real
+    // deployment meets this at startup with the two commands that fix it rather
+    // than discovering months later that half its history has no author. Not a
+    // free upgrade for an existing deployment, which is the cost of the guard
+    // being worth anything.
+    if !allow_unattributed && !addr.ip().is_loopback() && !ws.require_attribution().await? {
+        anyhow::bail!(
+            "refusing to serve {addr}: this workspace does not require attribution, so a write \
+             through the API can land with no author.\n  \
+             fix it:       origofs --workspace <dir> require-attribution on\n  \
+             or accept it: origofs serve --allow-unattributed\n  \
+             (a loopback bind is exempt, for local dev)"
+        );
+    }
     // Validated here rather than left to `router_with`, which *panics* on a
     // malformed root — correct for a library whose caller is code, wrong
     // for a value a user typed.
@@ -260,8 +286,21 @@ pub async fn serve(ws: Workspace, args: ServeArgs) -> Result<()> {
             Some(n) => Some(n),
             None => defaults.max_concurrent_requests,
         },
+        // Exposing the co-editing sockets is a second decision, not a consequence
+        // of having built with `coedit` — see `ApiOptions::coedit_routes`.
+        #[cfg(feature = "coedit")]
+        coedit_routes: coedit,
         ..defaults
     };
+    #[cfg(not(feature = "coedit"))]
+    if coedit {
+        // Refuse rather than ignore: a flag that silently does nothing is how an
+        // operator concludes co-editing is exposed when it is not, or the reverse.
+        anyhow::bail!(
+            "--coedit: this origofs was built without co-editing, so there are no \
+             co-editing routes to mount (rebuild with `--features coedit`)"
+        );
+    }
     // `build_api_auth` refuses to serve unauthenticated *writes* off
     // loopback. Reads are a separate decision and default to open, so say
     // so rather than letting a public bind quietly publish every file's
