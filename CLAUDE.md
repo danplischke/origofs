@@ -415,9 +415,46 @@ write path enforces this and you must not weaken it:
   actor denied a read would simply turn enforcement off. The raw forms stay for
   provisioning, which by construction has no actor — the first grant in a fresh
   workspace precedes anyone holding rights in it.
+- **A default is recorded when a workspace is created, not flipped globally
+  (`defaults.rs`).** Every safety switch here defaults off, each for the same
+  reason: turning it on would change what an existing deployment already does.
+  That argument is about *upgrades*, and it was being applied to new workspaces
+  too — so a system built on "every edit is recorded against the actor that made
+  it" handed you a fresh workspace with no access control at all. A workspace now
+  carries `defaults.epoch` stamped at creation and starts with that epoch's
+  posture; one created before this has no epoch key, nothing ever writes one to
+  it, and it keeps its behaviour forever. **Epoch 1 is `acl.enforce_reads` on.**
+  - **`init` keys on the schema version, not on the key being absent.** `init`
+    *is* the migration runner and executes on every open, so "stamp when the key
+    is missing" would have flipped every existing workspace on upgrade. A store
+    being created reports schema version 0 before `meta.init()`; that is the only
+    honest signal, and `open_workspace` uses the create-vs-lookup outcome for the
+    same reason. Tenant workspaces inherit from the workspace they were created
+    from, so a pre-epoch store does not start handing new defaults to tenants
+    onboarded after an upgrade.
+  - **Epochs are append-only.** Adding a setting to epoch 1 would silently change
+    what an already-created epoch-1 workspace means; add an epoch 2.
+  - **What epoch 1 costs, precisely.** Nothing for an actor: with no grants,
+    `effective_perms` falls back to the write policy and both policies carry
+    `READ`. What it closes is the **anonymous** door — `ReadAuth` answers 401 once
+    enforcement is on. So an HTTP consumer that reads without a credential works
+    against an existing workspace and gets 401 against a new one. That found a
+    real gap in `examples/web/server`, which passed `authn` but no `reader`: it
+    knew who every caller was and served their reads anonymously anyway, so read
+    grants never applied to it. **When mounting `build_router`, pass `reader=` as
+    well as `authn=`** unless the read surface is deliberately public.
+  - Deliberately *not* in epoch 1: `acl.default_deny` (with no grants it denies
+    every actor, so a fresh workspace would refuse its creator);
+    `write.require_attribution` (it makes `origofs write /x` without `--actor` an
+    error, which is the README's first command — guarded at the surface that
+    matters instead: **`origofs serve` refuses a non-loopback bind without it**,
+    scoped and worded like `build_api_auth`'s refusal to expose an unauthenticated
+    API, with `--allow-unattributed` as the stated way out); trash retention (a
+    surprise storage bill); POSIX locks (takes locking away from the kernel).
 - **Reads are checked only where a workspace opts in.** `Perms::READ` went from a
   bit nothing consulted to one `ensure_may_read_at` enforces, behind
-  `acl_enforce_reads` (workspace setting, **default off**) — reads have never been
+  `acl_enforce_reads` (workspace setting, **off for a workspace that already
+  existed**; on for one created now, see above) — reads have never been
   checked, so no existing workspace holds read grants and enforcing on upgrade
   would stop every actor at once. The attributed reads (`read_as`,
   `read_range_as`, `stat_as`, `ls_as`, `readlink_as`, `blame_as`) run it; the
@@ -567,7 +604,7 @@ interface, gate the module on `unix` (not just the feature) and split the CLI ar
 the same way** — gating on the feature alone is what kept the Windows target from
 compiling at all until #107.
 | `git` | `origofs_sdk::git` | Real-`git` interop: export/import genuine git objects. The `git-remote-origofs` binary (shipped by `origofs-cli`, `git clone origofs://…`) builds on it. |
-| `coedit` | — | Opt-in CRDT co-editing (yrs); adds the y-sync WebSocket to the `api` surface. Kept separate from `full`. |
+| `coedit` | — | Opt-in CRDT co-editing (yrs). Kept separate from `full`, and **building it does not mount the y-sync WebSocket** — that takes `ApiOptions::coedit_routes` (`origofs serve --coedit`), see below. |
 | `metrics` | — | Opt-in metrics recording (emit-only, no exporter); adds `GET /metrics` + per-request instrumentation to the `api` surface. Kept separate from `full`. |
 
 ## Conventions & gotchas that will bite you
@@ -609,6 +646,16 @@ compiling at all until #107.
   would break a conforming client to diagnose a non-conforming one. Awareness is
   *handled* (relayed) so it is not counted — every Yjs client emits it constantly,
   and a warning per heartbeat would bury the signal.
+- **Building with `coedit` is not consent to expose it.** The routes are mounted
+  only when `ApiOptions::coedit_routes` is set (`origofs serve --coedit`; the CLI
+  also needs `--features coedit`, which the shipped binary does not carry, so it
+  links no `yrs` at all). Two different decisions were riding on one flag: a build
+  that wants `CoeditDoc` and the checkpoint API in-process should not thereby open
+  a socket that feeds client bytes to the pinned-`yrs` UB below. Same split
+  `origofs.fastapi`'s route groups already make (`coedit-ws` vs
+  `coedit-checkpoint`, #160). All four routes move together on purpose — the
+  sockets are the UB path, but the checkpoint and undo routes are useless without
+  a room, so gating them apart would ship a confusing half-configuration.
 - **`yrs` is pinned at 0.23.5 on purpose, and the co-editing socket is exposed
   because of it (#144).** A malformed y-sync update reaches
   `from_utf8_unchecked` (`encoding/read.rs`, `updates/decoder.rs`) and is then

@@ -26,6 +26,12 @@ async fn fixture() -> (TestFs, WriteCtx, i64, i64) {
     let meta: Arc<dyn MetadataStore> = Arc::new(SqliteMetadataStore::open_in_memory().unwrap());
     let fs = Fs::new(meta, Arc::new(MemStore::new()));
     fs.init().await.unwrap();
+    // These tests are about the *mount* checks, and several start from reads being
+    // open so they can show the switch turning them off. A workspace created by
+    // this build starts with enforcement on (`origofs_core::defaults`), so return
+    // it to the pre-epoch posture rather than rewriting each test's premise; the
+    // creation posture itself is pinned in `creation_defaults.rs`.
+    fs.set_acl_enforce_reads(false).await.unwrap();
 
     fs.mkdir_p("/src").await.unwrap();
     fs.mkdir_p("/docs").await.unwrap();

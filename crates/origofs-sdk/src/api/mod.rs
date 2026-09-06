@@ -496,6 +496,31 @@ pub struct ApiOptions {
     /// rooms to checkpoint and the type does not exist.
     #[cfg(feature = "coedit")]
     pub checkpoint: CheckpointPolicy,
+    /// Mount the co-editing routes — the two y-sync WebSockets, the host-driven
+    /// tree checkpoint, and undo/redo. **Off by default, and the default is the
+    /// point.**
+    ///
+    /// Building with `coedit` and *exposing* co-editing to the network are two
+    /// different decisions, and one flag was making them together. The socket
+    /// feeds client bytes straight into `yrs`, which is pinned at 0.23.5 because
+    /// every version through 0.27.4 reaches `from_utf8_unchecked` on a malformed
+    /// update — undefined behaviour, aborting under the debug UB checks and
+    /// **silent in release**, from 51 bytes (#144). Nothing local contains it: the
+    /// abort is non-unwinding, so `catch_unwind` is no help. So a build that wants
+    /// `CoeditDoc` and the checkpoint API in-process should not thereby open a
+    /// socket that accepts those bytes from anyone who can reach the port.
+    ///
+    /// This is the same split `origofs.fastapi`'s route groups already make
+    /// (`coedit-ws` vs `coedit-checkpoint`, #160), for the same reason: a host
+    /// with its own save path needs origofs not to mount a second write surface it
+    /// did not ask for.
+    ///
+    /// All four routes move together deliberately. The sockets are the UB path,
+    /// but the checkpoint and undo routes are useless without a room to drive, so
+    /// gating them apart would ship an option whose only effect is a confusing
+    /// half-configuration.
+    #[cfg(feature = "coedit")]
+    pub coedit_routes: bool,
 }
 
 impl Default for ApiOptions {
@@ -509,6 +534,8 @@ impl Default for ApiOptions {
             max_concurrent_requests: Some(512),
             #[cfg(feature = "coedit")]
             checkpoint: CheckpointPolicy::default(),
+            #[cfg(feature = "coedit")]
+            coedit_routes: false,
         }
     }
 }
@@ -588,8 +615,11 @@ pub fn router_with(ws: Shared, auth: Arc<dyn Authenticator>, options: ApiOptions
     }
     // The co-editing WebSocket authenticates itself (it accepts a `?token=` query
     // param a browser can't send as a header), so it sits outside the read gate.
+    //
+    // Mounted only when asked for: see `ApiOptions::coedit_routes` for why the
+    // build feature is not by itself consent to expose this.
     #[cfg(feature = "coedit")]
-    {
+    if options.coedit_routes {
         data = data
             .route("/coedit/{*path}", get(coedit::coedit_ws))
             // The tree shape (#92): the same socket over a `Y.XmlFragment`, plus the

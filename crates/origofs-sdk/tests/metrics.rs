@@ -33,6 +33,11 @@ async fn metrics_endpoint_serves_prometheus_exposition() {
     let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
         .await
         .unwrap();
+    // The metric labels are what this pins, and the requests it counts are read
+    // anonymously. A workspace created by this build enforces reads
+    // (`origofs_core::defaults`), which would turn those into 401s and change the
+    // labels for an unrelated reason.
+    ws.set_acl_enforce_reads(false).await.unwrap();
     let agent = ws.create_agent("claude", "opus", None).await.unwrap();
     let session = ws.create_session(agent, Some("metrics")).await.unwrap();
     let auth = BearerAuth::new().with_token(TOKEN, agent, Some(session));

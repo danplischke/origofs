@@ -453,8 +453,18 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
     pub async fn init(&self) -> Result<()> {
         self.check_store_format().await?;
         self.check_schema_version().await?;
+        // Whether this store is being *created* rather than reopened, captured
+        // before `meta.init()` runs the migrations — after that it never reads 0
+        // again. `init` is the migration runner and so executes on every open, so
+        // "the key is absent" would not have distinguished a new store from an old
+        // one that simply predates the key. See [`crate::defaults`].
+        let fresh_store = self.meta.schema_version().await? == 0;
         self.meta.init().await?;
         self.init_versioning().await?;
+        if fresh_store {
+            self.stamp_creation_defaults(crate::defaults::CURRENT_EPOCH)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1996,15 +2006,22 @@ impl<C: ContentStore + Clone> Fs<Arc<dyn MetadataStore>, C> {
         validate_component(name).map_err(|_| {
             OrigoFSError::InvalidArgument(format!("invalid workspace name: {name:?}"))
         })?;
-        let (id, root) = match self.meta.lookup_workspace(name).await? {
-            Some(existing) => existing,
+        // `created` is the only honest signal that this workspace is new: config is
+        // keyed `(workspace_id, key)`, so a new workspace starts with an empty
+        // config, and the store's schema version says nothing about it. The
+        // concurrent-create loser takes the `AlreadyExists` arm and is *not* new —
+        // the winner stamps it.
+        let (id, root, created) = match self.meta.lookup_workspace(name).await? {
+            Some((id, root)) => (id, root, false),
             None => match self.meta.create_workspace(name).await {
-                Ok(created) => created,
-                Err(OrigoFSError::AlreadyExists(_)) => self
-                    .meta
-                    .lookup_workspace(name)
-                    .await?
-                    .ok_or_else(|| OrigoFSError::AlreadyExists(format!("workspace {name}")))?,
+                Ok((id, root)) => (id, root, true),
+                Err(OrigoFSError::AlreadyExists(_)) => {
+                    let (id, root) =
+                        self.meta.lookup_workspace(name).await?.ok_or_else(|| {
+                            OrigoFSError::AlreadyExists(format!("workspace {name}"))
+                        })?;
+                    (id, root, false)
+                }
                 Err(e) => return Err(e),
             },
         };
@@ -2012,6 +2029,12 @@ impl<C: ContentStore + Clone> Fs<Arc<dyn MetadataStore>, C> {
         // Give a freshly created workspace its versioning refs/config; idempotent
         // for one that already exists.
         fs.init().await?;
+        if created {
+            // Inherited from *this* workspace, not from the current build: a store
+            // that predates creation-time defaults must not start handing them to
+            // workspaces created inside it at runtime. See [`crate::defaults`].
+            fs.inherit_creation_defaults(self).await?;
+        }
         Ok((id, fs))
     }
 }

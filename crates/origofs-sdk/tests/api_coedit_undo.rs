@@ -13,7 +13,7 @@ use axum::Router;
 use axum::body::Body;
 use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use origofs_sdk::api::{BearerAuth, router};
+use origofs_sdk::api::{ApiOptions, BearerAuth, router_with};
 use origofs_sdk::{Perms, Workspace};
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,7 +101,17 @@ async fn serve() -> (Server, i64, i64) {
         .with_token("tok-alice", alice, Some(alice_s))
         .with_token("tok-bob", bob, Some(bob_s));
     let ws = Arc::new(ws);
-    let app = router(ws.clone(), Arc::new(auth));
+    // The co-editing routes are mounted only when asked for — building with
+    // `coedit` is not by itself consent to expose a y-sync socket. See
+    // `ApiOptions::coedit_routes`.
+    let app = router_with(
+        ws.clone(),
+        Arc::new(auth),
+        ApiOptions {
+            coedit_routes: true,
+            ..Default::default()
+        },
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let served = app.clone();
@@ -391,7 +401,17 @@ async fn a_second_worker_is_refused_the_same_actors_stack() {
     // `Coordinator`, so each has its own room registry and its own worker id —
     // exactly what two processes behind a balancer have.
     async fn worker(ws: Arc<Workspace>, auth: Arc<BearerAuth>) -> (Router, std::net::SocketAddr) {
-        let app = router(ws, auth);
+        // The co-editing routes are mounted only when asked for — building with
+        // `coedit` is not by itself consent to expose a y-sync socket. See
+        // `ApiOptions::coedit_routes`.
+        let app = router_with(
+            ws,
+            auth,
+            ApiOptions {
+                coedit_routes: true,
+                ..Default::default()
+            },
+        );
         // Bind before spawning: the address has to be known to the test, and
         // waiting for it from inside the spawned task would deadlock a
         // current-thread runtime.

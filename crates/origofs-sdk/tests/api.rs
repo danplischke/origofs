@@ -32,6 +32,14 @@ async fn fixture() -> Fixture {
     let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
         .await
         .unwrap();
+    // These tests pin the *routes*, and most read anonymously to do it. A workspace
+    // created by this build starts with `acl.enforce_reads` on
+    // (`origofs_core::defaults`), under which `ReadAuth` answers 401 to an
+    // unauthenticated read — so without this the whole file would be re-testing one
+    // switch. Enforcement off is still a supported configuration and the one these
+    // assertions are about; the new default's effect on this surface has its own
+    // test (`an_anonymous_read_is_refused_on_a_new_workspace`).
+    ws.set_acl_enforce_reads(false).await.unwrap();
     // The server owns identity: actors exist in the DB and tokens map to them.
     let admin = ws.create_human("admin", None).await.unwrap();
     let agent = ws.create_agent("claude", "opus", None).await.unwrap();

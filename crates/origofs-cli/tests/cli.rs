@@ -2760,6 +2760,13 @@ impl Server {
 #[test]
 fn serve_gate_reads_requires_a_credential_for_reads() {
     let ws = Ws::init();
+    // `--gate-reads` is a *transport* gate and this test is about it alone. A
+    // workspace created now also enforces reads at the engine
+    // (`origofs_core::defaults`), which answers 401 for the same anonymous request
+    // — so leaving it on would make the "open" leg below pass or fail for the other
+    // reason. The creation default has its own test, `a_new_workspace_enforces_reads`.
+    ws.run(&["acl", "enforce-reads", "off"])
+        .expect_ok("legacy posture");
     let actor = ws.actor(&["alice"]);
     ws.write_as("/secret.txt", actor, "classified\n")
         .expect_ok("write");
@@ -2848,6 +2855,65 @@ fn serve_reads_auth_tokens_from_the_environment() {
     );
 }
 
+/// `serve` refuses a non-loopback bind on a workspace that does not require
+/// attribution.
+///
+/// A shared write surface is where "who wrote this" stops being answerable, and
+/// attribution is the point of the system. `write.require_attribution` stays off
+/// by default — turning it on would break `origofs write` without `--actor`, the
+/// README's first command — so the guard lives here, scoped and worded like
+/// `build_api_auth`'s refusal to expose an unauthenticated API: loopback is exempt,
+/// and the refusal names both ways out.
+///
+/// **Only the refusal is asserted, deliberately.** Every accepting case — the
+/// override, a loopback bind, or attribution actually being required — binds a
+/// port and serves until killed, so driving one through `ws.run` hangs the suite
+/// rather than passing. (Learned the direct way: `0.0.0.0:0` binds happily on a
+/// free port.) `Server::start` exists for a serve that comes up and is already
+/// used by the tests above; what needs pinning here is the refusal, which is the
+/// part that exits.
+#[test]
+fn serve_refuses_an_unattributed_non_loopback_bind() {
+    let ws = Ws::init();
+
+    ws.run(&["serve", "--addr", "0.0.0.0:0", "--auth-token", "t=1"])
+        .expect_err("a non-loopback bind without required attribution")
+        .stderr_has("does not require attribution");
+
+    // The message has to name both ways out, or the operator meeting it at 3am has
+    // a refusal and no next step.
+    ws.run(&["serve", "--addr", "0.0.0.0:0", "--auth-token", "t=1"])
+        .expect_err("the refusal names its remedies")
+        .stderr_has("require-attribution on")
+        .stderr_has("--allow-unattributed");
+}
+
+/// `origofs init` gives a workspace read enforcement, and it still works.
+///
+/// The posture a workspace is born with (`origofs_core::defaults`), asserted
+/// through the binary because that is where an operator meets it. Two halves,
+/// because either alone would be misleading: the switch is on, *and* the ordinary
+/// single-user flow is unaffected — a read still succeeds, because with no grants
+/// `effective_perms` falls back to the actor's write policy and both policies
+/// carry `READ`.
+#[test]
+fn a_new_workspace_enforces_reads() {
+    let ws = Ws::init();
+    ws.run(&["acl", "enforce-reads"])
+        .expect_ok("show")
+        .stdout_has("on");
+
+    let actor = ws.actor(&["alice"]);
+    let a = actor.to_string();
+    ws.write_as("/doc.md", actor, "hello\n")
+        .expect_ok("write on a new workspace");
+    ws.run(&["read", "/doc.md", "--actor", &a])
+        .expect_ok("an actor with no grant still reads")
+        .stdout_has("hello");
+    ws.run(&["ls", "/", "--actor", &a])
+        .expect_ok("and still lists");
+}
+
 /// The ACL surface, end to end through the binary (issues #123, #124).
 ///
 /// Until now the engine's ACLs were reachable from Rust and Python and from no
@@ -2899,7 +2965,11 @@ fn acl_grants_gate_reads_end_to_end() {
         .expect_ok("check denied")
         .stdout_lacks("read");
 
-    // Off by default: bob reads everything until someone opts in.
+    // A workspace created now enforces reads (`origofs_core::defaults`); turn it
+    // back off to show the un-enforced path this test is walking, which is what a
+    // workspace created before that still does.
+    ws.run(&["acl", "enforce-reads", "off", "--by", &o])
+        .expect_ok("legacy posture");
     ws.run(&["acl", "enforce-reads"])
         .expect_ok("show")
         .stdout_has("off");

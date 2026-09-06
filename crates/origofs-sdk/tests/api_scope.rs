@@ -42,6 +42,11 @@ async fn fixture() -> Fixture {
             .await
             .unwrap(),
     );
+    // Tenancy scoping is what this file pins, and the presence rows it inspects
+    // are read anonymously in places. A workspace created by this build also
+    // enforces reads (`origofs_core::defaults`), which would refuse those for an
+    // unrelated reason; the creation default is asserted in `api_read_acl.rs`.
+    ws.set_acl_enforce_reads(false).await.unwrap();
     let actor = ws.create_human("dan", None).await.unwrap();
     let session = ws.create_session(actor, Some("api")).await.unwrap();
     let auth = || {

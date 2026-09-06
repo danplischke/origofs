@@ -9,7 +9,7 @@
 #![cfg(all(feature = "api", feature = "coedit"))]
 
 use futures::{SinkExt, StreamExt};
-use origofs_sdk::api::{BearerAuth, router};
+use origofs_sdk::api::{ApiOptions, BearerAuth, router_with};
 use origofs_sdk::{MemStore, Workspace};
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,7 +76,17 @@ async fn reset_schema(dsn: &str) {
 
 /// Bring up an API server for `ws` on an ephemeral port; return its address.
 async fn spawn_worker(ws: Arc<Workspace>, auth: Arc<BearerAuth>) -> std::net::SocketAddr {
-    let app = router(ws, auth);
+    // The co-editing routes are mounted only when asked for — building with
+    // `coedit` is not by itself consent to expose a y-sync socket. See
+    // `ApiOptions::coedit_routes`.
+    let app = router_with(
+        ws,
+        auth,
+        ApiOptions {
+            coedit_routes: true,
+            ..Default::default()
+        },
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

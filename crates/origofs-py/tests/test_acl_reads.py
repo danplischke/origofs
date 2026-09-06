@@ -28,6 +28,12 @@ async def _fixture():
     ws = await origofs.Workspace.open_local(
         os.path.join(d, "meta.db"), os.path.join(d, "cas")
     )
+    # Start from the pre-epoch posture. This file is about what the switch does,
+    # so each test turns it on where it means to; a workspace created now has it
+    # on already (`origofs_core::defaults`), which would make the "until it opts
+    # in" tests assert the wrong thing. The creation default is asserted in
+    # test_a_new_workspace_enforces_reads below.
+    await ws.set_acl_enforce_reads(False)
     owner = await ws.create_human("owner", None)
     bob = await ws.create_agent("bob", "opus", None)
     octx = origofs.WriteCtx.actor(owner)
@@ -320,3 +326,58 @@ async def test_purging_takes_the_write_right_not_merely_a_credential():
     assert c.delete(f"/trash/{sid}", headers={"X-Actor": str(bob)}).status_code == 403
     assert c.delete(f"/trash/{sid}", headers={"X-Actor": str(owner)}).status_code == 200
     assert c.get("/trash", headers={"X-Actor": str(owner)}).json() == []
+
+
+@_sync
+async def test_a_new_workspace_enforces_reads():
+    """The posture a workspace is born with (`origofs_core::defaults`).
+
+    Every switch here defaults off because turning one on would change what an
+    existing deployment does — an argument about *upgrades* that was also being
+    applied to workspaces created a minute ago. A default is recorded at creation
+    now, so a new workspace starts enforcing while an existing one is untouched.
+
+    Both halves matter and each alone would mislead. Enforcement is on; and an
+    actor holding no grant at all still reads, because `effective_perms` falls
+    back to the actor's write policy and both policies carry READ. What the
+    default actually closes is the *anonymous* door, asserted below.
+    """
+    d = tempfile.mkdtemp()
+    ws = await origofs.Workspace.open_local(
+        os.path.join(d, "meta.db"), os.path.join(d, "cas")
+    )
+    assert await ws.acl_enforce_reads() is True
+
+    owner = await ws.create_human("owner", None)
+    octx = origofs.WriteCtx.actor(owner)
+    await ws.grant(owner, "/", "read+write", None)
+    await ws.write_as(octx, "/doc.md", b"hello\n")
+
+    bob = await ws.create_agent("bob", "opus", None)
+    bctx = origofs.WriteCtx.actor(bob)
+    assert bytes(await ws.read_as(bctx, "/doc.md")) == b"hello\n"
+    assert await ws.stat_as(bctx, "/doc.md")
+    assert await ws.ls_as(bctx, "/")
+
+
+@_sync
+async def test_the_router_refuses_an_anonymous_read_on_a_new_workspace():
+    """The new default's one real consequence, at the surface where it lands.
+
+    A host mounting the FastAPI router over a *new* workspace stops serving
+    unauthenticated reads. That is the intended trade — the alternative is a fresh
+    deployment publishing every file's bytes, its blame and its audit log to
+    anyone who can reach the port — but it is a behaviour change, and this is
+    where it should fail loudly if it is ever reverted by accident.
+    """
+    d = tempfile.mkdtemp()
+    ws = await origofs.Workspace.open_local(
+        os.path.join(d, "meta.db"), os.path.join(d, "cas")
+    )
+    owner = await ws.create_human("owner", None)
+    await ws.grant(owner, "/", "read+write", None)
+    await ws.write_as(origofs.WriteCtx.actor(owner), "/doc.md", b"hello\n")
+
+    c = _app(ws, owner, owner)
+    assert c.get("/files/doc.md").status_code == 401
+    assert c.get("/files/doc.md", headers={"X-Actor": str(owner)}).status_code == 200

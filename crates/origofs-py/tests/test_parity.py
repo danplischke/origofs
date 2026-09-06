@@ -1123,6 +1123,10 @@ async def test_reads_are_open_until_the_workspace_opts_in():
     # so no workspace has read grants and enforcing on upgrade would stop every
     # actor at once.
     ws = await workspace()
+    # Stand in for a workspace created before `defaults.epoch`: one created now
+    # has enforcement on (`origofs_core::defaults`), and the invariant under test
+    # here is precisely that such a workspace is *not* what this is about.
+    await ws.set_acl_enforce_reads(False)
     owner = await ws.create_human("owner", None)
     await ws.grant(owner, "/", "read+write", None)
     await ws.write_as(origofs.WriteCtx.actor(owner), "/doc.md", b"secret\n")

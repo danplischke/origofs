@@ -87,9 +87,14 @@ def test_suggestion_flow_mixes_human_and_agent_blame():
         sid = r.json()["id"]
         assert c.get("/api/doc/doc.md").json()["text"] == v1.decode(), "not applied yet"
 
-        pending = c.get("/fs/suggestions", params={"status": "pending"}).json()
+        pending = c.get(
+            "/fs/suggestions", params={"status": "pending"}, headers=_auth("tok-grace")
+        ).json()
         assert sid in [s["id"] for s in pending]
-        assert "appended by claude" in c.get(f"/fs/suggestions/{sid}/diff").text
+        assert (
+            "appended by claude"
+            in c.get(f"/fs/suggestions/{sid}/diff", headers=_auth("tok-grace")).text
+        )
 
         # A reviewer accepts it — applied, credited to the agent (the author).
         c.post(f"/fs/suggestions/{sid}/accept", headers=_auth("tok-grace")).raise_for_status()
@@ -162,7 +167,7 @@ def test_commit_then_log_records_history():
         r = c.post("/fs/commit", json={"message": "first", "author": "ada"},
                    headers=_auth("tok-ada"))
         r.raise_for_status()
-        log = c.get("/fs/log").json()
+        log = c.get("/fs/log", headers=_auth("tok-ada")).json()
         assert log and log[0]["message"] == "first"
         assert isinstance(log[0]["hash"], str) and len(log[0]["hash"]) == 64
 

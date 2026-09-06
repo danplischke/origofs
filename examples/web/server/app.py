@@ -205,7 +205,14 @@ class _WsProxy:
 
 # The full origofs workspace API under /fs, attribution driven by `_authn`. Mounted
 # once, at import time, against the proxy — never inside the lifespan.
-app.include_router(build_router(_WsProxy(), authn=_authn), prefix="/fs")
+#
+# `reader=_authn` matters as much as `authn`: without it every read on this router
+# is anonymous, so `Perms.READ` never applies to them and a workspace with read
+# enforcement on refuses them outright. This app already knows who the caller is —
+# the same bearer token drives both — so reads run as that actor and the read
+# grants mean something. Pass `reader=None` only for a deliberately public
+# read surface.
+app.include_router(build_router(_WsProxy(), authn=_authn, reader=_authn), prefix="/fs")
 
 
 @app.get("/api/config")
