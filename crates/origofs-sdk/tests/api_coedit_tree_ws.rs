@@ -292,8 +292,26 @@ async fn the_sweeper_persists_a_tree_room_without_inventing_a_body() {
         .await
         .unwrap();
 
-    // Give the sweeper several ticks with the socket still open.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Wait for the sweeper to persist, with the socket still open. Polled to a
+    // deadline rather than slept for a fixed span: the sweeper is a background
+    // task doing a durable write, so any fixed wait is a bet on how promptly a
+    // loaded machine schedules it — and this one lost that bet on CI while
+    // passing everywhere else. The deadline is long enough to be a real failure
+    // if it expires, and the loop exits as soon as the sidecar lands, so the
+    // usual run is no slower than the sleep it replaces.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        // The directory itself is created by the persist path, so "not there
+        // yet" is the pre-sweep state rather than an error.
+        if ws
+            .ls(origofs_sdk::COEDIT_SIDECAR_DIR)
+            .await
+            .is_ok_and(|entries| !entries.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     // The file was never invented…
     assert!(

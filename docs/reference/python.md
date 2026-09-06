@@ -28,6 +28,12 @@ async def main():
     for span in await ws.blame("/notes/a.txt"):
         print(span["line_start"], span["line_end"], span["actor"]["name"])
 
+    # Who wrote the bytes that are there now is `blame`; when the file changed is
+    # `log_path`. It descends the tree per commit rather than flattening it, so a
+    # large workspace costs no more than a small one.
+    for rev in await ws.log_path("/notes/a.txt", limit=10):
+        print(rev["status"], rev["commit"][:12], rev["message"])
+
 asyncio.run(main())
 ```
 

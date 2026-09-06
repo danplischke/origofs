@@ -180,8 +180,24 @@ enum Cmd {
         #[arg(long)]
         actor: Option<i64>,
     },
-    /// Show commit history (HEAD, first-parent).
-    Log,
+    /// Show commit history (HEAD, first-parent). With a PATH, show only the
+    /// commits that changed that path — `origofs log /src/main.rs`.
+    Log {
+        /// Limit the history to the commits that changed this path. Resolves the
+        /// path per commit by descending the tree, so it costs the same whether
+        /// the repository holds ten files or ten thousand.
+        path: Option<String>,
+        /// Stop after this many revisions. Caps what is returned, not what is
+        /// walked: a path that was never touched still walks the whole history.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
     /// Show working-tree changes relative to HEAD.
     Status,
     /// Compare two refs/commits: changed paths, or one file's line diff with
@@ -433,6 +449,25 @@ enum Cmd {
     /// Show per-line authorship (blame) for a file.
     Blame {
         path: String,
+        /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
+        /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
+        /// unattributed and open, which is what an unenforced workspace does
+        /// anyway.
+        #[arg(long)]
+        actor: Option<i64>,
+    },
+    /// The attributed writes recorded against one file, newest first: who, when,
+    /// which byte range, and the content addresses either side.
+    ///
+    /// Finer than `log` — individual writes, including ones never committed — but
+    /// it records changes rather than preserving them: the content those hashes
+    /// name is not a GC root, so after `origofs gc` a row can name bytes that are
+    /// gone. Unattributed writes (and everything through a mount) record nothing.
+    Edits {
+        path: String,
+        /// Stop after this many ops.
+        #[arg(long)]
+        limit: Option<usize>,
         /// Read as this actor, so `acl_enforce_reads` is applied to the answer.
         /// Falls back to `ORIGOFS_ACTOR`. Optional: unset, the read is
         /// unattributed and open, which is what an unenforced workspace does
@@ -1614,7 +1649,7 @@ async fn main() -> Result<()> {
             author,
             actor,
         } => cmd::history::commit(&ws, message, author, actor).await?,
-        Cmd::Log => cmd::history::log(&ws).await?,
+        Cmd::Log { path, limit, actor } => cmd::history::log(&ws, path, limit, actor).await?,
         Cmd::Status => cmd::history::status(&ws).await?,
         Cmd::Diff {
             from,
@@ -1706,6 +1741,9 @@ async fn main() -> Result<()> {
         Cmd::Acl { cmd } => cmd::attribution::acl(&ws, cmd).await?,
         Cmd::RequireAttribution { setting } => {
             cmd::attribution::require_attribution(&ws, setting).await?
+        }
+        Cmd::Edits { path, limit, actor } => {
+            cmd::attribution::edits(&ws, path, limit, actor).await?
         }
         Cmd::PosixLocks { setting, path } => cmd::admin::posix_locks(&ws, setting, path).await?,
         Cmd::Blame { path, actor } => cmd::attribution::blame(&ws, path, actor).await?,

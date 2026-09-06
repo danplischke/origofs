@@ -1923,28 +1923,29 @@ impl AttributionStore for SqliteMetadataStore {
                 "SELECT id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts
                  FROM edit_op WHERE workspace_id = ?1 AND actor_id = ?2 AND (?3 IS NULL OR session_id = ?3) ORDER BY id",
             )?;
-            let rows = stmt.query_map(params![self.workspace_id, actor_id, session_id], |r| {
-                Ok(EditOp {
-                    id: r.get(0)?,
-                    session_id: r.get(1)?,
-                    actor_id: r.get(2)?,
-                    tool_call_id: r.get(3)?,
-                    ino: r.get(4)?,
-                    path: r.get(5)?,
-                    op: r.get(6)?,
-                    byte_start: r.get(7)?,
-                    byte_len: r.get(8)?,
-                    pre_hash: r.get(9)?,
-                    post_hash: r.get(10)?,
-                    ts: r.get(11)?,
-                })
-            })?;
+            let rows = stmt.query_map(
+                params![self.workspace_id, actor_id, session_id],
+                edit_op_from_row,
+            )?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
             }
             Ok(out)
         })
+    }
+
+    async fn list_edit_ops_for_ino(&self, ino: Ino, limit: Option<usize>) -> Result<Vec<EditOp>> {
+        self.edit_ops_by(EditOpBy::Ino(ino), limit).await
+    }
+
+    async fn list_edit_ops_for_path(
+        &self,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<EditOp>> {
+        let path = path.to_string();
+        self.edit_ops_by(EditOpBy::Path(path), limit).await
     }
 
     async fn set_blob_blame(&self, content: &Hash, runs: &str) -> Result<()> {
@@ -2740,10 +2741,112 @@ fn row_to_suggestion(r: &rusqlite::Row) -> rusqlite::Result<Suggestion> {
     })
 }
 
+/// Which column an op-log lookup keys on. The two have separate indexes (V23)
+/// and separate meanings — see the trait methods.
+enum EditOpBy {
+    Ino(Ino),
+    Path(String),
+}
+
+impl SqliteMetadataStore {
+    /// One op-log query for both keys: same projection, same newest-first order,
+    /// only the predicate differs. Written once so the two cannot drift in the
+    /// column list, which is what makes their results comparable.
+    async fn edit_ops_by(&self, by: EditOpBy, limit: Option<usize>) -> Result<Vec<EditOp>> {
+        blocking_section(move || {
+            let conn = self.lock();
+            // `-1` is SQLite's "no limit", so an absent cap needs no second query.
+            let cap = limit.map_or(-1i64, |n| n as i64);
+            let sql = format!(
+                "SELECT id, session_id, actor_id, tool_call_id, ino, path, op, byte_start, byte_len, pre_hash, post_hash, ts FROM edit_op \
+                 WHERE workspace_id = ?1 AND {} = ?2 ORDER BY id DESC LIMIT ?3",
+                match by {
+                    EditOpBy::Ino(_) => "ino",
+                    EditOpBy::Path(_) => "path",
+                }
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let key: Box<dyn rusqlite::ToSql> = match by {
+                EditOpBy::Ino(i) => Box::new(i),
+                EditOpBy::Path(p) => Box::new(p),
+            };
+            let rows = stmt.query_map(params![self.workspace_id, key, cap], edit_op_from_row)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// One `edit_op` row. Shared so every op-log query decodes the same projection in
+/// the same order — a column list that drifts between two queries is a silently
+/// wrong field, not a compile error.
+fn edit_op_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EditOp> {
+    Ok(EditOp {
+        id: r.get(0)?,
+        session_id: r.get(1)?,
+        actor_id: r.get(2)?,
+        tool_call_id: r.get(3)?,
+        ino: r.get(4)?,
+        path: r.get(5)?,
+        op: r.get(6)?,
+        byte_start: r.get(7)?,
+        byte_len: r.get(8)?,
+        pre_hash: r.get(9)?,
+        post_hash: r.get(10)?,
+        ts: r.get(11)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{FileKind, InodeInit};
+
+    /// V23 added two indexes so the op-log can be read *about a file*. An index
+    /// the planner declines to use is an index that costs writes and buys
+    /// nothing, and nothing about the query text says which way it went — so ask
+    /// the planner directly. Both keys, because they are separate indexes.
+    #[tokio::test]
+    async fn the_op_log_queries_use_the_v23_indexes() {
+        let store = SqliteMetadataStore::open_in_memory().unwrap();
+        store.init().await.unwrap();
+        let plan = |sql: &str| -> String {
+            let conn = store.lock();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows.join(" | ")
+        };
+
+        let by_ino = plan(
+            "SELECT id FROM edit_op WHERE workspace_id = 1 AND ino = 2 ORDER BY id DESC LIMIT 5",
+        );
+        assert!(
+            by_ino.contains("idx_edit_op_ino"),
+            "the inode-keyed op-log read is not using its index: {by_ino}"
+        );
+        let by_path = plan(
+            "SELECT id FROM edit_op WHERE workspace_id = 1 AND path = '/a' ORDER BY id DESC LIMIT 5",
+        );
+        assert!(
+            by_path.contains("idx_edit_op_path"),
+            "the path-keyed op-log read is not using its index: {by_path}"
+        );
+        // `id` trails both indexes so the ordering comes from the index too. A
+        // plan that sorts has read every matching row first, which is most of what
+        // the index was for on a file with a long history.
+        assert!(
+            !by_ino.contains("USE TEMP B-TREE") && !by_path.contains("USE TEMP B-TREE"),
+            "newest-first is being sorted rather than read in index order:\n  \
+             {by_ino}\n  {by_path}"
+        );
+    }
 
     // M4: a panic while another operation holds the lock must not brick the
     // store for the rest of the process. `parking_lot::Mutex` does not poison —

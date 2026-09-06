@@ -316,6 +316,28 @@ pub const MIGRATIONS: &[Migration] = &[
         sqlite: V22,
         postgres: V22,
     },
+    // V23 -- the two indexes that make the op-log answerable *about a file*.
+    //
+    // `edit_op` has been indexed by actor and by session since V4, which are the
+    // axes `list_edit_ops` takes and the ones `revert_session` walks. Nothing
+    // indexed the columns that identify the thing edited, so "what happened to
+    // this file" was a full scan of every attributed write the workspace had ever
+    // recorded -- the one table guaranteed to grow forever.
+    //
+    // Both, because they answer different questions and neither subsumes the
+    // other. `ino` follows a file across renames (a rename records the
+    // destination path against the same inode, and inode ids are `AUTOINCREMENT` /
+    // `IDENTITY`, so they are never reused and the key stays unambiguous for the
+    // life of the store). `path` is the only handle left once the inode is gone,
+    // which is exactly when the delete is the row somebody is looking for.
+    //
+    // `id` trails each one so the index also orders the result: the op-log is
+    // read newest-first and `id` is its append order.
+    Migration {
+        version: 23,
+        sqlite: V23,
+        postgres: V23,
+    },
 ];
 
 /// The highest migration version this build knows about — the schema version a
@@ -916,6 +938,11 @@ CREATE TABLE IF NOT EXISTS coedit_undo_claim(
 );
 CREATE INDEX IF NOT EXISTS idx_coedit_undo_claim_holder ON coedit_undo_claim(holder);
 CREATE INDEX IF NOT EXISTS idx_coedit_undo_claim_expiry ON coedit_undo_claim(expires_at);
+";
+
+const V23: &str = "
+CREATE INDEX IF NOT EXISTS idx_edit_op_path ON edit_op(workspace_id, path, id);
+CREATE INDEX IF NOT EXISTS idx_edit_op_ino  ON edit_op(workspace_id, ino, id);
 ";
 
 #[cfg(test)]

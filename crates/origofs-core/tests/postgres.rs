@@ -1176,3 +1176,71 @@ async fn postgres_suggestion_replace_contract_matches_sqlite() {
         .unwrap();
     assert_eq!(status(other).await, SuggestionStatus::Superseded);
 }
+
+/// The op-log read *about a file* (V23), on the backend whose SQL is written
+/// separately from SQLite's.
+///
+/// Worth its own test because the two implementations differ in exactly the
+/// places a shared behavioural test would not reach: `$1` against `?1`, and an
+/// absent cap that becomes `NULL` here where SQLite uses `-1`. `LIMIT NULL` means
+/// "no limit" in Postgres — a belief until something asserts it, and a silent
+/// truncation to zero rows if it were wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_edit_ops_at_matches_the_sqlite_contract() {
+    let Some(dsn) = dsn() else {
+        eprintln!("skipping postgres_edit_ops_at: ORIGOFS_PG_TEST_URL unset");
+        return;
+    };
+    let _guard = pg_lock().lock().await;
+    reset(&dsn).await;
+
+    let meta = PostgresMetadataStore::connect(&dsn).await.unwrap();
+    meta.init().await.unwrap();
+    let fs = Fs::new(Arc::new(meta), Arc::new(MemStore::new()));
+    fs.init().await.unwrap();
+    let actor = fs.create_agent("agent", "opus", None).await.unwrap();
+    let ctx = WriteCtx::actor(actor);
+
+    fs.write_as(ctx, "/a.txt", b"one\n").await.unwrap();
+    fs.write_as(ctx, "/a.txt", b"two\n").await.unwrap();
+    fs.rename_as(ctx, "/a.txt", "/b.txt").await.unwrap();
+    fs.write_as(ctx, "/b.txt", b"three\n").await.unwrap();
+
+    // No cap: `LIMIT NULL`. All four rows, newest first, including the two
+    // recorded under the old name — the inode key following the rename.
+    let all = fs.edit_ops_at("/b.txt", None).await.unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|o| (o.op.as_str(), o.path.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("write", "/b.txt"),
+            ("rename", "/b.txt"),
+            ("write", "/a.txt"),
+            ("write", "/a.txt"),
+        ]
+    );
+
+    // A cap takes the newest, not the oldest.
+    let capped = fs.edit_ops_at("/b.txt", Some(2)).await.unwrap();
+    assert_eq!(capped.len(), 2);
+    assert_eq!(capped[0].id, all[0].id);
+    assert_eq!(capped[1].id, all[1].id);
+
+    // The path-keyed fallback, for an inode that no longer exists.
+    fs.write_as(ctx, "/gone.txt", b"x\n").await.unwrap();
+    fs.remove_or_propose(ctx, "/gone.txt", None, None)
+        .await
+        .unwrap();
+    let gone = fs.edit_ops_at("/gone.txt", None).await.unwrap();
+    assert_eq!(
+        gone.iter().map(|o| o.op.as_str()).collect::<Vec<_>>(),
+        ["remove", "write"]
+    );
+    assert!(
+        gone[0].pre_hash.is_some(),
+        "a delete names what it destroyed"
+    );
+
+    assert!(fs.edit_ops_at("/never.txt", None).await.unwrap().is_empty());
+}

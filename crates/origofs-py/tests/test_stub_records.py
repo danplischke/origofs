@@ -156,6 +156,7 @@ async def _collect() -> dict:
         "StatResult": await ws.stat("/docs/notes.txt"),
         "DirEntry": (await ws.ls("/docs"))[0],
         "CommitRecord": (await ws.log())[0],
+        "PathRevision": (await ws.log_path("/docs/notes.txt"))[0],
         "DiffEntry": (await ws.status())[0],
         "BranchRecord": (await ws.branches())[0],
         "EventRecord": (await ws.watch(0))[0],

@@ -218,6 +218,42 @@ pub async fn revert_session(
     Ok(())
 }
 
+/// The op-log read *about a file*: every attributed write, newest first.
+///
+/// Sits beside `blame` because it answers the same question at a different
+/// granularity — who touched these bytes, per write rather than per line.
+pub async fn edits(
+    ws: &Workspace,
+    path: String,
+    limit: Option<usize>,
+    actor: Option<i64>,
+) -> Result<()> {
+    let ops = match read_ctx(actor)? {
+        Some(ctx) => ws.edit_ops_at_as(ctx, &path, limit).await?,
+        None => ws.edit_ops_at(&path, limit).await?,
+    };
+    if ops.is_empty() {
+        println!("{path}: no attributed writes recorded");
+    }
+    for o in ops {
+        let who = ws
+            .get_actor(o.actor_id)
+            .await?
+            .map(|a| a.display_name)
+            .unwrap_or_else(|| format!("actor:{}", o.actor_id));
+        // The recorded path, not the one asked about: for a file that has been
+        // renamed they differ, and the row's own path is what says when that
+        // happened.
+        let range = match o.op.as_str() {
+            "write" => format!(" [{}..{}]", o.byte_start, o.byte_start + o.byte_len),
+            _ => String::new(),
+        };
+        println!("{} {:<6} {who}{range} {}", o.ts, o.op, o.path);
+    }
+
+    Ok(())
+}
+
 pub async fn blame(ws: &Workspace, path: String, actor: Option<i64>) -> Result<()> {
     let ranges = match read_ctx(actor)? {
         Some(ctx) => ws.blame_as(ctx, &path).await?,

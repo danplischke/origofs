@@ -1083,6 +1083,47 @@ impl<M: MetadataStore, C: ContentStore> Fs<M, C> {
         self.diff_file(from, to, path).await
     }
 
+    /// [`log_path`](Fs::log_path), checked against [`Perms::READ`] at `path`.
+    ///
+    /// A per-path read like `blame_as` and `diff_file_as`: the history of a file
+    /// is the set of commits that changed it and when, which is a description of
+    /// that file's content over time rather than a different subject. The check
+    /// runs before the walk, so a refusal cannot be told apart from a path that
+    /// was never committed — the same reason every other read check runs before
+    /// its lookup.
+    ///
+    /// Note the check is at `path` alone. `log_path` never reads a file body, so
+    /// there is nothing else it could disclose; the per-revision patch goes
+    /// through [`diff_file_as`](Self::diff_file_as), which checks again.
+    pub async fn log_path_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<crate::version::PathRevision>> {
+        self.ensure_may_read_at(ctx, "read the history of", path)
+            .await?;
+        self.log_path(path, limit).await
+    }
+
+    /// [`edit_ops_at`](Fs::edit_ops_at), checked against [`Perms::READ`] at
+    /// `path`.
+    ///
+    /// The op-log for a file names who changed which byte ranges and when, which
+    /// is more about its content than `blame` is, not less. Checked before the
+    /// lookup for the usual reason — the resolve that picks the inode key would
+    /// otherwise answer "does this path exist" for an actor that may not ask.
+    pub async fn edit_ops_at_as(
+        &self,
+        ctx: crate::WriteCtx,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<crate::attribution::EditOp>> {
+        self.ensure_may_read_at(ctx, "read the edit log of", path)
+            .await?;
+        self.edit_ops_at(path, limit).await
+    }
+
     /// [`presence`](Fs::presence), with sessions at unreadable paths removed.
     ///
     /// Presence is a live map of who is editing what, so under enforcement an
