@@ -52,7 +52,7 @@ serde_json      = { version = "1.0.151", optional = true }  # api, mcp
 anyhow          = { version = "1.0.104", optional = true }  # sandbox
 async-recursion = { version = "1.1.1",   optional = true }  # git
 flate2          = { version = "1.0.35",  optional = true }  # git
-sha1            = { version = "0.10.6",  optional = true }  # git
+sha1            = { version = "0.11.0",  optional = true }  # git
 sha2            = { version = "0.10.9",  optional = true }  # git
 hex             = { version = "0.4.3",   optional = true }  # git
 # `limit` for the concurrency cap that provides backpressure; `timeout` (on
@@ -138,7 +138,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "s
 # tampered object, a deep history) that the real `git` binary would refuse to
 # produce — so the importer's own bounds can be tested against them.
 flate2 = "1.0.35"
-sha1 = "0.10.6"
+sha1 = "0.11.0"
 hex = "0.4.3"
 
 # The NFS surface test (nfs.rs) drives nfsserve types directly; Unix-only.
