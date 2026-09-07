@@ -159,7 +159,7 @@ async fn alice_can_narrow_her_agent_within_her_subtree() {
         fs.write_or_propose(ctx, "/proj/f.md", b"x", None, None)
             .await
             .unwrap(),
-        origofs_core::WriteOutcome::Proposed(_)
+        origofs_core::WriteOutcome::Proposed { .. }
     ));
     assert!(
         fs.grant_as(ctx, agent, "/proj", Perms::WRITE)

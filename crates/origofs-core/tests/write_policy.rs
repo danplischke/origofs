@@ -106,7 +106,7 @@ async fn a_propose_only_removal_is_queued_not_refused() {
         .await
         .unwrap();
     let id = match outcome {
-        WriteOutcome::Proposed(id) => id,
+        WriteOutcome::Proposed { id, .. } => id,
         WriteOutcome::Wrote => panic!("a propose-only actor must not delete directly"),
     };
     assert_eq!(&fs.read("/doomed.txt").await.unwrap()[..], b"still here");

@@ -496,6 +496,19 @@ def _under(root: str, path: Optional[str]) -> bool:
     return path == root or path.startswith(root + "/")
 
 
+def _proposed(p: str, outcome: Any) -> dict:
+    """The response for a write or delete the caller's policy queued for review.
+
+    ``pending_siblings`` is the actor's *other* pending drafts at the path, so a
+    client learns it stacked a proposal rather than revising one from the call
+    that did it (#164); ``POST /suggestions/{id}/supersede`` retires one. Read
+    defensively: ``WorkspaceProtocol`` types the outcome as ``Any``, and a host's
+    double may predate the field.
+    """
+    siblings = list(getattr(outcome, "pending_siblings", None) or ())
+    return {"path": p, "proposed": outcome.suggestion_id, "pending_siblings": siblings}
+
+
 def _scoped(root: str, path: str) -> str:
     """Resolve a caller-supplied path inside `root`.
 
@@ -1573,7 +1586,7 @@ def build_router(
             outcome = await _run(ws.write_or_propose(ctx, p, body, None))
             if outcome.wrote:
                 return {"path": p, "written": size}
-            return {"path": p, "proposed": outcome.suggestion_id}
+            return _proposed(p, outcome)
         finally:
             if spill is not None and not spill.closed:
                 spill.close()
@@ -1597,7 +1610,7 @@ def build_router(
         outcome = await _run(ws.remove_or_propose(ctx, p, f"delete {p}"))
         if outcome.wrote:
             return {"removed": p}
-        return {"path": p, "proposed": outcome.suggestion_id}
+        return _proposed(p, outcome)
 
     # --- directories --------------------------------------------------------
 

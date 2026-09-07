@@ -644,6 +644,13 @@ class WriteOutcome:
     def suggestion_id(self) -> Optional[int]:
         """The suggestion id if the edit was queued for review; ``None`` if written."""
         ...
+    @property
+    def pending_siblings(self) -> list[int]:
+        """When queued: this actor's *other* pending proposals at the path, newest
+        first (#164). Non-empty means the edit was stacked beside them rather than
+        revising one via ``replaces``; each is the actor's own to retire with
+        ``supersede_suggestion``. Empty when written directly."""
+        ...
 
 class S3Config:
     """Connection settings for an S3-compatible object store (S3/R2/MinIO, or GCS

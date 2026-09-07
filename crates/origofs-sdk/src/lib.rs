@@ -1825,6 +1825,13 @@ impl Workspace {
     /// `Propose` actor's edit is queued as a suggestion for review
     /// ([`WriteOutcome::Proposed`]). The entry point an untrusted surface routes
     /// writes through so a propose-only actor can't land an unreviewed edit.
+    ///
+    /// A queued edit's outcome also names this actor's **other** pending drafts at
+    /// the path (`pending_siblings`, #164): non-empty means the proposal was
+    /// stacked beside them rather than revising one via `replaces`, and each id is
+    /// one the actor may retire with
+    /// [`supersede_suggestion`](Self::supersede_suggestion) — so a caller learns it
+    /// stacked from the call that did it, not from a later reject.
     pub async fn write_or_propose(
         &self,
         ctx: WriteCtx,

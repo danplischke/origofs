@@ -829,6 +829,38 @@ fn write_policy_propose_routes_cli_writes_into_the_review_queue() {
     assert_eq!(ws.run(&["read", "/f.txt"]).stdout, "agent version\n");
 }
 
+/// A second propose-only write to the same path is stacked beside the first,
+/// and the CLI says so (#164, item 4): the id to retire, and the subcommand that
+/// does it. Silent on a first draft, and silent again once the abandoned one is
+/// withdrawn.
+#[test]
+fn a_stacked_proposal_is_reported_with_its_sibling() {
+    let ws = Ws::init();
+    let alice = ws.actor(&["alice"]);
+    let agent = ws.actor(&["claude", "--agent", "--model", "m"]);
+    ws.write_as("/f.txt", alice, "original\n")
+        .expect_ok("alice write");
+    ws.run(&["write-policy", &agent.to_string(), "propose"])
+        .expect_ok("write-policy");
+
+    ws.write_as("/f.txt", agent, "v1\n")
+        .expect_ok("first draft")
+        .stdout_has("queued suggestion #1")
+        .stdout_lacks("stacked");
+    ws.write_as("/f.txt", agent, "v2\n")
+        .expect_ok("second draft")
+        .stdout_has("queued suggestion #2")
+        .stdout_has("also has #1 pending")
+        .stdout_has("origofs supersede");
+
+    ws.run(&["supersede", "1", "--actor", &agent.to_string()])
+        .expect_ok("withdraw the abandoned draft");
+    ws.write_as("/f.txt", agent, "v3\n")
+        .expect_ok("third draft")
+        .stdout_has("also has #2 pending")
+        .stdout_lacks("#1 pending");
+}
+
 /// `write-policy` is actor-agnostic and takes its policy as a free string, so a
 /// typo must be rejected loudly. Silently ignoring `propse` would leave an agent
 /// the operator believed was gated writing directly forever.

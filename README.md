@@ -247,6 +247,15 @@ Every propose call takes it — `suggest`, `suggest_delete`, `write_or_propose`,
 `remove_or_propose`, and the CRDT `suggest_coedit` / `suggest_coedit_tree` pair —
 so revising is the same one-call shape whichever kind of proposal you make.
 
+origofs will not decide for you which of the two you meant, but it does tell you
+the question came up: when a propose-only actor's `write` or `rm` is queued, the
+outcome names that actor's **other** pending drafts on the path —
+`pending_siblings` on `WriteOutcome` (Rust and Python) and in the `PUT`/`DELETE
+/v1/files` response, spelled out in words by the CLI and the MCP tool result.
+Non-empty means the proposal was stacked rather than revised, and each id is the
+actor's own to retire — so an agent learns it stacked from the call that did it,
+with the id in hand, rather than from a reviewer's later reject.
+
 `supersede` is the standalone form, for retiring a draft with nothing taking its
 place. It is distinct from `reject`, which records that a *reviewer* looked
 and declined; an author may always withdraw their own, while retiring somebody

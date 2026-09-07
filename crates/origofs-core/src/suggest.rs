@@ -31,12 +31,29 @@ use crate::types::Hash;
 // compile error at every call site. `non_exhaustive` would force a wildcard arm
 // that silently swallows it instead — the opposite of the intent. Adding a
 // variant here is a breaking change on purpose.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteOutcome {
     /// The actor writes directly; the edit landed in the working tree.
     Wrote,
-    /// The actor is propose-only; the edit was queued as this suggestion for review.
-    Proposed(i64),
+    /// The actor is propose-only; the edit was queued as suggestion `id` for review.
+    Proposed {
+        id: i64,
+        /// This actor's **other** pending proposals at the path, newest first —
+        /// the drafts the new one now sits beside (#164).
+        ///
+        /// Revising is opt-in (`replaces`), because origofs cannot tell a revision
+        /// from an alternative a reviewer is meant to choose between. What it
+        /// *can* tell is that the question has arisen, and this is where it says
+        /// so: non-empty means a second proposal was stacked rather than revised,
+        /// and each id is one the caller may retire — `replaces` on the next
+        /// propose, or [`Fs::supersede_suggestion`] now — without a further
+        /// round trip to find it. Empty after a `replaces` that retired the only
+        /// earlier draft. Only this actor's own drafts are named: those are the
+        /// ones it may dispose of without holding `WRITE`, and naming another
+        /// actor's would disclose proposals at a path to a caller the
+        /// id-addressed reads answer *not found* for.
+        pending_siblings: Vec<i64>,
+    },
 }
 
 /// What a suggestion proposes, and therefore how it is applied (issue #75 §3.2).
@@ -292,7 +309,11 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             }
             p if p.contains(crate::acl::Perms::PROPOSE) => {
                 let id = self.suggest_delete(ctx, path, summary, replaces).await?;
-                Ok(WriteOutcome::Proposed(id))
+                let pending_siblings = self.pending_drafts_beside(ctx.actor, path, id).await?;
+                Ok(WriteOutcome::Proposed {
+                    id,
+                    pending_siblings,
+                })
             }
             p => Err(OrigoFSError::Denied(format!(
                 "actor {} may not remove or propose removal at {path} (effective \
@@ -341,7 +362,11 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
             }
             p if p.contains(crate::acl::Perms::PROPOSE) => {
                 let id = self.suggest(ctx, path, data, summary, replaces).await?;
-                Ok(WriteOutcome::Proposed(id))
+                let pending_siblings = self.pending_drafts_beside(ctx.actor, path, id).await?;
+                Ok(WriteOutcome::Proposed {
+                    id,
+                    pending_siblings,
+                })
             }
             // Neither write nor propose. Only reachable via an explicit grant of
             // `Perms::NONE` or deny-by-default, since the `write_policy` fallback
@@ -354,6 +379,22 @@ impl<M: MetadataStore, C: ContentStore> crate::engine::Fs<M, C> {
                 ctx.actor
             ))),
         }
+    }
+
+    /// `actor`'s pending proposals at `path` other than `except`, newest first —
+    /// what [`WriteOutcome::Proposed`] reports as `pending_siblings`.
+    ///
+    /// Read *after* the create, so a draft `replaces` just retired is not in it
+    /// and a non-empty answer means exactly "still pending beside yours".
+    async fn pending_drafts_beside(&self, actor: i64, path: &str, except: i64) -> Result<Vec<i64>> {
+        Ok(self
+            .meta
+            .list_suggestions(Some(SuggestionStatus::Pending), Some(path))
+            .await?
+            .into_iter()
+            .filter(|s| s.actor_id == actor && s.id != except)
+            .map(|s| s.id)
+            .collect())
     }
 
     /// Propose an edit to `path` without applying it. The bytes are stored in
