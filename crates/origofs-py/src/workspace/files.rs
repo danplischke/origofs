@@ -202,9 +202,12 @@ impl Workspace {
                 .write_or_propose(c, &path, &data, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
-            let (wrote, suggestion_id) = match outcome {
-                CoreWriteOutcome::Wrote => (true, None),
-                CoreWriteOutcome::Proposed(id) => (false, Some(id)),
+            let (wrote, suggestion_id, pending_siblings) = match outcome {
+                CoreWriteOutcome::Wrote => (true, None, Vec::new()),
+                CoreWriteOutcome::Proposed {
+                    id,
+                    pending_siblings,
+                } => (false, Some(id), pending_siblings),
             };
             Python::attach(|py| {
                 Py::new(
@@ -212,6 +215,7 @@ impl Workspace {
                     WriteOutcome {
                         wrote,
                         suggestion_id,
+                        pending_siblings,
                     },
                 )
             })
@@ -369,9 +373,12 @@ impl Workspace {
                 .remove_or_propose(c, &path, summary.as_deref(), replaces)
                 .await
                 .map_err(to_pyerr)?;
-            let (wrote, suggestion_id) = match outcome {
-                CoreWriteOutcome::Wrote => (true, None),
-                CoreWriteOutcome::Proposed(id) => (false, Some(id)),
+            let (wrote, suggestion_id, pending_siblings) = match outcome {
+                CoreWriteOutcome::Wrote => (true, None, Vec::new()),
+                CoreWriteOutcome::Proposed {
+                    id,
+                    pending_siblings,
+                } => (false, Some(id), pending_siblings),
             };
             Python::attach(|py| {
                 Py::new(
@@ -379,6 +386,7 @@ impl Workspace {
                     WriteOutcome {
                         wrote,
                         suggestion_id,
+                        pending_siblings,
                     },
                 )
             })

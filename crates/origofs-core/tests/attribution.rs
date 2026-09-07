@@ -720,7 +720,7 @@ async fn write_policy_gates_direct_writes_into_suggestions() {
         .await
         .unwrap();
     let sid = match out {
-        WriteOutcome::Proposed(id) => id,
+        WriteOutcome::Proposed { id, .. } => id,
         WriteOutcome::Wrote => panic!("a propose-only actor must not write directly"),
     };
     assert_eq!(&fs.read("/doc").await.unwrap()[..], b"from alice"); // unchanged

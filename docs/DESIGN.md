@@ -807,7 +807,12 @@ each write is, and a storage engine that agents point at untrusted code and untr
   `supersede_suggestion` is the standalone form. It is opt-in because two drafts a reviewer is meant to choose
   between is a real workflow that origofs cannot distinguish from a revision, and retiring one automatically
   would discard an alternative nobody asked it to. The retirement is ordered **before** the create, so a caller
-  can rely on "if this returned, the old one is gone"; the reverse window costs nothing recoverable.
+  can rely on "if this returned, the old one is gone"; the reverse window costs nothing recoverable. What origofs
+  *can* tell is that the question arose: a queued `write_or_propose`/`remove_or_propose` reports the actor's other
+  pending drafts at the path as `pending_siblings`, so the caller learns it stacked from the call that did it and
+  holds the id to retire. Only the actor's own drafts are named — those are the ones it may dispose of without
+  `WRITE`, and naming another actor's would disclose proposals at a path to a caller the id-addressed reads
+  answer *not found* for.
 - **Encryption key & nonce discipline:** convergent encryption keeps dedup (identical plaintext → identical
   ciphertext, which the shared content address already revealed — a documented, accepted trade-off), but the AEAD
   fails closed everywhere else: `put_keyed` refuses any non-content-addressed key, so a mutable-value keyed store

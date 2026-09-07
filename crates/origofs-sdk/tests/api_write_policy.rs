@@ -75,6 +75,50 @@ async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, body)
 }
 
+fn put(path: &str, token: &str, body: &[u8]) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+fn delete(path: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// A queued `PUT`/`DELETE` names the actor's other pending drafts at the path
+/// (#164, item 4), so a client learns it stacked a proposal rather than revising
+/// one from the response to the call that did it — with the id to retire via
+/// `POST /suggestions/{id}/supersede`. A landed write carries no such key.
+#[tokio::test]
+async fn a_queued_write_reports_its_pending_siblings() {
+    let f = fixture().await;
+    let (status, first) = send(&f.app, put("/v1/files/committed.txt", T_PROPOSE, b"v1")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["pending_siblings"], json!([]), "{first}");
+    let v1 = first["proposed"].as_i64().unwrap();
+
+    let (status, second) = send(&f.app, put("/v1/files/committed.txt", T_PROPOSE, b"v2")).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["pending_siblings"], json!([v1]), "{second}");
+    let v2 = second["proposed"].as_i64().unwrap();
+
+    let (status, third) = send(&f.app, delete("/v1/files/committed.txt", T_PROPOSE)).await;
+    assert_eq!(status, StatusCode::OK, "{third}");
+    assert_eq!(third["pending_siblings"], json!([v2, v1]), "{third}");
+
+    let (status, landed) = send(&f.app, put("/v1/files/committed.txt", T_TRUSTED, b"v3")).await;
+    assert_eq!(status, StatusCode::OK, "{landed}");
+    assert!(landed.get("pending_siblings").is_none(), "{landed}");
+}
+
 /// A propose-only actor cannot discard the workspace by switching branches.
 #[tokio::test]
 async fn checkout_is_refused_for_a_propose_only_actor() {

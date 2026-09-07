@@ -653,6 +653,93 @@ async fn a_queued_write_creates_no_directories() {
     );
 }
 
+/// A second proposal on a path names the first one (#164, item 4).
+///
+/// Revising is opt-in — `replaces` — because origofs cannot tell a revision from
+/// an alternative. An agent reads tool results, not docs, so the result of the
+/// stacking call is where it has to learn that it stacked, and which id to
+/// retire: without this, a propose-only agent told "revise" calls `origofs_write`
+/// again, the earlier draft stays pending, and the reviewer who rejects the
+/// revision can still accept the draft the agent abandoned.
+#[tokio::test]
+async fn a_stacked_proposal_names_the_draft_it_sits_beside() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let ws = Workspace::open_local(dir.path().join("meta.db"), dir.path().join("cas"))
+        .await
+        .unwrap();
+    let human = ws.create_human("h", None).await.unwrap();
+    ws.write_as(WriteCtx::actor(human), "/n.md", b"base\n")
+        .await
+        .unwrap();
+    let agent = ws.create_agent("claude", "opus", None).await.unwrap();
+    let session = ws.create_session(agent, Some("mcp")).await.unwrap();
+    ws.set_write_policy(agent, WritePolicy::Propose)
+        .await
+        .unwrap();
+    let s = McpServer::new(ws.clone(), agent, session);
+
+    let first = s
+        .handle(call(
+            "origofs_write",
+            json!({"path":"/n.md","content":"v1"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first["result"]["isError"], false, "{}", text(&first));
+    assert!(
+        !text(&first).contains("stacked"),
+        "a first draft sits beside nothing: {}",
+        text(&first)
+    );
+    let pending = |ws: Workspace| async move {
+        ws.list_suggestions(Some(SuggestionStatus::Pending), Some("/n.md"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>()
+    };
+    let v1 = pending(ws.clone()).await[0];
+
+    let second = s
+        .handle(call(
+            "origofs_write",
+            json!({"path":"/n.md","content":"v2"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second["result"]["isError"], false, "{}", text(&second));
+    let t = text(&second);
+    assert!(
+        t.contains(&format!("#{v1}")) && t.contains("origofs_supersede"),
+        "the agent must be told which draft it stacked beside and how to retire it: {t}"
+    );
+
+    // And once it does what the note says, the next write is a clean revision.
+    let sup = s
+        .handle(call("origofs_supersede", json!({"id": v1})))
+        .await
+        .unwrap();
+    assert_eq!(sup["result"]["isError"], false, "{}", text(&sup));
+    let third = s
+        .handle(call(
+            "origofs_edit",
+            json!({"path":"/n.md","old":"base","new":"v3"}),
+        ))
+        .await
+        .unwrap();
+    let t = text(&third);
+    // `v2` is still pending — the agent superseded `v1`, not `v2` — so the edit
+    // reports that one and only that one.
+    let still = pending(ws.clone()).await;
+    assert_eq!(still.len(), 2, "{still:?}");
+    let v2 = *still.iter().find(|&&id| id != v1).unwrap();
+    assert!(
+        t.contains(&format!("#{v2}")) && !t.contains(&format!("#{v1}")),
+        "{t}"
+    );
+}
+
 /// The same path works for a trusted agent: the parent is created, attributed.
 #[tokio::test]
 async fn a_direct_agent_creates_parents_attributed() {

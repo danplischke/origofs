@@ -95,6 +95,40 @@ async def test_write_or_propose_carries_replaces():
     assert await _status(ws, second.suggestion_id) == "pending"
 
 
+
+@asyncio_test
+async def test_a_stacked_proposal_names_the_drafts_it_sits_beside():
+    """Item 4 of the issue: the propose call reports what it was stacked beside,
+    so a caller can tell it should have said ``replaces`` -- and has the id to
+    retire -- without a second round trip."""
+    ws, h, a = await _fixture()
+    other = await ws.create_agent("b", "opus", None)
+    await ws.set_write_policy(other, "propose")
+    b = origofs.WriteCtx.actor(other)
+
+    first = await ws.write_or_propose(a, "/n.md", b"v1\n", None)
+    assert first.pending_siblings == []
+    # Another actor's draft is not this one's to retire, so it is not offered.
+    await ws.suggest(b, "/n.md", b"theirs\n", None)
+
+    second = await ws.write_or_propose(a, "/n.md", b"v2\n", None)
+    assert second.pending_siblings == [first.suggestion_id]
+    assert f"#{first.suggestion_id}" in repr(second)
+
+    # A revision retires what it names and nothing else; the abandoned first
+    # draft is still there, and still reported.
+    third = await ws.remove_or_propose(a, "/n.md", None, replaces=second.suggestion_id)
+    assert third.pending_siblings == [first.suggestion_id]
+    await ws.supersede_suggestion(first.suggestion_id, a)
+    fourth = await ws.write_or_propose(
+        a, "/n.md", b"v4\n", None, replaces=third.suggestion_id
+    )
+    assert fourth.pending_siblings == []
+    # A direct write has nothing to report.
+    landed = await ws.write_or_propose(h, "/n.md", b"landed\n", None)
+    assert landed.wrote and landed.pending_siblings == []
+
+
 _LOOP = asyncio.new_event_loop()
 
 
@@ -206,3 +240,19 @@ def test_a_settled_suggestion_is_409_over_http():
         assert r.status_code == 409, r.text
         assert tc.post(f"/suggestions/{sid}/reject?token=h").status_code == 409
         assert tc.post(f"/suggestions/{sid}/supersede?token=a").status_code == 409
+
+
+def test_a_queued_put_reports_its_pending_siblings_over_http():
+    app, ws, h = _app()
+    _run(lambda: ws.write_as(h, "/n.md", b"base\n"))
+    with TestClient(app) as tc:
+        first = tc.put("/files/n.md?token=a", content=b"v1\n").json()
+        assert first["pending_siblings"] == [], first
+        second = tc.put("/files/n.md?token=a", content=b"v2\n").json()
+        assert second["pending_siblings"] == [first["proposed"]], second
+        gone = tc.delete("/files/n.md?token=a").json()
+        assert gone["pending_siblings"] == [second["proposed"], first["proposed"]], gone
+        # A landed write says nothing about drafts: the key belongs to the
+        # queued shape only.
+        landed = tc.put("/files/n.md?token=h", content=b"landed\n").json()
+        assert "pending_siblings" not in landed, landed

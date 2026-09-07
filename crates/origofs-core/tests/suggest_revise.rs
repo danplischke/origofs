@@ -255,7 +255,7 @@ async fn write_or_propose_and_remove_or_propose_carry_replaces() {
     let (h, a) = (WriteCtx::actor(human), WriteCtx::actor(agent));
     fs.write_as(h, "/n.md", b"base\n").await.unwrap();
 
-    let WriteOutcome::Proposed(v1) = fs
+    let WriteOutcome::Proposed { id: v1, .. } = fs
         .write_or_propose(a, "/n.md", b"v1\n", None, None)
         .await
         .unwrap()
@@ -264,7 +264,7 @@ async fn write_or_propose_and_remove_or_propose_carry_replaces() {
     };
     // Revising the edit into a proposed *deletion* is still a revision of the same
     // intent about the same path.
-    let WriteOutcome::Proposed(v2) = fs
+    let WriteOutcome::Proposed { id: v2, .. } = fs
         .remove_or_propose(a, "/n.md", None, Some(v1))
         .await
         .unwrap()
@@ -385,4 +385,85 @@ async fn a_settled_suggestion_reports_a_conflict_on_every_resolve_path() {
         assert!(err.is_conflict(), "so every surface maps it to 409");
         assert!(!err.retryable(), "terminal: read the row, do not replay");
     }
+}
+
+/// The propose call **names the drafts it was stacked beside** (#164, the
+/// issue's item 4). Revising is opt-in because origofs cannot tell a revision
+/// from an alternative; what it can tell is that the question has come up, and
+/// a caller that finds out from the outcome can retire the draft it abandoned
+/// without a second round trip — or without having kept the id at all.
+#[tokio::test]
+async fn a_stacked_proposal_names_the_drafts_it_sits_beside() {
+    use origofs_core::{WriteOutcome, WritePolicy};
+    let fs = fixture().await;
+    let human = fs.create_human("h", None).await.unwrap();
+    let agent = fs.create_agent("a", "m", Some(human)).await.unwrap();
+    let other = fs.create_agent("b", "m", Some(human)).await.unwrap();
+    for actor in [agent, other] {
+        fs.set_write_policy(actor, WritePolicy::Propose)
+            .await
+            .unwrap();
+    }
+    let (h, a, b) = (
+        WriteCtx::actor(human),
+        WriteCtx::actor(agent),
+        WriteCtx::actor(other),
+    );
+    fs.write_as(h, "/n.md", b"base\n").await.unwrap();
+
+    let proposed = |o: WriteOutcome| match o {
+        WriteOutcome::Proposed {
+            id,
+            pending_siblings,
+        } => (id, pending_siblings),
+        WriteOutcome::Wrote => panic!("a propose-only actor must propose"),
+    };
+
+    // A first draft sits beside nothing.
+    let (v1, beside) = proposed(
+        fs.write_or_propose(a, "/n.md", b"v1\n", None, None)
+            .await
+            .unwrap(),
+    );
+    assert!(beside.is_empty(), "{beside:?}");
+
+    // Somebody else's draft on the same path is not this actor's to retire, so
+    // it is not offered as something to retire.
+    fs.suggest(b, "/n.md", b"theirs\n", None, None)
+        .await
+        .unwrap();
+
+    // Stacking without `replaces` is legal, and reported.
+    let (v2, beside) = proposed(
+        fs.write_or_propose(a, "/n.md", b"v2\n", None, None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(beside, vec![v1]);
+
+    // A revision retires what it names and nothing else: `v1` is still pending
+    // beside the new draft, and still reported — the report is "what is still
+    // there", not "what you just did".
+    let (v3, beside) = proposed(
+        fs.remove_or_propose(a, "/n.md", None, Some(v2))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(status(&fs, v2).await, SuggestionStatus::Superseded);
+    assert_eq!(beside, vec![v1]);
+
+    // Once the abandoned draft is withdrawn, the next revision reports nothing.
+    fs.supersede_suggestion(v1, a, None).await.unwrap();
+    let (_v4, beside) = proposed(
+        fs.write_or_propose(a, "/n.md", b"v4\n", None, Some(v3))
+            .await
+            .unwrap(),
+    );
+    assert!(beside.is_empty(), "{beside:?}");
+    // And the other actor's draft was never touched by any of it.
+    let pending = fs
+        .list_suggestions(Some(SuggestionStatus::Pending), Some("/n.md"))
+        .await
+        .unwrap();
+    assert!(pending.iter().any(|s| s.actor_id == other), "{pending:?}");
 }

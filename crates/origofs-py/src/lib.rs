@@ -661,13 +661,29 @@ struct WriteOutcome {
     /// review; `None` when it was written directly.
     #[pyo3(get)]
     suggestion_id: Option<i64>,
+    /// When queued: this actor's **other** pending proposals at the path, newest
+    /// first (#164). Non-empty means the edit was stacked beside them rather than
+    /// revising one via ``replaces``; each is the actor's own to retire with
+    /// ``supersede_suggestion``. Empty when written directly.
+    #[pyo3(get)]
+    pending_siblings: Vec<i64>,
 }
 
 #[pymethods]
 impl WriteOutcome {
     fn __repr__(&self) -> String {
         match self.suggestion_id {
-            Some(id) => format!("WriteOutcome(proposed suggestion #{id})"),
+            Some(id) if self.pending_siblings.is_empty() => {
+                format!("WriteOutcome(proposed suggestion #{id})")
+            }
+            Some(id) => format!(
+                "WriteOutcome(proposed suggestion #{id}, stacked beside pending {})",
+                self.pending_siblings
+                    .iter()
+                    .map(|s| format!("#{s}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             None => "WriteOutcome(wrote)".to_string(),
         }
     }

@@ -1284,7 +1284,15 @@ async fn write_file(
             origofs_core::metrics::record_write(body.len() as u64);
             Ok(Json(json!({ "path": p, "written": body.len() })))
         }
-        WriteOutcome::Proposed(id) => Ok(Json(json!({ "path": p, "proposed": id }))),
+        // `pending_siblings`: this actor's other pending drafts at the path, so a
+        // client learns it stacked rather than revised from the call that did it
+        // (#164). Retire one with `POST /suggestions/{id}/supersede`.
+        WriteOutcome::Proposed {
+            id,
+            pending_siblings,
+        } => Ok(Json(json!({
+            "path": p, "proposed": id, "pending_siblings": pending_siblings
+        }))),
     }
 }
 
@@ -1303,7 +1311,12 @@ async fn delete_file(
         .await?
     {
         WriteOutcome::Wrote => Ok(Json(json!({ "removed": p }))),
-        WriteOutcome::Proposed(id) => Ok(Json(json!({ "path": p, "proposed": id }))),
+        WriteOutcome::Proposed {
+            id,
+            pending_siblings,
+        } => Ok(Json(json!({
+            "path": p, "proposed": id, "pending_siblings": pending_siblings
+        }))),
     }
 }
 

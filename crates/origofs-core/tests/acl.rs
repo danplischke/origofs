@@ -62,7 +62,7 @@ async fn an_actor_with_no_grant_falls_back_to_its_write_policy() {
         fs.write_or_propose(ctx, "/other.txt", b"x", None, None)
             .await
             .unwrap(),
-        WriteOutcome::Proposed(_)
+        WriteOutcome::Proposed { .. }
     ));
     assert!(
         fs.stat("/other.txt").await.is_err(),
@@ -103,7 +103,7 @@ async fn a_grant_makes_write_possible_only_where_it_covers() {
             fs.write_or_propose(ctx, "/src/main.rs", b"nope", None, None)
                 .await
                 .unwrap(),
-            WriteOutcome::Proposed(_)
+            WriteOutcome::Proposed { .. }
         ),
         "the grant covers /docs only; a write to /src must be queued, not applied"
     );
@@ -170,7 +170,7 @@ async fn a_grant_does_not_cover_a_lookalike_sibling() {
             fs.write_or_propose(ctx, "/tenant-abc/f.txt", b"theirs", None, None)
                 .await
                 .unwrap(),
-            WriteOutcome::Proposed(_)
+            WriteOutcome::Proposed { .. }
         ),
         "`/tenant-a` must not cover `/tenant-abc` — the exact neighbour a prefix \
          grant exists to exclude"
@@ -304,7 +304,7 @@ async fn removal_and_writing_agree_about_a_path() {
         fs.remove_or_propose(ctx, "/src/f.txt", None, None)
             .await
             .unwrap(),
-        WriteOutcome::Proposed(_)
+        WriteOutcome::Proposed { .. }
     ));
     assert!(
         fs.stat("/src/f.txt").await.is_ok(),
@@ -445,7 +445,7 @@ async fn grants_do_not_leak_between_actors() {
             fs.write_or_propose(WriteCtx::actor(bob), "/shared/f.txt", b"x", None, None)
                 .await
                 .unwrap(),
-            WriteOutcome::Proposed(_)
+            WriteOutcome::Proposed { .. }
         ),
         "one actor's grant must not authorize another"
     );
@@ -542,7 +542,7 @@ async fn require_attribution_does_not_second_guess_the_write_policy() {
     assert!(
         matches!(
             fs.write_or_propose(ctx, "/d/f.txt", b"y", None, None).await,
-            Ok(origofs_core::WriteOutcome::Proposed(_))
+            Ok(origofs_core::WriteOutcome::Proposed { .. })
         ),
         "require_attribution must not turn a queued write into a refusal"
     );
@@ -739,7 +739,7 @@ async fn reviewing_is_checked_at_the_suggestions_path() {
         .await
         .unwrap()
     {
-        WriteOutcome::Proposed(id) => id,
+        WriteOutcome::Proposed { id, .. } => id,
         other => panic!("expected a proposal, got {other:?}"),
     };
     let out_of_scope = match fs
@@ -747,7 +747,7 @@ async fn reviewing_is_checked_at_the_suggestions_path() {
         .await
         .unwrap()
     {
-        WriteOutcome::Proposed(id) => id,
+        WriteOutcome::Proposed { id, .. } => id,
         other => panic!("expected a proposal, got {other:?}"),
     };
 

@@ -196,6 +196,14 @@ write path enforces this and you must not weaken it:
     workflow and origofs cannot tell it from a revision, so retiring the earlier
     one automatically would silently discard the alternative — the same class of
     unasked-for outcome as #158, in the other direction.
+  - **Opt-in means the caller has to know, so the outcome tells it.** A queued
+    `write_or_propose`/`remove_or_propose` returns `Proposed { id, pending_siblings }`
+    — the actor's *other* pending drafts at the path. Non-empty means it stacked
+    rather than revised, and each id is its own to retire; the MCP and CLI results
+    say so in words, the HTTP APIs and Python carry the list. Only the actor's own
+    drafts are named: those are the ones it may dispose of without `WRITE`, and
+    naming another's would disclose proposals at a path to a caller the
+    id-addressed reads answer *not found* for.
   - **"Stale" is not "obsolete".** `supersede_stale_byte_suggestions` retires
     proposals whose *base moved on*, and an author revising a draft has changed no
     bytes, so it returns `0` for siblings. That is a different relation, not a gap

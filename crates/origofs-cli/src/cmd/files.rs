@@ -89,10 +89,14 @@ pub async fn write(
                     // subcommand sets.
                     match ws.write_or_propose(ctx, &path, &data, None, None).await? {
                         origofs_sdk::WriteOutcome::Wrote => {}
-                        origofs_sdk::WriteOutcome::Proposed(suggestion_id) => {
+                        origofs_sdk::WriteOutcome::Proposed {
+                            id: suggestion_id,
+                            pending_siblings,
+                        } => {
                             println!(
                                 "actor {actor} is propose-only: queued suggestion #{suggestion_id} for {path} (pending review)"
                             );
+                            stacked_note(&pending_siblings, &path, actor);
                         }
                     }
                 }
@@ -155,6 +159,24 @@ pub async fn info(ws: &Workspace, path: String, no_probe: bool) -> Result<()> {
     Ok(())
 }
 
+/// Say which of the actor's earlier drafts the queued one was stacked beside
+/// (#164), and how to retire one. Silent when there are none.
+fn stacked_note(pending_siblings: &[i64], path: &str, actor: i64) {
+    if pending_siblings.is_empty() {
+        return;
+    }
+    let ids = pending_siblings
+        .iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "note: actor {actor} also has {ids} pending on {path}; this one was stacked beside \
+         them, not revised. `origofs supersede <id> --actor {actor}` retires a draft you \
+         abandoned, or pass --replaces on `suggest` next time."
+    );
+}
+
 pub async fn rm(ws: &Workspace, path: String, actor: Option<i64>) -> Result<()> {
     match resolve_actor(actor)? {
         Some(actor) => {
@@ -165,10 +187,14 @@ pub async fn rm(ws: &Workspace, path: String, actor: Option<i64>) -> Result<()> 
             // opposite direction.
             match ws.remove_or_propose(ctx, &path, None, None).await? {
                 origofs_sdk::WriteOutcome::Wrote => {}
-                origofs_sdk::WriteOutcome::Proposed(id) => {
+                origofs_sdk::WriteOutcome::Proposed {
+                    id,
+                    pending_siblings,
+                } => {
                     println!(
                         "actor {actor} is propose-only: queued suggestion #{id} to delete {path} (pending review)"
                     );
+                    stacked_note(&pending_siblings, &path, actor);
                 }
             }
         }

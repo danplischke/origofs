@@ -9,6 +9,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ### Added
 
+- **A proposal can be revised, not only stacked (#164).** `write_or_propose` had
+  no update-in-place, so an actor told "revise your proposal" could only propose
+  again — a *sibling* on the same base. Accept handled that by accident (landing
+  either moves the file, so the other goes stale); reject did not, leaving the
+  abandoned draft `pending` on a base that still matched the file, so it accepted
+  cleanly and landed text the author had replaced and the reviewer never chose.
+  `replaces` on every propose call (`suggest`, `suggest_delete`,
+  `write_or_propose`, `remove_or_propose`, `suggest_coedit`,
+  `suggest_coedit_tree`; `--replaces` on the CLI, `?replaces=` on
+  `POST /suggestions`, `replaces` on `origofs_suggest`) retires that draft as the
+  new one is created, and `supersede_suggestion` (`origofs supersede`,
+  `POST /suggestions/{id}/supersede`, `origofs_supersede`) is the standalone
+  withdrawal — the author's own always, anyone else's with `WRITE` at its path,
+  as rejecting it takes. Opt-in rather than automatic, because two drafts a
+  reviewer is meant to choose between is a real workflow origofs cannot tell from
+  a revision. Because it is opt-in, a queued `write_or_propose`/`remove_or_propose`
+  now reports the actor's *other* pending drafts at the path (`pending_siblings`
+  in `WriteOutcome`, Python's `WriteOutcome`, and the `PUT`/`DELETE /v1/files`
+  responses; in words on the CLI and in the MCP result), so a caller learns it
+  stacked from the call that did it and holds the id to retire.
+  `supersede_stale_suggestions` is documented as what it always was: base moved
+  on, and only that — it returns `0` for siblings on an unchanged base.
+
 - **Per-actor undo/redo in live co-editing (#146).** Every editor a host binds
   to this expects Ctrl+Z to work and to undo *the user's own* typing. There was
   no undo stack, no redo, and no inverse-op journal anywhere in the tree.
@@ -99,6 +122,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — see
 
 ### Changed
 
+- **`WriteOutcome::Proposed` is a struct variant and the enum is no longer
+  `Copy` (#164).** `Proposed(i64)` became `Proposed { id, pending_siblings }`;
+  match on `Proposed { id, .. }`. The Python `WriteOutcome` and the HTTP
+  responses only gain a field.
+- **A settled suggestion is a conflict, not a bad request (#164).** Accepting,
+  rejecting or superseding a row that is already accepted, rejected or superseded
+  returns `OrigoFSError::AlreadyResolved` (`already_resolved`, HTTP `409`,
+  `AlreadyResolvedError` under `ConflictError` in Python) instead of
+  `InvalidArgument` (`400`, `ValueError`): the request was well-formed and merely
+  out of date, and unlike `StaleBase` or a raced `Conflict` there is nothing to
+  retry — read the row's status.
 - **The tree co-editing room is confirmed compatible with PlateJS/Slate, and the
   claim is now pinned by a test against the real client** (#152). It was reported
   as wire-*incompatible*: `@platejs/yjs` binds through `@slate-yjs/core`, which

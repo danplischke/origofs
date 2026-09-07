@@ -190,10 +190,14 @@ impl McpServer {
                     .await?
                 {
                     WriteOutcome::Wrote => Ok(format!("wrote {} bytes to {p}", data.len())),
-                    WriteOutcome::Proposed(id) => Ok(format!(
+                    WriteOutcome::Proposed {
+                        id,
+                        pending_siblings,
+                    } => Ok(format!(
                         "proposed suggestion #{id} for {p} ({} bytes) — pending review; \
-                         this agent is propose-only",
-                        data.len()
+                         this agent is propose-only{}",
+                        data.len(),
+                        stacked_note(&pending_siblings)
                     )),
                 }
             }
@@ -254,9 +258,13 @@ impl McpServer {
                         "edited {p} ({count} replacement{})",
                         if count == 1 { "" } else { "s" }
                     )),
-                    WriteOutcome::Proposed(id) => Ok(format!(
+                    WriteOutcome::Proposed {
+                        id,
+                        pending_siblings,
+                    } => Ok(format!(
                         "proposed suggestion #{id} for {p} (edit) — pending review; \
-                         this agent is propose-only"
+                         this agent is propose-only{}",
+                        stacked_note(&pending_siblings)
                     )),
                 }
             }
@@ -528,9 +536,13 @@ impl McpServer {
                     .await?
                 {
                     WriteOutcome::Wrote => Ok(format!("removed {}", path()?)),
-                    WriteOutcome::Proposed(id) => Ok(format!(
-                        "proposed deletion #{id} for {} (pending review)",
-                        path()?
+                    WriteOutcome::Proposed {
+                        id,
+                        pending_siblings,
+                    } => Ok(format!(
+                        "proposed deletion #{id} for {} (pending review){}",
+                        path()?,
+                        stacked_note(&pending_siblings)
                     )),
                 }
             }
@@ -687,6 +699,33 @@ fn tool(name: &str, description: &str, props: Value, required: &[&str]) -> Value
             "required": required,
         }
     })
+}
+
+/// The tail of a propose result that names the drafts the new one was stacked
+/// beside (#164). An agent reads tool results, not docs, so this is where it
+/// learns it should have revised: the ids are its own, and `origofs_supersede`
+/// retires one in a single call. Empty when there is nothing beside it.
+fn stacked_note(pending_siblings: &[i64]) -> String {
+    if pending_siblings.is_empty() {
+        return String::new();
+    }
+    let ids = pending_siblings
+        .iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        ". Note: your earlier proposal{} {ids} on this path {} still pending beside it — \
+         this one was stacked, not revised. If it replaces one, retire that with \
+         origofs_supersede (or pass `replaces` on origofs_suggest next time); otherwise a \
+         reviewer can still accept the draft you abandoned",
+        if pending_siblings.len() == 1 { "" } else { "s" },
+        if pending_siblings.len() == 1 {
+            "is"
+        } else {
+            "are"
+        },
+    )
 }
 
 fn tool_defs() -> Vec<Value> {
